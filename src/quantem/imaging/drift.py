@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from typing import List, Optional, Union
+from typing import List, Optional, Self, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -114,10 +114,11 @@ class DriftCorrection(AutoSerialize):
     def from_file(
         cls,
         file_paths: Sequence[str],
-        scan_direction_degrees: Union[Sequence[float], NDArray],
+        scan_direction_degrees: Sequence[float] | NDArray,
         file_type: str | None = None,
-    ) -> "DriftCorrection":
+    ) -> Self:
         image_list = [Dataset2d.from_file(fp, file_type=file_type) for fp in file_paths]
+
         return cls.from_data(
             image_list,
             scan_direction_degrees,
@@ -126,9 +127,14 @@ class DriftCorrection(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        images: Union[List[Dataset2d], List[NDArray], Dataset3d, NDArray],
-        scan_direction_degrees: Union[List[float], NDArray],
-    ) -> "DriftCorrection":
+        images: List[Dataset2d] | List[NDArray] | Dataset3d | NDArray,
+        scan_direction_degrees: List[float] | NDArray,
+    ) -> Self:
+        if len(images) < 2:
+            raise ValueError(
+                "DriftCorrection currently requires at least a pair of images to initialize."
+            )
+
         validated_images = validate_list_of_dataset2d(images)
 
         return cls(
@@ -190,7 +196,7 @@ class DriftCorrection(AutoSerialize):
     def preprocess(
         self,
         pad_fraction: float = 0.25,
-        pad_value: Union[float, str, List[float]] = "median",
+        pad_value: float | str | List[float] = "median",
         kde_sigma: float = 0.5,
         number_knots: int = 1,
         show_merged: bool = False,
