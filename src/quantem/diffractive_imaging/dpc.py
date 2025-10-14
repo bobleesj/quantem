@@ -1,13 +1,12 @@
 from collections.abc import Sequence
-from typing import List, Optional, Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-import matplotlib.pyplot as plt
 
-from quantem.core.io.serialize import AutoSerialize
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization import show_2d
 
 
@@ -19,7 +18,6 @@ class DPC(AutoSerialize):
     For now just implement simple CoM
     """
 
-
     _token = object()
 
     def __init__(
@@ -28,9 +26,7 @@ class DPC(AutoSerialize):
         _token: object | None = None,
     ):
         if _token is not self._token:
-            raise RuntimeError(
-                "Use DriftCorrection.from_data() or .from_file() to instantiate this class."
-            )
+            raise RuntimeError("Use DPC.from_data() or .from_file() to instantiate this class.")
         self._dataset = dataset
 
     @classmethod
@@ -47,9 +43,8 @@ class DPC(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        dataset: Union[Dataset4dstem, Dataset4d, NDArray],
+        dataset: Dataset4dstem | Dataset4d | NDArray,
     ) -> "DPC":
-
         return cls(
             dataset=dataset,
             _token=cls._token,
@@ -64,17 +59,17 @@ class DPC(AutoSerialize):
     def dataset(self, value: Dataset4dstem):
         self._dataset = Dataset4dstem
 
-
     # Preprocessing center of mass
     def preprocess(
         self,
         mask_diffraction: NDArray | None = None,
-        rotation_steps = 180,
-        normalize_zero_com: bool = True,
-        print_optimization = True,
-        plot_optimization = True,
-        plot_com_raw = False,
-        plot_com = True,
+        rotation_steps=180,
+        normalize_zero_com=True,
+        print_optimization=True,
+        plot_optimization=True,
+        plot_com_raw=False,
+        plot_com=True,
+        plot_com_mag=True,
         **kwargs,
     ) -> "DPC":
         """
@@ -96,38 +91,42 @@ class DPC(AutoSerialize):
         self.intensity_sum : (Nx, Ny) float64   # denominator (masked or unmasked)
         """
 
-        I = self._dataset.array  # shape: (Nx, Ny, Nkx, Nky)
+        I = self._dataset.array  # shape: (Nx, Ny, Nkx, Nky) # noqa: E741
         Nx, Ny, Nkx, Nky = I.shape
-        x = np.arange(Nkx, dtype=np.float64)          # (Nkx,)
-        y = np.arange(Nky, dtype=np.float64)          # (Nky,)
+        x = np.arange(Nkx, dtype=np.float64)  # (Nkx,)
+        y = np.arange(Nky, dtype=np.float64)  # (Nky,)
 
         if mask_diffraction is not None:
             mask = np.asarray(mask_diffraction, dtype=bool)
             if mask.shape != (Nkx, Nky):
                 raise ValueError("`mask_diffraction` must have shape (Nkx, Nky).")
 
-            m = mask.astype(np.float64)               # (Nkx, Nky)
-            wx = (x[:, None] * m)                     # (Nkx, Nky)
-            wy = (y[None, :] * m)                     # (Nkx, Nky)
+            m = mask.astype(np.float64)  # (Nkx, Nky)
+            wx = x[:, None] * m  # (Nkx, Nky)
+            wy = y[None, :] * m  # (Nkx, Nky)
 
             # Denominator and numerators via 2D weights; no large temporaries
-            denom = np.tensordot(I, m,  axes=([2, 3], [0, 1]))  # (Nx, Ny)
+            denom = np.tensordot(I, m, axes=([2, 3], [0, 1]))  # (Nx, Ny)
             num_x = np.tensordot(I, wx, axes=([2, 3], [0, 1]))  # (Nx, Ny)
             num_y = np.tensordot(I, wy, axes=([2, 3], [0, 1]))  # (Nx, Ny)
 
         else:
             # Unmasked: use separable reductions to minimize memory
-            denom = I.sum(axis=(2, 3))                          # (Nx, Ny)
+            denom = I.sum(axis=(2, 3))  # (Nx, Ny)
 
-            Iy = I.sum(axis=3)                                   # (Nx, Ny, Nkx)
-            num_x = np.tensordot(Iy, x, axes=([2], [0]))         # (Nx, Ny)
+            Iy = I.sum(axis=3)  # (Nx, Ny, Nkx)
+            num_x = np.tensordot(Iy, x, axes=([2], [0]))  # (Nx, Ny)
 
-            Ix = I.sum(axis=2)                                   # (Nx, Ny, Nky)
-            num_y = np.tensordot(Ix, y, axes=([2], [0]))         # (Nx, Ny)
+            Ix = I.sum(axis=2)  # (Nx, Ny, Nky)
+            num_y = np.tensordot(Ix, y, axes=([2], [0]))  # (Nx, Ny)
 
         with np.errstate(divide="ignore", invalid="ignore"):
-            com_x = np.divide(num_x, denom, out=np.full_like(denom, np.nan, dtype=np.float64), where=denom != 0)
-            com_y = np.divide(num_y, denom, out=np.full_like(denom, np.nan, dtype=np.float64), where=denom != 0)
+            com_x = np.divide(
+                num_x, denom, out=np.full_like(denom, np.nan, dtype=np.float64), where=denom != 0
+            )
+            com_y = np.divide(
+                num_y, denom, out=np.full_like(denom, np.nan, dtype=np.float64), where=denom != 0
+            )
 
         self.com_x_raw = com_x
         self.com_y_raw = com_y
@@ -135,7 +134,7 @@ class DPC(AutoSerialize):
         self._mask_diffraction = mask_diffraction
 
         # Refine rotation using curl minimization
-        self._rotation_angles_deg = np.linspace(0,180,rotation_steps,endpoint=False)
+        self._rotation_angles_deg = np.linspace(0, 180, rotation_steps, endpoint=False)
         self._rotation_angles = np.deg2rad(self._rotation_angles_deg)
         cosa = np.cos(self._rotation_angles)
         sina = np.sin(self._rotation_angles)
@@ -150,8 +149,8 @@ class DPC(AutoSerialize):
         Yy = 0.5 * (Y[1:-1, 2:] - Y[1:-1, :-2])
 
         # Precompute terms used in curl after rotation
-        D  = Xx + Yy       # divergence(X, Y)
-        C  = Yx - Xy       # curl(X, Y)
+        D = Xx + Yy  # divergence(X, Y)
+        C = Yx - Xy  # curl(X, Y)
         D2 = Yx + Xy
         C2 = Xx - Yy
 
@@ -160,7 +159,7 @@ class DPC(AutoSerialize):
 
         for i in range(self._rotation_angles.size):
             s, c = sina[i], cosa[i]
-            curl0 = s * D  + c * C
+            curl0 = s * D + c * C
             curl1 = s * D2 + c * C2
             metric[i] = np.mean(curl0**2)
             metric_transpose[i] = np.mean(curl1**2)
@@ -188,10 +187,12 @@ class DPC(AutoSerialize):
         if normalize_zero_com:
             self.com_x -= np.mean(self.com_x)
             self.com_y -= np.mean(self.com_y)
-            
+
         # print the best fit optimization
         if print_optimization:
-            print(f"Best rotation angle: {self._rotation_best_deg:.3f} deg; transpose: {self._rotation_best_transpose}")
+            print(
+                f"Best rotation angle: {self._rotation_best_deg:.3f} deg; transpose: {self._rotation_best_transpose}"
+            )
 
         # Plot the best fit rotation
         if plot_optimization:
@@ -216,10 +217,11 @@ class DPC(AutoSerialize):
                 i_best = int(np.argmin(metric))
                 y_best = metric[i_best]
             ax.plot(
-                self._rotation_best_deg, 
-                y_best, "o", 
-                markerfacecolor=(0, 1, 0), 
-                markeredgecolor=(0, 0, 0), 
+                self._rotation_best_deg,
+                y_best,
+                "o",
+                markerfacecolor=(0, 1, 0),
+                markeredgecolor=(0, 0, 0),
                 markersize=6,
             )
 
@@ -237,10 +239,10 @@ class DPC(AutoSerialize):
                     self.com_y_raw,
                 ],
                 title=[
-                    'Raw CoM x',
-                    'Raw CoM y',
+                    "Raw CoM x",
+                    "Raw CoM y",
                 ],
-                cmap = 'RdBu_r',
+                cmap="RdBu_r",
                 **kwargs,
             )
         if plot_com:
@@ -250,15 +252,24 @@ class DPC(AutoSerialize):
                     self.com_y,
                 ],
                 title=[
-                    'Optmized CoM x',
-                    'Optmized CoM y',
+                    "Optmized CoM x",
+                    "Optmized CoM y",
                 ],
-                cmap = 'RdBu_r',
+                cmap="RdBu_r",
+                **kwargs,
+            )
+
+        if plot_com_mag:
+            show_2d(
+                [np.sqrt(self.com_x**2 + self.com_y**2)],
+                title=[
+                    "Optimized CoM magnitude",
+                ],
+                cmap="RdBu_r",
                 **kwargs,
             )
 
         return self
-
 
     def reconstruct(
         self,
@@ -334,8 +345,10 @@ class DPC(AutoSerialize):
             ph = int(np.round(H * pad_factor))
             pw = int(np.round(W * pad_factor))
 
-            pad_x = np.zeros((ph, pw), dtype=np.float64); pad_x[:H, :W] = gx
-            pad_y = np.zeros((ph, pw), dtype=np.float64); pad_y[:H, :W] = gy
+            pad_x = np.zeros((ph, pw), dtype=np.float64)
+            pad_x[:H, :W] = gx
+            pad_y = np.zeros((ph, pw), dtype=np.float64)
+            pad_y[:H, :W] = gy
 
             mask = np.zeros((ph, pw), dtype=bool)
             mask[:H, :W] = True
@@ -359,11 +372,16 @@ class DPC(AutoSerialize):
                 prev_phase = phase_pad.copy()
 
                 # Centered finite-difference gradient
-                grad_x = (np.roll(phase_pad, 1, axis=0) - np.roll(phase_pad, -1, axis=0)) / (2.0 * dx)
-                grad_y = (np.roll(phase_pad, 1, axis=1) - np.roll(phase_pad, -1, axis=1)) / (2.0 * dy)
+                grad_x = (np.roll(phase_pad, 1, axis=0) - np.roll(phase_pad, -1, axis=0)) / (
+                    2.0 * dx
+                )
+                grad_y = (np.roll(phase_pad, 1, axis=1) - np.roll(phase_pad, -1, axis=1)) / (
+                    2.0 * dy
+                )
 
                 # Residual in the valid (unpadded) region
-                rx = np.zeros_like(grad_x); ry = np.zeros_like(grad_y)
+                rx = np.zeros_like(grad_x)
+                ry = np.zeros_like(grad_y)
                 rx[mask] = pad_x[mask] - grad_x[mask]
                 ry[mask] = pad_y[mask] - grad_y[mask]
 
@@ -372,9 +390,16 @@ class DPC(AutoSerialize):
                 phase_pad = phase_pad + s * update
 
                 # Error & backtracking
-                grad_x = (np.roll(phase_pad, 1, axis=0) - np.roll(phase_pad, -1, axis=0)) / (2.0 * dx)
-                grad_y = (np.roll(phase_pad, 1, axis=1) - np.roll(phase_pad, -1, axis=1)) / (2.0 * dy)
-                err_new = np.mean((pad_x[mask] - grad_x[mask]) ** 2 + (pad_y[mask] - grad_y[mask]) ** 2) / denom
+                grad_x = (np.roll(phase_pad, 1, axis=0) - np.roll(phase_pad, -1, axis=0)) / (
+                    2.0 * dx
+                )
+                grad_y = (np.roll(phase_pad, 1, axis=1) - np.roll(phase_pad, -1, axis=1)) / (
+                    2.0 * dy
+                )
+                err_new = (
+                    np.mean((pad_x[mask] - grad_x[mask]) ** 2 + (pad_y[mask] - grad_y[mask]) ** 2)
+                    / denom
+                )
 
                 if backtrack and (err_new > err):
                     phase_pad = prev_phase
@@ -393,14 +418,15 @@ class DPC(AutoSerialize):
             # Poisson solve with Neumann BCs via DCT. Sign fixed to match FFT convention.
             from scipy.fft import dctn, idctn
 
-            ddx = np.empty_like(gx); ddy = np.empty_like(gy)
+            ddx = np.empty_like(gx)
+            ddy = np.empty_like(gy)
             ddx[1:-1, :] = (gx[2:, :] - gx[:-2, :]) / (2 * dx)
-            ddx[0, :]    = (gx[1, :] - gx[0, :]) / dx
-            ddx[-1, :]   = (gx[-1, :] - gx[-2, :]) / dx
+            ddx[0, :] = (gx[1, :] - gx[0, :]) / dx
+            ddx[-1, :] = (gx[-1, :] - gx[-2, :]) / dx
 
             ddy[:, 1:-1] = (gy[:, 2:] - gy[:, :-2]) / (2 * dy)
-            ddy[:, 0]    = (gy[:, 1] - gy[:, 0]) / dy
-            ddy[:, -1]   = (gy[:, -1] - gy[:, -2]) / dy
+            ddy[:, 0] = (gy[:, 1] - gy[:, 0]) / dy
+            ddy[:, -1] = (gy[:, -1] - gy[:, -2]) / dy
 
             # Use negative divergence so DCT result matches FFT method orientation.
             rhs = -(ddx + ddy)
@@ -408,8 +434,9 @@ class DPC(AutoSerialize):
             rhs_hat = dctn(rhs, type=2, norm="ortho")
             m = np.arange(H, dtype=np.float64)[:, None]
             n = np.arange(W, dtype=np.float64)[None, :]
-            lam = (2.0 - 2.0 * np.cos(np.pi * m / H)) / (dx * dx) + \
-                  (2.0 - 2.0 * np.cos(np.pi * n / W)) / (dy * dy)
+            lam = (2.0 - 2.0 * np.cos(np.pi * m / H)) / (dx * dx) + (
+                2.0 - 2.0 * np.cos(np.pi * n / W)
+            ) / (dy * dy)
             lam[0, 0] = np.inf  # remove DC
             phi_hat = rhs_hat / lam
             phi_hat[0, 0] = 0.0
@@ -449,6 +476,3 @@ class DPC(AutoSerialize):
             show_2d(self.phase, title=f"CoM-DPC Phase ({label})", cbar=True, **kwargs)
 
         return self
-
-
-
