@@ -31,6 +31,7 @@ class Dataset(AutoSerialize):
     """
 
     _token = object()
+    _registry: dict[int, type] = {}
 
     def __init__(
         self,
@@ -40,6 +41,7 @@ class Dataset(AutoSerialize):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -52,6 +54,7 @@ class Dataset(AutoSerialize):
         self.units = units
         self.signal_units = signal_units
         self._file_path = None
+        self._metadata = metadata
 
     @classmethod
     def from_array(
@@ -115,6 +118,10 @@ class Dataset(AutoSerialize):
     def array(self, value: NDArray) -> None:
         self._array = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
 
     @property
     def name(self) -> str:
@@ -574,7 +581,7 @@ class Dataset(AutoSerialize):
                     self.sampling[axis] *= factor
             return None
 
-    def __getitem__(self, index) -> "Dataset":
+    def __getitem__(self, index) -> Self:
         """
         General indexing method for Dataset objects.
 
@@ -627,10 +634,18 @@ class Dataset(AutoSerialize):
                     j = kept_axes.index(i)
                     new_sampling[j] *= idx.step
 
-        cls = type(self)
+        out_ndim = array_view.ndim
+
+        if out_ndim == self.ndim:
+            cls = type(self)
+        else:
+            try:
+                cls = self._registry[out_ndim]
+            except KeyError:
+                cls = Dataset
 
         # Construct new dataset
-        return cls.from_array(
+        return cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
             array=array_view,
             name=f"{self.name}{index}",
             origin=new_origin,
@@ -638,3 +653,13 @@ class Dataset(AutoSerialize):
             units=new_units,
             signal_units=self.signal_units,
         )
+
+    @classmethod
+    def register_dimension(cls, ndim: int):
+        """Decorator for registering subclasses for a specific dimensionality."""
+
+        def decorator(subclass):
+            cls._registry[ndim] = subclass
+            return subclass
+
+        return decorator
