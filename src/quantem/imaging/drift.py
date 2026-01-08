@@ -600,7 +600,7 @@ class DriftCorrection(AutoSerialize):
 
         PyTorch Parameters (ignored if backend="scipy")
         -----------------------------------------------
-        adam_steps : int, default 50
+        adam_steps : int, default 5
             Number of Adam optimization steps per image.
         lr : float, default 0.02
             Learning rate for Adam optimizer.
@@ -628,52 +628,30 @@ class DriftCorrection(AutoSerialize):
         if not hasattr(self, "knots"):
             print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
-
-        # Initialize PyTorch tensors if using pytorch backend
-        pytorch_ctx = None
-        if backend == "pytorch":
-            try:
-                pytorch_ctx = self._init_pytorch_context()
-            except Exception as e:
-                warnings.warn(f"PyTorch init failed ({e}), falling back to scipy.", RuntimeWarning)
-                backend = "scipy"
-
-        # Main optimization loop (shared structure)
-        desc = f"Solving nonrigid drift ({backend})"
-        for _ in tqdm(range(num_iterations), desc=desc):
+        # Main optimization loop
+        for _ in tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({backend})"):
             for ind in range(self.shape[0]):
-                # Reference = average of other images (shared)
                 image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
                 knots_init = self.knots[ind]
-
-                # Optimize knots (backend-specific)
+                # Optimize knots
                 if backend == "pytorch":
                     knots_updated = self._optimize_knots_pytorch(
-                        ind, image_ref, knots_init, pytorch_ctx,
-                        adam_steps=adam_steps, lr=lr,
-                    )
+                        ind, image_ref, knots_init, adam_steps=adam_steps, lr=lr)
                 else:
                     knots_updated = self._optimize_knots_scipy(
                         ind, image_ref, knots_init,
                         max_optimize_iterations=max_optimize_iterations,
-                        solve_individual_rows=solve_individual_rows,
-                    )
-
-                # Apply max shift regularization (shared, scipy-specific param)
+                        solve_individual_rows=solve_individual_rows)
+                # Max shift regularization
                 if regularization_max_image_shift_px is not None:
                     knots_shift = knots_updated - self.knots[ind]
                     knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
                     sub = knots_dist > regularization_max_image_shift_px
-                    knots_updated[0][sub] = (
-                        self.knots[ind][0][sub]
-                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub]
-                    )
-                    knots_updated[1][sub] = (
-                        self.knots[ind][1][sub]
-                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub]
-                    )
-
-                # Apply smoothness regularization (shared)
+                    knots_updated[0][sub] = (self.knots[ind][0][sub]
+                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                    knots_updated[1][sub] = (self.knots[ind][1][sub]
+                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                # Smoothness regularization
                 if regularization_sigma_px is not None and regularization_sigma_px > 0:
                     knots_smoothed = knots_updated.copy()
                     for dim in range(knots_updated.shape[0]):
@@ -686,35 +664,19 @@ class DriftCorrection(AutoSerialize):
                             residual_smooth = gaussian_filter(residual, sigma=regularization_sigma_px)
                             knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
                     knots_updated = knots_smoothed
-
-                # Apply step size (shared)
+                # Step size
                 if regularization_update_step_size is not None:
-                    knots_updated = (
-                        self.knots[ind]
-                        + (knots_updated - self.knots[ind]) * regularization_update_step_size
-                    )
-
-                # Update knots (shared)
+                    knots_updated = (self.knots[ind]
+                        + (knots_updated - self.knots[ind]) * regularization_update_step_size)
                 self.knots[ind] = knots_updated
-
-            # Update warped images (shared)
+            # Update warped images
             for ind in range(self.shape[0]):
                 self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                    self.interpolator[ind].warp_image(
-                        self.images[ind].array, self.knots[ind]
-                    )
-                )
-
-            # Translation alignment (shared)
+                    self.interpolator[ind].warp_image(self.images[ind].array, self.knots[ind]))
+            # Translation alignment
             self.align_translation(
-                min_image_shift=min_image_shift,
-                max_image_shift=max_image_shift,
-                show_images=False,
-                show_merged=False,
-                show_knots=False,
-            )
-
-            # Error tracking (shared)
+                min_image_shift=min_image_shift, max_image_shift=max_image_shift,
+                show_images=False, show_merged=False, show_knots=False)
             self.calculate_error(2)
 
         if show_merged:
@@ -733,163 +695,88 @@ class DriftCorrection(AutoSerialize):
 
         return self
 
-    def _init_pytorch_context(self):
-        """Initialize PyTorch tensors for non-rigid optimization."""
-        device = get_device()
-        num_images = self.shape[0]
-        H, W = self.images[0].array.shape
-
-        return {
-            "device": device,
-            "H": H,
-            "W": W,
-            "images_t": [
-                torch.tensor(img.array, dtype=torch.float32, device=device)
-                for img in self.images
-            ],
-            "interp_params": [
-                {
-                    "scan_fast": torch.tensor(
-                        self.interpolator[i].scan_fast, dtype=torch.float32, device=device
-                    ),
-                    "u": torch.tensor(
-                        self.interpolator[i].u, dtype=torch.float32, device=device
-                    ),
-                }
-                for i in range(num_images)
-            ],
-        }
-
     def _optimize_knots_pytorch(
-        self,
-        ind: int,
-        image_ref: np.ndarray,
-        knots_init: np.ndarray,
-        ctx: dict,
-        adam_steps: int = 50,
-        lr: float = 0.02,
+        self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
+        adam_steps: int = 5, lr: float = 0.02,
     ) -> np.ndarray:
-        """PyTorch Adam batched optimization for one image."""
+        """PyTorch Adam batched optimization for one image (single knot only)."""
+        # TODO: support multiple knots (requires differentiable spline interpolation)
         if knots_init.shape[2] != 1:
-            # Fallback for multi-knot case
-            return knots_init.copy()
-
-        device = ctx["device"]
-        H, W = ctx["H"], ctx["W"]
-        image_ref_t = torch.tensor(image_ref, dtype=torch.float32, device=device)
-        target_t = ctx["images_t"][ind]
-
-        # Initialize knots as trainable tensor (all rows at once)
-        knots_t = torch.tensor(
-            knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True
-        )
-        optimizer = torch.optim.Adam([knots_t], lr=lr)
-
-        # Precompute scale factors
-        scale_x = ctx["interp_params"][ind]["scan_fast"][0] * (H - 1)
-        scale_y = ctx["interp_params"][ind]["scan_fast"][1] * (W - 1)
-        u_t = ctx["interp_params"][ind]["u"]
-
+            raise NotImplementedError(
+                f"PyTorch backend only supports single knot (got {knots_init.shape[2]}). "
+                "Use backend='scipy' for multiple knots.")
+        device = get_device()
+        H, W = self.images[idx].array.shape
+        # Convert to tensors
+        ref_image = torch.tensor(image_ref, dtype=torch.float32, device=device)
+        target_image = torch.tensor(self.images[idx].array, dtype=torch.float32, device=device)
+        row_position = torch.tensor(self.interpolator[idx].u, dtype=torch.float32, device=device)
+        scan_fast = self.interpolator[idx].scan_fast
+        scale_x = scan_fast[0] * (H - 1)
+        scale_y = scan_fast[1] * (W - 1)
+        # Initialize knots as trainable tensor: shape (2, num_rows)
+        knots = torch.tensor(knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True)
+        optimizer = torch.optim.Adam([knots], lr=lr)
         # Adam optimization (batched over all rows)
         for _ in range(adam_steps):
             optimizer.zero_grad()
-
-            # Transform all rows at once
-            xa = knots_t[0, :, None] + u_t[None, :] * scale_x
-            ya = knots_t[1, :, None] + u_t[None, :] * scale_y
-
-            # Clamp and compute bilinear interpolation indices
+            # Transform: single knot = shift along scan direction
+            xa = knots[0, :, None] + row_position[None, :] * scale_x
+            ya = knots[1, :, None] + row_position[None, :] * scale_y
+            # Bilinear interpolation (boundary clamp critical for quality)
             xa_c = xa.clamp(0, H - 1.001)
             ya_c = ya.clamp(0, W - 1.001)
             xf = xa_c.floor().long().clamp(0, H - 2)
             yf = ya_c.floor().long().clamp(0, W - 2)
-            dx = xa_c - xf.float()
-            dy = ya_c - yf.float()
-
-            # Bilinear interpolation (batched)
-            warped = (
-                image_ref_t[xf, yf] * (1 - dx) * (1 - dy)
-                + image_ref_t[xf + 1, yf] * dx * (1 - dy)
-                + image_ref_t[xf, yf + 1] * (1 - dx) * dy
-                + image_ref_t[xf + 1, yf + 1] * dx * dy
-            )
-
-            # MSE loss
-            loss = ((warped - target_t) ** 2).mean()
+            dx, dy = xa_c - xf.float(), ya_c - yf.float()
+            warped = (ref_image[xf, yf] * (1 - dx) * (1 - dy)
+                      + ref_image[xf + 1, yf] * dx * (1 - dy)
+                      + ref_image[xf, yf + 1] * (1 - dx) * dy
+                      + ref_image[xf + 1, yf + 1] * dx * dy)
+            loss = ((warped - target_image) ** 2).mean()
             loss.backward()
             optimizer.step()
-
-        # Convert back to numpy
-        knots_updated = np.zeros_like(knots_init)
-        knots_updated[:, :, 0] = knots_t.detach().cpu().numpy()
-        return knots_updated
+        return knots.detach().cpu().numpy()[:, :, None]
 
     def _optimize_knots_scipy(
-        self,
-        ind: int,
-        image_ref: np.ndarray,
-        knots_init: np.ndarray,
-        max_optimize_iterations: int = 10,
-        solve_individual_rows: bool = True,
+        self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
+        max_optimize_iterations: int = 10, solve_individual_rows: bool = True,
     ) -> np.ndarray:
         """SciPy L-BFGS optimization for one image."""
         shape_knots = knots_init.shape
-
+        options = {"maxiter": max_optimize_iterations} if max_optimize_iterations else {}
         if solve_individual_rows:
             knots_updated = np.zeros_like(knots_init)
-
             for row_ind in range(knots_init.shape[1]):
                 x0 = knots_init[:, row_ind, :].ravel()
-
                 def cost_function(x):
                     knots_row = x.reshape(shape_knots[0], shape_knots[2])
-                    xa, ya = self.interpolator[ind].transform_rows(knots_row)
-
+                    xa, ya = self.interpolator[idx].transform_rows(knots_row)
                     xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
                     yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                    dx = xa - xf
-                    dy = ya - yf
-
-                    warped = (
-                        image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                        + image_ref[xf + 1, yf] * dx * (1 - dy)
-                        + image_ref[xf, yf + 1] * (1 - dx) * dy
-                        + image_ref[xf + 1, yf + 1] * dx * dy
-                    )
-
-                    residual = warped - self.images[ind].array[row_ind, :]
-                    return np.sum(residual**2)
-
-                options = {"maxiter": max_optimize_iterations} if max_optimize_iterations else {}
+                    dx, dy = xa - xf, ya - yf
+                    warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
+                              + image_ref[xf + 1, yf] * dx * (1 - dy)
+                              + image_ref[xf, yf + 1] * (1 - dx) * dy
+                              + image_ref[xf + 1, yf + 1] * dx * dy)
+                    return np.sum((warped - self.images[idx].array[row_ind, :]) ** 2)
                 result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                 knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
-
         else:
             x0 = knots_init.ravel()
-
             def cost_function(x):
                 knots = x.reshape(shape_knots)
-                xa, ya = self.interpolator[ind].transform_coordinates(knots)
-
+                xa, ya = self.interpolator[idx].transform_coordinates(knots)
                 xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
                 yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                dx = xa - xf
-                dy = ya - yf
-
-                warped = (
-                    image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                    + image_ref[xf + 1, yf] * dx * (1 - dy)
-                    + image_ref[xf, yf + 1] * (1 - dx) * dy
-                    + image_ref[xf + 1, yf + 1] * dx * dy
-                )
-
-                residual = warped - self.images[ind].array
-                return np.sum(residual**2)
-
-            options = {"maxiter": max_optimize_iterations} if max_optimize_iterations else {}
+                dx, dy = xa - xf, ya - yf
+                warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
+                          + image_ref[xf + 1, yf] * dx * (1 - dy)
+                          + image_ref[xf, yf + 1] * (1 - dx) * dy
+                          + image_ref[xf + 1, yf + 1] * dx * dy)
+                return np.sum((warped - self.images[idx].array) ** 2)
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
-
         return knots_updated
 
     def generate_corrected_image(
