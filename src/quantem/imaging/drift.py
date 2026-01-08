@@ -723,9 +723,10 @@ class DriftCorrection(AutoSerialize):
             # Transform: single knot = shift along scan direction
             xa = knots[0, :, None] + row_position[None, :] * scale_x
             ya = knots[1, :, None] + row_position[None, :] * scale_y
-            # Bilinear interpolation (boundary clamp critical for quality)
+            # Bilinear interpolation (boundary clamp critical for lower RMSE than scipy's L-BFGS)
             xa_c = xa.clamp(0, H - 1.001)
             ya_c = ya.clamp(0, W - 1.001)
+            # Guarantee xf+1 ≤ H-1 
             xf = xa_c.floor().long().clamp(0, H - 2)
             yf = ya_c.floor().long().clamp(0, W - 2)
             dx, dy = xa_c - xf.float(), ya_c - yf.float()
