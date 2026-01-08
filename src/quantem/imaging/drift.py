@@ -3,12 +3,15 @@ from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
+
+from quantem.core.config import get_device
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -552,7 +555,10 @@ class DriftCorrection(AutoSerialize):
     # non-rigid alignment
     def align_nonrigid(
         self,
+        backend: str = "pytorch",
         num_iterations: int = 8,
+        adam_steps: int = 50,
+        lr: float = 0.02,
         max_optimize_iterations: int = 10,
         regularization_sigma_px: float = 16.0,
         regularization_poly_order: int = 1,
@@ -567,17 +573,231 @@ class DriftCorrection(AutoSerialize):
         **kwargs,
     ):
         """
-        Non-rigid drift correction.
-        """
+        Non-rigid drift correction using PyTorch (default) or SciPy backend.
 
+        Parameters
+        ----------
+        backend : str, default "pytorch"
+            Optimization backend. "pytorch" uses GPU-accelerated Adam optimizer
+            with batched optimization (faster). "scipy" uses L-BFGS row-by-row.
+        num_iterations : int, default 8
+            Number of outer iterations for alternating optimization.
+        adam_steps : int, default 50
+            Number of Adam optimization steps per image (pytorch backend only).
+        lr : float, default 0.02
+            Learning rate for Adam optimizer (pytorch backend only).
+        max_optimize_iterations : int, default 10
+            Maximum iterations per row (scipy backend only).
+        regularization_sigma_px : float, default 16.0
+            Gaussian smoothing sigma for knot regularization.
+        regularization_poly_order : int, default 1
+            Polynomial order for trend removal in regularization.
+        regularization_max_image_shift_px : float, optional
+            Maximum allowed shift per iteration.
+        regularization_update_step_size : float, default 0.8
+            Step size for knot updates (0-1, lower = more conservative).
+        solve_individual_rows : bool, default True
+            If True, optimize each row independently (scipy only).
+        min_image_shift : float, optional
+            Minimum shift for translation alignment between iterations.
+        max_image_shift : float, default 32.0
+            Maximum shift for translation alignment between iterations.
+        show_merged : bool, default True
+            Show merged image after alignment.
+        show_images : bool, default False
+            Show individual aligned images.
+        show_knots : bool, default True
+            Overlay knot positions on visualizations.
+        """
         if not hasattr(self, "knots"):
             print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
 
-        for iterations in tqdm(
-            range(num_iterations),
-            desc="Solving nonrigid drift",
-        ):
+        # Select backend
+        if backend == "pytorch":
+            try:
+                self._align_nonrigid_pytorch(
+                    num_iterations=num_iterations,
+                    adam_steps=adam_steps,
+                    lr=lr,
+                    regularization_sigma_px=regularization_sigma_px,
+                    regularization_update_step_size=regularization_update_step_size,
+                    min_image_shift=min_image_shift,
+                    max_image_shift=max_image_shift,
+                )
+            except Exception as e:
+                warnings.warn(f"PyTorch backend failed ({e}), falling back to scipy.", RuntimeWarning)
+                backend = "scipy"
+
+        if backend == "scipy":
+            self._align_nonrigid_scipy(
+                num_iterations=num_iterations,
+                max_optimize_iterations=max_optimize_iterations,
+                regularization_sigma_px=regularization_sigma_px,
+                regularization_poly_order=regularization_poly_order,
+                regularization_max_image_shift_px=regularization_max_image_shift_px,
+                regularization_update_step_size=regularization_update_step_size,
+                solve_individual_rows=solve_individual_rows,
+                min_image_shift=min_image_shift,
+                max_image_shift=max_image_shift,
+            )
+
+        if show_merged:
+            self.plot_merged_images(
+                show_knots=show_knots,
+                title="Merged: non-rigid",
+                **kwargs,
+            )
+
+        if show_images:
+            self.plot_transformed_images(
+                show_knots=show_knots,
+                title=[f"Image {i}: non-rigid" for i in range(self.shape[0])],
+                **kwargs,
+            )
+
+        return self
+
+    def _align_nonrigid_pytorch(
+        self,
+        num_iterations: int = 8,
+        adam_steps: int = 50,
+        lr: float = 0.02,
+        regularization_sigma_px: float = 16.0,
+        regularization_update_step_size: float = 0.8,
+        min_image_shift: Optional[float] = None,
+        max_image_shift: Optional[float] = 32.0,
+    ):
+        """PyTorch Adam batched non-rigid alignment."""
+        device = get_device()
+        num_images = self.shape[0]
+        H, W = self.images[0].array.shape
+
+        # Pre-convert images and interpolator params to tensors
+        images_t = [
+            torch.tensor(img.array, dtype=torch.float32, device=device)
+            for img in self.images
+        ]
+        interp_params = [
+            {
+                "scan_fast": torch.tensor(
+                    self.interpolator[i].scan_fast, dtype=torch.float32, device=device
+                ),
+                "u": torch.tensor(
+                    self.interpolator[i].u, dtype=torch.float32, device=device
+                ),
+            }
+            for i in range(num_images)
+        ]
+
+        for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (PyTorch)"):
+            for ind in range(num_images):
+                # Reference = average of other images
+                image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
+                image_ref_t = torch.tensor(image_ref, dtype=torch.float32, device=device)
+                target_t = images_t[ind]
+
+                knots_init = self.knots[ind]
+                if knots_init.shape[2] != 1:
+                    continue  # Skip multi-knot case
+
+                # Initialize knots as trainable tensor (all rows at once)
+                knots_t = torch.tensor(
+                    knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True
+                )
+                optimizer = torch.optim.Adam([knots_t], lr=lr)
+
+                # Precompute scale factors
+                scale_x = interp_params[ind]["scan_fast"][0] * (H - 1)
+                scale_y = interp_params[ind]["scan_fast"][1] * (W - 1)
+                u_t = interp_params[ind]["u"]
+
+                # Adam optimization (batched over all rows)
+                for _ in range(adam_steps):
+                    optimizer.zero_grad()
+
+                    # Transform all rows at once
+                    xa = knots_t[0, :, None] + u_t[None, :] * scale_x
+                    ya = knots_t[1, :, None] + u_t[None, :] * scale_y
+
+                    # Clamp and compute bilinear interpolation indices
+                    xa_c = xa.clamp(0, H - 1.001)
+                    ya_c = ya.clamp(0, W - 1.001)
+                    xf = xa_c.floor().long().clamp(0, H - 2)
+                    yf = ya_c.floor().long().clamp(0, W - 2)
+                    dx = xa_c - xf.float()
+                    dy = ya_c - yf.float()
+
+                    # Bilinear interpolation (batched)
+                    warped = (
+                        image_ref_t[xf, yf] * (1 - dx) * (1 - dy)
+                        + image_ref_t[xf + 1, yf] * dx * (1 - dy)
+                        + image_ref_t[xf, yf + 1] * (1 - dx) * dy
+                        + image_ref_t[xf + 1, yf + 1] * dx * dy
+                    )
+
+                    # MSE loss
+                    loss = ((warped - target_t) ** 2).mean()
+                    loss.backward()
+                    optimizer.step()
+
+                # Convert back to numpy
+                knots_updated = np.zeros_like(knots_init)
+                knots_updated[:, :, 0] = knots_t.detach().cpu().numpy()
+
+                # Apply smoothness regularization
+                if regularization_sigma_px is not None and regularization_sigma_px > 0:
+                    for dim in range(2):
+                        x = np.arange(knots_updated.shape[1])
+                        y = knots_updated[dim, :, 0]
+                        trend = np.polyval(np.polyfit(x, y, deg=1), x)
+                        knots_updated[dim, :, 0] = (
+                            gaussian_filter(y - trend, sigma=regularization_sigma_px) + trend
+                        )
+
+                # Apply step size
+                if regularization_update_step_size is not None:
+                    self.knots[ind] = (
+                        self.knots[ind]
+                        + (knots_updated - self.knots[ind]) * regularization_update_step_size
+                    )
+                else:
+                    self.knots[ind] = knots_updated
+
+            # Update warped images
+            for ind in range(num_images):
+                self.images_warped.array[ind], self.weights_warped.array[ind] = (
+                    self.interpolator[ind].warp_image(
+                        self.images[ind].array, self.knots[ind]
+                    )
+                )
+
+            # Translation alignment
+            self.align_translation(
+                min_image_shift=min_image_shift,
+                max_image_shift=max_image_shift,
+                show_images=False,
+                show_merged=False,
+                show_knots=False,
+            )
+
+            # Error tracking
+            self.calculate_error(2)
+
+    def _align_nonrigid_scipy(
+        self,
+        num_iterations: int = 8,
+        max_optimize_iterations: int = 10,
+        regularization_sigma_px: float = 16.0,
+        regularization_poly_order: int = 1,
+        regularization_max_image_shift_px: Optional[float] = None,
+        regularization_update_step_size: Optional[float] = 0.8,
+        solve_individual_rows: bool = True,
+        min_image_shift: Optional[float] = None,
+        max_image_shift: Optional[float] = 32.0,
+    ):
+        """SciPy L-BFGS non-rigid alignment (original implementation)."""
+        for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (SciPy)"):
             for ind in range(self.shape[0]):
                 image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
 
@@ -609,7 +829,6 @@ class DriftCorrection(AutoSerialize):
                             residual = warped - self.images[ind].array[row_ind, :]
                             return np.sum(residual**2)
 
-                        # Run optimization
                         options = (
                             {"maxiter": max_optimize_iterations}
                             if max_optimize_iterations is not None
@@ -640,7 +859,6 @@ class DriftCorrection(AutoSerialize):
                         residual = warped - self.images[ind].array
                         return np.sum(residual**2)
 
-                    # Run optimization
                     options = (
                         {"maxiter": max_optimize_iterations}
                         if max_optimize_iterations is not None
@@ -649,7 +867,7 @@ class DriftCorrection(AutoSerialize):
                     result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                     knots_updated = result.x.reshape(shape_knots)
 
-                # apply max shift regularization if needed
+                # Apply max shift regularization if needed
                 if regularization_max_image_shift_px is not None:
                     knots_shift = knots_updated - self.knots[ind]
                     knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
@@ -663,7 +881,7 @@ class DriftCorrection(AutoSerialize):
                         + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub]
                     )
 
-                # apply smoothness regularization if needed
+                # Apply smoothness regularization if needed
                 if regularization_sigma_px is not None and regularization_sigma_px > 0:
                     knots_smoothed = knots_updated.copy()
 
@@ -675,7 +893,6 @@ class DriftCorrection(AutoSerialize):
                             coefs = np.polyfit(x, y, deg=regularization_poly_order)
                             trend = np.polyval(coefs, x)
 
-                            # Remove trend, filter, add back
                             residual = y - trend
                             residual_smooth = gaussian_filter(
                                 residual, sigma=regularization_sigma_px
@@ -696,11 +913,10 @@ class DriftCorrection(AutoSerialize):
 
             # Update images
             for ind in range(self.shape[0]):
-                self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                    ind
-                ].warp_image(
-                    self.images[ind].array,
-                    self.knots[ind],
+                self.images_warped.array[ind], self.weights_warped.array[ind] = (
+                    self.interpolator[ind].warp_image(
+                        self.images[ind].array, self.knots[ind]
+                    )
                 )
 
             # Translation alignment
@@ -714,22 +930,6 @@ class DriftCorrection(AutoSerialize):
 
             # Error tracking
             self.calculate_error(2)
-
-        if show_merged:
-            self.plot_merged_images(
-                show_knots=show_knots,
-                title="Merged: non-rigid",
-                **kwargs,
-            )
-
-        if show_images:
-            self.plot_transformed_images(
-                show_knots=show_knots,
-                title=[f"Image {i}: non-rigid" for i in range(self.shape[0])],
-                **kwargs,
-            )
-
-        return self
 
     def generate_corrected_image(
         self,
