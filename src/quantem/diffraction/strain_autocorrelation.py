@@ -416,17 +416,26 @@ class StrainMapAutocorrelation(AutoSerialize):
         r_center = dp_shape[0] // 2
         c_center = dp_shape[1] // 2
 
-        for r, c in it:
-            dp = self.dataset.array[r, c] * self.mask_diffraction + self.mask_diffraction_inv
+        # Pre-compute all FFTs at once (batched for speed)
+        dp = self.dataset.array.reshape(scan_r * scan_c, *dp_shape)
+        dp = dp * self.mask_diffraction + self.mask_diffraction_inv
 
-            if mode == "linear":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
-            elif mode == "log":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
-            elif mode == "gamma":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
-            else:
-                raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+        if mode == "linear":
+            dp_proc = dp
+        elif mode == "log":
+            dp_proc = np.log1p(dp)
+        elif mode == "gamma":
+            dp_proc = np.power(np.clip(dp, 0.0, None), g)
+        else:
+            raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+
+        im_all = np.fft.fftshift(
+            np.abs(np.fft.fft2(dp_proc, axes=(-2, -1))),
+            axes=(-2, -1),
+        )
+
+        for r, c in it:
+            im = im_all[r * scan_c + c]
 
             u_fit_abs, v_fit_abs = _refine_lattice_vectors(
                 im,
