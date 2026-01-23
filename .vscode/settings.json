@@ -1,4 +1,16 @@
 {
+    "files.exclude": {
+        "**/.claude": true,
+        "**/.claude*": true,
+        "**/CLAUDE.md": true,
+        "**/.mypy_cache": true,
+        "**/.pytest_cache": true,
+        "**/.ruff_cache": true,
+        "**/__pycache__": true,
+        "**/.ipynb_checkpoints": true,
+        "**/node_modules": true,
+        "**/dist": true
+    },
     "python.languageServer": "None",
     "python.terminal.activateEnvInCurrentTerminal": true,
     "python.defaultInterpreterPath": ".venv/bin/python",
