@@ -7,16 +7,12 @@ Includes playback controls, statistics, ROI selection, FFT, and more.
 
 import pathlib
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Union
 
 import anywidget
 import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
-
-if TYPE_CHECKING:
-    from quantem.core.datastructures.dataset3d import Dataset3d
 
 
 class Colormap(str, Enum):
@@ -192,11 +188,11 @@ class Show3D(anywidget.AnyWidget):
     def __init__(
         self,
         data,
-        labels: Optional[List[str]] = None,
+        labels: list[str] | None = None,
         title: str = "",
-        cmap: Union[str, Colormap] = Colormap.MAGMA,
-        vmin: Optional[float] = None,
-        vmax: Optional[float] = None,
+        cmap: str | Colormap = Colormap.MAGMA,
+        vmin: float | None = None,
+        vmax: float | None = None,
         pixel_size: float = 0.0,
         scale_bar_visible: bool = True,
         scale_bar_length_px: int = 50,
@@ -207,7 +203,7 @@ class Show3D(anywidget.AnyWidget):
         percentile_low: float = 1.0,
         percentile_high: float = 99.0,
         fps: float = 5.0,
-        timestamps: Optional[List[float]] = None,
+        timestamps: list[float] | None = None,
         timestamp_unit: str = "s",
         show_fft: bool = False,
         show_stats: bool = True,
