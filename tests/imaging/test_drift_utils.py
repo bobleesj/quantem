@@ -14,10 +14,12 @@ from quantem.imaging.drift_utils import (
     _parabolic_peak_2d,
     _parabolic_sub_pixel,
     _symmetric_pad,
+    backward_warp,
     bilinear_kde_batch,
     cross_corr_batch,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
+    initialize_scanline_knots,
 )
 
 
@@ -116,6 +118,32 @@ def test_bilinear_kde_matches_numpy(scale):
     )
 
 
+def test_initialize_scanline_knots_single_knot_centers_footprint():
+    """Single-knot init should place a vertical anchor line at the scan start edge.
+
+    For a 0 deg scan, the anchors are vertically arranged at constant column,
+    while the full scanline footprint spans the canvas width symmetrically
+    around the padded center once the fast-scan direction is applied.
+    """
+    input_shape = (4, 6)
+    output_shape = (8, 10)
+    scan_fast = np.array([0.0, 1.0])
+    scan_slow = np.array([1.0, 0.0])
+
+    knots = initialize_scanline_knots(
+        input_shape=input_shape,
+        output_shape=output_shape,
+        scan_fast=scan_fast,
+        scan_slow=scan_slow,
+        number_knots=1,
+    )
+
+    expected_rows = np.arange(2.0, 6.0)
+    expected_col = np.full(input_shape[0], 2.0)
+    np.testing.assert_allclose(knots[0, :, 0], expected_rows)
+    np.testing.assert_allclose(knots[1, :, 0], expected_col)
+
+
 # ---------------------------------------------------------------------------
 # Mid-level: smoothing and padding that the KDE depends on
 # ---------------------------------------------------------------------------
@@ -186,3 +214,89 @@ def test_parabolic_sub_pixel_exact():
         val_p1 = torch.tensor([-(1 - offset) ** 2])
         result = _parabolic_sub_pixel(val_m1, val_0, val_p1)
         assert abs(result.item() - offset) < 1e-6, f"Failed for offset={offset}"
+
+
+# ---------------------------------------------------------------------------
+# backward_warp: grid_sample inverse of bilinear_kde_batch
+# ---------------------------------------------------------------------------
+
+
+def test_backward_warp_identity():
+    """Zero drift and zero rigid shift must return the input unchanged."""
+    rng = np.random.default_rng(42)
+    image = torch.tensor(rng.random((64, 64)).astype(np.float32))
+    result = backward_warp(image, drift=(0.0, 0.0), rigid_shift=(0.0, 0.0))
+    np.testing.assert_allclose(result.numpy(), image.numpy(), atol=1e-5)
+
+
+def test_backward_warp_pure_translation():
+    """A rigid shift with zero drift should translate the image.
+
+    Shift a smooth image by a known amount and verify the center region
+    matches the expected translated content.
+    """
+    n = 64
+    rng = np.random.default_rng(42)
+    from scipy.ndimage import gaussian_filter as gf
+    image_np = gf(rng.random((n, n)).astype(np.float32), sigma=3)
+    image = torch.tensor(image_np)
+
+    shift_row, shift_col = 3.0, -2.0
+    result = backward_warp(image, drift=(0.0, 0.0), rigid_shift=(shift_row, shift_col))
+
+    # Fourier shift for ground truth
+    k_row = np.fft.fftfreq(n)[:, None]
+    k_col = np.fft.fftfreq(n)[None, :]
+    expected = np.real(np.fft.ifft2(
+        np.fft.fft2(image_np)
+        * np.exp(-2j * np.pi * (k_row * shift_row + k_col * shift_col))
+    )).astype(np.float32)
+
+    # Compare center region (avoid border effects from grid_sample vs Fourier wrapping)
+    c = 10
+    np.testing.assert_allclose(
+        result.numpy()[c:-c, c:-c], expected[c:-c, c:-c], atol=0.02,
+    )
+
+
+def test_backward_warp_batch():
+    """Batch dim should work: (N, H, W) input returns (N, H, W) output."""
+    rng = np.random.default_rng(42)
+    images = torch.tensor(rng.random((3, 32, 32)).astype(np.float32))
+    result = backward_warp(images, drift=(0.01, -0.02))
+    assert result.shape == (3, 32, 32)
+
+
+def test_backward_warp_reverses_known_drift():
+    """Apply a known column drift then undo it; center region must match original.
+
+    This is the key correctness test: forward-drift an image by shifting
+    each scanline, then call backward_warp with the same drift rate.
+    The center region of the round-tripped image should match the original.
+    """
+    n = 128
+    rng = np.random.default_rng(42)
+    from scipy.ndimage import gaussian_filter as gf
+    original = gf(rng.random((n, n)).astype(np.float32), sigma=4)
+
+    drift_col = 0.05  # 0.05 px/line → 6.4 px total
+    offset = np.arange(n) - (n - 1) / 2
+
+    # Forward drift: shift each scanline's columns
+    drifted = np.zeros_like(original)
+    for r in range(n):
+        shift = drift_col * offset[r]
+        # sub-pixel shift via Fourier
+        k = np.fft.fftfreq(n)
+        row_fft = np.fft.fft(original[r])
+        drifted[r] = np.real(np.fft.ifft(row_fft * np.exp(-2j * np.pi * k * shift)))
+
+    corrected = backward_warp(
+        torch.tensor(drifted), drift=(0.0, drift_col),
+    ).numpy()
+
+    # Check center region matches original (avoid edges where content is lost)
+    c = 15
+    np.testing.assert_allclose(
+        corrected[c:-c, c:-c], original[c:-c, c:-c], atol=0.05,
+    )

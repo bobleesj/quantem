@@ -2,13 +2,59 @@
 
 import math
 
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch.fft import fft2, fftfreq, ifft2, ifftshift
 
 
 # ---------------------------------------------------------------------------
 # Public API - called by DriftCorrection in drift.py
 # ---------------------------------------------------------------------------
+
+
+def initialize_scanline_knots(
+    input_shape: tuple[int, int],
+    output_shape: tuple[int, int],
+    scan_fast: NDArray,
+    scan_slow: NDArray,
+    number_knots: int,
+) -> NDArray:
+    """Build the initial knot grid used by ``DriftCorrection.preprocess``.
+
+    The knot anchors define where each scanline starts on the padded canvas
+    before any affine or non-rigid optimization. For ``number_knots == 1``,
+    this is a vertical line of anchors at the fast-scan start edge of the
+    centered footprint. The full scanline width is then added later by
+    ``transform_coordinates_single_knot``.
+
+    Parameters
+    ----------
+    input_shape : tuple[int, int]
+        Raw image shape ``(num_rows, num_cols)``.
+    output_shape : tuple[int, int]
+        Padded canvas shape ``(num_rows, num_cols)``.
+    scan_fast : NDArray
+        Unit vector of the fast scan direction in ``(row, col)`` order.
+    scan_slow : NDArray
+        Unit vector of the slow scan direction in ``(row, col)`` order.
+    number_knots : int
+        Number of control knots per scanline.
+
+    Returns
+    -------
+    NDArray
+        Initial knot array with shape ``(2, input_rows, number_knots)``.
+    """
+    v_slow = np.linspace(-(input_shape[0] - 1) / 2, (input_shape[0] - 1) / 2, input_shape[0])
+    u_fast = np.linspace(-(input_shape[1] - 1) / 2, (input_shape[1] - 1) / 2, number_knots)
+    row_knots = ((output_shape[0] - 1) / 2
+                 + u_fast[None, :] * scan_fast[0]
+                 + v_slow[:, None] * scan_slow[0])
+    col_knots = ((output_shape[1] - 1) / 2
+                 + u_fast[None, :] * scan_fast[1]
+                 + v_slow[:, None] * scan_slow[1])
+    return np.stack([row_knots, col_knots], axis=0)
 
 
 def bilinear_kde_batch(
@@ -332,6 +378,70 @@ def transform_coordinates_single_knot(
     row_coords = knots[0, :, 0:1] + fast_fraction[None, :] * scan_fast[0] * (num_rows - 1)
     col_coords = knots[1, :, 0:1] + fast_fraction[None, :] * scan_fast[1] * (num_cols - 1)
     return row_coords, col_coords
+
+
+def backward_warp(
+    images: torch.Tensor,
+    drift: tuple[float, float],
+    rigid_shift: tuple[float, float] = (0.0, 0.0),
+) -> torch.Tensor:
+    """Apply drift correction via backward interpolation (``grid_sample``).
+
+    Builds a per-scanline sampling grid that undoes the estimated affine
+    drift and optional rigid translation, then resamples with bilinear
+    interpolation.  Unlike the forward-scatter path
+    (``bilinear_kde_batch``), this introduces **no blur** and preserves
+    high-frequency features such as lattice fringes.
+
+    Parameters
+    ----------
+    images : torch.Tensor
+        Images to correct, shape ``(N, H, W)`` or ``(H, W)``.
+        For 4D-STEM, pass detector-pixel slices in chunks.
+    drift : tuple[float, float]
+        Affine drift rate ``(row_slope, col_slope)`` in pixels per scan
+        line, as returned by ``align_affine_single_sided``'s
+        ``best_drift``.
+    rigid_shift : tuple[float, float], default (0.0, 0.0)
+        Global ``(row, col)`` translation to apply, as returned by
+        ``align_affine_single_sided``'s ``rigid_shift``.
+
+    Returns
+    -------
+    torch.Tensor
+        Corrected images, same shape as *images*.
+    """
+    squeeze = images.dim() == 2
+    if squeeze:
+        images = images[None]
+    n, h, w = images.shape
+    device, dtype = images.device, images.dtype
+
+    offset = torch.arange(h, device=device, dtype=dtype) - (h - 1) / 2
+    drift_row, drift_col = drift
+    shift_row, shift_col = rigid_shift
+
+    sample_r = (
+        torch.arange(h, device=device, dtype=dtype)[:, None].expand(-1, w)
+        - drift_row * offset[:, None]
+        - shift_row
+    )
+    sample_c = (
+        torch.arange(w, device=device, dtype=dtype)[None, :].expand(h, -1)
+        - drift_col * offset[:, None]
+        - shift_col
+    )
+
+    grid_r = 2.0 * sample_r / (h - 1) - 1.0
+    grid_c = 2.0 * sample_c / (w - 1) - 1.0
+    # grid_sample expects (N, H, W, 2) with (x=col, y=row)
+    grid = torch.stack([grid_c, grid_r], dim=-1)[None].expand(n, -1, -1, -1)
+
+    out = torch.nn.functional.grid_sample(
+        images[:, None], grid, mode="bilinear",
+        align_corners=True, padding_mode="border",
+    )[:, 0]
+    return out[0] if squeeze else out
 
 
 def gaussian_smooth_batch(
