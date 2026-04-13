@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from scipy.ndimage import gaussian_filter
 from quantem.core.datastructures.dataset2d import Dataset2d
-from quantem.imaging.drift import DriftCorrection, align_affine_single_sided
+from quantem.imaging.drift import DriftCorrection
 
 
 def make_synthetic_drift_data(scale=1, seed=42):
@@ -152,57 +152,6 @@ def test_full_pipeline_deterministic():
     )
 
 
-def test_align_affine_single_sided_recovers_known_drift():
-    """Single-sided affine search should recover a known per-line drift."""
-    rng = np.random.default_rng(42)
-    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
-    row_grid, col_grid = np.meshgrid(
-        np.arange(reference.shape[0], dtype=np.float32),
-        np.arange(reference.shape[1], dtype=np.float32),
-        indexing="ij",
-    )
-    scanline_offset = (
-        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
-    )[:, None]
-    expected_drift = np.array([0.03, -0.05], dtype=np.float32)
-    moving = bilinear_sample(
-        reference,
-        row_grid + expected_drift[0] * scanline_offset,
-        col_grid + expected_drift[1] * scanline_offset,
-    ).astype(np.float32)
-
-    result = align_affine_single_sided(
-        reference_image=reference,
-        moving_image=moving,
-        scan_direction_degrees=0.0,
-        pad_fraction=0.25,
-        pad_value=0.0,
-        kde_sigma=0.5,
-        number_knots=1,
-        step=0.01,
-        num_tests=13,
-        refine=True,
-        device="cpu",
-    )
-    baseline = align_affine_single_sided(
-        reference_image=reference,
-        moving_image=moving,
-        scan_direction_degrees=0.0,
-        pad_fraction=0.25,
-        pad_value=0.0,
-        kde_sigma=0.5,
-        number_knots=1,
-        step=0.0,
-        num_tests=1,
-        refine=False,
-        device="cpu",
-    )
-
-    np.testing.assert_allclose(result["best_drift"], expected_drift, atol=0.011)
-    assert result["best_cost"] < baseline["best_cost"] * 0.9
-    assert result["reference_canvas"].shape == (80, 80)
-    assert result["moving_canvas"].shape == (80, 80)
-
 
 def test_preprocess_single_image_builds_centered_canvas():
     """Preprocess should support a single image for geometry-only reuse.
@@ -232,13 +181,13 @@ def test_preprocess_single_image_builds_centered_canvas():
 
 # Baseline values from float32 torch path, captured once and frozen.
 # (scale, error, knots0_sum, knots1_sum)
-# Recaptured on torch 2.10.0, scipy 1.17.1, numpy 2.4.3 (2026-04-09).
+# Recaptured after torch-native knots unification (knots stored as torch tensors).
 # scale=1 is bit-exact across versions; scale=2,4 shifted by ~0.03-1.1%
 # due to optimizer trajectory divergence from dependency upgrades.
 AFFINE_BASELINES = [
-    (1, 0.09237676858901978, 12157.7373046875, 28546.2626953125),
-    (2, 0.13840317726135254, 49798.91015625, 113529.08984375),
-    (4, 0.16398872435092926, 194687.2578125, 459648.7421875),
+    (1, 0.09237674623727798, 12157.736328125, 28546.263671875),
+    (2, 0.13840323686599731, 49798.91015625, 113529.09375),
+    (4, 0.16396018862724304, 194685.40625, 459650.59375),
 ]
 
 
@@ -256,16 +205,16 @@ def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0
     np.testing.assert_almost_equal(
         drift.error_track[-1, 1], expected_error, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[0].sum(), expected_k0, decimal=6)
+        drift.knots[0].sum().item(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[1].sum(), expected_k1, decimal=6)
+        drift.knots[1].sum().item(), expected_k1, decimal=6)
 
 
 # Frozen baselines for the pytorch backend with optimizer_name="adam".
-# Recaptured on torch 2.10.0, scipy 1.17.1, numpy 2.4.3 (2026-04-09).
+# Recaptured after torch-native knots unification (adam_steps=50).
 NONRIGID_ADAM_BASELINES = [
-    (1, 0.05627801641821861, 12023.871063232422, 28671.676582336426),
-    (2, 0.1293669193983078, 49747.038246154785, 113559.02951431274),
+    (1, 0.05627802759408951, 12023.8701171875, 28671.677734375),
+    (2, 0.12936685979366302, 49747.04296875, 113559.015625),
 ]
 
 
@@ -297,18 +246,16 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
     np.testing.assert_almost_equal(
         drift.error_track[-1, 1], expected_error, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[0].sum(), expected_k0, decimal=6)
+        drift.knots[0].sum().item(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[1].sum(), expected_k1, decimal=6)
+        drift.knots[1].sum().item(), expected_k1, decimal=6)
 
 
 # Frozen baselines for the pytorch backend with optimizer_name="lbfgs".
-# Shares _compiled_loss_fn with the Adam path, so this catches regressions
-# in either the optimizer dispatch or the shared loss.
-# Recaptured on torch 2.10.0, scipy 1.17.1, numpy 2.4.3 (2026-04-09).
+# Recaptured after torch-native knots unification.
 NONRIGID_LBFGS_BASELINES = [
-    (1, 0.07269975543022156, 12152.98459815979, 28536.15177345276),
-    (2, 0.110267274081707, 50195.45083999634, 113757.61969947815),
+    (1, 0.0727548599243164, 12151.92578125, 28535.07421875),
+    (2, 0.11218203604221344, 50291.56640625, 113703.953125),
 ]
 
 
@@ -337,9 +284,9 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     np.testing.assert_almost_equal(
         drift.error_track[-1, 1], expected_error, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[0].sum(), expected_k0, decimal=6)
+        drift.knots[0].sum().item(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[1].sum(), expected_k1, decimal=6)
+        drift.knots[1].sum().item(), expected_k1, decimal=6)
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +297,8 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
 def test_align_affine_fixed_indices_recovers_known_drift():
     """align_affine(fixed_indices=[0]) should recover a known single-sided drift.
 
-    Same setup as test_align_affine_single_sided_recovers_known_drift but
-    exercised through the unified DriftCorrection API.
+    Synthetic image with known per-line drift, exercised through the unified
+    DriftCorrection API with fixed_indices.
     """
     rng = np.random.default_rng(42)
     reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
@@ -382,7 +329,7 @@ def test_align_affine_fixed_indices_recovers_known_drift():
         show_merged=False,
         show_images=False,
     )
-    knots0_before = drift.knots[0].copy()
+    knots0_before = drift.knots[0].clone()
 
     drift.align_affine(
         step=0.01,
@@ -395,11 +342,11 @@ def test_align_affine_fixed_indices_recovers_known_drift():
 
     # Reference knots must not have changed
     np.testing.assert_array_equal(
-        drift.knots[0], knots0_before,
+        drift.knots[0].cpu().numpy(), knots0_before.cpu().numpy(),
         err_msg="fixed_indices=[0] should leave image 0 knots unchanged",
     )
     # Moving image knots should have changed (drift was applied)
-    assert not np.array_equal(drift.knots[1], knots0_before), \
+    assert not np.array_equal(drift.knots[1].cpu().numpy(), knots0_before.cpu().numpy()), \
         "Image 1 knots should have been modified by the affine search"
     # Error should have decreased
     assert drift.error_track[-1, 1] < drift.error_track[0, 1], \
@@ -430,10 +377,10 @@ def test_align_affine_fixed_indices_none_matches_default():
     )
 
     np.testing.assert_array_almost_equal(
-        drift_a.knots[0], drift_b.knots[0], decimal=10,
+        drift_a.knots[0].cpu().numpy(), drift_b.knots[0].cpu().numpy(), decimal=10,
     )
     np.testing.assert_array_almost_equal(
-        drift_a.knots[1], drift_b.knots[1], decimal=10,
+        drift_a.knots[1].cpu().numpy(), drift_b.knots[1].cpu().numpy(), decimal=10,
     )
     np.testing.assert_almost_equal(
         drift_a.error_track[-1, 1], drift_b.error_track[-1, 1], decimal=10,
@@ -455,3 +402,127 @@ def test_preprocess_normalize_scales_to_unit_range():
         arr = dc.images[i].array
         assert arr.min() >= -0.01, f"Image {i} min={arr.min()}"
         assert arr.max() <= 1.01, f"Image {i} max={arr.max()}"
+
+
+# ---------------------------------------------------------------------------
+# Tests for fixed_indices support in align_nonrigid
+# ---------------------------------------------------------------------------
+
+
+def test_align_nonrigid_fixed_indices_freezes_reference():
+    """align_nonrigid(fixed_indices=[0]) must not modify reference knots.
+
+    The reference (image 0) knots should stay frozen while the moving
+    image's knots are optimized against the fixed reference.
+    """
+    rng = np.random.default_rng(42)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    expected_drift = np.array([0.03, -0.05], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + expected_drift[0] * scanline_offset,
+        col_grid + expected_drift[1] * scanline_offset,
+    ).astype(np.float32)
+
+    drift = DriftCorrection.from_data(
+        images=[reference, moving],
+        scan_direction_degrees=[0.0, 0.0],
+    ).preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    drift.align_affine(
+        step=0.01, num_tests=13, refine=True,
+        fixed_indices=[0], show_merged=False, show_images=False,
+    )
+    knots0_after_affine = drift.knots[0].clone()
+
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="adam",
+        num_iterations=2, adam_steps=20,
+        regularization_sigma_px=8.0, lr=0.02,
+        fixed_indices=[0],
+        show_merged=False, show_images=False,
+    )
+
+    # Reference knots must not have changed
+    np.testing.assert_array_equal(
+        drift.knots[0].cpu().numpy(), knots0_after_affine.cpu().numpy(),
+        err_msg="fixed_indices=[0] should leave image 0 knots unchanged in nonrigid",
+    )
+    # Moving image knots should have changed
+    assert not np.array_equal(
+        drift.knots[1].cpu().numpy(), knots0_after_affine.cpu().numpy()
+    ), "Image 1 knots should have been modified by nonrigid optimization"
+
+
+def test_align_nonrigid_fixed_indices_reduces_error():
+    """Nonrigid with fixed_indices should reduce alignment error."""
+    rng = np.random.default_rng(42)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    expected_drift = np.array([0.03, -0.05], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + expected_drift[0] * scanline_offset,
+        col_grid + expected_drift[1] * scanline_offset,
+    ).astype(np.float32)
+
+    drift = DriftCorrection.from_data(
+        images=[reference, moving],
+        scan_direction_degrees=[0.0, 0.0],
+    ).preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    drift.align_affine(
+        step=0.01, num_tests=13, refine=True,
+        fixed_indices=[0], show_merged=False, show_images=False,
+    )
+    error_after_affine = drift.error_track[-1, 1]
+
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="adam",
+        num_iterations=2, adam_steps=20,
+        regularization_sigma_px=8.0, lr=0.02,
+        fixed_indices=[0],
+        show_merged=False, show_images=False,
+    )
+    error_after_nonrigid = drift.error_track[-1, 1]
+
+    assert error_after_nonrigid <= error_after_affine * 1.1, (
+        f"Nonrigid should not significantly increase error: "
+        f"{error_after_nonrigid} vs {error_after_affine}"
+    )
+
+
+def test_align_nonrigid_fixed_indices_all_fixed_raises():
+    """fixed_indices covering all images should raise ValueError."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(
+        step=0.02, num_tests=5, refine=True,
+        show_merged=False, show_images=False,
+    )
+    with pytest.raises(ValueError, match="All images are fixed"):
+        drift.align_nonrigid(
+            backend="pytorch", fixed_indices=[0, 1],
+            show_merged=False, show_images=False,
+        )

@@ -1,6 +1,5 @@
 from collections.abc import Sequence
-import time
-from typing import Any, Self
+from typing import Self
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +24,6 @@ from quantem.core.utils.compound_validators import (
 from quantem.core.utils.imaging_utils import (
     bilinear_kde,
     cross_correlation_shift,
-    fourier_cropping,
 )
 from quantem.imaging.drift_utils import (
     backward_warp,
@@ -39,369 +37,6 @@ from quantem.imaging.drift_utils import (
 )
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
-
-
-@torch.inference_mode()
-def align_affine_single_sided(
-    reference_image: Dataset2d | NDArray,
-    moving_image: Dataset2d | NDArray,
-    scan_direction_degrees: float = 0.0,
-    pad_fraction: float = 0.25,
-    pad_value: float | str | list[float] = "median",
-    kde_sigma: float = 0.5,
-    number_knots: int = 1,
-    step: float = 0.02,
-    num_tests: int = 11,
-    refine: bool = True,
-    upsample_factor: int = 8,
-    max_image_shift: float | None = 32,
-    chunk_size: int | None = None,
-    device: str | int | torch.device | None = None,
-    verbose: bool = False,
-    print_candidates: bool = False,
-    show_plot: bool = False,
-    plot_axsize: tuple[int, int] = (7, 7),
-) -> dict[str, Any]:
-    """Estimate affine scan drift for one moving image against a fixed reference.
-
-    .. deprecated::
-        Use ``DriftCorrection.from_data([ref, moving], [deg, deg]).preprocess().align_affine(fixed_indices=[0])``
-        instead. This standalone function will be removed in a future release.
-
-    This is the single-sided variant needed for 4D-STEM VDF alignment: the
-    moving image's knot field is optimized against a fixed reference image on
-    a shared padded canvas. Unlike ``DriftCorrection.align_affine()``, the
-    affine update is never applied to the reference image, so the relative
-    geometry actually changes for same-angle scan pairs like ``[0, 0]``.
-
-    The function intentionally supports only ``number_knots == 1`` so it can
-    reuse the fast torch path built around ``transform_coordinates_single_knot``.
-
-    Parameters
-    ----------
-    reference_image : Dataset2d or ndarray
-        Fixed reference image, already in the target geometry.
-    moving_image : Dataset2d or ndarray
-        Image whose affine scan drift should be estimated.
-    scan_direction_degrees : float, default 0.0
-        Scan direction of the moving image, measured relative to vertical.
-    pad_fraction, pad_value, kde_sigma, number_knots
-        Same meaning as ``DriftCorrection.preprocess``.
-    step, num_tests, refine, upsample_factor, max_image_shift
-        Same affine grid-search and translation-alignment controls as
-        ``DriftCorrection.align_affine``.
-    chunk_size : int or None
-        Optional number of drift candidates to evaluate per pass.
-    device : str, int, torch.device, or None
-        Torch device to use. If None, uses the current quantem default device.
-    verbose : bool
-        If True, print the selected drift after each search pass, the
-        initial/final coordinate bounds, and a final timing/fit summary.
-    print_candidates : bool, default False
-        If True, print every tested drift candidate with its MAE cost and
-        zero-shift normalized cross-correlation (NCC) against the fixed
-        reference canvas. This is intended for debugging the objective.
-    show_plot : bool, default False
-        If True, show the padded reference canvas with the initial moving-image
-        knot anchors and scan footprint overlaid.
-    plot_axsize : tuple[int, int], default (7, 7)
-        Axes size passed to ``show_2d`` when ``show_plot`` is True.
-
-    Returns
-    -------
-    dict[str, Any]
-        Dictionary containing:
-        - ``drift``: single-image ``DriftCorrection`` object holding the best knots
-        - ``best_drift``: total best drift vector ``(row_slope, col_slope)`` in px/line
-        - ``best_cost``: translation-aligned MAE from the cross-correlation objective
-        - ``rigid_shift``: rigid ``(row, col)`` translation applied to the moving image
-        - ``reference_canvas``: fixed reference warped onto the padded canvas
-        - ``moving_canvas``: moving image warped with the best drift
-        - ``row_coords`` / ``col_coords``: best destination coordinates for the moving image
-    """
-    warnings.warn(
-        "align_affine_single_sided is deprecated. Use "
-        "DriftCorrection.from_data([ref, moving], [deg, deg])"
-        ".preprocess().align_affine(fixed_indices=[0]) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if number_knots != 1:
-        raise ValueError(
-            "align_affine_single_sided currently supports only number_knots == 1."
-        )
-    if num_tests % 2 == 0:
-        raise ValueError(f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}.")
-
-    reference_ds, moving_ds = validate_list_of_dataset2d([reference_image, moving_image])
-    if reference_ds.shape != moving_ds.shape:
-        raise ValueError(
-            "reference_image and moving_image must have the same shape. "
-            f"Got {reference_ds.shape} and {moving_ds.shape}."
-        )
-
-    moving_drift = DriftCorrection.from_data(
-        images=[moving_ds],
-        scan_direction_degrees=[scan_direction_degrees],
-    )
-    if device is not None:
-        moving_drift._device, _ = validate_device(device)
-    moving_drift.preprocess(
-        pad_fraction=pad_fraction,
-        pad_value=pad_value,
-        kde_sigma=kde_sigma,
-        number_knots=number_knots,
-        show_merged=False,
-        show_images=False,
-    )
-    initial_knots = moving_drift.knots[0].copy()
-
-    device_str = moving_drift._device
-    dtype = moving_drift._dtype
-    canvas_shape = moving_drift.shape[1:]
-    scan_fast_t = moving_drift.scan_fast_t[0]
-    moving_t = moving_drift.images_t[0]
-    num_rows = moving_ds.shape[0]
-    scanline_offset_t = (
-        torch.arange(num_rows, dtype=dtype, device=device_str) - (num_rows - 1) / 2
-    )
-    scanline_offset_np = scanline_offset_t.cpu().numpy()
-
-    pad_values = validate_pad_value(pad_value, [reference_ds, moving_ds])
-    reference_t = torch.tensor(reference_ds.array, dtype=dtype, device=device_str)
-    initial_knots_t = torch.tensor(initial_knots, dtype=dtype, device=device_str)
-    row_ref, col_ref = transform_coordinates_single_knot(
-        initial_knots_t, scan_fast_t, moving_ds.shape
-    )
-    if (
-        float(row_ref.min()) < 0
-        or float(row_ref.max()) > canvas_shape[0] - 1
-        or float(col_ref.min()) < 0
-        or float(col_ref.max()) > canvas_shape[1] - 1
-    ):
-        raise RuntimeError(
-            "Initial moving-image footprint leaves the padded canvas; "
-            "increase pad_fraction before running the search."
-        )
-    reference_canvas, _ = bilinear_kde_batch(
-        row_ref[None],
-        col_ref[None],
-        reference_t[None],
-        canvas_shape,
-        kde_sigma,
-        float(pad_values[0]),
-    )
-    reference_canvas = reference_canvas[0]
-    shift_mask = None
-    if max_image_shift is not None:
-        canvas_rows, canvas_cols = canvas_shape
-        dist_row = fftfreq(canvas_rows, 1.0 / canvas_rows, device=device_str, dtype=dtype)
-        dist_col = fftfreq(canvas_cols, 1.0 / canvas_cols, device=device_str, dtype=dtype)
-        shift_mask = dist_row[:, None] ** 2 + dist_col[None, :] ** 2 >= max_image_shift**2
-    freq_grids = (
-        fftfreq(canvas_shape[0], device=device_str, dtype=dtype)[:, None],
-        fftfreq(canvas_shape[1], device=device_str, dtype=dtype)[None, :],
-    )
-    if verbose:
-        print(
-            f"Initial moving-image coords: row [{float(row_ref.min()):.1f}, {float(row_ref.max()):.1f}], "
-            f"col [{float(col_ref.min()):.1f}, {float(col_ref.max()):.1f}]"
-        )
-    if show_plot:
-        init_row = initial_knots[0, :, 0]
-        init_col = initial_knots[1, :, 0]
-        fig, ax = show_2d(
-            reference_canvas.cpu().numpy(),
-            title=f"Fixed reference with initial moving-image footprint ({canvas_shape})",
-            axsize=plot_axsize,
-        )
-        ax.scatter(init_col, init_row, s=8, c="red", label="moving-image anchors")
-        ax.scatter(
-            col_ref[:, 0].cpu().numpy(),
-            row_ref[:, 0].cpu().numpy(),
-            s=3,
-            c="cyan",
-            alpha=0.4,
-            label="moving-image start",
-        )
-        ax.scatter(
-            col_ref[:, -1].cpu().numpy(),
-            row_ref[:, -1].cpu().numpy(),
-            s=3,
-            c="yellow",
-            alpha=0.4,
-            label="moving-image end",
-        )
-        ax.legend(loc="upper right")
-        plt.show()
-
-    search_t0 = time.perf_counter()
-    grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
-    row_grid, col_grid = np.meshgrid(grid_axis, grid_axis, indexing="ij")
-    circular_mask = row_grid**2 + col_grid**2 <= (num_tests / 2) ** 2
-    drift_vectors = np.vstack((row_grid[circular_mask], col_grid[circular_mask])).T * step
-    if chunk_size is None:
-        chunk_size = len(drift_vectors)
-
-    def _evaluate_candidates(candidates: NDArray, label: str) -> tuple[np.ndarray, float]:
-        best_local_cost = float("inf")
-        best_local_drift = np.zeros(2, dtype=float)
-        base_knots_t = torch.tensor(moving_drift.knots[0], dtype=dtype, device=device_str)
-        row_base, col_base = transform_coordinates_single_knot(
-            base_knots_t, scan_fast_t, moving_ds.shape
-        )
-        for start in range(0, len(candidates), chunk_size):
-            stop = min(start + chunk_size, len(candidates))
-            drift_chunk = torch.tensor(candidates[start:stop], dtype=dtype, device=device_str)
-            row_candidates = (
-                row_base[None]
-                + drift_chunk[:, 0, None, None] * scanline_offset_t[None, :, None]
-            )
-            col_candidates = (
-                col_base[None]
-                + drift_chunk[:, 1, None, None] * scanline_offset_t[None, :, None]
-            )
-            warped, _ = bilinear_kde_batch(
-                row_candidates,
-                col_candidates,
-                moving_t,
-                canvas_shape,
-                kde_sigma,
-                float(moving_drift.pad_value[0]),
-            )
-            ref_chunk = reference_canvas[None].expand(warped.shape[0], -1, -1)
-            costs = cross_corr_batch(
-                ref_chunk,
-                warped,
-                upsample_factor,
-                max_shift_mask=shift_mask,
-                freq_grids=freq_grids,
-            )
-            if print_candidates:
-                cross_corr = torch.fft.ifft2(
-                    torch.fft.fft2(ref_chunk) * torch.fft.fft2(warped).conj()
-                ).real
-                if shift_mask is not None:
-                    cross_corr = cross_corr.masked_fill(shift_mask[None], 0.0)
-                cc_peak = cross_corr.amax(dim=(1, 2))
-                for local_idx, (drift_row, drift_col) in enumerate(candidates[start:stop]):
-                    print(
-                        f"{label}: drift=({drift_row:+.4f}, {drift_col:+.4f}) px/line, "
-                        f"aligned_mae={float(costs[local_idx]):.4f}, "
-                        f"cc_peak={float(cc_peak[local_idx]):.6e}"
-                    )
-            idx = int(torch.argmin(costs))
-            cost = float(costs[idx])
-            if cost < best_local_cost:
-                best_local_cost = cost
-                best_local_drift = candidates[start + idx].copy()
-        return best_local_drift, best_local_cost
-
-    drift_total = np.zeros(2, dtype=float)
-    best_step, coarse_cost = _evaluate_candidates(drift_vectors, "coarse")
-    moving_drift.knots[0][0] += best_step[0] * scanline_offset_np[:, None]
-    moving_drift.knots[0][1] += best_step[1] * scanline_offset_np[:, None]
-    drift_total += best_step
-    if verbose:
-        print(
-            f"single-sided affine coarse: ({best_step[0]:+.4f}, {best_step[1]:+.4f}) px/line, "
-            f"cost={coarse_cost:.4f}"
-        )
-
-    if refine:
-        drift_fine = drift_vectors / (num_tests - 1)
-        best_step, refine_cost = _evaluate_candidates(drift_fine, "refine")
-        moving_drift.knots[0][0] += best_step[0] * scanline_offset_np[:, None]
-        moving_drift.knots[0][1] += best_step[1] * scanline_offset_np[:, None]
-        drift_total += best_step
-        if verbose:
-            print(
-                f"single-sided affine refine: ({best_step[0]:+.4f}, {best_step[1]:+.4f}) px/line, "
-                f"cost={refine_cost:.4f}"
-            )
-
-    best_knots_t = torch.tensor(moving_drift.knots[0], dtype=dtype, device=device_str)
-    row_coords, col_coords = transform_coordinates_single_knot(
-        best_knots_t, scan_fast_t, moving_ds.shape
-    )
-    if (
-        float(row_coords.min()) < 0
-        or float(row_coords.max()) > canvas_shape[0] - 1
-        or float(col_coords.min()) < 0
-        or float(col_coords.max()) > canvas_shape[1] - 1
-    ):
-        raise RuntimeError(
-            "Best moving-image warp leaves the padded canvas; increase pad_fraction "
-            "or reduce the search range."
-        )
-    moving_canvas, moving_weights = bilinear_kde_batch(
-        row_coords[None],
-        col_coords[None],
-        moving_t[None],
-        canvas_shape,
-        kde_sigma,
-        float(moving_drift.pad_value[0]),
-    )
-    rigid_shifts = translate_align(
-        torch.stack((reference_canvas, moving_canvas[0])),
-        upsample_factor=upsample_factor,
-        max_image_shift=max_image_shift,
-    )
-    rigid_shift = rigid_shifts[1] - rigid_shifts[0]
-    moving_drift.knots[0][0] += float(rigid_shift[0].cpu().numpy())
-    moving_drift.knots[0][1] += float(rigid_shift[1].cpu().numpy())
-    best_knots_t = torch.tensor(moving_drift.knots[0], dtype=dtype, device=device_str)
-    row_coords, col_coords = transform_coordinates_single_knot(
-        best_knots_t, scan_fast_t, moving_ds.shape
-    )
-    moving_canvas, moving_weights = bilinear_kde_batch(
-        row_coords[None],
-        col_coords[None],
-        moving_t[None],
-        canvas_shape,
-        kde_sigma,
-        float(moving_drift.pad_value[0]),
-    )
-    moving_drift.images_warped.array[0] = moving_canvas[0].cpu().numpy()
-    moving_drift.weights_warped.array[0] = moving_weights[0].cpu().numpy()
-
-    final_cost = float(
-        cross_corr_batch(
-            reference_canvas[None],
-            moving_canvas,
-            upsample_factor,
-            max_shift_mask=shift_mask,
-            freq_grids=freq_grids,
-        )[0]
-    )
-    search_time_s = time.perf_counter() - search_t0
-    if verbose:
-        print(
-            f"Best moving-image coords: row [{float(row_coords.min()):.1f}, {float(row_coords.max()):.1f}], "
-            f"col [{float(col_coords.min()):.1f}, {float(col_coords.max()):.1f}]"
-        )
-        print(
-            f"Rigid shift: row={float(rigid_shift[0]):+.3f} px, "
-            f"col={float(rigid_shift[1]):+.3f} px"
-        )
-        print(f"Grid search: {search_time_s:.1f}s")
-        print(f"Best drift: ({drift_total[0]:+.4f}, {drift_total[1]:+.4f}) px/line")
-        print(f"Total: row={drift_total[0] * num_rows:.1f} px, col={drift_total[1] * num_rows:.1f} px")
-        print(f"Best aligned MAE: {final_cost:.4f}")
-    return {
-        "drift": moving_drift,
-        "best_drift": drift_total,
-        "best_cost": final_cost,
-        "rigid_shift": rigid_shift.cpu().numpy(),
-        "search_time_s": search_time_s,
-        "reference_canvas": reference_canvas.cpu().numpy(),
-        "moving_canvas": moving_canvas[0].cpu().numpy(),
-        "initial_knots": initial_knots.copy(),
-        "initial_row_coords": row_ref.cpu().numpy(),
-        "initial_col_coords": col_ref.cpu().numpy(),
-        "row_coords": row_coords.cpu().numpy(),
-        "col_coords": col_coords.cpu().numpy(),
-    }
 
 
 class DriftCorrection(AutoSerialize):
@@ -642,12 +277,16 @@ class DriftCorrection(AutoSerialize):
         )
         # Initialize knots - each image's scanlines mapped to the padded canvas
         self.knots = [
-            initialize_scanline_knots(
-                input_shape=self.images[img_idx].shape,
-                output_shape=self.shape[1:],
-                scan_fast=self.scan_fast[img_idx],
-                scan_slow=self.scan_slow[img_idx],
-                number_knots=self.number_knots,
+            torch.tensor(
+                initialize_scanline_knots(
+                    input_shape=self.images[img_idx].shape,
+                    output_shape=self.shape[1:],
+                    scan_fast=self.scan_fast[img_idx],
+                    scan_slow=self.scan_slow[img_idx],
+                    number_knots=self.number_knots,
+                ),
+                dtype=self._dtype,
+                device=self._device,
             )
             for img_idx in range(self.shape[0])
         ]
@@ -678,9 +317,8 @@ class DriftCorrection(AutoSerialize):
         canvas_shape = (self.shape[1], self.shape[2])
         warped_t = torch.zeros(self.shape[0], *canvas_shape, dtype=dtype, device=device)
         for img_idx in range(self.shape[0]):
-            knots_t = torch.tensor(self.knots[img_idx], dtype=dtype, device=device)
             row_t, col_t = transform_coordinates_single_knot(
-                knots_t, self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
             warped, weights = bilinear_kde_batch(
                 row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
                 self.kde_sigma, self.pad_value[img_idx])
@@ -738,7 +376,7 @@ class DriftCorrection(AutoSerialize):
                 ind
             ].warp_image(
                 self.images[ind].array,
-                self.knots[ind],
+                self.knots[ind].cpu().numpy(),
             )
         kwargs.pop("title", None)
         if show_merged:
@@ -875,7 +513,9 @@ class DriftCorrection(AutoSerialize):
             for img_idx in range(self.shape[0]):
                 if img_idx in fixed_set:
                     continue
-                scanline_offset = np.arange(self.knots[img_idx].shape[1]) - (self.knots[img_idx].shape[1] - 1) / 2
+                num_rows = self.knots[img_idx].shape[1]
+                scanline_offset = torch.arange(num_rows, dtype=self.knots[img_idx].dtype,
+                                               device=self.knots[img_idx].device) - (num_rows - 1) / 2
                 self.knots[img_idx][0] += drift_vec[0] * scanline_offset[:, None]
                 self.knots[img_idx][1] += drift_vec[1] * scanline_offset[:, None]
 
@@ -994,26 +634,32 @@ class DriftCorrection(AutoSerialize):
         # with grid_sample (no canvas, no KDE).
         if fixed_set:
             fixed_idx = sorted(fixed_set)[0]
-            moving_idx = 1 - fixed_idx
-            return backward_warp_grid_search(
-                self.images_t[fixed_idx], self.images_t[moving_idx],
-                drift_vectors_t, upsample_factor, max_image_shift,
-                chunk_size)
+            moving_indices = [i for i in range(len(self.images_t)) if i not in fixed_set]
+            if not moving_indices:
+                raise ValueError("All images are fixed — nothing to optimize.")
+            total_costs = None
+            for mov_idx in moving_indices:
+                _, costs = backward_warp_grid_search(
+                    self.images_t[fixed_idx], self.images_t[mov_idx],
+                    drift_vectors_t, upsample_factor, max_image_shift,
+                    chunk_size)
+                total_costs = costs if total_costs is None else total_costs + costs
+            return torch.argmin(total_costs).item(), total_costs
 
         canvas_shape = (self.shape[1], self.shape[2])
+        n_images = len(self.images_t)
         # Base coordinates shared across all candidates
         base_data = []
-        for img_idx in range(2):
-            knots_t = torch.tensor(self.knots[img_idx], dtype=dtype, device=device)
+        for img_idx in range(n_images):
             row_base, col_base = transform_coordinates_single_knot(
-                knots_t, self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
             num_rows = self.knots[img_idx].shape[1]
             scanline_offset = (torch.arange(num_rows, dtype=dtype, device=device)
                                - (num_rows - 1) / 2)
             base_data.append((self.images_t[img_idx], row_base, col_base, scanline_offset))
         # Pre-warp fixed images once (knots unchanged across candidates)
         fixed_warped = {}
-        for img_idx in range(2):
+        for img_idx in range(n_images):
             if img_idx in fixed_set:
                 image_t, row_base, col_base, _ = base_data[img_idx]
                 warped, _ = bilinear_kde_batch(
@@ -1044,10 +690,11 @@ class DriftCorrection(AutoSerialize):
             cs = chunk_end - chunk_start
             if chunk_idx == 0 and chunked:
                 torch.cuda.reset_peak_memory_stats(device)
-            warped_pair = []
-            for img_idx in range(2):
+            # Warp each image (fixed → expand once, moving → drift-shifted)
+            warped_images = []
+            for img_idx in range(n_images):
                 if img_idx in fixed_set:
-                    warped_pair.append(fixed_warped[img_idx][None].expand(cs, -1, -1))
+                    warped_images.append(fixed_warped[img_idx][None].expand(cs, -1, -1))
                 else:
                     image_t, row_base, col_base, scanline_offset = base_data[img_idx]
                     row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
@@ -1056,12 +703,17 @@ class DriftCorrection(AutoSerialize):
                         row_candidates, col_candidates, image_t,
                         canvas_shape, self.kde_sigma,
                         self.pad_value[img_idx])
-                    warped_pair.append(warped)
-            all_costs.append(cross_corr_batch(
-                warped_pair[0], warped_pair[1],
-                upsample_factor,
-                max_shift_mask=shift_mask,
-                freq_grids=freq_grids))
+                    warped_images.append(warped)
+            # Score all unique pairs and sum costs
+            chunk_cost = torch.zeros(cs, dtype=dtype, device=device)
+            for i in range(n_images):
+                for j in range(i + 1, n_images):
+                    chunk_cost += cross_corr_batch(
+                        warped_images[i], warped_images[j],
+                        upsample_factor,
+                        max_shift_mask=shift_mask,
+                        freq_grids=freq_grids)
+            all_costs.append(chunk_cost)
             # After chunk 0, replace the conservative static estimate with the
             # actual measured per-candidate cost and print one summary line so
             # the user can see how the chunking adapted to their GPU state.
@@ -1117,8 +769,8 @@ class DriftCorrection(AutoSerialize):
 
         Three phases: warp → solve translation → re-warp. When ``knots_batch``
         is provided, reads/writes a single batched torch tensor (zero numpy
-        crossings). Without it, falls back to ``self.knots`` (numpy) for
-        compatibility with ``align_affine``.
+        crossings). Without it, reads/writes ``self.knots`` (torch tensors)
+        for compatibility with ``align_affine``.
 
         Set ``solve_translation=False`` to only warp and sync without
         re-solving translation - used after the nonrigid loop to populate
@@ -1162,7 +814,7 @@ class DriftCorrection(AutoSerialize):
                     # transform_coordinates_single_knot expects (2, N, 1)
                     knots_img = knots_batch[img_idx].detach()[:, :, None]
                 else:
-                    knots_img = torch.as_tensor(self.knots[img_idx], dtype=dtype, device=device)
+                    knots_img = self.knots[img_idx]
                 row_t, col_t = transform_coordinates_single_knot(
                     knots_img, self.scan_fast_t[img_idx], self.images[img_idx].shape)
                 warped, weights = bilinear_kde_batch(
@@ -1191,10 +843,9 @@ class DriftCorrection(AutoSerialize):
             knots_batch[:, 0] += shifts_t[:, 0:1]
             knots_batch[:, 1] += shifts_t[:, 1:2]
         else:
-            shifts_np = shifts_t.cpu().numpy()
             for img_idx in range(num_images):
-                self.knots[img_idx][0] += shifts_np[img_idx, 0]
-                self.knots[img_idx][1] += shifts_np[img_idx, 1]
+                self.knots[img_idx][0] += shifts_t[img_idx, 0]
+                self.knots[img_idx][1] += shifts_t[img_idx, 1]
         # Re-warp with corrected knots
         _warp_all(warped_t, weights_t)
         if knots_batch is None:
@@ -1217,6 +868,7 @@ class DriftCorrection(AutoSerialize):
         max_optimize_iterations: int = 10,
         regularization_max_image_shift_px: float | None = None,
         solve_individual_rows: bool = True,
+        fixed_indices: list[int] | None = None,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -1337,6 +989,22 @@ class DriftCorrection(AutoSerialize):
         solve_individual_rows : bool, default True
             If True, optimize each row independently.
 
+        Fixed-Reference Parameters
+        --------------------------
+        fixed_indices : list[int] or None, default None
+            Indices of images whose knots should NOT be optimized.
+            Use ``fixed_indices=[0]`` for single-sided alignment where
+            image 0 is the reference (e.g. merged HAADF) and only the
+            remaining image(s) are corrected. When set:
+
+            - **Reference**: The mean of the fixed images is used as
+              the optimization target for every moving image, instead of
+              the leave-one-out mean.
+            - **Optimizer**: Only moving images' knots receive gradient
+              updates; fixed knots are frozen.
+            - **Translation**: Shifts are anchored to fixed images
+              (passed through to ``_warp_and_translate_torch``).
+
         Display Parameters
         ------------------
         show_merged : bool, default True
@@ -1359,6 +1027,13 @@ class DriftCorrection(AutoSerialize):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
             )
+        fixed_set = frozenset(fixed_indices) if fixed_indices is not None else frozenset()
+        moving_indices = [i for i in range(self.shape[0]) if i not in fixed_set]
+        if fixed_set and not moving_indices:
+            raise ValueError(
+                "All images are fixed — nothing to optimize. "
+                "fixed_indices must leave at least one moving image."
+            )
         if backend == "pytorch":
             device = self._device
             dtype = self._dtype
@@ -1368,9 +1043,9 @@ class DriftCorrection(AutoSerialize):
                 raise NotImplementedError(
                     "PyTorch backend only supports single knot. "
                     "Use backend='scipy' for multiple knots.")
-            knots_batch = torch.tensor(
-                np.stack([self.knots[i][:, :, 0] for i in range(num_images)]),
-                dtype=dtype, device=device, requires_grad=True)
+            knots_batch = torch.stack(
+                [self.knots[i][:, :, 0] for i in range(num_images)]
+            ).clone().detach().requires_grad_(True)
             num_rows_knot = knots_batch.shape[2]
             target_batch = torch.stack(self.images_t)
             # Build u tensors once and reuse - same scan-position vector projects
@@ -1409,15 +1084,27 @@ class DriftCorrection(AutoSerialize):
                 x_norm = (x_knot - x_knot.mean()) / x_knot.std()
                 vander = torch.stack([x_norm ** p for p in range(regularization_poly_order + 1)], dim=1)
             warped_t = self._warp_and_translate_torch(
-                max_image_shift, upsample_factor=8, knots_batch=knots_batch)
+                max_image_shift, upsample_factor=8, knots_batch=knots_batch,
+                fixed_indices=fixed_set)
+            # Build a boolean mask on device to zero fixed gradients efficiently.
+            # Shape: (num_images, 1, 1) — broadcasts over (2, num_rows_knot).
+            if fixed_set:
+                grad_mask = torch.ones(num_images, 1, 1, dtype=dtype, device=device)
+                for idx in fixed_set:
+                    grad_mask[idx] = 0.0
             error_buffer = []
             for _ in tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({optimizer_name})"):
                 # Build the reference under no_grad: arithmetic on warped_t (an
                 # inference tensor) would otherwise return an autograd-tracked
                 # leaf, and the optimizer would build a graph through it.
                 with torch.no_grad():
-                    warped_sum = warped_t.sum(0)
-                    ref_batch = (warped_sum[None] - warped_t) / (num_images - 1)
+                    if fixed_set:
+                        # Fixed images define the reference for all moving images.
+                        fixed_mean = warped_t[sorted(fixed_set)].mean(0)
+                        ref_batch = fixed_mean[None].expand(num_images, -1, -1)
+                    else:
+                        warped_sum = warped_t.sum(0)
+                        ref_batch = (warped_sum[None] - warped_t) / (num_images - 1)
                     knots_prev = knots_batch.detach().clone()
                 # Regularization alters the loss surface between outer iters, so
                 # stale momentum / curvature history would push knots the wrong way.
@@ -1426,25 +1113,34 @@ class DriftCorrection(AutoSerialize):
                     self._optimize_knots_adam(
                         ref_batch, target_batch, knots_batch,
                         row_scan_offsets, col_scan_offsets, row_scale, col_scale,
-                        optimizer, adam_steps)
+                        optimizer, adam_steps,
+                        grad_mask=grad_mask if fixed_set else None)
                 else:
                     self._optimize_knots_lbfgs(
                         ref_batch, target_batch, knots_batch,
                         row_scan_offsets, col_scan_offsets, row_scale, col_scale,
-                        optimizer)
+                        optimizer,
+                        grad_mask=grad_mask if fixed_set else None)
                 self._regularize_knots(
                     knots_batch, knots_prev, vander,
                     regularization_max_image_shift_px,
                     regularization_sigma_px,
                     regularization_update_step_size)
+                # Restore fixed knots — regularization is a global smooth that
+                # would subtly shift them via polynomial detrend + Gaussian blur.
+                if fixed_set:
+                    with torch.no_grad():
+                        for idx in fixed_set:
+                            knots_batch[idx] = knots_prev[idx]
                 warped_t = self._warp_and_translate_torch(
-                    max_image_shift, upsample_factor=8, knots_batch=knots_batch)
+                    max_image_shift, upsample_factor=8, knots_batch=knots_batch,
+                    fixed_indices=fixed_set)
                 # Per-iter error stays on GPU; sync once after the loop
                 images_mean = warped_t.mean(dim=0)
                 error_buffer.append(torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2)))
-            # Sync knots back to numpy; leave images_warped lazy so callers
+            # Sync knots back; leave images_warped lazy so callers
             # that never plot avoid the GPU→CPU transfer of the warped stack.
-            knots_final = knots_batch.detach().cpu().numpy()
+            knots_final = knots_batch.detach()
             for img_idx in range(num_images):
                 self.knots[img_idx][:, :, 0] = knots_final[img_idx]
             self._images_warped_stale = True
@@ -1461,20 +1157,29 @@ class DriftCorrection(AutoSerialize):
                 else:
                     self.error_track = np.vstack((self.error_track, new_rows))
         else:
+            # Precompute fixed reference for scipy path when fixed_indices is set
+            if fixed_set:
+                fixed_idx_list = sorted(fixed_set)
             for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (scipy)"):
                 for ind in range(self.shape[0]):
-                    image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
+                    if ind in fixed_set:
+                        continue
+                    if fixed_set:
+                        image_ref = self.images_warped.array[fixed_idx_list].mean(axis=0)
+                    else:
+                        image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
+                    knots_np = self.knots[ind].cpu().numpy()
                     knots_updated = self._optimize_knots_scipy(
-                        ind, image_ref, self.knots[ind],
+                        ind, image_ref, knots_np,
                         max_optimize_iterations=max_optimize_iterations,
                         solve_individual_rows=solve_individual_rows)
                     if regularization_max_image_shift_px is not None:
-                        knots_shift = knots_updated - self.knots[ind]
+                        knots_shift = knots_updated - knots_np
                         knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
                         sub = knots_dist > regularization_max_image_shift_px
-                        knots_updated[0][sub] = (self.knots[ind][0][sub]
+                        knots_updated[0][sub] = (knots_np[0][sub]
                             + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
-                        knots_updated[1][sub] = (self.knots[ind][1][sub]
+                        knots_updated[1][sub] = (knots_np[1][sub]
                             + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
                     if regularization_sigma_px is not None and regularization_sigma_px > 0:
                         knots_smoothed = knots_updated.copy()
@@ -1489,10 +1194,11 @@ class DriftCorrection(AutoSerialize):
                                 knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
                         knots_updated = knots_smoothed
                     if regularization_update_step_size is not None:
-                        knots_updated = (self.knots[ind]
-                            + (knots_updated - self.knots[ind]) * regularization_update_step_size)
-                    self.knots[ind] = knots_updated
-                warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
+                        knots_updated = (knots_np
+                            + (knots_updated - knots_np) * regularization_update_step_size)
+                    self.knots[ind] = torch.tensor(knots_updated, dtype=self._dtype, device=self._device)
+                warped_t = self._warp_and_translate_torch(
+                    max_image_shift, upsample_factor=8, fixed_indices=fixed_set)
                 self.calculate_error(2, _warped_t=warped_t)
 
         if show_merged:
@@ -1514,7 +1220,7 @@ class DriftCorrection(AutoSerialize):
     def _optimize_knots_adam(
         self, ref_batch, target_batch, knots_batch,
         row_scan_offsets, col_scan_offsets, row_scale, col_scale,
-        optimizer, adam_steps,
+        optimizer, adam_steps, grad_mask=None,
     ):
         """Run ``adam_steps`` of Adam on a batched knot tensor against ``_compiled_loss_fn``."""
         ref_t = ref_batch[:, None]
@@ -1524,6 +1230,8 @@ class DriftCorrection(AutoSerialize):
                 knots_batch, ref_t, target_batch,
                 row_scan_offsets, col_scan_offsets, row_scale, col_scale)
             loss.backward()
+            if grad_mask is not None:
+                knots_batch.grad.mul_(grad_mask)
             optimizer.step()
 
     @staticmethod
@@ -1549,7 +1257,7 @@ class DriftCorrection(AutoSerialize):
     def _optimize_knots_lbfgs(
         self, ref_batch, target_batch, knots_batch,
         row_scan_offsets, col_scan_offsets, row_scale, col_scale,
-        optimizer,
+        optimizer, grad_mask=None,
     ):
         """Run one LBFGS outer step (line search re-evaluates the closure several times)."""
         ref_t = ref_batch[:, None]
@@ -1559,6 +1267,8 @@ class DriftCorrection(AutoSerialize):
                 knots_batch, ref_t, target_batch,
                 row_scan_offsets, col_scan_offsets, row_scale, col_scale)
             loss.backward()
+            if grad_mask is not None:
+                knots_batch.grad.mul_(grad_mask)
             return loss
         optimizer.step(closure)
 
@@ -1651,6 +1361,10 @@ class DriftCorrection(AutoSerialize):
         """
         Generate the final drift-corrected image after aligning a stack of input images.
 
+        The entire pipeline (warping, Fourier filtering, masking, cropping) runs
+        on GPU via PyTorch, transferring to CPU only for the final
+        ``Dataset2d`` output and the ``distance_transform_edt`` mask step.
+
         Parameters
         ----------
         upsample_factor : int, default 2
@@ -1692,107 +1406,86 @@ class DriftCorrection(AutoSerialize):
           on their scan angles, utilizing a bounded sine sigmoid for smooth transition.
         - Upsampling enhances interpolation precision but may increase computational cost.
         """
+        device = self._device
+        dtype = self._dtype
 
-        # init
-        stack_corr = np.zeros(
-            (
-                self.shape[0],
-                np.round(self.shape[1] * upsample_factor).astype("int"),
-                np.round(self.shape[2] * upsample_factor).astype("int"),
-            )
-        )
-        weight_corr = np.zeros(
-            (
-                self.shape[0],
-                np.round(self.shape[1] * upsample_factor).astype("int"),
-                np.round(self.shape[2] * upsample_factor).astype("int"),
-            )
-        )
+        up_h = round(self.shape[1] * upsample_factor)
+        up_w = round(self.shape[2] * upsample_factor)
+        canvas_up = (up_h, up_w)
 
         if kde_sigma is None:
             kde_sigma = self.kde_sigma
 
-        # Update images
+        # Warp all images onto upsampled canvas on GPU
+        stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
+        weight_corr = torch.zeros_like(stack_corr)
+
         for ind in range(self.shape[0]):
-            stack_corr[ind], weight_corr[ind] = self.interpolator[ind].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-                kde_sigma=kde_sigma,
-                upsample_factor=upsample_factor,
+            row_t, col_t = transform_coordinates_single_knot(
+                self.knots[ind], self.scan_fast_t[ind], self.images[ind].shape)
+            warped, weights = bilinear_kde_batch(
+                row_t[None] * upsample_factor,
+                col_t[None] * upsample_factor,
+                self.images_t[ind],
+                canvas_up,
+                kde_sigma * upsample_factor,
+                self.pad_value[ind],
             )
+            stack_corr[ind] = warped[0]
+            weight_corr[ind] = weights[0]
 
         if fourier_filter:
-            # Apply fourier filtering
-            kx = np.fft.fftfreq(stack_corr.shape[1])[:, None]
-            ky = np.fft.fftfreq(stack_corr.shape[2])[None, :]
-            kt = np.arctan2(ky, kx)
+            kx = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
+            ky = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
+            kt = torch.atan2(ky, kx)
 
-            stack_fft = np.fft.fft2(stack_corr)
-            weights = np.zeros_like(stack_corr)
+            stack_fft = torch.fft.fft2(stack_corr)
+            weights = torch.zeros_like(stack_corr)
 
-            for ind in range(stack_corr.shape[0]):
-                # Calculate weights as a function of angle
-                weights[ind] = np.abs(
-                    np.mod((kt - self.scan_direction[ind]) / np.pi + 0.5, 1.0) - 0.5
-                ) / (1 / 2)
-                weights[ind][0, 0] = 1.0
-
-                # Apply sigmoid to weighting function
-                weights[ind] = bounded_sine_sigmoid(
-                    weights[ind],
-                    midpoint=filter_midpoint,
-                )
-
-                # Weight the fourier transformed images
+            for ind in range(self.shape[0]):
+                weights[ind] = torch.abs(
+                    torch.remainder((kt - self.scan_direction[ind]) / np.pi + 0.5, 1.0) - 0.5
+                ) / 0.5
+                weights[ind, 0, 0] = 1.0
+                weights[ind] = _bounded_sine_sigmoid_torch(
+                    weights[ind], midpoint=filter_midpoint)
                 stack_fft[ind] *= weights[ind]
 
-            weights_sum = np.sum(weights, axis=0)
-            image_corr_fft = np.zeros_like(weights_sum, dtype=complex)
-            np.divide(
-                np.sum(stack_fft, axis=0),
-                weights_sum,
-                where=weights_sum > 0.0,
-                out=image_corr_fft,
-            )
-
+            weights_sum = weights.sum(0)
+            image_corr_fft = torch.zeros_like(weights_sum, dtype=stack_fft.dtype)
+            nonzero = weights_sum > 0.0
+            image_corr_fft[nonzero] = stack_fft.sum(0)[nonzero] / weights_sum[nonzero]
         else:
-            image_corr_fft = np.fft.fft2(np.mean(stack_corr, axis=0))
+            image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
 
         if mask_output:
-            # Note that we compute 2 boolean masks to round off the corners of image blending
-
-            # calculate mask from product of individual image masks
-            # scale weights by upsample factor to normalize to mean value of 1.0
-            mask_edge = np.prod(weight_corr >= (weight_thresh / upsample_factor**2), axis=0)
-            # Set outermost pixels to False to define the boundary for edge blending
+            # distance_transform_edt has no torch equivalent — compute on CPU
+            weight_np = weight_corr.cpu().numpy()
+            mask_edge = np.prod(weight_np >= (weight_thresh / upsample_factor**2), axis=0)
             mask_edge[:, 0] = False
             mask_edge[:, -1] = False
             mask_edge[0, :] = False
             mask_edge[-1, :] = False
-            # Find inner boundary mask
             mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
-            # compute mask using edge blending value
-            mask = (
+            mask_np = (
                 np.cos(
                     (np.pi / 2)
                     * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
                 )
                 ** 2
             )
-            # Mean pad value
+            mask_t = torch.as_tensor(mask_np, dtype=dtype, device=device)
             pad_value_mean = np.mean([ind.pad_value for ind in self.interpolator])
-            # apply mask
-            image_corr_fft = np.fft.fft2(
-                np.fft.ifft2(image_corr_fft) * mask + pad_value_mean * (1 - mask)
+            image_corr_fft = torch.fft.fft2(
+                torch.fft.ifft2(image_corr_fft).real * mask_t + pad_value_mean * (1 - mask_t)
             )
 
         if output_original_shape:
-            image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
+            image_corr_fft = _fourier_crop_torch(
+                image_corr_fft, self.shape[-2:]) / upsample_factor**2
 
-        # TODO - adjust origin / sampling if output sampling is different from input
-        # i.e. if output_original_shape is False, and upsample_factor > 1
         image_corr = Dataset2d.from_array(
-            np.real(np.fft.ifft2(image_corr_fft)),
+            torch.fft.ifft2(image_corr_fft).real.cpu().numpy(),
             name="drift corrected image",
             origin=self.images[0].origin,
             sampling=self.images[0].sampling,
@@ -1801,15 +1494,12 @@ class DriftCorrection(AutoSerialize):
 
         if show_image:
             fig, ax = show_2d(image_corr.array, **kwargs)
-            # Force a render whether we're drawing into a provided Axes or a fresh Figure
             ax_to_draw = kwargs.get("ax", ax)
             try:
                 ax_to_draw.figure.canvas.draw_idle()
-                # If we're not drawing into a caller-provided Axes, also pop the window
                 if "ax" not in kwargs:
                     plt.show()
             except Exception:
-                # Fallback: if backend is odd, try a blocking show
                 plt.show()
         return image_corr
 
@@ -1864,8 +1554,9 @@ class DriftCorrection(AutoSerialize):
         )
         if show_knots:
             for a0 in range(self.shape[0]):
-                x = self.knots[a0][0]
-                y = self.knots[a0][1]
+                knots_np = self.knots[a0].cpu().numpy()
+                x = knots_np[0]
+                y = knots_np[1]
                 ax[a0].plot(
                     y,
                     x,
@@ -1951,8 +1642,9 @@ class DriftCorrection(AutoSerialize):
         )
         if show_knots:
             for a0 in range(self.shape[0]):
-                x = self.knots[a0][0]
-                y = self.knots[a0][1]
+                knots_np = self.knots[a0].cpu().numpy()
+                x = knots_np[0]
+                y = knots_np[1]
                 ax.plot(
                     y,
                     x,
@@ -2114,3 +1806,39 @@ def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
     y[in_band] = np.sin(t * np.pi / 2) ** 2
     y[x > right] = 1.0
     return y
+
+
+def _bounded_sine_sigmoid_torch(x: torch.Tensor, midpoint: float = 0.5,
+                                 width: float = 1.0) -> torch.Tensor:
+    """Torch-native bounded sine sigmoid (branchless, GPU-friendly).
+
+    Equivalent to :func:`bounded_sine_sigmoid` but operates on torch tensors
+    without host-side branching, enabling fused GPU execution.
+    """
+    width = min(width, 2 * midpoint, 2 * (1 - midpoint))
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+    t = ((x - left) / width).clamp(0.0, 1.0)
+    return torch.where(x > right, torch.ones_like(x), torch.sin(t * (np.pi / 2)) ** 2)
+
+
+def _fourier_crop_torch(fft_array: torch.Tensor,
+                         crop_shape: tuple[int, int]) -> torch.Tensor:
+    """Crop a corner-centered FFT tensor to retain only lowest frequencies.
+
+    Torch equivalent of :func:`fourier_cropping` — slices the four
+    corner quadrants of the FFT to produce a smaller spectrum that,
+    when inverse-transformed, gives a lower-resolution version of the
+    original signal.
+    """
+    crop_h, crop_w = crop_shape
+    h1 = crop_h // 2
+    h2 = crop_h - h1
+    w1 = crop_w // 2
+    w2 = crop_w - w1
+    result = torch.zeros(crop_shape, dtype=fft_array.dtype, device=fft_array.device)
+    result[:h1, :w1] = fft_array[:h1, :w1]
+    result[:h1, -w2:] = fft_array[:h1, -w2:]
+    result[-h2:, :w1] = fft_array[-h2:, :w1]
+    result[-h2:, -w2:] = fft_array[-h2:, -w2:]
+    return result
