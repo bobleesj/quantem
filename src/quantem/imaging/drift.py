@@ -63,6 +63,10 @@ def align_affine_single_sided(
 ) -> dict[str, Any]:
     """Estimate affine scan drift for one moving image against a fixed reference.
 
+    .. deprecated::
+        Use ``DriftCorrection.from_data([ref, moving], [deg, deg]).preprocess().align_affine(fixed_indices=[0])``
+        instead. This standalone function will be removed in a future release.
+
     This is the single-sided variant needed for 4D-STEM VDF alignment: the
     moving image's knot field is optimized against a fixed reference image on
     a shared padded canvas. Unlike ``DriftCorrection.align_affine()``, the
@@ -114,6 +118,13 @@ def align_affine_single_sided(
         - ``moving_canvas``: moving image warped with the best drift
         - ``row_coords`` / ``col_coords``: best destination coordinates for the moving image
     """
+    warnings.warn(
+        "align_affine_single_sided is deprecated. Use "
+        "DriftCorrection.from_data([ref, moving], [deg, deg])"
+        ".preprocess().align_affine(fixed_indices=[0]) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if number_knots != 1:
         raise ValueError(
             "align_affine_single_sided currently supports only number_knots == 1."
@@ -730,6 +741,7 @@ class DriftCorrection(AutoSerialize):
         upsample_factor: int = 8,
         max_image_shift: float | None = 32,
         chunk_size: int | None = None,
+        fixed_indices: list[int] | None = None,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -772,6 +784,13 @@ class DriftCorrection(AutoSerialize):
         chunk_size : int or None
             Number of candidates per pass. If None, all candidates at once.
             Set to a smaller value if you run out of memory.
+        fixed_indices : list[int] or None
+            Indices of images whose knots should never be modified.
+            Use ``fixed_indices=[0]`` for single-sided alignment where
+            image 0 is a fixed reference (e.g. a merged HAADF) and only
+            the remaining images are optimized. When ``None`` (default),
+            all images receive the affine drift correction — the standard
+            behaviour for 0°/90° scan pairs.
         show_merged : bool
             Display the merged (averaged) image after alignment.
         show_images : bool
@@ -796,6 +815,12 @@ class DriftCorrection(AutoSerialize):
         >>> drift = DriftCorrection.from_data(
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
+
+        Single-sided alignment (4D-STEM VDF against a fixed HAADF reference):
+
+        >>> drift = DriftCorrection.from_data(
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        >>> drift.preprocess().align_affine(fixed_indices=[0])
         """
         if self.shape[0] < 2:
             raise ValueError(
@@ -806,6 +831,7 @@ class DriftCorrection(AutoSerialize):
             raise ValueError(
                 f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}."
             )
+        fixed_set = frozenset(fixed_indices) if fixed_indices is not None else frozenset()
         # Build candidate grid with circular mask (~21% fewer than square)
         grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
         row_grid, col_grid = np.meshgrid(grid_axis, grid_axis, indexing="ij")
@@ -828,16 +854,21 @@ class DriftCorrection(AutoSerialize):
 
         def _apply_drift(drift_vec):
             for img_idx in range(self.shape[0]):
+                if img_idx in fixed_set:
+                    continue
                 scanline_offset = np.arange(self.knots[img_idx].shape[1]) - (self.knots[img_idx].shape[1] - 1) / 2
                 self.knots[img_idx][0] += drift_vec[0] * scanline_offset[:, None]
                 self.knots[img_idx][1] += drift_vec[1] * scanline_offset[:, None]
 
         def _search_and_apply(candidates, label):
-            best_idx, costs = self._affine_grid_search_batch(candidates, upsample_factor, max_image_shift, chunk_size)
+            best_idx, costs = self._affine_grid_search_batch(
+                candidates, upsample_factor, max_image_shift, chunk_size,
+                fixed_indices=fixed_set)
             _apply_drift(candidates[best_idx])
             if verbose:
                 _print_top_candidates(label, candidates, costs)
-            warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor)
+            warped_t = self._warp_and_translate_torch(
+                max_image_shift, upsample_factor, fixed_indices=fixed_set)
             self.calculate_error(1, _warped_t=warped_t)
             return candidates[best_idx]
 
@@ -883,13 +914,19 @@ class DriftCorrection(AutoSerialize):
         return self
 
     @torch.inference_mode()
-    def _affine_grid_search_batch(self, drift_vectors, upsample_factor, max_image_shift, chunk_size=None):
+    def _affine_grid_search_batch(self, drift_vectors, upsample_factor, max_image_shift,
+                                  chunk_size=None, fixed_indices=None):
         """Evaluate all candidate drift vectors in parallel.
 
         Warps both images for each candidate using ``bilinear_kde_batch``
         and scores alignment quality via ``cross_corr_batch``. Without
         batching, each candidate would be a separate Python iteration - this
         is the key operation that enables the 300x speedup.
+
+        When ``fixed_indices`` is provided, images at those indices are
+        warped once with their current knots (no candidate drift) and
+        reused across all chunks. Only non-fixed images receive the
+        candidate drift offsets.
 
         Parameters
         ----------
@@ -901,6 +938,9 @@ class DriftCorrection(AutoSerialize):
             Maximum allowed shift for cross-correlation peak search.
         chunk_size : int or None
             Number of candidates per pass. If None, all at once.
+        fixed_indices : frozenset[int] or None
+            Indices of images whose knots should not receive candidate
+            drift. These images are warped once and reused.
 
         Returns
         -------
@@ -911,6 +951,7 @@ class DriftCorrection(AutoSerialize):
         """
         device = self._device
         dtype = self._dtype
+        fixed_set = fixed_indices if fixed_indices else frozenset()
         num_candidates = drift_vectors.shape[0]
         drift_vectors_t = torch.tensor(drift_vectors, dtype=dtype, device=device)
         canvas_shape = (self.shape[1], self.shape[2])
@@ -924,6 +965,15 @@ class DriftCorrection(AutoSerialize):
             scanline_offset = (torch.arange(num_rows, dtype=dtype, device=device)
                                - (num_rows - 1) / 2)
             base_data.append((self.images_t[img_idx], row_base, col_base, scanline_offset))
+        # Pre-warp fixed images once (knots unchanged across candidates)
+        fixed_warped = {}
+        for img_idx in range(2):
+            if img_idx in fixed_set:
+                image_t, row_base, col_base, _ = base_data[img_idx]
+                warped, _ = bilinear_kde_batch(
+                    row_base[None], col_base[None], image_t,
+                    canvas_shape, self.kde_sigma, self.pad_value[img_idx])
+                fixed_warped[img_idx] = warped[0]
         # Precompute shift mask and frequency grids (shared across chunks)
         shift_mask = None
         if max_image_shift is not None:
@@ -945,18 +995,22 @@ class DriftCorrection(AutoSerialize):
         while chunk_start < num_candidates:
             chunk_end = min(chunk_start + chunk_size, num_candidates)
             drift_chunk = drift_vectors_t[chunk_start:chunk_end]
+            cs = chunk_end - chunk_start
             if chunk_idx == 0 and chunked:
                 torch.cuda.reset_peak_memory_stats(device)
             warped_pair = []
             for img_idx in range(2):
-                image_t, row_base, col_base, scanline_offset = base_data[img_idx]
-                row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
-                col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
-                warped, _ = bilinear_kde_batch(
-                    row_candidates, col_candidates, image_t,
-                    canvas_shape, self.kde_sigma,
-                    self.pad_value[img_idx])
-                warped_pair.append(warped)
+                if img_idx in fixed_set:
+                    warped_pair.append(fixed_warped[img_idx][None].expand(cs, -1, -1))
+                else:
+                    image_t, row_base, col_base, scanline_offset = base_data[img_idx]
+                    row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
+                    col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
+                    warped, _ = bilinear_kde_batch(
+                        row_candidates, col_candidates, image_t,
+                        canvas_shape, self.kde_sigma,
+                        self.pad_value[img_idx])
+                    warped_pair.append(warped)
             all_costs.append(cross_corr_batch(
                 warped_pair[0], warped_pair[1],
                 upsample_factor,
@@ -1011,6 +1065,7 @@ class DriftCorrection(AutoSerialize):
         upsample_factor: int = 8,
         knots_batch: torch.Tensor | None = None,
         solve_translation: bool = True,
+        fixed_indices: frozenset[int] | None = None,
     ) -> torch.Tensor:
         """Regenerate warped images and solve translation on GPU.
 
@@ -1022,6 +1077,10 @@ class DriftCorrection(AutoSerialize):
         Set ``solve_translation=False`` to only warp and sync without
         re-solving translation - used after the nonrigid loop to populate
         ``self.images_warped`` from final knots.
+
+        When ``fixed_indices`` is provided, translation shifts are anchored
+        to those images (their shifts become zero) so that fixed images
+        never move on the canvas.
 
         Parameters
         ----------
@@ -1035,6 +1094,9 @@ class DriftCorrection(AutoSerialize):
         solve_translation : bool
             If False, skip translation alignment (Phase 2+3). Only warp
             once using current knots and sync to CPU.
+        fixed_indices : frozenset[int] or None
+            Indices of images that should not receive translation shifts.
+            When set, shifts are re-anchored so fixed images stay in place.
 
         Returns
         -------
@@ -1045,6 +1107,7 @@ class DriftCorrection(AutoSerialize):
         dtype = self._dtype
         num_images = self.shape[0]
         canvas_shape = (self.shape[1], self.shape[2])
+        fixed_set = fixed_indices if fixed_indices else frozenset()
 
         def _warp_all(warped_t, weights_t):
             """Warp all images onto the canvas using current knots."""
@@ -1071,6 +1134,13 @@ class DriftCorrection(AutoSerialize):
             return warped_t
         # Solve translation shifts and apply to knots
         shifts_t = translate_align(warped_t, upsample_factor, max_image_shift)
+        # When fixed images are present, anchor shifts to them instead of the mean
+        if fixed_set:
+            fixed_idx_list = sorted(fixed_set)
+            anchor = shifts_t[fixed_idx_list].mean(0)
+            shifts_t -= anchor
+            for idx in fixed_set:
+                shifts_t[idx] = 0.0
         if knots_batch is not None:
             knots_batch[:, 0] += shifts_t[:, 0:1]
             knots_batch[:, 1] += shifts_t[:, 1:2]
