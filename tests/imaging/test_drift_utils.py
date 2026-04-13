@@ -17,6 +17,7 @@ from quantem.imaging.drift_utils import (
     backward_warp,
     bilinear_kde_batch,
     cross_corr_batch,
+    fourier_shift_warp,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
     initialize_scanline_knots,
@@ -299,4 +300,84 @@ def test_backward_warp_reverses_known_drift():
     c = 15
     np.testing.assert_allclose(
         corrected[c:-c, c:-c], original[c:-c, c:-c], atol=0.05,
+    )
+
+
+# ---------------------------------------------------------------------------
+# fourier_shift_warp
+# ---------------------------------------------------------------------------
+
+
+def test_fourier_shift_warp_identity():
+    """Zero drift + zero rigid shift should return the input unchanged."""
+    img = torch.randn(64, 64, dtype=torch.float32)
+    out = fourier_shift_warp(img, drift=(0.0, 0.0))
+    torch.testing.assert_close(out, img, atol=1e-5, rtol=1e-5)
+
+
+def test_fourier_shift_warp_reverses_known_drift():
+    """Fourier warp should recover a Fourier-drifted image with near-zero error.
+
+    Unlike backward_warp (bilinear/bicubic), the column-direction shift
+    is exact — the only error comes from row-direction linear mixing.
+    """
+    n = 128
+    rng = np.random.default_rng(42)
+    from scipy.ndimage import gaussian_filter as gf
+    original = gf(rng.random((n, n)).astype(np.float32), sigma=4)
+
+    drift_col = 0.05  # 0.05 px/line → 6.4 px total
+    offset = np.arange(n) - (n - 1) / 2
+
+    # Forward drift: shift each scanline's columns via Fourier (exact)
+    drifted = np.zeros_like(original)
+    for r in range(n):
+        shift = drift_col * offset[r]
+        k = np.fft.fftfreq(n)
+        row_fft = np.fft.fft(original[r])
+        drifted[r] = np.real(np.fft.ifft(row_fft * np.exp(-2j * np.pi * k * shift)))
+
+    corrected = fourier_shift_warp(
+        torch.tensor(drifted), drift=(0.0, drift_col),
+    ).numpy()
+
+    # Column-only drift → Fourier correction should be near-exact
+    c = 15
+    np.testing.assert_allclose(
+        corrected[c:-c, c:-c], original[c:-c, c:-c], atol=0.01,
+    )
+
+
+def test_fourier_shift_warp_beats_bilinear_on_high_freq():
+    """Fourier roundtrip preserves high-frequency content better than bilinear.
+
+    Drift a high-freq image, correct with each method, compare to original.
+    Fourier should be more accurate because it doesn't attenuate frequencies.
+    """
+    n = 256
+    x = np.arange(n, dtype=np.float32)
+    # Integer cycles for perfect periodicity (avoids Fourier boundary artifacts)
+    cycles = int(0.4 * n)  # 102 full cycles
+    img = np.sin(2 * np.pi * cycles / n * x)[None, :].repeat(n, axis=0).astype(np.float32)
+
+    drift_col = 0.03  # 0.03 px/line → ~3.8 px total
+    offset = np.arange(n) - (n - 1) / 2
+
+    # Forward drift: shift each scanline's columns via Fourier (exact)
+    drifted = np.zeros_like(img)
+    for r in range(n):
+        shift = drift_col * offset[r]
+        k = np.fft.fftfreq(n)
+        row_fft = np.fft.fft(img[r])
+        drifted[r] = np.real(np.fft.ifft(row_fft * np.exp(-2j * np.pi * k * shift)))
+
+    drifted_t = torch.tensor(drifted)
+    bilinear_out = backward_warp(drifted_t, drift=(0.0, drift_col), mode="bilinear").numpy()
+    fourier_out = fourier_shift_warp(drifted_t, drift=(0.0, drift_col)).numpy()
+
+    c = 20
+    err_bilinear = np.sqrt(np.mean((bilinear_out[c:-c, c:-c] - img[c:-c, c:-c]) ** 2))
+    err_fourier = np.sqrt(np.mean((fourier_out[c:-c, c:-c] - img[c:-c, c:-c]) ** 2))
+    assert err_fourier < err_bilinear, (
+        f"Fourier ({err_fourier:.6f}) should beat bilinear ({err_bilinear:.6f})"
     )

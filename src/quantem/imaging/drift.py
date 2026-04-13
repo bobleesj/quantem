@@ -555,6 +555,7 @@ class DriftCorrection(AutoSerialize):
         pad_value: float | str | list[float] = "median",
         kde_sigma: float = 0.5,
         number_knots: int = 1,
+        normalize: bool = False,
         show_merged: bool = False,
         show_images: bool = False,
         show_knots: bool = True,
@@ -587,6 +588,12 @@ class DriftCorrection(AutoSerialize):
             Number of Bezier knots per scanline. Use ``1`` (recommended)
             for linear drift correction. Higher values allow per-scanline
             curvature but are slower and rarely needed.
+        normalize : bool
+            If True, min-max normalize each image to ``[0, 1]`` before
+            warping.  Recommended when aligning images with different
+            intensity scales (e.g. HAADF reference vs 4D-STEM virtual
+            dark-field) so the MAE cost function treats both equally.
+            For same-detector pairs (e.g. 0°/90°) this is unnecessary.
         show_merged : bool
             Display the merged (averaged) warped images after preprocessing.
         show_images : bool
@@ -606,7 +613,18 @@ class DriftCorrection(AutoSerialize):
         >>> drift = DriftCorrection.from_data(
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
+
+        For mixed-type images (HAADF + VDF), use normalize:
+
+        >>> drift = DriftCorrection.from_data(
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
+        if normalize:
+            for img in self.images:
+                arr = img.array.astype(np.float32)
+                lo, hi = arr.min(), arr.max()
+                img.array = (arr - lo) / (hi - lo + 1e-8)
         self.pad_fraction = float(pad_fraction)
         self.pad_value = validate_pad_value(pad_value, self.images)
         self.kde_sigma = float(kde_sigma)

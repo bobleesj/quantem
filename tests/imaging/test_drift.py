@@ -438,3 +438,20 @@ def test_align_affine_fixed_indices_none_matches_default():
     np.testing.assert_almost_equal(
         drift_a.error_track[-1, 1], drift_b.error_track[-1, 1], decimal=10,
     )
+
+
+def test_preprocess_normalize_scales_to_unit_range():
+    """preprocess(normalize=True) should scale each image to [0, 1]."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    # Artificially scale im1 to a very different range
+    im1_scaled = im1 * 1000 + 5000
+
+    dc = DriftCorrection.from_data(
+        images=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
+    )
+    dc.preprocess(normalize=True, show_merged=False, show_images=False)
+
+    for i in range(2):
+        arr = dc.images[i].array
+        assert arr.min() >= -0.01, f"Image {i} min={arr.min()}"
+        assert arr.max() <= 1.01, f"Image {i} max={arr.max()}"
