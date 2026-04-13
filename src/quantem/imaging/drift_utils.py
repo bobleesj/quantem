@@ -523,6 +523,120 @@ def fourier_shift_warp(
     return out[0] if squeeze else out
 
 
+@torch.inference_mode()
+def backward_warp_grid_search(
+    ref_image: torch.Tensor,
+    mov_image: torch.Tensor,
+    drift_vectors: torch.Tensor,
+    upsample_factor: int,
+    max_image_shift: float | None,
+    chunk_size: int | None = None,
+) -> tuple[int, torch.Tensor]:
+    """Score drift candidates by backward-warping the moving image.
+
+    For each candidate ``(dr, dc)``, builds a sampling grid that undoes the
+    drift::
+
+        sample_row[i, j] = i - dr * (i - center)
+        sample_col[i, j] = j - dc * (i - center)
+
+    then backward-warps the moving image with ``grid_sample`` (bicubic) and
+    scores alignment with the reference via ``cross_corr_batch``.
+
+    This avoids forward-scatter KDE artifacts that bias the cost when only
+    one image's geometry changes (``fixed_indices`` mode).  The periodic
+    wrapping in ``bilinear_kde_batch`` creates geometry-dependent seam
+    artifacts that differ between the fixed reference and the drift-shifted
+    moving image, making the MAE minimum diverge from the true drift.
+    Backward-warp scoring eliminates this by working at original resolution
+    without any canvas or KDE.
+
+    Parameters
+    ----------
+    ref_image : torch.Tensor
+        Reference image, shape ``(H, W)``.
+    mov_image : torch.Tensor
+        Moving image to correct, shape ``(H, W)``.
+    drift_vectors : torch.Tensor
+        Candidate drift rates, shape ``(N, 2)`` — columns ``(row_rate, col_rate)``.
+    upsample_factor : int
+        Sub-pixel precision for cross-correlation refinement.
+    max_image_shift : float or None
+        Maximum allowed translational shift in pixels.
+    chunk_size : int or None
+        Candidates per GPU pass.  ``None`` auto-selects based on free memory.
+
+    Returns
+    -------
+    tuple[int, torch.Tensor]
+        Index of the best candidate and full cost tensor of shape ``(N,)``.
+    """
+    device = ref_image.device
+    dtype = ref_image.dtype
+    h, w = ref_image.shape
+    num_candidates = drift_vectors.shape[0]
+    center = (h - 1) / 2.0
+
+    rows = torch.arange(h, device=device, dtype=dtype)
+    cols = torch.arange(w, device=device, dtype=dtype)
+    offset = rows - center  # (H,)
+
+    shift_mask = None
+    if max_image_shift is not None:
+        dist_r = fftfreq(h, 1.0 / h, device=device, dtype=dtype)
+        dist_c = fftfreq(w, 1.0 / w, device=device, dtype=dtype)
+        shift_mask = dist_r[:, None] ** 2 + dist_c[None, :] ** 2 >= max_image_shift ** 2
+    freq_grids = (
+        fftfreq(h, device=device, dtype=dtype)[:, None],
+        fftfreq(w, device=device, dtype=dtype)[None, :],
+    )
+
+    if chunk_size is None:
+        if device.type == "cuda":
+            bytes_per_element = torch.finfo(dtype).bits // 8
+            # grid (H*W*2) + warped (H*W) + FFT buffers (H*W*8*2)
+            per_cand_bytes = h * w * bytes_per_element * (2 + 1 + 16)
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            chunk_size = max(1, int(free_bytes * 0.4 / per_cand_bytes))
+            chunk_size = min(chunk_size, num_candidates)
+        else:
+            chunk_size = num_candidates
+
+    all_costs = []
+    for chunk_start in range(0, num_candidates, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, num_candidates)
+        cs = chunk_end - chunk_start
+        drift_chunk = drift_vectors[chunk_start:chunk_end]
+
+        dr = drift_chunk[:, 0]  # (cs,)
+        dc = drift_chunk[:, 1]  # (cs,)
+
+        row_shift = dr[:, None] * offset[None, :]  # (cs, H)
+        col_shift = dc[:, None] * offset[None, :]  # (cs, H)
+
+        samp_r = rows[None, :, None].expand(cs, h, w) - row_shift[:, :, None]
+        samp_c = cols[None, None, :].expand(cs, h, w) - col_shift[:, :, None]
+
+        grid_y = 2.0 * samp_r / (h - 1) - 1.0
+        grid_x = 2.0 * samp_c / (w - 1) - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+
+        warped = torch.nn.functional.grid_sample(
+            mov_image[None, None].expand(cs, 1, h, w), grid,
+            mode="bicubic", align_corners=True, padding_mode="border",
+        )[:, 0]
+
+        ref_batch = ref_image[None].expand(cs, -1, -1)
+        costs = cross_corr_batch(
+            ref_batch, warped, upsample_factor,
+            max_shift_mask=shift_mask, freq_grids=freq_grids,
+        )
+        all_costs.append(costs)
+
+    all_costs = torch.cat(all_costs)
+    return torch.argmin(all_costs).item(), all_costs
+
+
 def gaussian_smooth_batch(
     field_stack: torch.Tensor,
     sigma: float,

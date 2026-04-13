@@ -15,6 +15,7 @@ from quantem.imaging.drift_utils import (
     _parabolic_sub_pixel,
     _symmetric_pad,
     backward_warp,
+    backward_warp_grid_search,
     bilinear_kde_batch,
     cross_corr_batch,
     fourier_shift_warp,
@@ -380,4 +381,90 @@ def test_fourier_shift_warp_beats_bilinear_on_high_freq():
     err_fourier = np.sqrt(np.mean((fourier_out[c:-c, c:-c] - img[c:-c, c:-c]) ** 2))
     assert err_fourier < err_bilinear, (
         f"Fourier ({err_fourier:.6f}) should beat bilinear ({err_bilinear:.6f})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# backward_warp_grid_search
+# ---------------------------------------------------------------------------
+
+def test_backward_warp_grid_search_finds_known_centered_drift():
+    """backward_warp_grid_search should find the correct drift rate
+    for a centered drift model within 1 coarse step."""
+    from scipy.ndimage import map_coordinates
+    rng = np.random.default_rng(42)
+    N = 128
+    ref = gaussian_filter(rng.random((N, N)), sigma=2.0).astype(np.float32)
+    true_row, true_col = 0.04, -0.06
+    center = (N - 1) / 2.0
+    rr, cc = np.meshgrid(
+        np.arange(N, dtype=np.float32),
+        np.arange(N, dtype=np.float32),
+        indexing="ij",
+    )
+    offset = (np.arange(N, dtype=np.float32) - center)[:, None]
+    drifted = map_coordinates(
+        ref,
+        [rr + true_row * offset, cc + true_col * offset],
+        order=1, mode="nearest",
+    ).astype(np.float32)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ref_t = torch.tensor(ref, device=device)
+    mov_t = torch.tensor(drifted, device=device)
+
+    step = 0.02
+    axis = np.arange(-5, 6) * step
+    rg, cg = np.meshgrid(axis, axis, indexing="ij")
+    mask = rg**2 + cg**2 <= (5 * step)**2
+    candidates = torch.tensor(
+        np.vstack((rg[mask], cg[mask])).T, dtype=torch.float32, device=device)
+
+    best_idx, costs = backward_warp_grid_search(
+        ref_t, mov_t, candidates, upsample_factor=8, max_image_shift=32)
+
+    est = candidates[best_idx].cpu().numpy()
+    assert abs(est[0] - true_row) <= step, (
+        f"Row drift error {abs(est[0] - true_row):.4f} exceeds step {step}")
+    assert abs(est[1] - true_col) <= step, (
+        f"Col drift error {abs(est[1] - true_col):.4f} exceeds step {step}")
+
+
+def test_backward_warp_grid_search_true_drift_beats_zero():
+    """Cost at true drift should be lower than cost at zero drift."""
+    from scipy.ndimage import map_coordinates
+    rng = np.random.default_rng(123)
+    N = 64
+    ref = gaussian_filter(rng.random((N, N)), sigma=2.0).astype(np.float32)
+    true_row, true_col = 0.05, 0.03
+    center = (N - 1) / 2.0
+    rr, cc = np.meshgrid(
+        np.arange(N, dtype=np.float32),
+        np.arange(N, dtype=np.float32),
+        indexing="ij",
+    )
+    offset = (np.arange(N, dtype=np.float32) - center)[:, None]
+    drifted = map_coordinates(
+        ref,
+        [rr + true_row * offset, cc + true_col * offset],
+        order=1, mode="nearest",
+    ).astype(np.float32)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ref_t = torch.tensor(ref, device=device)
+    mov_t = torch.tensor(drifted, device=device)
+
+    candidates = torch.tensor([
+        [0.0, 0.0],
+        [true_row, true_col],
+    ], dtype=torch.float32, device=device)
+
+    best_idx, costs = backward_warp_grid_search(
+        ref_t, mov_t, candidates, upsample_factor=8, max_image_shift=32)
+
+    costs_np = costs.cpu().numpy()
+    assert best_idx == 1, "True drift should have lower cost than zero drift"
+    assert costs_np[1] < costs_np[0], (
+        f"True drift cost ({costs_np[1]:.6f}) should be lower than "
+        f"zero drift cost ({costs_np[0]:.6f})"
     )

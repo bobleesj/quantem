@@ -29,6 +29,7 @@ from quantem.core.utils.imaging_utils import (
 )
 from quantem.imaging.drift_utils import (
     backward_warp,
+    backward_warp_grid_search,
     bilinear_kde_batch,
     cross_corr_batch,
     gaussian_smooth_1d,
@@ -878,9 +879,19 @@ class DriftCorrection(AutoSerialize):
                 self.knots[img_idx][0] += drift_vec[0] * scanline_offset[:, None]
                 self.knots[img_idx][1] += drift_vec[1] * scanline_offset[:, None]
 
-        def _search_and_apply(candidates, label):
+        def _search_and_apply(candidates, label, accumulated_drift=None):
+            # When fixed_indices is set, backward_warp_grid_search scores
+            # absolute drift rates on the raw images (not canvas-warped).
+            # After the coarse pass, _apply_drift bakes the coarse drift into
+            # the knots, but the raw images are unchanged — so the refine
+            # candidates (small deltas) must be offset by the accumulated
+            # drift so that backward_warp_grid_search tests the correct total
+            # drift rates.
+            search_candidates = candidates
+            if fixed_set and accumulated_drift is not None:
+                search_candidates = candidates + accumulated_drift[None, :]
             best_idx, costs = self._affine_grid_search_batch(
-                candidates, upsample_factor, max_image_shift, chunk_size,
+                search_candidates, upsample_factor, max_image_shift, chunk_size,
                 fixed_indices=fixed_set)
             _apply_drift(candidates[best_idx])
             if verbose:
@@ -893,7 +904,8 @@ class DriftCorrection(AutoSerialize):
         drift_total = _search_and_apply(drift_vectors, "Coarse search")
         if refine:
             drift_fine = drift_vectors / (num_tests - 1)
-            drift_total = drift_total + _search_and_apply(drift_fine, "Refine search")
+            drift_total = drift_total + _search_and_apply(
+                drift_fine, "Refine search", accumulated_drift=drift_total)
         if verbose:
             num_rows = self.images[0].shape[0]
             drift_rate = np.sqrt(drift_total[0] ** 2 + drift_total[1] ** 2)
@@ -972,6 +984,22 @@ class DriftCorrection(AutoSerialize):
         fixed_set = fixed_indices if fixed_indices else frozenset()
         num_candidates = drift_vectors.shape[0]
         drift_vectors_t = torch.tensor(drift_vectors, dtype=dtype, device=device)
+
+        # When fixed_indices is set, use backward-warp scoring to avoid
+        # KDE forward-scatter bias.  The periodic wrapping in
+        # bilinear_kde_batch creates geometry-dependent seam artifacts
+        # that differ between the fixed reference and drift-shifted
+        # moving image, making the MAE minimum diverge from the true
+        # drift.  Backward-warp scoring works at original resolution
+        # with grid_sample (no canvas, no KDE).
+        if fixed_set:
+            fixed_idx = sorted(fixed_set)[0]
+            moving_idx = 1 - fixed_idx
+            return backward_warp_grid_search(
+                self.images_t[fixed_idx], self.images_t[moving_idx],
+                drift_vectors_t, upsample_factor, max_image_shift,
+                chunk_size)
+
         canvas_shape = (self.shape[1], self.shape[2])
         # Base coordinates shared across all candidates
         base_data = []
