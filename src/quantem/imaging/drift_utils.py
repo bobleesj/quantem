@@ -513,12 +513,10 @@ def fourier_shift_warp(
     # which shifts the signal by -d in the spatial domain.
     phase = torch.exp(2j * torch.pi * freq_col[None, :] * col_shifts[:, None].to(torch.complex64))  # (H, W)
 
-    # Apply per-row FFT → phase shift → IFFT
-    out = torch.zeros_like(row_corrected)
-    for i in range(n):
-        spectrum = torch.fft.fft(row_corrected[i].to(torch.complex64), dim=-1)  # (H, W)
-        spectrum *= phase
-        out[i] = torch.fft.ifft(spectrum, dim=-1).real.to(dtype)
+    # Apply batched FFT → phase shift → IFFT (vectorised across batch)
+    spectrum = torch.fft.fft(row_corrected.to(torch.complex64), dim=-1)  # (N, H, W)
+    spectrum *= phase[None, :, :]  # broadcast phase (H, W) across batch
+    out = torch.fft.ifft(spectrum, dim=-1).real.to(dtype)  # (N, H, W)
 
     return out[0] if squeeze else out
 
