@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.fft import fftfreq
-import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter
@@ -351,33 +350,33 @@ class DriftCorrection(AutoSerialize):
         """
         Solve for the translation between all images in DriftCorrection.images_warped
         """
-        dxy = np.zeros((self.shape[0], 2))
+        shifts = np.zeros((self.shape[0], 2))
         F_ref = np.fft.fft2(self.images_warped.array[0])
-        for ind in range(1, self.shape[0]):
-            shifts, image_shift = cross_correlation_shift(
+        for img_idx in range(1, self.shape[0]):
+            shift, image_shift = cross_correlation_shift(
                 F_ref,
-                np.fft.fft2(self.images_warped.array[ind]),
+                np.fft.fft2(self.images_warped.array[img_idx]),
                 upsample_factor=upsample_factor,
                 max_shift=max_image_shift,
                 fft_input=True,
                 fft_output=True,
                 return_shifted_image=True,
             )
-            dxy[ind, :] = shifts
-            F_ref = F_ref * ind / (ind + 1) + image_shift / (ind + 1)
-        dxy -= np.mean(dxy, axis=0)
+            shifts[img_idx, :] = shift
+            F_ref = F_ref * img_idx / (img_idx + 1) + image_shift / (img_idx + 1)
+        shifts -= np.mean(shifts, axis=0)
         if min_image_shift is not None:
-            if np.linalg.norm(dxy[ind]) < min_image_shift:
-                dxy[ind] = 0.0
-        for ind in range(self.shape[0]):
-            self.knots[ind][0] += dxy[ind, 0]
-            self.knots[ind][1] += dxy[ind, 1]
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
+            if np.linalg.norm(shifts[img_idx]) < min_image_shift:
+                shifts[img_idx] = 0.0
+        for img_idx in range(self.shape[0]):
+            self.knots[img_idx][0] += shifts[img_idx, 0]
+            self.knots[img_idx][1] += shifts[img_idx, 1]
+        for img_idx in range(self.shape[0]):
+            self.images_warped.array[img_idx], self.weights_warped.array[img_idx] = self.interpolator[
+                img_idx
             ].warp_image(
-                self.images[ind].array,
-                self.knots[ind].cpu().numpy(),
+                self.images[img_idx].array,
+                self.knots[img_idx].cpu().numpy(),
             )
         kwargs.pop("title", None)
         if show_merged:
@@ -676,15 +675,6 @@ class DriftCorrection(AutoSerialize):
             scanline_offset = (torch.arange(num_rows, dtype=dtype, device=device)
                                - (num_rows - 1) / 2)
             base_data.append((self.images_t[img_idx], row_base, col_base, scanline_offset))
-        # Pre-warp fixed images once (knots unchanged across candidates)
-        fixed_warped = {}
-        for img_idx in range(n_images):
-            if img_idx in fixed_set:
-                image_t, row_base, col_base, _ = base_data[img_idx]
-                warped, _ = bilinear_kde_batch(
-                    row_base[None], col_base[None], image_t,
-                    canvas_shape, self.kde_sigma, self.pad_value[img_idx])
-                fixed_warped[img_idx] = warped[0]
         # Precompute shift mask and frequency grids (shared across chunks)
         shift_mask = None
         if max_image_shift is not None:
@@ -712,17 +702,14 @@ class DriftCorrection(AutoSerialize):
             # Warp each image (fixed → expand once, moving → drift-shifted)
             warped_images = []
             for img_idx in range(n_images):
-                if img_idx in fixed_set:
-                    warped_images.append(fixed_warped[img_idx][None].expand(cs, -1, -1))
-                else:
-                    image_t, row_base, col_base, scanline_offset = base_data[img_idx]
-                    row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
-                    col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
-                    warped, _ = bilinear_kde_batch(
-                        row_candidates, col_candidates, image_t,
-                        canvas_shape, self.kde_sigma,
-                        self.pad_value[img_idx])
-                    warped_images.append(warped)
+                image_t, row_base, col_base, scanline_offset = base_data[img_idx]
+                row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
+                col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
+                warped, _ = bilinear_kde_batch(
+                    row_candidates, col_candidates, image_t,
+                    canvas_shape, self.kde_sigma,
+                    self.pad_value[img_idx])
+                warped_images.append(warped)
             # Score all unique pairs and sum costs
             chunk_cost = torch.zeros(cs, dtype=dtype, device=device)
             for i in range(n_images):
@@ -1180,26 +1167,26 @@ class DriftCorrection(AutoSerialize):
             if fixed_set:
                 fixed_idx_list = sorted(fixed_set)
             for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (scipy)"):
-                for ind in range(self.shape[0]):
-                    if ind in fixed_set:
+                for img_idx in range(self.shape[0]):
+                    if img_idx in fixed_set:
                         continue
                     if fixed_set:
                         image_ref = self.images_warped.array[fixed_idx_list].mean(axis=0)
                     else:
-                        image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
-                    knots_np = self.knots[ind].cpu().numpy()
+                        image_ref = np.delete(self.images_warped.array, img_idx, axis=0).mean(axis=0)
+                    knots_np = self.knots[img_idx].cpu().numpy()
                     knots_updated = self._optimize_knots_scipy(
-                        ind, image_ref, knots_np,
+                        img_idx, image_ref, knots_np,
                         max_optimize_iterations=max_optimize_iterations,
                         solve_individual_rows=solve_individual_rows)
                     if regularization_max_image_shift_px is not None:
                         knots_shift = knots_updated - knots_np
                         knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
-                        sub = knots_dist > regularization_max_image_shift_px
-                        knots_updated[0][sub] = (knots_np[0][sub]
-                            + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
-                        knots_updated[1][sub] = (knots_np[1][sub]
-                            + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                        exceeds_max = knots_dist > regularization_max_image_shift_px
+                        knots_updated[0][exceeds_max] = (knots_np[0][exceeds_max]
+                            + knots_shift[0][exceeds_max] * regularization_max_image_shift_px / knots_dist[exceeds_max])
+                        knots_updated[1][exceeds_max] = (knots_np[1][exceeds_max]
+                            + knots_shift[1][exceeds_max] * regularization_max_image_shift_px / knots_dist[exceeds_max])
                     if regularization_sigma_px is not None and regularization_sigma_px > 0:
                         knots_smoothed = knots_updated.copy()
                         for dim in range(2):
@@ -1215,7 +1202,7 @@ class DriftCorrection(AutoSerialize):
                     if regularization_update_step_size is not None:
                         knots_updated = (knots_np
                             + (knots_updated - knots_np) * regularization_update_step_size)
-                    self.knots[ind] = torch.tensor(knots_updated, dtype=self._dtype, device=self._device)
+                    self.knots[img_idx] = torch.tensor(knots_updated, dtype=self._dtype, device=self._device)
                 warped_t = self._warp_and_translate_torch(
                     max_image_shift, upsample_factor=8, fixed_indices=fixed_set)
                 self.calculate_error(2, _warped_t=warped_t)
@@ -1337,14 +1324,14 @@ class DriftCorrection(AutoSerialize):
                 x0 = knots_init[:, row_ind, :].ravel()
                 def cost_function(x):
                     knots_row = x.reshape(shape_knots[0], shape_knots[2])
-                    xa, ya = self.interpolator[idx].transform_rows(knots_row)
-                    xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
-                    yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                    dx, dy = xa - xf, ya - yf
-                    warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                              + image_ref[xf + 1, yf] * dx * (1 - dy)
-                              + image_ref[xf, yf + 1] * (1 - dx) * dy
-                              + image_ref[xf + 1, yf + 1] * dx * dy)
+                    row_coords, col_coords = self.interpolator[idx].transform_rows(knots_row)
+                    rf = np.clip(np.floor(row_coords).astype(int), 0, self.shape[1] - 2)
+                    cf = np.clip(np.floor(col_coords).astype(int), 0, self.shape[2] - 2)
+                    dr, dc = row_coords - rf, col_coords - cf
+                    warped = (image_ref[rf, cf] * (1 - dr) * (1 - dc)
+                              + image_ref[rf + 1, cf] * dr * (1 - dc)
+                              + image_ref[rf, cf + 1] * (1 - dr) * dc
+                              + image_ref[rf + 1, cf + 1] * dr * dc)
                     return np.sum((warped - self.images[idx].array[row_ind, :]) ** 2)
                 result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                 knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
@@ -1352,14 +1339,14 @@ class DriftCorrection(AutoSerialize):
             x0 = knots_init.ravel()
             def cost_function(x):
                 knots = x.reshape(shape_knots)
-                xa, ya = self.interpolator[idx].transform_coordinates(knots)
-                xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
-                yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                dx, dy = xa - xf, ya - yf
-                warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                          + image_ref[xf + 1, yf] * dx * (1 - dy)
-                          + image_ref[xf, yf + 1] * (1 - dx) * dy
-                          + image_ref[xf + 1, yf + 1] * dx * dy)
+                row_coords, col_coords = self.interpolator[idx].transform_coordinates(knots)
+                rf = np.clip(np.floor(row_coords).astype(int), 0, self.shape[1] - 2)
+                cf = np.clip(np.floor(col_coords).astype(int), 0, self.shape[2] - 2)
+                dr, dc = row_coords - rf, col_coords - cf
+                warped = (image_ref[rf, cf] * (1 - dr) * (1 - dc)
+                          + image_ref[rf + 1, cf] * dr * (1 - dc)
+                          + image_ref[rf, cf + 1] * (1 - dr) * dc
+                          + image_ref[rf + 1, cf + 1] * dr * dc)
                 return np.sum((warped - self.images[idx].array) ** 2)
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
@@ -1373,7 +1360,7 @@ class DriftCorrection(AutoSerialize):
         fourier_filter: bool = True,
         filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
-        weight_thresh=0.1,
+        weight_thresh: float = 0.1,
         show_image: bool = True,
         **kwargs,
     ):
@@ -1439,19 +1426,19 @@ class DriftCorrection(AutoSerialize):
         stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
         weight_corr = torch.zeros_like(stack_corr)
 
-        for ind in range(self.shape[0]):
+        for img_idx in range(self.shape[0]):
             row_t, col_t = transform_coordinates_single_knot(
-                self.knots[ind], self.scan_fast_t[ind], self.images[ind].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
             warped, weights = bilinear_kde_batch(
                 row_t[None] * upsample_factor,
                 col_t[None] * upsample_factor,
-                self.images_t[ind],
+                self.images_t[img_idx],
                 canvas_up,
                 kde_sigma * upsample_factor,
-                self.pad_value[ind],
+                self.pad_value[img_idx],
             )
-            stack_corr[ind] = warped[0]
-            weight_corr[ind] = weights[0]
+            stack_corr[img_idx] = warped[0]
+            weight_corr[img_idx] = weights[0]
 
         if fourier_filter:
             kx = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
@@ -1461,14 +1448,14 @@ class DriftCorrection(AutoSerialize):
             stack_fft = torch.fft.fft2(stack_corr)
             weights = torch.zeros_like(stack_corr)
 
-            for ind in range(self.shape[0]):
-                weights[ind] = torch.abs(
-                    torch.remainder((kt - self.scan_direction[ind]) / np.pi + 0.5, 1.0) - 0.5
+            for img_idx in range(self.shape[0]):
+                weights[img_idx] = torch.abs(
+                    torch.remainder((kt - self.scan_direction[img_idx]) / np.pi + 0.5, 1.0) - 0.5
                 ) / 0.5
-                weights[ind, 0, 0] = 1.0
-                weights[ind] = _bounded_sine_sigmoid_torch(
-                    weights[ind], midpoint=filter_midpoint)
-                stack_fft[ind] *= weights[ind]
+                weights[img_idx, 0, 0] = 1.0
+                weights[img_idx] = _bounded_sine_sigmoid_torch(
+                    weights[img_idx], midpoint=filter_midpoint)
+                stack_fft[img_idx] *= weights[img_idx]
 
             weights_sum = weights.sum(0)
             image_corr_fft = torch.zeros_like(weights_sum, dtype=stack_fft.dtype)
@@ -2129,11 +2116,11 @@ class DriftCorrection(AutoSerialize):
             **kwargs,
         )
         if show_knots:
-            for a0 in range(self.shape[0]):
-                knots_np = self.knots[a0].cpu().numpy()
+            for img_idx in range(self.shape[0]):
+                knots_np = self.knots[img_idx].cpu().numpy()
                 x = knots_np[0]
                 y = knots_np[1]
-                ax[a0].plot(
+                ax[img_idx].plot(
                     y,
                     x,
                     color="r",
@@ -2147,7 +2134,7 @@ class DriftCorrection(AutoSerialize):
         """
         Plot the convergence of the drift correction.
         """
-        sub = np.abs(self.error_track[:, 0] - 2) < 0.1
+        is_nonrigid = self.error_track[:, 0] == 2
         error = self.error_track[:, 1]
         it = np.arange(error.shape[0])
 
@@ -2157,10 +2144,10 @@ class DriftCorrection(AutoSerialize):
         color = (1, 0, 0)  # red
 
         # Plot Affine
-        if np.any(~sub):
+        if np.any(~is_nonrigid):
             ax[0].plot(
-                it[~sub],
-                100 * error[~sub],
+                it[~is_nonrigid],
+                100 * error[~is_nonrigid],
                 marker="o",
                 color=color,
                 linestyle="-",
@@ -2175,14 +2162,14 @@ class DriftCorrection(AutoSerialize):
             ax[0].axis("off")
 
         # Plot Non-Rigid
-        if np.any(sub):
-            first_true = np.argmax(sub)
+        if np.any(is_nonrigid):
+            first_true = np.argmax(is_nonrigid)
             if first_true > 0:
-                sub[first_true - 1] = True
+                is_nonrigid[first_true - 1] = True
 
             ax[1].plot(
-                it[sub],
-                100 * error[sub],
+                it[is_nonrigid],
+                100 * error[is_nonrigid],
                 marker="o",
                 color=color,
                 linestyle="-",
@@ -2209,8 +2196,8 @@ class DriftCorrection(AutoSerialize):
             **kwargs,
         )
         if show_knots:
-            for a0 in range(self.shape[0]):
-                knots_np = self.knots[a0].cpu().numpy()
+            for img_idx in range(self.shape[0]):
+                knots_np = self.knots[img_idx].cpu().numpy()
                 x = knots_np[0]
                 y = knots_np[1]
                 ax.plot(
@@ -2232,12 +2219,8 @@ class DriftInterpolator:
         self.input_shape = input_shape
         self.output_shape = output_shape
         self.scan_fast = scan_fast
-        self.scan_slow = scan_slow
         self.pad_value = pad_value
         self.kde_sigma = kde_sigma
-
-        self.rows_input = np.arange(input_shape[0])
-        self.cols_input = np.arange(input_shape[1])
         self.u = np.linspace(0, 1, input_shape[1])
 
     def transform_rows(
@@ -2248,21 +2231,21 @@ class DriftInterpolator:
         basis = np.linspace(0, 1, num_knots)
 
         if num_knots == 1:
-            xa = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (self.input_shape[0] - 1)
-            ya = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (self.input_shape[1] - 1)
+            row_coords = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (self.input_shape[0] - 1)
+            col_coords = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (self.input_shape[1] - 1)
         elif num_knots == 2:
-            xa = interp1d(basis, knots_row[0], kind="linear", assume_sorted=True)(self.u)
-            ya = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(self.u)
+            row_coords = interp1d(basis, knots_row[0], kind="linear", assume_sorted=True)(self.u)
+            col_coords = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(self.u)
         else:
             kind = "quadratic" if num_knots == 3 else "cubic"
-            xa = interp1d(
+            row_coords = interp1d(
                 basis,
                 knots_row[0],
                 kind=kind,
                 fill_value="extrapolate",
                 assume_sorted=True,
             )(self.u)
-            ya = interp1d(
+            col_coords = interp1d(
                 basis,
                 knots_row[1],
                 kind=kind,
@@ -2270,7 +2253,7 @@ class DriftInterpolator:
                 assume_sorted=True,
             )(self.u)
 
-        return xa, ya
+        return row_coords, col_coords
 
     def transform_coordinates(
         self,
@@ -2279,15 +2262,14 @@ class DriftInterpolator:
         num_knots = knots.shape[-1]
 
         if num_knots == 1:
-            # vectorized version for speed
-            xa, ya = self.transform_rows(knots)
+            row_coords, col_coords = self.transform_rows(knots)
         else:
-            xa = np.zeros(self.input_shape)
-            ya = np.zeros(self.input_shape)
+            row_coords = np.zeros(self.input_shape)
+            col_coords = np.zeros(self.input_shape)
             for i in range(self.input_shape[0]):
-                xa[i], ya[i] = self.transform_rows(knots[:, i])
+                row_coords[i], col_coords[i] = self.transform_rows(knots[:, i])
 
-        return xa, ya
+        return row_coords, col_coords
 
     def warp_image(
         self,
@@ -2298,25 +2280,20 @@ class DriftInterpolator:
         pad_value=None,
         upsample_factor=None,
     ) -> NDArray:
-        xa, ya = self.transform_coordinates(
-            knots,
-        )
+        row_coords, col_coords = self.transform_coordinates(knots)
 
         if kde_sigma is None:
             kde_sigma = self.kde_sigma
-
         if output_shape is None:
             output_shape = self.output_shape
-
         if pad_value is None:
             pad_value = self.pad_value
-
         if upsample_factor is None:
             upsample_factor = 1.0
 
         image_interp, weight_interp = bilinear_kde(
-            xa=xa * upsample_factor,  # rows
-            ya=ya * upsample_factor,  # cols
+            xa=row_coords * upsample_factor,
+            ya=col_coords * upsample_factor,
             values=image,
             output_shape=np.round(np.array(output_shape) * upsample_factor).astype("int"),
             kde_sigma=kde_sigma * upsample_factor,
@@ -2327,61 +2304,12 @@ class DriftInterpolator:
         return image_interp, weight_interp
 
 
-def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
-    """
-    Piecewise bounded sigmoid: zero, raised sine squared, one.
-
-    Parameters
-    ----------
-    x : array-like, shape (...,)
-        Input values in [0, 1].
-    midpoint : float    
-        Center of the sigmoid transition.
-    width : float
-        Width of the sigmoid (range over which it ramps from 0 to 1).
-    Returns
-    -------
-    y : array-like
-        Output in [0, 1], same shape as x.
-    """
-    x = np.asarray(x)
-    # Truncate width if midpoint too close to edge
-    left_max = midpoint - width / 2
-    right_min = midpoint + width / 2
-    if left_max < 0:
-        warnings.warn(
-            f"width={width} is too large for midpoint={midpoint}, "
-            f"clamping width to {2 * midpoint}.",
-            RuntimeWarning,
-        )
-        width = 2 * midpoint
-
-    if right_min > 1:
-        warnings.warn(
-            f"width={width} is too large for midpoint={midpoint}, "
-            f"clamping width to {2 * (1 - midpoint)}.",
-            RuntimeWarning,
-        )
-        width = 2 * (1 - midpoint)
-    # Recalculate edges
-    left = midpoint - width / 2
-    right = midpoint + width / 2
-
-    y = np.zeros_like(x, dtype=float)
-    in_band = (x >= left) & (x <= right)
-    # Map [left, right] to [0, pi/2]
-    t = (x[in_band] - left) / width  # goes from 0 to 1
-    y[in_band] = np.sin(t * np.pi / 2) ** 2
-    y[x > right] = 1.0
-    return y
-
-
 def _bounded_sine_sigmoid_torch(x: torch.Tensor, midpoint: float = 0.5,
                                  width: float = 1.0) -> torch.Tensor:
-    """Torch-native bounded sine sigmoid (branchless, GPU-friendly).
+    """Bounded sine sigmoid (branchless, GPU-friendly).
 
-    Equivalent to :func:`bounded_sine_sigmoid` but operates on torch tensors
-    without host-side branching, enabling fused GPU execution.
+    Maps values smoothly from 0 to 1 using a sine-squared transition
+    between ``midpoint - width/2`` and ``midpoint + width/2``.
     """
     width = min(width, 2 * midpoint, 2 * (1 - midpoint))
     left = midpoint - width / 2
