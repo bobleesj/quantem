@@ -532,7 +532,7 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
 # Tests for apply_correction() and validation
 # ──────────────────────────────────────────────────────────────
 
-def _make_single_sided_dc(scan_h=64, drift_rate=(0.05, 0.1), seed=42):
+def _make_single_sided_dc(scan_h=256, drift_rate=(0.05, 0.1), seed=42):
     """Helper: build a DriftCorrection with known single-sided drift."""
     np.random.seed(seed)
     yy, xx = np.mgrid[:scan_h, :scan_h]
@@ -603,8 +603,8 @@ def test_apply_correction_invalid_mode_raises():
 
 def test_apply_correction_wrong_height_raises():
     """apply_correction with mismatched image height should raise."""
-    dc, _, _ = _make_single_sided_dc(scan_h=64)
-    wrong_size = np.zeros((32, 64), dtype=np.float32)
+    dc, _, _ = _make_single_sided_dc()
+    wrong_size = np.zeros((32, 256), dtype=np.float32)
     with pytest.raises(ValueError, match="Image height"):
         dc.apply_correction(images=wrong_size)
 
@@ -668,6 +668,108 @@ def test_plot_correction_summary_runs():
         show_fft=False, show_diff=False, cmap="viridis", show_ticks=True,
     )
     assert fig3 is not None
+
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+# --------------- drift_rate, print_drift_stats, plot_correction_comparison, plot_radial_power ------
+
+def test_drift_rate_matches_ground_truth():
+    """drift_rate should approximate the known drift slope."""
+    rate_gt = (0.05, 0.1)
+    # Use larger image for more accurate drift estimation
+    dc, _, _ = _make_single_sided_dc(drift_rate=rate_gt)
+    rate = dc.drift_rate
+    # Negative because knots compensate drift
+    assert abs(rate[0] + rate_gt[0]) < 0.04, f"row rate {rate[0]} far from {-rate_gt[0]}"
+    assert abs(rate[1] + rate_gt[1]) < 0.04, f"col rate {rate[1]} far from {-rate_gt[1]}"
+
+
+def test_drift_rate_before_align_raises():
+    """drift_rate before preprocess/align should raise RuntimeError."""
+    dc = DriftCorrection.from_data(
+        images=[np.zeros((32, 32)), np.zeros((32, 32))],
+        scan_direction_degrees=[0.0, 0.0],
+    )
+    with pytest.raises(RuntimeError, match="preprocess"):
+        _ = dc.drift_rate
+
+
+def test_print_drift_stats(capsys):
+    """print_drift_stats should output rate, total, and confidence."""
+    dc, _, _ = _make_single_sided_dc()
+    dc.print_drift_stats()
+    out = capsys.readouterr().out
+    assert "Drift rate:" in out
+    assert "Total drift:" in out
+    assert "Affine confidence:" in out
+
+
+def test_print_drift_stats_with_nonrigid(capsys):
+    """print_drift_stats after nonrigid should also print nonrigid max."""
+    dc, _, _ = _make_single_sided_dc()
+    dc.align_nonrigid(fixed_indices=[0], show_merged=False, show_images=False)
+    dc.print_drift_stats()
+    out = capsys.readouterr().out
+    assert "Nonrigid max correction:" in out
+
+
+def test_plot_correction_comparison_runs():
+    """plot_correction_comparison should produce fig, axes, metrics."""
+    import matplotlib
+    matplotlib.use('Agg')
+    dc, _, _ = _make_single_sided_dc()
+    # After affine only — should still work (no nonrigid)
+    fig, axes, metrics = dc.plot_correction_comparison(crop=40)
+    assert fig is not None
+    assert "nonrigid bicubic" in metrics
+    assert len(metrics) >= 2  # at least raw + nonrigid bicubic
+
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_plot_correction_comparison_with_nonrigid():
+    """plot_correction_comparison after nonrigid should show all 4 modes."""
+    import matplotlib
+    matplotlib.use('Agg')
+    dc, _, _ = _make_single_sided_dc()
+    dc.align_nonrigid(fixed_indices=[0], show_merged=False, show_images=False)
+    fig, axes, metrics = dc.plot_correction_comparison(crop=40, show_fft=False)
+    assert fig is not None
+    # Should have affine + nonrigid × bilinear + bicubic = 4 + raw
+    assert "affine bilinear" in metrics
+    assert "affine bicubic" in metrics
+    assert "nonrigid bilinear" in metrics
+    assert "nonrigid bicubic" in metrics
+
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_plot_radial_power_runs():
+    """plot_radial_power should produce a figure."""
+    import matplotlib
+    matplotlib.use('Agg')
+    dc, _, _ = _make_single_sided_dc()
+    fig, ax = dc.plot_radial_power(crop=40)
+    assert fig is not None
+    assert len(ax.get_lines()) >= 2  # at least ref + one method
+
+    import matplotlib.pyplot as plt
+    plt.close("all")
+
+
+def test_plot_radial_power_custom_methods():
+    """plot_radial_power with user-provided methods dict."""
+    import matplotlib
+    matplotlib.use('Agg')
+    dc, ref, drifted = _make_single_sided_dc()
+    custom = {"reference": ref, "drifted": drifted}
+    fig, ax = dc.plot_radial_power(methods=custom, crop=40)
+    assert fig is not None
+    assert len(ax.get_lines()) == 2
 
     import matplotlib.pyplot as plt
     plt.close("all")

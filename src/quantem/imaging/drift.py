@@ -598,6 +598,8 @@ class DriftCorrection(AutoSerialize):
                 **kwargs,
             )
 
+        self._knots_after_affine = [k.clone() for k in self.knots]
+
         return self
 
     @torch.inference_mode()
@@ -1725,41 +1727,18 @@ class DriftCorrection(AutoSerialize):
             corrected_np = np.asarray(corrected)
 
         # --- centre crop ---
+        s, crop = self._center_crop_slice(ref_np, crop)
         h, w = ref_np.shape
-        if crop is None:
-            crop = int(min(h, w) * 0.8) // 2 * 2
-        r0, c0 = (h - crop) // 2, (w - crop) // 2
-        s = (slice(r0, r0 + crop), slice(c0, c0 + crop))
 
         ref_c = ref_np[s].astype(np.float32)
         raw_c = raw_np[s].astype(np.float32)
         cor_c = corrected_np[s].astype(np.float32)
 
         # --- metrics ---
-        def _znorm(a):
-            return (a - a.mean()) / (a.std() + 1e-8)
-
-        def _rms(a, b):
-            return float(np.sqrt(((_znorm(a) - _znorm(b)) ** 2).mean()))
-
-        def _ncc(a, b):
-            an, bn = _znorm(a), _znorm(b)
-            return float(np.corrcoef(an.ravel(), bn.ravel())[0, 1])
-
-        def _log_fft(img):
-            n_h, n_w = img.shape
-            hann = np.outer(np.hanning(n_h), np.hanning(n_w))
-            f = np.fft.fftshift(np.fft.fft2(img * hann))
-            mag = np.log1p(np.abs(f))
-            cy, cx = n_h // 2, n_w // 2
-            yy, xx = np.ogrid[-cy:n_h - cy, -cx:n_w - cx]
-            mag[yy ** 2 + xx ** 2 < fft_mask_radius ** 2] = 0
-            return mag
-
-        raw_rms = _rms(raw_c, ref_c)
-        cor_rms = _rms(cor_c, ref_c)
-        raw_ncc = _ncc(raw_c, ref_c)
-        cor_ncc = _ncc(cor_c, ref_c)
+        raw_rms = self._rms(raw_c, ref_c)
+        cor_rms = self._rms(cor_c, ref_c)
+        raw_ncc = self._ncc(raw_c, ref_c)
+        cor_ncc = self._ncc(cor_c, ref_c)
 
         # --- build grid of rows ---
         nrows = 1 + int(show_fft) + int(show_diff)
@@ -1809,8 +1788,9 @@ class DriftCorrection(AutoSerialize):
                 fft_titles = ["FFT: Reference", "FFT: Raw", "FFT: Corrected"]
                 fft_kwargs = {k: v for k, v in kwargs.items()
                               if k not in ("cmap",)}
+                fft_fn = lambda img: self._log_fft(img, fft_mask_radius)
                 show_2d(
-                    [_log_fft(ref_c), _log_fft(raw_c), _log_fft(cor_c)],
+                    [fft_fn(ref_c), fft_fn(raw_c), fft_fn(cor_c)],
                     title=fft_titles,
                     figax=(fig, axes_grid[row]),
                     axsize=axsize,
@@ -1819,9 +1799,9 @@ class DriftCorrection(AutoSerialize):
                 row += 1
 
             if show_diff:
-                ref_n = _znorm(ref_c)
-                diff_raw = _znorm(raw_c) - ref_n
-                diff_cor = _znorm(cor_c) - ref_n
+                ref_n = self._znorm(ref_c)
+                diff_raw = self._znorm(raw_c) - ref_n
+                diff_cor = self._znorm(cor_c) - ref_n
                 vmax = float(
                     max(np.abs(diff_raw).max(), np.abs(diff_cor).max()) * 0.8
                 )
@@ -1856,6 +1836,291 @@ class DriftCorrection(AutoSerialize):
         print(f"  RMS reduction: {reduction:.1f}%")
 
         return fig, axs
+
+    @staticmethod
+    def _znorm(a: np.ndarray) -> np.ndarray:
+        a = a.astype(np.float32)
+        return (a - a.mean()) / (a.std() + 1e-8)
+
+    @staticmethod
+    def _rms(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.sqrt(((DriftCorrection._znorm(a)
+                                - DriftCorrection._znorm(b)) ** 2).mean()))
+
+    @staticmethod
+    def _ncc(a: np.ndarray, b: np.ndarray) -> float:
+        an = DriftCorrection._znorm(a)
+        bn = DriftCorrection._znorm(b)
+        return float(np.corrcoef(an.ravel(), bn.ravel())[0, 1])
+
+    @staticmethod
+    def _log_fft(
+        img: np.ndarray, mask_radius: int = 5,
+    ) -> np.ndarray:
+        n_h, n_w = img.shape
+        hann = np.outer(np.hanning(n_h), np.hanning(n_w))
+        f = np.fft.fftshift(np.fft.fft2(img * hann))
+        mag = np.log1p(np.abs(f))
+        cy, cx = n_h // 2, n_w // 2
+        yy, xx = np.ogrid[-cy:n_h - cy, -cx:n_w - cx]
+        mag[yy ** 2 + xx ** 2 < mask_radius ** 2] = 0
+        return mag
+
+    def _center_crop_slice(
+        self, ref_np: np.ndarray, crop: int | None,
+    ) -> tuple[tuple[slice, slice], int]:
+        h, w = ref_np.shape
+        if crop is None:
+            crop = int(min(h, w) * 0.8) // 2 * 2
+        r0, c0 = (h - crop) // 2, (w - crop) // 2
+        return (slice(r0, r0 + crop), slice(c0, c0 + crop)), crop
+
+    @property
+    def drift_rate(self) -> tuple[float, float]:
+        """Per-scanline drift rate ``(row, col)`` from the affine fit.
+
+        Returns the linear slope of the knot displacement for the last
+        image relative to the first.  Only meaningful after
+        :meth:`align_affine`.
+        """
+        if not hasattr(self, "_initial_knots"):
+            raise RuntimeError("Call preprocess() then align_affine() first.")
+        idx = len(self.knots) - 1
+        # Use affine-only knots if available, else current knots
+        knots = (self._knots_after_affine[idx]
+                 if hasattr(self, "_knots_after_affine")
+                 else self.knots[idx])
+        delta = knots - self._initial_knots[idx]  # (2, H, 1)
+        n = delta.shape[1]
+        row_rate = float((delta[0, -1, 0] - delta[0, 0, 0]) / max(n - 1, 1))
+        col_rate = float((delta[1, -1, 0] - delta[1, 0, 0]) / max(n - 1, 1))
+        return (row_rate, col_rate)
+
+    def print_drift_stats(self, target_index: int = -1) -> None:
+        """Print a concise summary of drift estimation results.
+
+        Reports the linear drift rate, total displacement, and nonrigid
+        correction magnitude (if :meth:`align_nonrigid` was run).
+        """
+        idx = target_index % len(self.knots)
+        rate = self.drift_rate
+        n = self.knots[idx].shape[1]
+        print(f"Drift rate:  ({rate[0]:+.4f}, {rate[1]:+.4f}) px/line")
+        print(f"Total drift: ({rate[0]*n:.1f}, {rate[1]*n:.1f}) px "
+              f"over {n} lines")
+        if hasattr(self, "_knots_after_affine"):
+            delta_aff = (self._knots_after_affine[idx]
+                         - self._initial_knots[idx])
+            delta_nr = self.knots[idx] - self._initial_knots[idx]
+            nr_max = float((delta_nr - delta_aff).abs().max())
+            print(f"Nonrigid max correction: {nr_max:.2f} px")
+        if hasattr(self, "affine_confidence_margin"):
+            m = self.affine_confidence_margin
+            tag = "high" if m > 5 else "low" if m < 2 else "moderate"
+            print(f"Affine confidence: {m:.1f}% ({tag})")
+
+    def plot_correction_comparison(
+        self,
+        crop: int | None = None,
+        target_index: int = -1,
+        axsize: tuple[float, float] = (3.5, 3.5),
+        show_fft: bool = True,
+        **kwargs,
+    ):
+        """Compare all correction modes in a single figure.
+
+        Automatically applies affine-only and nonrigid corrections with
+        both ``bilinear`` and ``bicubic`` interpolation, then shows them
+        alongside the reference in a grid with RMS / NCC metrics.
+
+        Requires :meth:`align_affine` (and optionally
+        :meth:`align_nonrigid`) to have been called.
+
+        Parameters
+        ----------
+        crop : int, optional
+            Center-crop size.  *None* → 80 % of shorter dimension.
+        target_index : int, default -1
+            Which image to correct.
+        axsize : tuple, default (3.5, 3.5)
+            Size of each panel.
+        show_fft : bool, default True
+            Show FFT magnitude row below the images.
+        **kwargs
+            Forwarded to :func:`show_2d`.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        axes : np.ndarray
+        metrics : dict
+            ``{method_name: (rms, ncc)}``
+        """
+        idx = target_index % len(self.knots)
+        ref_np = self.images[0].array
+        raw_np = self.images[idx].array
+        s, crop = self._center_crop_slice(ref_np, crop)
+
+        # Compute corrections
+        has_nonrigid = hasattr(self, "_knots_after_affine") and not torch.equal(
+            self.knots[idx], self._knots_after_affine[idx]
+        )
+        saved_knots = self.knots[idx].clone()
+        results = {}
+
+        if has_nonrigid:
+            # Affine-only
+            self.knots[idx] = self._knots_after_affine[idx]
+            results["affine bilinear"] = self.apply_correction(
+                image_index=target_index, mode="bilinear").cpu().numpy()
+            results["affine bicubic"] = self.apply_correction(
+                image_index=target_index, mode="bicubic").cpu().numpy()
+            # Restore nonrigid knots
+            self.knots[idx] = saved_knots
+
+        results["nonrigid bilinear"] = self.apply_correction(
+            image_index=target_index, mode="bilinear").cpu().numpy()
+        results["nonrigid bicubic"] = self.apply_correction(
+            image_index=target_index, mode="bicubic").cpu().numpy()
+
+        # Metrics
+        ref_c = ref_np[s].astype(np.float32)
+        metrics = {}
+        labels = ["HAADF ref", "raw (drifted)"]
+        panels = [ref_c, raw_np[s].astype(np.float32)]
+        for name, img in results.items():
+            labels.append(name)
+            panels.append(img[s].astype(np.float32))
+            metrics[name] = (self._rms(img[s], ref_c),
+                             self._ncc(img[s], ref_c))
+
+        raw_rms, raw_ncc = self._rms(raw_np[s], ref_c), self._ncc(raw_np[s], ref_c)
+        metrics["raw (drifted)"] = (raw_rms, raw_ncc)
+
+        # Titles
+        titles = ["HAADF ref"]
+        titles.append(f"raw (RMS={raw_rms:.3f})")
+        for name in list(results.keys()):
+            r, n = metrics[name]
+            titles.append(f"{name}\nRMS={r:.3f} NCC={n:.3f}")
+
+        # Build grid
+        nrows = 1 + int(show_fft)
+        ncols = len(panels)
+        fw, fh = axsize
+        fig, axes_grid = plt.subplots(
+            nrows, ncols, figsize=(fw * ncols, fh * nrows), squeeze=False,
+        )
+
+        show_2d(panels, title=titles,
+                figax=(fig, axes_grid[0]), axsize=axsize, **kwargs)
+
+        if show_fft:
+            fft_panels = [self._log_fft(p) for p in panels]
+            fft_titles = [f"FFT: {l}" for l in labels]
+            fft_kw = {k: v for k, v in kwargs.items() if k != "cmap"}
+            show_2d(fft_panels, title=fft_titles,
+                    figax=(fig, axes_grid[1]), axsize=axsize, **fft_kw)
+
+        fig.tight_layout()
+
+        # Print table
+        h, w = ref_np.shape
+        print(f"--- RMS / NCC vs reference (center {crop}×{crop} "
+              f"crop from {h}×{w}) ---")
+        print(f"{'Method':>20s}   RMS    NCC")
+        print("-" * 45)
+        for name in ["raw (drifted)"] + list(results.keys()):
+            r, n = metrics[name]
+            print(f"{name:>20s}  {r:.4f}  {n:.4f}")
+
+        return fig, axes_grid, metrics
+
+    def plot_radial_power(
+        self,
+        methods: dict[str, np.ndarray] | None = None,
+        crop: int | None = None,
+        target_index: int = -1,
+        figsize: tuple[float, float] = (10, 6),
+    ):
+        """Radial FFT power spectrum comparing correction methods.
+
+        Higher power at high spatial frequencies indicates sharper
+        features.  Useful for verifying that drift correction preserves
+        (or recovers) lattice fringe resolution.
+
+        Parameters
+        ----------
+        methods : dict, optional
+            ``{label: image_ndarray}``.  If *None*, auto-generates from
+            the current pipeline state (raw, affine, nonrigid).
+        crop : int, optional
+            Center-crop size.  *None* → 80 % of shorter dimension.
+        target_index : int, default -1
+            Which image to correct when auto-generating methods.
+        figsize : tuple, default (10, 6)
+            Figure size.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        ax : matplotlib.axes.Axes
+        """
+        idx = target_index % len(self.knots)
+        ref_np = self.images[0].array
+        raw_np = self.images[idx].array
+        s, crop = self._center_crop_slice(ref_np, crop)
+
+        if methods is None:
+            methods = {"HAADF ref": ref_np[s], "raw (drifted)": raw_np[s]}
+            has_nonrigid = (
+                hasattr(self, "_knots_after_affine")
+                and not torch.equal(
+                    self.knots[idx], self._knots_after_affine[idx])
+            )
+            saved = self.knots[idx].clone()
+            if has_nonrigid:
+                self.knots[idx] = self._knots_after_affine[idx]
+                methods["affine bicubic"] = self.apply_correction(
+                    image_index=target_index, mode="bicubic"
+                ).cpu().numpy()[s]
+                self.knots[idx] = saved
+            methods["nonrigid bicubic"] = self.apply_correction(
+                image_index=target_index, mode="bicubic"
+            ).cpu().numpy()[s]
+        else:
+            methods = {k: v[s] if v.shape != (crop, crop) else v
+                       for k, v in methods.items()}
+
+        def _radial(img: np.ndarray):
+            n = img.shape[0]
+            hann = np.outer(np.hanning(n), np.hanning(n))
+            f = np.fft.fftshift(np.fft.fft2(img.astype(np.float32) * hann))
+            power = np.abs(f) ** 2
+            cy, cx = n // 2, n // 2
+            yy, xx = np.ogrid[-cy:n - cy, -cx:n - cx]
+            r = np.sqrt(yy ** 2 + xx ** 2).astype(int)
+            max_r = min(cy, cx)
+            radial = np.zeros(max_r)
+            for ri in range(max_r):
+                mask = r == ri
+                if mask.any():
+                    radial[ri] = power[mask].mean()
+            freqs = np.arange(max_r) / n
+            return freqs, radial
+
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        for label, img in methods.items():
+            freqs, power = _radial(img)
+            ax.semilogy(freqs[1:], power[1:], label=label, alpha=0.8)
+        ax.set_xlabel("Spatial frequency (cycles/pixel)")
+        ax.set_ylabel("Power (log scale)")
+        ax.set_title("Radial FFT power spectrum")
+        ax.legend()
+        ax.set_xlim(0, 0.5)
+        fig.tight_layout()
+
+        return fig, ax
 
     def plot_transformed_images(self, show_knots: bool = True, **kwargs):
         self._ensure_warped_images()
