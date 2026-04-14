@@ -526,3 +526,123 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
             backend="pytorch", fixed_indices=[0, 1],
             show_merged=False, show_images=False,
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# Tests for apply_correction() and validation
+# ──────────────────────────────────────────────────────────────
+
+def _make_single_sided_dc(scan_h=64, drift_rate=(0.05, 0.1), seed=42):
+    """Helper: build a DriftCorrection with known single-sided drift."""
+    np.random.seed(seed)
+    yy, xx = np.mgrid[:scan_h, :scan_h]
+    ref = np.sin(0.1 * yy + 0.15 * xx).astype(np.float32) * 50 + 100
+    rows = np.arange(scan_h, dtype=np.float32)
+    from scipy.ndimage import map_coordinates
+    rr, cc = np.mgrid[:scan_h, :scan_h]
+    src_r = rr - drift_rate[0] * rows[:, None]
+    src_c = cc - drift_rate[1] * rows[:, None]
+    drifted = map_coordinates(ref, [src_r, src_c], order=3, mode='nearest').astype(np.float32)
+
+    dc = DriftCorrection.from_data(
+        images=[ref, drifted],
+        scan_direction_degrees=[0.0, 0.0],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
+        number_knots=1, normalize=True,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11, refine=True,
+        fixed_indices=[0], upsample_factor=8, max_image_shift=32,
+        show_merged=False, show_images=False,
+    )
+    return dc, ref, drifted
+
+
+def test_apply_correction_reduces_rms():
+    """apply_correction should produce an image closer to the reference."""
+    dc, ref, drifted = _make_single_sided_dc()
+    corrected = dc.apply_correction(mode='bicubic').cpu().numpy()
+    # z-normalize for fair comparison
+    def znorm(a):
+        return (a - a.mean()) / (a.std() + 1e-8)
+    crop = 10  # avoid edges
+    s = slice(crop, -crop)
+    ref_n = znorm(ref[s, s])
+    raw_rms = float(np.sqrt(((znorm(drifted[s, s]) - ref_n)**2).mean()))
+    cor_rms = float(np.sqrt(((znorm(corrected[s, s]) - ref_n)**2).mean()))
+    assert cor_rms < raw_rms * 0.8, (
+        f"apply_correction should reduce RMS: raw={raw_rms:.4f}, corrected={cor_rms:.4f}"
+    )
+
+
+def test_apply_correction_accepts_external_images():
+    """apply_correction(images=...) should work on external arrays."""
+    dc, ref, drifted = _make_single_sided_dc()
+    import torch
+    # Pass external image as numpy
+    result_np = dc.apply_correction(images=drifted, mode='bilinear')
+    assert result_np.shape == drifted.shape
+    # Pass external image as tensor
+    t = torch.tensor(drifted, device=dc._device, dtype=torch.float32)
+    result_t = dc.apply_correction(images=t, mode='bilinear')
+    assert result_t.shape == t.shape
+    # Both should produce same output
+    diff = float((result_np - result_t).abs().max())
+    assert diff < 1e-5, f"numpy vs tensor path differ by {diff}"
+
+
+def test_apply_correction_invalid_mode_raises():
+    """apply_correction with invalid mode should raise ValueError."""
+    dc, _, _ = _make_single_sided_dc()
+    with pytest.raises(ValueError, match="mode must be one of"):
+        dc.apply_correction(mode='cubic')
+
+
+def test_apply_correction_wrong_height_raises():
+    """apply_correction with mismatched image height should raise."""
+    dc, _, _ = _make_single_sided_dc(scan_h=64)
+    wrong_size = np.zeros((32, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="Image height"):
+        dc.apply_correction(images=wrong_size)
+
+
+def test_apply_correction_before_preprocess_raises():
+    """apply_correction before preprocess() should raise RuntimeError."""
+    dc = DriftCorrection.from_data(
+        images=[np.zeros((64, 64)), np.zeros((64, 64))],
+        scan_direction_degrees=[0.0, 0.0],
+    )
+    with pytest.raises(RuntimeError, match="preprocess"):
+        dc.apply_correction()
+
+
+def test_affine_confidence_margin_exists():
+    """align_affine should set affine_confidence_margin."""
+    dc, _, _ = _make_single_sided_dc()
+    assert hasattr(dc, 'affine_confidence_margin')
+    assert dc.affine_confidence_margin > 0, "Margin should be positive for clear drift"
+
+
+def test_apply_correction_with_nonrigid():
+    """apply_correction after nonrigid should reduce error further."""
+    dc, ref, drifted = _make_single_sided_dc()
+    aff_corrected = dc.apply_correction(mode='bicubic').cpu().numpy()
+    dc.align_nonrigid(
+        fixed_indices=[0],
+        show_merged=False, show_images=False,
+    )
+    nr_corrected = dc.apply_correction(mode='bicubic').cpu().numpy()
+    def znorm(a):
+        return (a - a.mean()) / (a.std() + 1e-8)
+    crop = 10
+    s = slice(crop, -crop)
+    ref_n = znorm(ref[s, s])
+    aff_rms = float(np.sqrt(((znorm(aff_corrected[s, s]) - ref_n)**2).mean()))
+    nr_rms = float(np.sqrt(((znorm(nr_corrected[s, s]) - ref_n)**2).mean()))
+    # Nonrigid should not be worse than affine (within tolerance)
+    assert nr_rms <= aff_rms * 1.05, (
+        f"Nonrigid should not be significantly worse: aff={aff_rms:.4f}, nr={nr_rms:.4f}"
+    )

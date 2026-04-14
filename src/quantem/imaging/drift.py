@@ -540,13 +540,26 @@ class DriftCorrection(AutoSerialize):
             warped_t = self._warp_and_translate_torch(
                 max_image_shift, upsample_factor, fixed_indices=fixed_set)
             self.calculate_error(1, _warped_t=warped_t)
-            return candidates[best_idx]
 
-        drift_total = _search_and_apply(drift_vectors, "Coarse search")
+            # Confidence: cost gap between best and runner-up (%)
+            costs_np = costs.cpu().numpy()
+            ranked = np.argsort(costs_np)
+            best_cost = costs_np[ranked[0]]
+            runner_up = costs_np[ranked[1]] if len(ranked) > 1 else best_cost
+            margin = (runner_up - best_cost) / (best_cost + 1e-12) * 100
+            return candidates[best_idx], margin
+
+        drift_total, coarse_margin = _search_and_apply(
+            drift_vectors, "Coarse search"
+        )
         if refine:
             drift_fine = drift_vectors / (num_tests - 1)
-            drift_total = drift_total + _search_and_apply(
+            dt, refine_margin = _search_and_apply(
                 drift_fine, "Refine search", accumulated_drift=drift_total)
+            drift_total = drift_total + dt
+            self.affine_confidence_margin = refine_margin
+        else:
+            self.affine_confidence_margin = coarse_margin
         if verbose:
             num_rows = self.images[0].shape[0]
             drift_rate = np.sqrt(drift_total[0] ** 2 + drift_total[1] ** 2)
@@ -566,6 +579,9 @@ class DriftCorrection(AutoSerialize):
             err = self.error_track
             print(f"Error: {err[0, 1]:.2f} -> {err[-1, 1]:.2f} "
                   f"({(err[0, 1] - err[-1, 1]) / err[0, 1] * 100:+.1f}%)")
+            margin = self.affine_confidence_margin
+            confidence = "high" if margin > 5 else "low" if margin < 2 else "moderate"
+            print(f"Confidence: {margin:.1f}% cost margin to runner-up ({confidence})")
 
         # Plots
         kwargs.pop("title", None)
@@ -1548,9 +1564,24 @@ class DriftCorrection(AutoSerialize):
             msg = "Call preprocess() before apply_correction()"
             raise RuntimeError(msg)
 
+        _valid_modes = {"bilinear", "bicubic"}
+        if mode not in _valid_modes:
+            raise ValueError(
+                f"mode must be one of {_valid_modes}, got {mode!r}"
+            )
+
         idx = image_index % len(self.knots)
-        delta = self.knots[idx] - self._initial_knots[idx]  # (2, H, num_knots)
-        drift_per_row = delta[:, :, 0]  # (2, H) — first knot per row
+        num_knots = self.knots[idx].shape[2]
+        if num_knots != 1:
+            raise NotImplementedError(
+                f"apply_correction only supports number_knots=1 "
+                f"(got {num_knots}). Use generate_corrected_image() "
+                f"for multi-knot setups."
+            )
+
+        delta = self.knots[idx] - self._initial_knots[idx]  # (2, H, 1)
+        drift_per_row = delta[:, :, 0]  # (2, H)
+        knot_h = drift_per_row.shape[1]
 
         if images is None:
             images_t = self.images_t[idx]
@@ -1560,6 +1591,14 @@ class DriftCorrection(AutoSerialize):
             )
         else:
             images_t = images.to(device=self._device, dtype=self._dtype)
+
+        img_h = images_t.shape[-2]
+        if img_h != knot_h:
+            raise ValueError(
+                f"Image height ({img_h}) does not match knot grid "
+                f"height ({knot_h}). The image must have the same "
+                f"number of scan rows as the data used in preprocess()."
+            )
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
