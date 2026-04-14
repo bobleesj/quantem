@@ -382,14 +382,14 @@ def transform_coordinates_single_knot(
 
 def backward_warp(
     images: torch.Tensor,
-    drift: tuple[float, float],
+    drift: tuple[float, float] | torch.Tensor,
     rigid_shift: tuple[float, float] = (0.0, 0.0),
     mode: str = "bicubic",
 ) -> torch.Tensor:
     """Apply drift correction via backward interpolation (``grid_sample``).
 
-    Builds a per-scanline sampling grid that undoes the estimated affine
-    drift and optional rigid translation, then resamples with the chosen
+    Builds a per-scanline sampling grid that undoes the estimated drift
+    and optional rigid translation, then resamples with the chosen
     interpolation kernel.
 
     Parameters
@@ -397,11 +397,21 @@ def backward_warp(
     images : torch.Tensor
         Images to correct, shape ``(N, H, W)`` or ``(H, W)``.
         For 4D-STEM, pass detector-pixel slices in chunks.
-    drift : tuple[float, float]
-        Affine drift rate ``(row_slope, col_slope)`` in pixels per scan
-        line, as returned by ``align_affine``'s knot delta.
+    drift : tuple[float, float] | torch.Tensor
+        **Affine mode** — ``(row_slope, col_slope)`` scalar drift rate
+        in pixels per scan line, as returned by ``align_affine``.
+
+        **Per-row mode** — a ``torch.Tensor`` of shape ``(2, H)`` or
+        ``(H, 2)`` giving the per-scanline shift in ``(row, col)``
+        order.  Typically obtained from ``align_nonrigid`` knot deltas::
+
+            delta = dc.knots[1] - knots_initial  # (2, H, 1)
+            drift_per_row = delta[:, :, 0]        # (2, H)
+
+        In per-row mode *rigid_shift* is ignored (it is already
+        incorporated in the per-row values).
     rigid_shift : tuple[float, float], default (0.0, 0.0)
-        Global ``(row, col)`` translation to apply.
+        Global ``(row, col)`` translation to apply (affine mode only).
     mode : str, default "bicubic"
         Interpolation kernel passed to ``grid_sample``.
         ``"bicubic"`` preserves more high-frequency content than
@@ -419,20 +429,37 @@ def backward_warp(
     n, h, w = images.shape
     device, dtype = images.device, images.dtype
 
-    offset = torch.arange(h, device=device, dtype=dtype) - (h - 1) / 2
-    drift_row, drift_col = drift
-    shift_row, shift_col = rigid_shift
-
-    sample_r = (
-        torch.arange(h, device=device, dtype=dtype)[:, None].expand(-1, w)
-        - drift_row * offset[:, None]
-        - shift_row
-    )
-    sample_c = (
-        torch.arange(w, device=device, dtype=dtype)[None, :].expand(h, -1)
-        - drift_col * offset[:, None]
-        - shift_col
-    )
+    if isinstance(drift, torch.Tensor):
+        # Per-row mode: drift is (2, H) or (H, 2)
+        if drift.shape == (h, 2):
+            drift = drift.T  # → (2, H)
+        if drift.shape != (2, h):
+            msg = f"Per-row drift must be (2, {h}) or ({h}, 2), got {drift.shape}"
+            raise ValueError(msg)
+        drift = drift.to(device=device, dtype=dtype)
+        sample_r = (
+            torch.arange(h, device=device, dtype=dtype)[:, None].expand(-1, w)
+            - drift[0][:, None]
+        )
+        sample_c = (
+            torch.arange(w, device=device, dtype=dtype)[None, :].expand(h, -1)
+            - drift[1][:, None]
+        )
+    else:
+        # Affine mode: drift is (row_slope, col_slope)
+        offset = torch.arange(h, device=device, dtype=dtype) - (h - 1) / 2
+        drift_row, drift_col = drift
+        shift_row, shift_col = rigid_shift
+        sample_r = (
+            torch.arange(h, device=device, dtype=dtype)[:, None].expand(-1, w)
+            - drift_row * offset[:, None]
+            - shift_row
+        )
+        sample_c = (
+            torch.arange(w, device=device, dtype=dtype)[None, :].expand(h, -1)
+            - drift_col * offset[:, None]
+            - shift_col
+        )
 
     grid_r = 2.0 * sample_r / (h - 1) - 1.0
     grid_c = 2.0 * sample_c / (w - 1) - 1.0
