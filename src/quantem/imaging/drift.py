@@ -1602,6 +1602,57 @@ class DriftCorrection(AutoSerialize):
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
+    def calculate_error(
+        self,
+        mode: int,
+        _warped_t: torch.Tensor | None = None,
+    ):
+        """Compute per-image MAE against the mean and append to error history.
+
+        Measures how well the warped images agree by computing the mean
+        absolute difference of each image from the stack mean. Without
+        error tracking, there is no way to verify that alignment steps
+        are actually improving the result.
+
+        Parameters
+        ----------
+        mode : int
+            Stage identifier (0=preprocess, 1=affine, 2=nonrigid).
+        _warped_t : torch.Tensor or None
+            If provided, compute error from this tensor directly,
+            avoiding a GPU-to-CPU round-trip.
+        """
+        if _warped_t is not None:
+            images_mean = _warped_t.mean(dim=0)
+            sig_diff = torch.mean(
+                torch.abs(_warped_t - images_mean[None]), dim=(1, 2)
+            ).cpu().numpy()
+        else:
+            self._ensure_warped_images()
+            images_mean = np.mean(self.images_warped.array, axis=0)
+            sig_diff = np.mean(
+                np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
+            )
+
+        error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
+
+        if not hasattr(self, "error_track"):
+            self.error_track = error_current[None, :]
+        else:
+            self.error_track = np.vstack((self.error_track, error_current))
+
+    def _ensure_warped_images(self):
+        """Lazily populate images_warped from current knots if marked stale."""
+        if getattr(self, "_images_warped_stale", False):
+            self._warp_and_translate_torch(
+                self._max_image_shift_cached, upsample_factor=8,
+                solve_translation=False)
+            self._images_warped_stale = False
+
+    # ##################################################################### #
+    #                          Plotting methods                              #
+    # ##################################################################### #
+
     def plot_correction_summary(
         self,
         corrected: torch.Tensor | np.ndarray | None = None,
@@ -1806,49 +1857,6 @@ class DriftCorrection(AutoSerialize):
 
         return fig, axs
 
-    def calculate_error(
-        self,
-        mode: int,
-        _warped_t: torch.Tensor | None = None,
-    ):
-        """Compute per-image MAE against the mean and append to error history.
-
-        Measures how well the warped images agree by computing the mean
-        absolute difference of each image from the stack mean. Without
-        error tracking, there is no way to verify that alignment steps
-        are actually improving the result.
-
-        Parameters
-        ----------
-        mode : int
-            Stage identifier (0=preprocess, 1=affine, 2=nonrigid).
-        _warped_t : torch.Tensor or None
-            If provided, compute error from this tensor directly,
-            avoiding a GPU-to-CPU round-trip.
-        """
-        if _warped_t is not None:
-            images_mean = _warped_t.mean(dim=0)
-            sig_diff = torch.mean(
-                torch.abs(_warped_t - images_mean[None]), dim=(1, 2)
-            ).cpu().numpy()
-        else:
-            # Lazy refresh: align_nonrigid defers the warped→numpy sync until
-            # someone reads it, so calculate_error must trigger the refresh.
-            self._ensure_warped_images()
-            images_mean = np.mean(self.images_warped.array, axis=0)
-            sig_diff = np.mean(
-                np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
-            )
-
-        # Error vector
-        error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
-
-        # Initialize or append to error tracking array
-        if not hasattr(self, "error_track"):
-            self.error_track = error_current[None, :]  # initialize with first row
-        else:
-            self.error_track = np.vstack((self.error_track, error_current))
-
     def plot_transformed_images(self, show_knots: bool = True, **kwargs):
         self._ensure_warped_images()
         fig, ax = show_2d(
@@ -1925,14 +1933,6 @@ class DriftCorrection(AutoSerialize):
         plt.tight_layout()
 
         return self
-
-    def _ensure_warped_images(self):
-        """Lazily populate images_warped from current knots if marked stale."""
-        if getattr(self, "_images_warped_stale", False):
-            self._warp_and_translate_torch(
-                self._max_image_shift_cached, upsample_factor=8,
-                solve_translation=False)
-            self._images_warped_stale = False
 
     def plot_merged_images(self, show_knots: bool = True, **kwargs):
         """
