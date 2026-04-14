@@ -325,6 +325,7 @@ class DriftCorrection(AutoSerialize):
             warped_t[img_idx] = warped[0]
             self.images_warped.array[img_idx] = warped[0].cpu().numpy()
             self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
+        self._initial_knots = [k.clone() for k in self.knots]
         self.calculate_error(0, _warped_t=warped_t)
         kwargs.pop("title", None)
         if show_merged:
@@ -1502,6 +1503,65 @@ class DriftCorrection(AutoSerialize):
             except Exception:
                 plt.show()
         return image_corr
+
+    def apply_correction(
+        self,
+        images: torch.Tensor | np.ndarray | None = None,
+        image_index: int = -1,
+        mode: str = "bicubic",
+    ) -> torch.Tensor:
+        """Apply drift correction via backward interpolation.
+
+        Uses the per-row drift estimated by :meth:`align_affine` and/or
+        :meth:`align_nonrigid` to correct images with ``grid_sample``.
+        This is the recommended way to apply corrections for single-sided
+        optimization (e.g. 4D-STEM VDF against fixed HAADF reference).
+
+        Parameters
+        ----------
+        images : torch.Tensor or np.ndarray, optional
+            Images to correct, shape ``(H, W)`` or ``(N, H, W)``.
+            If *None*, corrects the stored image at *image_index*.
+            Pass external data (e.g. detector-pixel slices from a 4D-STEM
+            cube) to apply the same drift correction to arbitrary images.
+        image_index : int, default -1
+            Which image's knot trajectory to use for the correction.
+            Default ``-1`` selects the last image (typical for the
+            ``[reference, target]`` two-image case).
+        mode : str, default "bicubic"
+            Interpolation kernel: ``"bicubic"`` or ``"bilinear"``.
+
+        Returns
+        -------
+        torch.Tensor
+            Corrected images on the same device, same shape as input.
+
+        Examples
+        --------
+        >>> dc = DriftCorrection.from_data(
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        >>> dc.preprocess(normalize=True).align_affine(fixed_indices=[0])
+        >>> dc.align_nonrigid(fixed_indices=[0])
+        >>> corrected_vdf = dc.apply_correction(mode='bicubic')
+        """
+        if not hasattr(self, "_initial_knots"):
+            msg = "Call preprocess() before apply_correction()"
+            raise RuntimeError(msg)
+
+        idx = image_index % len(self.knots)
+        delta = self.knots[idx] - self._initial_knots[idx]  # (2, H, num_knots)
+        drift_per_row = delta[:, :, 0]  # (2, H) — first knot per row
+
+        if images is None:
+            images_t = self.images_t[idx]
+        elif isinstance(images, np.ndarray):
+            images_t = torch.tensor(
+                images, dtype=self._dtype, device=self._device
+            )
+        else:
+            images_t = images.to(device=self._device, dtype=self._dtype)
+
+        return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
     def calculate_error(
         self,
