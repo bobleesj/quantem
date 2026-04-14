@@ -1602,6 +1602,210 @@ class DriftCorrection(AutoSerialize):
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
+    def plot_correction_summary(
+        self,
+        corrected: torch.Tensor | np.ndarray | None = None,
+        reference_index: int = 0,
+        target_index: int = -1,
+        crop: int | None = None,
+        mode: str = "bicubic",
+        show_fft: bool = True,
+        show_diff: bool = True,
+        fft_mask_radius: int = 5,
+        axsize: tuple[float, float] = (3.5, 3.5),
+        **kwargs,
+    ):
+        """One-liner before/after comparison of drift correction.
+
+        Shows the reference, raw (drifted) input, and corrected image
+        side by side with RMS and NCC metrics.  Optionally appends rows
+        for FFT magnitudes and difference maps.
+
+        The image and FFT rows are rendered via :func:`show_2d`, so all
+        of its keyword arguments (``cmap``, ``norm``, ``scalebar``,
+        ``cbar``, ``show_ticks``, …) are forwarded and can be used to
+        customise the panels.
+
+        Parameters
+        ----------
+        corrected : torch.Tensor or np.ndarray, optional
+            Pre-computed corrected image.  If *None*, calls
+            ``apply_correction(mode=mode)`` automatically.
+        reference_index : int, default 0
+            Index of the reference image (typically the fixed HAADF).
+        target_index : int, default -1
+            Index of the target image (the one being corrected).
+        crop : int, optional
+            Center-crop size in pixels.  If *None*, uses 80 % of the
+            shorter dimension to avoid edge artifacts.
+        mode : str, default "bicubic"
+            Interpolation mode if *corrected* is not provided.
+        show_fft : bool, default True
+            Append a row with log-FFT magnitudes.
+        show_diff : bool, default True
+            Append a row with difference maps (``seismic`` colourmap).
+        fft_mask_radius : int, default 5
+            Pixel radius of the zero-frequency mask in FFT panels.
+        axsize : tuple, default (3.5, 3.5)
+            Size of each subplot panel (passed to ``show_2d``).
+        **kwargs
+            Extra keyword arguments forwarded to ``show_2d`` for the
+            image and FFT rows (e.g. ``cmap``, ``norm``, ``scalebar``,
+            ``cbar``, ``show_ticks``).
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure object for further customisation.
+        axes : np.ndarray
+            2-D array of ``Axes`` objects (shape ``(nrows, 3)``).
+        """
+        ref_np = self.images[reference_index].array
+        idx = target_index % len(self.images)
+        raw_np = self.images[idx].array
+
+        if corrected is None:
+            corrected = self.apply_correction(
+                image_index=target_index, mode=mode
+            )
+        if isinstance(corrected, torch.Tensor):
+            corrected_np = corrected.cpu().numpy()
+        else:
+            corrected_np = np.asarray(corrected)
+
+        # --- centre crop ---
+        h, w = ref_np.shape
+        if crop is None:
+            crop = int(min(h, w) * 0.8) // 2 * 2
+        r0, c0 = (h - crop) // 2, (w - crop) // 2
+        s = (slice(r0, r0 + crop), slice(c0, c0 + crop))
+
+        ref_c = ref_np[s].astype(np.float32)
+        raw_c = raw_np[s].astype(np.float32)
+        cor_c = corrected_np[s].astype(np.float32)
+
+        # --- metrics ---
+        def _znorm(a):
+            return (a - a.mean()) / (a.std() + 1e-8)
+
+        def _rms(a, b):
+            return float(np.sqrt(((_znorm(a) - _znorm(b)) ** 2).mean()))
+
+        def _ncc(a, b):
+            an, bn = _znorm(a), _znorm(b)
+            return float(np.corrcoef(an.ravel(), bn.ravel())[0, 1])
+
+        def _log_fft(img):
+            n_h, n_w = img.shape
+            hann = np.outer(np.hanning(n_h), np.hanning(n_w))
+            f = np.fft.fftshift(np.fft.fft2(img * hann))
+            mag = np.log1p(np.abs(f))
+            cy, cx = n_h // 2, n_w // 2
+            yy, xx = np.ogrid[-cy:n_h - cy, -cx:n_w - cx]
+            mag[yy ** 2 + xx ** 2 < fft_mask_radius ** 2] = 0
+            return mag
+
+        raw_rms = _rms(raw_c, ref_c)
+        cor_rms = _rms(cor_c, ref_c)
+        raw_ncc = _ncc(raw_c, ref_c)
+        cor_ncc = _ncc(cor_c, ref_c)
+
+        # --- build grid of rows ---
+        nrows = 1 + int(show_fft) + int(show_diff)
+        ncols = 3
+
+        # Row 0 — images via show_2d
+        img_titles = [
+            "Reference",
+            f"Raw (RMS={raw_rms:.3f}, NCC={raw_ncc:.3f})",
+            f"Corrected (RMS={cor_rms:.3f}, NCC={cor_ncc:.3f})",
+        ]
+
+        if not show_fft and not show_diff:
+            # Single row — delegate entirely to show_2d
+            fig, axs = show_2d(
+                [ref_c, raw_c, cor_c],
+                title=img_titles,
+                axsize=axsize,
+                **kwargs,
+            )
+            if not isinstance(axs, np.ndarray):
+                axs = np.array([[axs]])
+            elif axs.ndim == 1:
+                axs = axs.reshape(1, -1)
+        else:
+            # Multi-row: create figure, use show_2d with figax for
+            # the image row, then manually handle FFT / diff rows.
+            fw, fh = axsize
+            fig, axes_grid = plt.subplots(
+                nrows, ncols,
+                figsize=(fw * ncols, fh * nrows),
+                squeeze=False,
+            )
+
+            # Image row via show_2d (respects user kwargs like cmap, norm, …)
+            show_2d(
+                [ref_c, raw_c, cor_c],
+                title=img_titles,
+                figax=(fig, axes_grid[0]),
+                axsize=axsize,
+                **kwargs,
+            )
+
+            row = 1
+
+            if show_fft:
+                fft_titles = ["FFT: Reference", "FFT: Raw", "FFT: Corrected"]
+                fft_kwargs = {k: v for k, v in kwargs.items()
+                              if k not in ("cmap",)}
+                show_2d(
+                    [_log_fft(ref_c), _log_fft(raw_c), _log_fft(cor_c)],
+                    title=fft_titles,
+                    figax=(fig, axes_grid[row]),
+                    axsize=axsize,
+                    **fft_kwargs,
+                )
+                row += 1
+
+            if show_diff:
+                ref_n = _znorm(ref_c)
+                diff_raw = _znorm(raw_c) - ref_n
+                diff_cor = _znorm(cor_c) - ref_n
+                vmax = float(
+                    max(np.abs(diff_raw).max(), np.abs(diff_cor).max()) * 0.8
+                )
+                axes_grid[row][0].axis("off")
+                axes_grid[row][0].text(
+                    0.5, 0.5,
+                    f"Crop: {crop}\u00d7{crop}\nfrom {h}\u00d7{w}",
+                    transform=axes_grid[row][0].transAxes,
+                    ha="center", va="center", fontsize=10, color="gray",
+                )
+                show_2d(
+                    [diff_raw, diff_cor],
+                    title=[
+                        f"Raw \u2212 Ref (RMS={raw_rms:.3f})",
+                        f"Corrected \u2212 Ref (RMS={cor_rms:.3f})",
+                    ],
+                    cmap="seismic",
+                    figax=(fig, axes_grid[row, 1:]),
+                    axsize=axsize,
+                    vmin=-vmax, vmax=vmax,
+                )
+
+            fig.tight_layout()
+            axs = axes_grid
+
+        # --- summary table ---
+        print(f"{'':>12s}   RMS     NCC")
+        print("-" * 35)
+        print(f"{'Raw':>12s}  {raw_rms:.4f}  {raw_ncc:.4f}")
+        print(f"{'Corrected':>12s}  {cor_rms:.4f}  {cor_ncc:.4f}")
+        reduction = (1 - cor_rms / raw_rms) * 100 if raw_rms > 0 else 0
+        print(f"  RMS reduction: {reduction:.1f}%")
+
+        return fig, axs
+
     def calculate_error(
         self,
         mode: int,

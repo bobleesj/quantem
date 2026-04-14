@@ -646,3 +646,28 @@ def test_apply_correction_with_nonrigid():
     assert nr_rms <= aff_rms * 1.05, (
         f"Nonrigid should not be significantly worse: aff={aff_rms:.4f}, nr={nr_rms:.4f}"
     )
+
+
+def test_plot_correction_summary_runs():
+    """plot_correction_summary should produce a figure without errors."""
+    import matplotlib
+    matplotlib.use('Agg')  # non-interactive backend
+    dc, ref, drifted = _make_single_sided_dc()
+
+    # Full summary (FFT + diff)
+    fig, axs = dc.plot_correction_summary(show_fft=True, show_diff=True)
+    assert fig is not None
+    assert axs.shape == (3, 3)  # 3 rows x 3 cols
+
+    # Images only — still returns (fig, axes)
+    fig2, axs2 = dc.plot_correction_summary(show_fft=False, show_diff=False)
+    assert fig2 is not None
+
+    # User kwargs forwarded to show_2d
+    fig3, axs3 = dc.plot_correction_summary(
+        show_fft=False, show_diff=False, cmap="viridis", show_ticks=True,
+    )
+    assert fig3 is not None
+
+    import matplotlib.pyplot as plt
+    plt.close("all")
