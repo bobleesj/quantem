@@ -104,7 +104,7 @@ def test_full_pipeline_deterministic():
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1],
+        images=[im0, im1],
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -130,7 +130,7 @@ def test_full_pipeline_deterministic():
     # Determinism: second run with same seed must match exactly
     im0_2, im1_2, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift2 = DriftCorrection.from_data(
-        imgs=[im0_2, im1_2],
+        images=[im0_2, im1_2],
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -165,7 +165,7 @@ def test_preprocess_single_image_builds_centered_canvas():
     im0, _, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     drift = DriftCorrection.from_data(
-        imgs=[im0],
+        images=[im0],
         scan_direction_degrees=[0.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -199,7 +199,7 @@ def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0
     """Affine on synthetic data must match frozen float32 baseline."""
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -231,7 +231,7 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -272,7 +272,7 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -322,7 +322,7 @@ def test_align_affine_fixed_indices_recovers_known_drift():
 
     # Save initial knots for reference image to verify they don't change
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -362,7 +362,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run without fixed_indices
     drift_a = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_a.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -371,7 +371,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run with explicit fixed_indices=None
     drift_b = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_b.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -397,14 +397,14 @@ def test_preprocess_normalize_scales_to_unit_range():
     im1_scaled = im1 * 1000 + 5000
 
     dc = DriftCorrection.from_data(
-        imgs=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
     )
     dc.preprocess(normalize=True, show_merged=False, show_images=False)
 
     for img_idx in range(2):
         arr = dc.imgs[img_idx].array
         assert arr.min() >= -0.01, f"Image {img_idx} min={arr.min()}"
-        assert arr.max() <= 1.01, f"Image {i} max={arr.max()}"
+        assert arr.max() <= 1.01, f"Image {img_idx} max={arr.max()}"
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def test_align_nonrigid_fixed_indices_freezes_reference():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -487,7 +487,7 @@ def test_align_nonrigid_fixed_indices_reduces_error():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -518,7 +518,7 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
     """fixed_indices covering all images should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -551,7 +551,7 @@ def test_align_nonrigid_gradient_mse_runs():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -600,7 +600,7 @@ def test_align_nonrigid_gradient_mse_lbfgs():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -643,7 +643,7 @@ def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
 
     def run_with_loss(loss_name, **kwargs):
         drift = DriftCorrection.from_data(
-            imgs=[reference, moving],
+            images=[reference, moving],
             scan_direction_degrees=[0.0, 0.0],
         ).preprocess(
             pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -673,7 +673,7 @@ def test_align_nonrigid_invalid_loss_raises():
     """Invalid loss name should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="loss must be one of"):
@@ -687,7 +687,7 @@ def test_align_nonrigid_gradient_mse_scipy_raises():
     """gradient_mse with scipy backend should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="only supported with backend='pytorch'"):
@@ -717,7 +717,7 @@ def test_align_nonrigid_regularization_sigma_none():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        imgs=[reference, moving],
+        images=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -752,7 +752,7 @@ def _make_single_sided_dc(scan_h=256, drift_rate=(0.05, 0.1), seed=42):
     drifted = map_coordinates(ref, [src_row, src_col], order=3, mode='nearest').astype(np.float32)
 
     dc = DriftCorrection.from_data(
-        imgs=[ref, drifted],
+        images=[ref, drifted],
         scan_direction_degrees=[0.0, 0.0],
     )
     dc.preprocess(
@@ -818,7 +818,7 @@ def test_apply_correction_wrong_height_raises():
 def test_apply_correction_before_preprocess_raises():
     """apply_correction before preprocess() should raise RuntimeError."""
     dc = DriftCorrection.from_data(
-        imgs=[np.zeros((64, 64)), np.zeros((64, 64))],
+        images=[np.zeros((64, 64)), np.zeros((64, 64))],
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -893,7 +893,7 @@ def test_drift_rate_matches_ground_truth():
 def test_drift_rate_before_align_raises():
     """drift_rate before preprocess/align should raise RuntimeError."""
     dc = DriftCorrection.from_data(
-        imgs=[np.zeros((32, 32)), np.zeros((32, 32))],
+        images=[np.zeros((32, 32)), np.zeros((32, 32))],
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -1166,7 +1166,7 @@ def test_apply_correction_multi_knot_batch_raises():
     ref = np.random.randn(64, 64).astype(np.float32)
     drifted = np.roll(ref, 2, axis=1).astype(np.float32)
     dc = DriftCorrection.from_data(
-        imgs=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
+        images=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
     )
     dc.preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
@@ -1310,3 +1310,25 @@ def test_apply_correction_4dstem_2d_raises():
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     with pytest.raises(ValueError, match="at least 3D"):
         dc.apply_correction_4dstem(ref)
+
+
+def test_generate_corrected_image_strip_padding():
+    """strip_padding=True returns original scan dimensions, not padded canvas."""
+    dc, ref, _ = _make_single_sided_dc(scan_h=128)
+    scan_h, scan_w = ref.shape
+
+    padded = dc.generate_corrected_image(
+        mask_output=False, strip_padding=False, show_image=False,
+    )
+    stripped = dc.generate_corrected_image(
+        mask_output=False, strip_padding=True, show_image=False,
+    )
+
+    canvas_h, canvas_w = dc.shape[1], dc.shape[2]
+    assert padded.array.shape == (canvas_h, canvas_w), (
+        f"Without strip_padding, shape should be canvas: {padded.array.shape}"
+    )
+    assert stripped.array.shape == (scan_h, scan_w), (
+        f"With strip_padding, shape should be original scan: {stripped.array.shape}"
+    )
+    assert canvas_h > scan_h, "Canvas should be larger than original scan"

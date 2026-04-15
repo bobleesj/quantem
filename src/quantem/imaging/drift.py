@@ -4,6 +4,7 @@ from typing import Self
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.fft import fftfreq
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
@@ -79,7 +80,7 @@ class DriftCorrection(AutoSerialize):
     Instantiate the DriftCorrection class, run preprocessing and alignment, and save/load results:
 
     >>> drift = DriftCorrection.from_data(
-    ...     imgs=[
+    ...     images=[
     ...         image0,  # 2D numpy array or Dataset2d
     ...         image1,
     ...     ],
@@ -174,10 +175,10 @@ class DriftCorrection(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        imgs: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
+        images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
-        validated_images = validate_list_of_dataset2d(imgs)
+        validated_images = validate_list_of_dataset2d(images)
 
         return cls(
             imgs=validated_images,
@@ -247,13 +248,13 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> drift = DriftCorrection.from_data(
-        ...     imgs=[im0, im1], scan_direction_degrees=[0, 90])
+        ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
 
         For mixed-type images (HAADF + VDF), use normalize:
 
         >>> drift = DriftCorrection.from_data(
-        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
         if normalize:
@@ -471,13 +472,13 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> drift = DriftCorrection.from_data(
-        ...     imgs=[im0, im1], scan_direction_degrees=[0, 90])
+        ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
 
         Single-sided alignment (4D-STEM VDF against a fixed HAADF reference):
 
         >>> drift = DriftCorrection.from_data(
-        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess().align_affine(fixed_indices=[0])
         """
         if self.shape[0] < 2:
@@ -697,7 +698,6 @@ class DriftCorrection(AutoSerialize):
         while chunk_start < num_candidates:
             chunk_end = min(chunk_start + chunk_size, num_candidates)
             drift_chunk = drift_vectors_t[chunk_start:chunk_end]
-            cs = chunk_end - chunk_start
             if chunk_idx == 0 and chunked:
                 torch.cuda.reset_peak_memory_stats(device)
             # Warp each image (fixed → expand once, moving → drift-shifted)
@@ -712,7 +712,7 @@ class DriftCorrection(AutoSerialize):
                     self.pad_value[img_idx])
                 warped_images.append(warped)
             # Score all unique pairs and sum costs
-            chunk_cost = torch.zeros(cs, dtype=dtype, device=device)
+            chunk_cost = torch.zeros(chunk_end - chunk_start, dtype=dtype, device=device)
             for i in range(n_images):
                 for j in range(i + 1, n_images):
                     chunk_cost += cross_corr_batch(
@@ -1467,6 +1467,7 @@ class DriftCorrection(AutoSerialize):
         self,
         upsample_factor: int = 2,
         output_original_shape: bool = True,
+        strip_padding: bool = False,
         mask_output: bool = True,
         mask_edge_blend: float = 8.0,
         fourier_filter: bool = True,
@@ -1489,6 +1490,11 @@ class DriftCorrection(AutoSerialize):
             Factor to upsample the output image for enhanced interpolation accuracy.
         output_original_shape : bool, default True
             If True, crop the output image back to the original input dimensions after processing.
+        strip_padding : bool, default False
+            If True and ``output_original_shape`` is True, further crop the result
+            to the original *scan* dimensions (removing the padding added by
+            ``preprocess(pad_fraction=...)``).  This ensures the returned image
+            covers exactly the same field-of-view as the raw input scans.
         mask_output : bool, default True
             If true, mask the output using the probe position weights
         mask_edge_blend : float, default 8.0
@@ -1605,8 +1611,17 @@ class DriftCorrection(AutoSerialize):
             image_corr_fft = _fourier_crop_torch(
                 image_corr_fft, self.shape[-2:]) / upsample_factor**2
 
+        corr_np = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
+
+        if strip_padding and output_original_shape:
+            scan_h, scan_w = self.imgs[0].shape[:2]
+            canvas_h, canvas_w = corr_np.shape[:2]
+            pad_h = (canvas_h - scan_h) // 2
+            pad_w = (canvas_w - scan_w) // 2
+            corr_np = corr_np[pad_h:pad_h + scan_h, pad_w:pad_w + scan_w]
+
         image_corr = Dataset2d.from_array(
-            torch.fft.ifft2(image_corr_fft).real.cpu().numpy(),
+            corr_np,
             name="drift corrected image",
             origin=self.imgs[0].origin,
             sampling=self.imgs[0].sampling,
@@ -1653,7 +1668,7 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> dc = DriftCorrection.from_data(
-        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> dc.preprocess(normalize=True).align_affine(fixed_indices=[0])
         >>> dc.align_nonrigid(fixed_indices=[0])
         >>> corrected_vdf = dc.apply_correction(mode='bicubic')
@@ -1759,8 +1774,6 @@ class DriftCorrection(AutoSerialize):
         >>> corrected = dc.apply_correction_4dstem(
         ...     cube_4d, output_device="cuda")
         """
-        import torch.nn.functional as F
-
         return_numpy = isinstance(ds_4d, np.ndarray) and output_device is None
         is_numpy = isinstance(ds_4d, np.ndarray)
         original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
@@ -1799,7 +1812,7 @@ class DriftCorrection(AutoSerialize):
         warp_grid = torch.stack([
             2.0 * sample_col / (scan_w - 1) - 1.0,
             2.0 * sample_row / (scan_h - 1) - 1.0,
-        ], dim=-1).unsqueeze(0)                               # (1, H, W, 2)
+        ], dim=-1)[None]                                       # (1, H, W, 2)
 
         # ── Flatten to (H, W, C) ──
         flat = (
@@ -1852,15 +1865,12 @@ class DriftCorrection(AutoSerialize):
             )
         for start in chunks:
             end = min(start + chunk_size, n_channels)
-            chunk_chw = flat[:, :, start:end].permute(2, 0, 1).contiguous()
-            chunk_f32 = chunk_chw.to(device=device, dtype=torch.float32).unsqueeze(0)
-            warped = F.grid_sample(
-                chunk_f32, warp_grid,
+            output[:, :, start:end] = F.grid_sample(
+                flat[:, :, start:end].permute(2, 0, 1).contiguous()
+                .to(device=device, dtype=torch.float32)[None],
+                warp_grid,
                 mode=mode, align_corners=True, padding_mode="border",
-            )
-            output[:, :, start:end] = warped.squeeze(0).permute(1, 2, 0).to(
-                device=target, dtype=out_dt)
-            del chunk_chw, chunk_f32, warped
+            )[0].permute(1, 2, 0).to(device=target, dtype=out_dt)
 
         result = output.reshape(original_shape)
         if return_numpy:
