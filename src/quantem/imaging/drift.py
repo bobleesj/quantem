@@ -367,9 +367,9 @@ class DriftCorrection(AutoSerialize):
             F_ref = F_ref * img_idx / (img_idx + 1) + image_shift / (img_idx + 1)
         shifts -= np.mean(shifts, axis=0)
         if min_image_shift is not None:
-            for i in range(1, self.shape[0]):
-                if np.linalg.norm(shifts[i]) < min_image_shift:
-                    shifts[i] = 0.0
+            for img_idx in range(1, self.shape[0]):
+                if np.linalg.norm(shifts[img_idx]) < min_image_shift:
+                    shifts[img_idx] = 0.0
         for img_idx in range(self.shape[0]):
             self.knots[img_idx][0] += shifts[img_idx, 0]
             self.knots[img_idx][1] += shifts[img_idx, 1]
@@ -977,9 +977,10 @@ class DriftCorrection(AutoSerialize):
             magnitude - the same default value that works on small synthetic
             drift will silently under-converge on real data with larger drift.
 
-            The auto-derived formula reserves half the total step budget for
-            search (covering up to ``max_image_shift / 2`` of nonlinear drift)
-            and the other half for refinement near the minimum.
+            The auto-derived formula uses a safety factor of 4 so the total
+            movement budget covers ``max_image_shift / 4`` of drift - enough
+            for refinement without overshooting at small image sizes where
+            actual drift is well below ``max_image_shift``.
 
             Override with an explicit float when you know the actual drift
             magnitude - e.g. ``lr=2.0`` for very-large-drift in-situ data,
@@ -1097,7 +1098,7 @@ class DriftCorrection(AutoSerialize):
                     "Use backend='scipy' for multiple knots.")
             knots_batch = torch.stack(
                 [self.knots[i][:, :, 0] for i in range(num_images)]
-            ).clone().detach().requires_grad_(True)
+            ).detach().requires_grad_(True)
             num_rows_knot = knots_batch.shape[2]
             target_batch = torch.stack(self.images_t)
             # Build u tensors once and reuse - same scan-position vector projects
@@ -1254,15 +1255,14 @@ class DriftCorrection(AutoSerialize):
                             + knots_shift[1][exceeds_max] * regularization_max_image_shift_px / knots_dist[exceeds_max])
                     if regularization_sigma_px is not None and regularization_sigma_px > 0:
                         knots_smoothed = knots_updated.copy()
-                        for dim in range(2):
-                            x = np.arange(knots_updated.shape[1])
+                        scanline_idx = np.arange(knots_updated.shape[1])
+                        for axis in range(2):
                             for knot_ind in range(knots_updated.shape[2]):
-                                y = knots_updated[dim, :, knot_ind]
-                                coefs = np.polyfit(x, y, deg=regularization_poly_order)
-                                trend = np.polyval(coefs, x)
-                                residual = y - trend
-                                residual_smooth = gaussian_filter(residual, sigma=regularization_sigma_px)
-                                knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
+                                knot_vals = knots_updated[axis, :, knot_ind]
+                                coefs = np.polyfit(scanline_idx, knot_vals, deg=regularization_poly_order)
+                                trend = np.polyval(coefs, scanline_idx)
+                                residual = knot_vals - trend
+                                knots_smoothed[axis, :, knot_ind] = gaussian_filter(residual, sigma=regularization_sigma_px) + trend
                         knots_updated = knots_smoothed
                     if regularization_update_step_size is not None:
                         knots_updated = (knots_np
@@ -1553,16 +1553,16 @@ class DriftCorrection(AutoSerialize):
             weight_corr[img_idx] = weights[0]
 
         if fourier_filter:
-            kx = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
-            ky = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
-            kt = torch.atan2(ky, kx)
+            freq_row = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
+            freq_col = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
+            freq_angle = torch.atan2(freq_col, freq_row)
 
             stack_fft = torch.fft.fft2(stack_corr)
             weights = torch.zeros_like(stack_corr)
 
             for img_idx in range(self.shape[0]):
                 weights[img_idx] = torch.abs(
-                    torch.remainder((kt - self.scan_direction[img_idx]) / np.pi + 0.5, 1.0) - 0.5
+                    torch.remainder((freq_angle - self.scan_direction[img_idx]) / np.pi + 0.5, 1.0) - 0.5
                 ) / 0.5
                 weights[img_idx, 0, 0] = 1.0
                 weights[img_idx] = _bounded_sine_sigmoid_torch(
@@ -1570,9 +1570,12 @@ class DriftCorrection(AutoSerialize):
                 stack_fft[img_idx] *= weights[img_idx]
 
             weights_sum = weights.sum(0)
-            image_corr_fft = torch.zeros_like(weights_sum, dtype=stack_fft.dtype)
-            nonzero = weights_sum > 0.0
-            image_corr_fft[nonzero] = stack_fft.sum(0)[nonzero] / weights_sum[nonzero]
+            fft_sum = stack_fft.sum(0)
+            image_corr_fft = torch.where(
+                weights_sum > 0.0,
+                fft_sum / weights_sum.clamp(min=1e-8),
+                torch.zeros_like(fft_sum),
+            )
         else:
             image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
 
@@ -1870,11 +1873,9 @@ class DriftCorrection(AutoSerialize):
                     device=self._device, dtype=self._dtype
                 )
 
-            corrected = self.apply_correction(
+            out_hwc[:, :, start:end] = self.apply_correction(
                 images=chunk_gpu, image_index=image_index, mode=mode,
-            )
-            out_hwc[:, :, start:end] = corrected.permute(1, 2, 0).cpu().to(_out_dt)
-            del chunk_gpu, corrected
+            ).permute(1, 2, 0).cpu().to(_out_dt)
 
         result_hwc = out_hwc
         if output_device is not None:
@@ -1897,14 +1898,9 @@ class DriftCorrection(AutoSerialize):
         # Apply output dtype
         if output_dtype == "same":
             if is_numpy and input_np_dtype is not None:
-                # Convert on CPU for numpy output
-                if result_hwc.is_cuda and return_numpy:
-                    result_hwc = result_hwc.cpu()
-                result_hwc = result_hwc.reshape(original_shape)
-                return result_hwc.cpu().numpy().astype(input_np_dtype) if return_numpy else result_hwc
-            elif not is_numpy:
-                pass  # already in original dtype from chunked path
-        elif output_dtype is not None and output_dtype != "same":
+                # cast to the torch equivalent of the original numpy dtype, then fall through
+                result_hwc = result_hwc.to(dtype=torch.from_numpy(np.empty(0, dtype=input_np_dtype)).dtype)
+        elif output_dtype is not None:
             result_hwc = result_hwc.to(dtype=output_dtype)
 
         result = result_hwc.reshape(original_shape)
@@ -2084,6 +2080,12 @@ class DriftCorrection(AutoSerialize):
     ) -> tuple:
         return drift_viz.plot_knots(self, figsize=figsize)
 
+    def plot_4dstem_correction(self, cube_raw, cube_corrected, **kwargs):
+        """Visualize 4D-STEM correction: VDF, mean DP, CBED comparisons."""
+        return drift_viz.plot_4dstem_correction(
+            self, cube_raw, cube_corrected, **kwargs,
+        )
+
 
 class _DriftInterpolator:
     def __init__(
@@ -2091,7 +2093,7 @@ class _DriftInterpolator:
         input_shape,
         output_shape,
         scan_fast,
-        scan_slow,
+        scan_slow,  # noqa: unused — kept for call-site compatibility; needed if multi-knot slow-scan is added
         pad_value,
         kde_sigma,
     ):
