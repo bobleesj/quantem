@@ -1709,11 +1709,14 @@ class DriftCorrection(AutoSerialize):
         mode: str = "bicubic",
         chunk_size: int = 64,
         output_dtype: torch.dtype | np.dtype | str | None = None,
+        progress: bool = False,
     ) -> torch.Tensor | np.ndarray:
         """Apply drift correction to a 3D or 4D data cube with automatic chunking.
 
-        Processes the cube in GPU-friendly chunks to avoid out-of-memory errors
-        on large datasets (e.g. 4D-STEM with 512×512×192×192 detector pixels).
+        Designed for large datasets that don't fit in GPU memory.  Only one
+        chunk of ``chunk_size`` channels is on the GPU at a time; the rest
+        stays on CPU (or in the original numpy array) so peak VRAM is
+        ``chunk_size × H × W × 8`` bytes (input + output in float32).
 
         Parameters
         ----------
@@ -1732,11 +1735,14 @@ class DriftCorrection(AutoSerialize):
         mode : str, default "bicubic"
             Interpolation kernel: ``"bicubic"`` or ``"bilinear"``.
         chunk_size : int, default 64
-            Number of channels to warp per GPU call. Lower values use
-            less VRAM. For 512×512 scans: 64 → ~67 MB, 1024 → ~1 GB.
+            Number of channels to warp per GPU call.  Memory per chunk
+            is approximately ``chunk_size × H × W × 8`` bytes (float32
+            input + output).  For 512×512 scans: 64 → ~134 MB VRAM.
         output_dtype : dtype, optional
             Cast the output to this dtype. If ``None``, returns float32.
             Use ``"same"`` to match the input dtype.
+        progress : bool, default False
+            Show a tqdm progress bar.
 
         Returns
         -------
@@ -1744,70 +1750,133 @@ class DriftCorrection(AutoSerialize):
             Corrected cube with the same shape and axis layout as input.
             Returns np.ndarray if input was np.ndarray, torch.Tensor otherwise.
 
+        Notes
+        -----
+        **Memory budget for a 512×512×192×192 4D-STEM dataset (uint16):**
+
+        ==================  ==========  ====================================
+        Component           Size        Notes
+        ==================  ==========  ====================================
+        Input (CPU)         19.3 GB     Original array, not copied
+        Output (CPU)        38.7 GB     float32; 19.3 GB with ``"same"``
+        GPU per chunk       134 MB      chunk_size=64, 512×512
+        ==================  ==========  ====================================
+
         Examples
         --------
         >>> # EDX spectral cube
         >>> corrected = dc.apply_correction_cube(
         ...     cube_eds, channel_axis=-1, chunk_size=64)
-        >>> # 4D-STEM
+        >>> # 4D-STEM — keep output as uint16 to halve CPU memory
         >>> corrected = dc.apply_correction_cube(
-        ...     cube_4d, channel_axis=2, chunk_size=256)
+        ...     cube_4d, channel_axis=2, chunk_size=256,
+        ...     output_dtype="same", progress=True)
         """
         return_numpy = isinstance(cube, np.ndarray)
-        if return_numpy:
-            input_np_dtype = cube.dtype
-            cube_t = torch.from_numpy(cube)
-        else:
-            input_np_dtype = None
-            cube_t = cube
+        is_numpy = return_numpy
 
-        original_shape = cube_t.shape
-        ndim = cube_t.dim()
+        if is_numpy:
+            original_shape = cube.shape
+            input_np_dtype = cube.dtype
+        else:
+            original_shape = tuple(cube.shape)
+            input_np_dtype = None
+
+        ndim = len(original_shape)
         if ndim < 3:
             raise ValueError(
                 f"cube must be at least 3D, got shape {original_shape}"
             )
 
         scan_h, scan_w = original_shape[0], original_shape[1]
-        # Collapse all channel dims into one
-        channel_dims = list(range(2, ndim))
         n_channels = 1
-        for d in channel_dims:
+        for d in range(2, ndim):
             n_channels *= original_shape[d]
 
-        # Reshape to (n_channels, scan_h, scan_w)
-        flat = cube_t.reshape(scan_h, scan_w, n_channels).permute(2, 0, 1)
-        flat = flat.contiguous()
+        # Resolve output dtype
+        if output_dtype == "same":
+            out_np_dtype = input_np_dtype if is_numpy else None
+            out_torch_dtype = cube.dtype if not is_numpy else None
+        else:
+            out_np_dtype = None
+            out_torch_dtype = output_dtype if output_dtype is not None else None
 
-        # Allocate output on CPU to avoid GPU OOM for large cubes
-        out_flat = torch.empty_like(flat)
+        # Flatten channel dims: work with (H, W, n_channels) view
+        if is_numpy:
+            flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
+        else:
+            flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
 
-        for start in range(0, n_channels, chunk_size):
-            end = min(start + chunk_size, n_channels)
-            chunk = flat[start:end]  # (chunk, H, W)
-            corrected_chunk = self.apply_correction(
-                images=chunk, image_index=image_index, mode=mode,
+        # Allocate output on CPU in the target dtype to minimize memory
+        if is_numpy:
+            if out_np_dtype is not None:
+                out_hwc = np.empty(
+                    (scan_h, scan_w, n_channels), dtype=out_np_dtype
+                )
+            else:
+                out_hwc = np.empty(
+                    (scan_h, scan_w, n_channels), dtype=np.float32
+                )
+        else:
+            _out_dt = out_torch_dtype if out_torch_dtype is not None else torch.float32
+            out_hwc = torch.empty(
+                (scan_h, scan_w, n_channels), dtype=_out_dt, device="cpu"
             )
-            out_flat[start:end] = corrected_chunk.to(out_flat.device)
+
+        # Process chunks — only chunk_size×H×W×4 bytes on GPU at a time
+        chunks = range(0, n_channels, chunk_size)
+        if progress:
+            chunks = tqdm(
+                chunks,
+                total=(n_channels + chunk_size - 1) // chunk_size,
+                desc="apply_correction_cube",
+                unit="chunk",
+            )
+
+        for start in chunks:
+            end = min(start + chunk_size, n_channels)
+            # Slice from (H, W, C) and transpose to (C, H, W)
+            if is_numpy:
+                chunk_hwc = flat_hwc[:, :, start:end]  # view, no copy
+                chunk_chw = np.ascontiguousarray(
+                    chunk_hwc.transpose(2, 0, 1)
+                )
+                chunk_gpu = torch.tensor(
+                    chunk_chw, dtype=self._dtype, device=self._device
+                )
+            else:
+                chunk_hwc = flat_hwc[:, :, start:end]
+                chunk_chw = chunk_hwc.permute(2, 0, 1).contiguous()
+                chunk_gpu = chunk_chw.to(
+                    device=self._device, dtype=self._dtype
+                )
+
+            corrected_chunk = self.apply_correction(
+                images=chunk_gpu, image_index=image_index, mode=mode,
+            )
+
+            # Write back to output in (H, W, C) layout
+            result_cpu = corrected_chunk.cpu()
+            if is_numpy:
+                result_hwc = result_cpu.numpy().transpose(1, 2, 0)
+                if out_np_dtype is not None:
+                    out_hwc[:, :, start:end] = result_hwc.astype(out_np_dtype)
+                else:
+                    out_hwc[:, :, start:end] = result_hwc
+            else:
+                result_hwc = result_cpu.permute(1, 2, 0)
+                if out_torch_dtype is not None:
+                    out_hwc[:, :, start:end] = result_hwc.to(out_torch_dtype)
+                else:
+                    out_hwc[:, :, start:end] = result_hwc
+
+            # Free GPU memory for this chunk
+            del chunk_gpu, corrected_chunk, result_cpu
 
         # Reshape back to original layout
-        result = out_flat.permute(1, 2, 0).reshape(original_shape)
-
-        # Handle output dtype
-        if output_dtype == "same":
-            if return_numpy:
-                result = result.to(torch.float32)
-            else:
-                result = result.to(cube.dtype)
-        elif output_dtype is not None:
-            result = result.to(output_dtype)
-
-        if return_numpy:
-            result_np = result.cpu().numpy()
-            if output_dtype == "same":
-                result_np = result_np.astype(input_np_dtype)
-            return result_np
-        return result
+        if is_numpy:
+            return out_hwc.reshape(original_shape)
+        return out_hwc.reshape(original_shape)
 
     def calculate_error(
         self,
