@@ -8,6 +8,7 @@ See PR #133 for images: https://github.com/electronmicroscopy/quantem/pull/133
 import numpy as np
 import pytest
 import torch
+import warnings
 import matplotlib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter, map_coordinates
@@ -118,6 +119,7 @@ def test_full_pipeline_deterministic():
     drift.align_nonrigid(
         num_iterations=2,
         regularization_sigma_px=0.5,
+        loss="mse",
         show_merged=False,
         show_images=False,
     )
@@ -144,6 +146,7 @@ def test_full_pipeline_deterministic():
     drift2.align_nonrigid(
         num_iterations=2,
         regularization_sigma_px=0.5,
+        loss="mse",
         show_merged=False,
         show_images=False,
     )
@@ -244,6 +247,7 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
         # default is now auto-derived from max_image_shift, but the frozen
         # baselines must stay numerically stable across that change.
         lr=0.02,
+        loss="mse",
         show_merged=False, show_images=False,
     )
     np.testing.assert_almost_equal(
@@ -282,6 +286,7 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
         backend="pytorch", optimizer_name="lbfgs",
         num_iterations=2, lbfgs_max_iter=20,
         regularization_sigma_px=16.0,
+        loss="mse",
         show_merged=False, show_images=False,
     )
     np.testing.assert_almost_equal(
@@ -504,6 +509,7 @@ def test_align_nonrigid_fixed_indices_reduces_error():
         num_iterations=2, adam_steps=20,
         regularization_sigma_px=8.0, lr=0.02,
         fixed_indices=[0],
+        loss="mse",
         show_merged=False, show_images=False,
     )
     error_after_nonrigid = drift.error_track[-1, 1]
@@ -1332,3 +1338,166 @@ def test_generate_corrected_image_strip_padding():
         f"With strip_padding, shape should be original scan: {stripped.array.shape}"
     )
     assert canvas_h > scan_h, "Canvas should be larger than original scan"
+
+
+# ---------------------------------------------------------------------------
+# Tests for loss="auto" resolution
+# ---------------------------------------------------------------------------
+
+
+def test_align_nonrigid_loss_auto_resolves_pytorch():
+    """loss='auto' should resolve to 'gradient_mse' for pytorch backend."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    # Should not raise — auto resolves to gradient_mse for pytorch
+    drift.align_nonrigid(
+        backend="pytorch", loss="auto", num_iterations=2,
+        show_merged=False, show_images=False,
+    )
+    # Verify it completed without error
+    assert drift.error_track is not None
+
+
+def test_align_nonrigid_loss_auto_resolves_scipy():
+    """loss='auto' should resolve to 'mse' for scipy backend."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    # Should not raise — auto resolves to mse for scipy
+    drift.align_nonrigid(
+        backend="scipy", loss="auto", num_iterations=1,
+        show_merged=False, show_images=False,
+    )
+    assert drift.error_track is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests for early stopping
+# ---------------------------------------------------------------------------
+
+
+def test_align_nonrigid_early_stopping():
+    """Early stopping should terminate before max iterations on easy data."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(
+        step=0.02, num_tests=5, refine=True,
+        show_merged=False, show_images=False,
+    )
+    # Use many max iterations but expect early stop on this easy synthetic data
+    drift.align_nonrigid(
+        num_iterations=64,
+        min_iterations=4,
+        early_stop_patience=3,
+        early_stop_rtol=1e-4,
+        loss="mse",
+        regularization_sigma_px=8.0,
+        show_merged=False, show_images=False,
+    )
+    # Should have stopped before 64 iterations
+    # error_track has initial rows + nonrigid rows; count nonrigid rows (mode=2.0)
+    nonrigid_rows = (drift.error_track[:, 0] == 2.0).sum()
+    assert nonrigid_rows < 64, (
+        f"Expected early stopping before 64 iterations, got {nonrigid_rows}"
+    )
+    assert nonrigid_rows >= 4, (
+        f"Must run at least min_iterations=4, got {nonrigid_rows}"
+    )
+
+
+def test_align_nonrigid_early_stopping_disabled():
+    """Setting patience >= num_iterations disables early stopping."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(
+        step=0.02, num_tests=5, refine=True,
+        show_merged=False, show_images=False,
+    )
+    drift.align_nonrigid(
+        num_iterations=8,
+        early_stop_patience=8,
+        loss="mse",
+        regularization_sigma_px=8.0,
+        show_merged=False, show_images=False,
+    )
+    nonrigid_rows = (drift.error_track[:, 0] == 2.0).sum()
+    assert nonrigid_rows == 8, (
+        f"With patience=num_iterations, should run all 8, got {nonrigid_rows}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for LBFGS + normalize warning
+# ---------------------------------------------------------------------------
+
+
+def test_align_nonrigid_lbfgs_normalize_warns():
+    """LBFGS with normalize=True should emit a warning."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(normalize=True, show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        drift.align_nonrigid(
+            optimizer_name="lbfgs", loss="mse",
+            num_iterations=1,
+            show_merged=False, show_images=False,
+        )
+        lbfgs_warnings = [x for x in w if "normalize=True + LBFGS" in str(x.message)]
+        assert len(lbfgs_warnings) == 1, (
+            f"Expected 1 LBFGS+normalize warning, got {len(lbfgs_warnings)}"
+        )
+
+
+def test_align_nonrigid_adam_normalize_no_warning():
+    """Adam with normalize=True should NOT emit a warning."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(normalize=True, show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        drift.align_nonrigid(
+            optimizer_name="adam", loss="mse",
+            num_iterations=2,
+            show_merged=False, show_images=False,
+        )
+        lbfgs_warnings = [x for x in w if "normalize=True + LBFGS" in str(x.message)]
+        assert len(lbfgs_warnings) == 0, (
+            f"Adam should not trigger LBFGS warning, got {len(lbfgs_warnings)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for sobel z-score normalization
+# ---------------------------------------------------------------------------
+
+
+def test_sobel_gradient_magnitude_znorm():
+    """_sobel_gradient_magnitude should z-score normalize each image."""
+    images = torch.randn(3, 64, 64)
+    # Scale each image differently to test gain invariance
+    images[1] *= 10.0
+    images[2] *= 0.01
+    result = DriftCorrection._sobel_gradient_magnitude(
+        images, pre_smooth=1.0, device=images.device, dtype=images.dtype,
+    )
+    assert result.shape == (3, 64, 64)
+    # Each image should have ~zero mean and ~unit std
+    for i in range(3):
+        mean = result[i].mean().item()
+        std = result[i].std().item()
+        assert abs(mean) < 0.01, f"Image {i} mean={mean}, expected ~0"
+        assert abs(std - 1.0) < 0.05, f"Image {i} std={std}, expected ~1.0"

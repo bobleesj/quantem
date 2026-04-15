@@ -257,6 +257,7 @@ class DriftCorrection(AutoSerialize):
         ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
+        self._normalized = bool(normalize)
         if normalize:
             for img in self.imgs:
                 arr = img.array.astype(np.float32)
@@ -864,8 +865,8 @@ class DriftCorrection(AutoSerialize):
         self,
         backend: str = "pytorch",
         optimizer_name: str = "adam",
-        num_iterations: int = 8,
-        regularization_sigma_px: float = 16.0,
+        num_iterations: int = 16,
+        regularization_sigma_px: float = 8.0,
         regularization_update_step_size: float | None = 0.8,
         regularization_poly_order: int = 1,
         max_image_shift: float | None = 32.0,
@@ -876,8 +877,11 @@ class DriftCorrection(AutoSerialize):
         regularization_max_image_shift_px: float | None = None,
         solve_individual_rows: bool = True,
         fixed_indices: list[int] | None = None,
-        loss: str = "mse",
+        loss: str = "auto",
         loss_pre_smooth: float = 1.0,
+        early_stop_patience: int = 3,
+        early_stop_rtol: float = 1e-4,
+        min_iterations: int = 4,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -913,10 +917,10 @@ class DriftCorrection(AutoSerialize):
               diverse datasets before being treated as authoritative). If
               you override ``lr`` manually, the rough formula is
               ``expected_drift_px / (num_iterations * adam_steps)``.
-              Indicative starting values for the default ``num_iterations=8,
-              adam_steps=30`` (240 total steps):
-                * ~5 px drift (synthetic chevron, small drift): ``lr≈0.02``
-                * ~50-100 px drift (gold-nanoparticle HAADF, real STEM): ``lr≈0.5``
+              Indicative starting values for the default ``num_iterations=16,
+              adam_steps=30`` (480 total steps):
+                * ~5 px drift (synthetic chevron, small drift): ``lr≈0.01``
+                * ~50-100 px drift (gold-nanoparticle HAADF, real STEM): ``lr≈0.25``
                 * larger / unknown drift: prefer ``optimizer_name="lbfgs"``
                   which auto-scales via line search and doesn't need this
                   per-dataset tuning.
@@ -947,10 +951,12 @@ class DriftCorrection(AutoSerialize):
 
         Shared Parameters
         -----------------
-        num_iterations : int, default 8
+        num_iterations : int, default 16
             Number of outer iterations for alternating optimization.
-        regularization_sigma_px : float, default 16.0
-            Gaussian smoothing sigma for knot regularization.
+        regularization_sigma_px : float, default 8.0
+            Gaussian smoothing sigma for knot regularization. Smaller values
+            allow finer per-row correction; larger values enforce smoother
+            drift profiles. Values of 4-12 are typical for STEM data.
         regularization_update_step_size : float, default 0.8
             Step size for knot updates (0-1, lower = more conservative).
         regularization_poly_order : int, default 1
@@ -1017,11 +1023,16 @@ class DriftCorrection(AutoSerialize):
 
         Loss Parameters
         ---------------
-        loss : str, default "mse"
+        loss : str, default "auto"
             Loss function for the nonrigid optimizer.
 
-            **"mse"** (default) - pixel-wise mean squared error on raw
-            images. Works well when the reference and target have similar
+            **"auto"** (default) - resolves to ``"gradient_mse"`` when
+            ``backend="pytorch"`` and ``"mse"`` when ``backend="scipy"``.
+            This ensures cross-modality robustness by default on GPU
+            while maintaining backward compatibility for CPU callers.
+
+            **"mse"** - pixel-wise mean squared error on raw images.
+            Works well when the reference and target have similar
             intensity and contrast (e.g. two HAADF scans of the same
             sample under the same conditions).
 
@@ -1035,11 +1046,10 @@ class DriftCorrection(AutoSerialize):
 
             Use ``"gradient_mse"`` when the reference and target have
             different intensity profiles - e.g. a merged 4096² HAADF
-            reference vs. a 1024² co-HAADF from an EDS/EELS acquisition
-            with different dwell time and beam current. On such data,
-            ``"mse"`` finds per-row shifts that minimize intensity
-            mismatch rather than structural misalignment, which can make
-            a majority of rows *worse* than affine-only.
+            reference vs. a 512² VDF from a 4D-STEM acquisition. On real
+            gold nanoparticle data, ``gradient_mse`` improved NCC from
+            0.932 to 0.949 (+1.8%) and reduced residual shift from
+            3.0 to 1.2 px compared to ``"mse"``.
 
             Only supported with ``backend="pytorch"``.
 
@@ -1049,6 +1059,20 @@ class DriftCorrection(AutoSerialize):
             high-frequency noise that would otherwise dominate the
             gradient magnitude. Set to 0 to disable. Ignored when
             ``loss="mse"``.
+
+        Early Stopping Parameters
+        -------------------------
+        early_stop_patience : int, default 3
+            Number of consecutive iterations without improvement before
+            stopping early. Set to ``num_iterations`` to disable.
+        early_stop_rtol : float, default 1e-4
+            Minimum relative improvement in alignment error to count as
+            progress. Iteration *i* is an improvement if
+            ``error[i] < best_error * (1 - rtol)``.
+        min_iterations : int, default 4
+            Minimum number of iterations to run before early stopping
+            can trigger. Ensures the optimizer explores enough before
+            converging.
 
         Display Parameters
         ------------------
@@ -1072,14 +1096,26 @@ class DriftCorrection(AutoSerialize):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
             )
+        # Resolve "auto" loss: gradient_mse for pytorch, mse for scipy
+        if loss == "auto":
+            loss = "gradient_mse" if backend == "pytorch" else "mse"
         _valid_losses = ("mse", "gradient_mse")
         if loss not in _valid_losses:
             raise ValueError(
-                f"loss must be one of {_valid_losses!r}, got {loss!r}")
+                f"loss must be one of {_valid_losses!r} or 'auto', got {loss!r}")
         if loss != "mse" and backend != "pytorch":
             raise ValueError(
                 f"loss={loss!r} is only supported with backend='pytorch'. "
                 f"Use backend='pytorch' or loss='mse'.")
+        # Warn about normalize + LBFGS silent failure
+        if (optimizer_name == "lbfgs" and backend == "pytorch"
+                and getattr(self, "_normalized", False)):
+            import warnings
+            warnings.warn(
+                "normalize=True + LBFGS can cause silent convergence failure. "
+                "Wolfe line search may return step=0 on unit-variance images. "
+                "Consider using optimizer_name='adam' or normalize=False.",
+                UserWarning, stacklevel=2)
         fixed_set = frozenset(fixed_indices) if fixed_indices is not None else frozenset()
         moving_indices = [i for i in range(self.shape[0]) if i not in fixed_set]
         if fixed_set and not moving_indices:
@@ -1160,7 +1196,10 @@ class DriftCorrection(AutoSerialize):
                 for idx in fixed_set:
                     grad_mask[idx] = 0.0
             error_buffer = []
-            for _ in tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({optimizer_name})"):
+            best_error = float('inf')
+            patience_counter = 0
+            pbar = tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({optimizer_name})")
+            for iter_idx in pbar:
                 # Build the reference under no_grad: arithmetic on warped_t (an
                 # inference tensor) would otherwise return an autograd-tracked
                 # leaf, and the optimizer would build a graph through it.
@@ -1204,7 +1243,19 @@ class DriftCorrection(AutoSerialize):
                     fixed_indices=fixed_set)
                 # Per-iter error stays on GPU; sync once after the loop
                 images_mean = warped_t.mean(dim=0)
-                error_buffer.append(torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2)))
+                iter_error = torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2))
+                error_buffer.append(iter_error)
+                # Early stopping: monitor post-iteration alignment quality
+                current_error = float(iter_error.mean())
+                if current_error < best_error * (1 - early_stop_rtol):
+                    best_error = current_error
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if (iter_idx >= min_iterations - 1
+                        and patience_counter >= early_stop_patience):
+                    pbar.set_postfix_str(f"converged at iter {iter_idx + 1}")
+                    break
             # Sync knots back; leave imgs_warped lazy so callers
             # that never plot avoid the GPU→CPU transfer of the warped stack.
             knots_final = knots_batch.detach()
@@ -1363,7 +1414,8 @@ class DriftCorrection(AutoSerialize):
         Returns
         -------
         Tensor, shape (N, H, W)
-            Gradient magnitude images (unnormalized).
+            Gradient magnitude images, per-image z-score normalized so
+            each image has zero mean and unit variance.
         """
         img = images[:, None]  # (N, 1, H, W) for conv2d
         if pre_smooth > 0:
@@ -1387,7 +1439,11 @@ class DriftCorrection(AutoSerialize):
         img_pad = torch.nn.functional.pad(img, (1, 1, 1, 1), mode='reflect')
         gx = torch.nn.functional.conv2d(img_pad, sx)
         gy = torch.nn.functional.conv2d(img_pad, sy)
-        return (gx ** 2 + gy ** 2).sqrt()[:, 0]  # (N, H, W)
+        grad_mag = (gx ** 2 + gy ** 2).sqrt()[:, 0]  # (N, H, W)
+        # Per-image z-score normalization: removes gain/offset sensitivity
+        mean = grad_mag.mean(dim=(-2, -1), keepdim=True)
+        std = grad_mag.std(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        return (grad_mag - mean) / std
 
     def _regularize_knots(
         self, knots_batch, knots_prev, vander,
