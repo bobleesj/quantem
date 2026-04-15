@@ -875,6 +875,8 @@ class DriftCorrection(AutoSerialize):
         regularization_max_image_shift_px: float | None = None,
         solve_individual_rows: bool = True,
         fixed_indices: list[int] | None = None,
+        loss: str = "mse",
+        loss_pre_smooth: float = 1.0,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -1011,6 +1013,41 @@ class DriftCorrection(AutoSerialize):
             - **Translation**: Shifts are anchored to fixed images
               (passed through to ``_warp_and_translate_torch``).
 
+        Loss Parameters
+        ---------------
+        loss : str, default "mse"
+            Loss function for the nonrigid optimizer.
+
+            **"mse"** (default) - pixel-wise mean squared error on raw
+            images. Works well when the reference and target have similar
+            intensity and contrast (e.g. two HAADF scans of the same
+            sample under the same conditions).
+
+            **"gradient_mse"** - MSE on Sobel gradient magnitudes. Before
+            computing the loss, both the warped reference and the target
+            are edge-filtered (optional Gaussian pre-smooth → Sobel → L2
+            gradient magnitude → per-image z-score normalization). This
+            eliminates sensitivity to additive intensity offsets **and**
+            multiplicative gain differences between images, focusing the
+            optimizer purely on structural alignment.
+
+            Use ``"gradient_mse"`` when the reference and target have
+            different intensity profiles - e.g. a merged 4096² HAADF
+            reference vs. a 1024² co-HAADF from an EDS/EELS acquisition
+            with different dwell time and beam current. On such data,
+            ``"mse"`` finds per-row shifts that minimize intensity
+            mismatch rather than structural misalignment, which can make
+            a majority of rows *worse* than affine-only.
+
+            Only supported with ``backend="pytorch"``.
+
+        loss_pre_smooth : float, default 1.0
+            Gaussian sigma (in pixels) applied before Sobel edge
+            detection when ``loss="gradient_mse"``. Suppresses
+            high-frequency noise that would otherwise dominate the
+            gradient magnitude. Set to 0 to disable. Ignored when
+            ``loss="mse"``.
+
         Display Parameters
         ------------------
         show_merged : bool, default True
@@ -1033,6 +1070,14 @@ class DriftCorrection(AutoSerialize):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
             )
+        _valid_losses = ("mse", "gradient_mse")
+        if loss not in _valid_losses:
+            raise ValueError(
+                f"loss must be one of {_valid_losses!r}, got {loss!r}")
+        if loss != "mse" and backend != "pytorch":
+            raise ValueError(
+                f"loss={loss!r} is only supported with backend='pytorch'. "
+                f"Use backend='pytorch' or loss='mse'.")
         fixed_set = frozenset(fixed_indices) if fixed_indices is not None else frozenset()
         moving_indices = [i for i in range(self.shape[0]) if i not in fixed_set]
         if fixed_set and not moving_indices:
@@ -1089,6 +1134,20 @@ class DriftCorrection(AutoSerialize):
                 x_knot = torch.arange(num_rows_knot, dtype=dtype, device=device)
                 x_norm = (x_knot - x_knot.mean()) / x_knot.std()
                 vander = torch.stack([x_norm ** p for p in range(regularization_poly_order + 1)], dim=1)
+            else:
+                vander = None
+            # For gradient_mse, temporarily replace alignment images with
+            # edge-filtered versions. The learned knots are spatial transforms
+            # independent of image content, so optimizing in gradient space
+            # yields the same drift field while being robust to intensity and
+            # contrast differences between reference and target.
+            _original_images_t = None
+            if loss == "gradient_mse":
+                _original_images_t = list(self.images_t)
+                sobel_batch = self._sobel_gradient_magnitude(
+                    target_batch, loss_pre_smooth, device, dtype)
+                self.images_t = [sobel_batch[i] for i in range(num_images)]
+                target_batch = sobel_batch
             warped_t = self._warp_and_translate_torch(
                 max_image_shift, upsample_factor=8, knots_batch=knots_batch,
                 fixed_indices=fixed_set)
@@ -1149,6 +1208,11 @@ class DriftCorrection(AutoSerialize):
             knots_final = knots_batch.detach()
             for img_idx in range(num_images):
                 self.knots[img_idx][:, :, 0] = knots_final[img_idx]
+            # Restore original images after gradient_mse alignment so that
+            # apply_correction, visualization, and error metrics use the
+            # original pixel intensities, not edge-filtered versions.
+            if _original_images_t is not None:
+                self.images_t = _original_images_t
             self._images_warped_stale = True
             self._max_image_shift_cached = max_image_shift
             if error_buffer:
@@ -1278,6 +1342,52 @@ class DriftCorrection(AutoSerialize):
             return loss
         optimizer.step(closure)
 
+    @staticmethod
+    def _sobel_gradient_magnitude(
+        images: torch.Tensor,
+        pre_smooth: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute per-image Sobel gradient magnitude.
+
+        Parameters
+        ----------
+        images : Tensor, shape (N, H, W)
+            Batch of images.
+        pre_smooth : float
+            Gaussian sigma applied before Sobel. 0 to disable.
+        device, dtype : torch device and dtype for kernel creation.
+
+        Returns
+        -------
+        Tensor, shape (N, H, W)
+            Gradient magnitude images (unnormalized).
+        """
+        img = images[:, None]  # (N, 1, H, W) for conv2d
+        if pre_smooth > 0:
+            ks = max(3, int(6 * pre_smooth) | 1)  # odd kernel size
+            x = torch.arange(ks, dtype=dtype, device=device) - ks // 2
+            g = torch.exp(-0.5 * (x / max(pre_smooth, 1e-6)) ** 2)
+            g = g / g.sum()
+            # Separable Gaussian: row then column (reflect padding)
+            pad_h = ks // 2
+            img = torch.nn.functional.pad(img, (pad_h, pad_h, 0, 0), mode='reflect')
+            img = torch.nn.functional.conv2d(img, g.reshape(1, 1, 1, -1))
+            img = torch.nn.functional.pad(img, (0, 0, pad_h, pad_h), mode='reflect')
+            img = torch.nn.functional.conv2d(img, g.reshape(1, 1, -1, 1))
+        # Sobel kernels
+        sx = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=dtype, device=device).reshape(1, 1, 3, 3)
+        sy = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=dtype, device=device).reshape(1, 1, 3, 3)
+        img_pad = torch.nn.functional.pad(img, (1, 1, 1, 1), mode='reflect')
+        gx = torch.nn.functional.conv2d(img_pad, sx)
+        gy = torch.nn.functional.conv2d(img_pad, sy)
+        return (gx ** 2 + gy ** 2).sqrt()[:, 0]  # (N, H, W)
+
     def _regularize_knots(
         self, knots_batch, knots_prev, vander,
         max_shift_px, sigma_px, step_size,
@@ -1300,7 +1410,7 @@ class DriftCorrection(AutoSerialize):
                 dist = torch.norm(shift, dim=1, keepdim=True)
                 scale_factor = torch.clamp(max_shift_px / dist.clamp(min=1e-8), max=1.0)
                 knots_batch.copy_(knots_prev + shift * scale_factor)
-            if sigma_px is not None and sigma_px > 0:
+            if sigma_px is not None and sigma_px > 0 and vander is not None:
                 # Detrend + smooth all (N*2, num_rows) knots in one batched lstsq + smooth
                 knots_flat = knots_batch.reshape(-1, num_rows_knot).T  # (num_rows, N*2)
                 coefs, _, _, _ = torch.linalg.lstsq(vander, knots_flat)

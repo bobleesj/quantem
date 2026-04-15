@@ -463,13 +463,15 @@ def backward_warp(
 
     grid_r = 2.0 * sample_r / (h - 1) - 1.0
     grid_c = 2.0 * sample_c / (w - 1) - 1.0
-    # grid_sample expects (N, H, W, 2) with (x=col, y=row)
-    grid = torch.stack([grid_c, grid_r], dim=-1)[None].expand(n, -1, -1, -1)
+    # Pass as (1, N, H, W) with a single (1, H, W, 2) grid so grid_sample applies
+    # one grid to all N channels in one kernel call. The alternative (N, 1, H, W)
+    # with (N, H, W, 2) materialises N identical grids — 4096× more memory for EDS.
+    grid = torch.stack([grid_c, grid_r], dim=-1)[None]  # (1, H, W, 2)
 
     out = torch.nn.functional.grid_sample(
-        images[:, None], grid, mode=mode,
+        images[None], grid, mode=mode,
         align_corners=True, padding_mode="border",
-    )[:, 0]
+    )[0]  # (N, H, W)
     return out[0] if squeeze else out
 
 

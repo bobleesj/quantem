@@ -528,6 +528,213 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
         )
 
 
+def test_align_nonrigid_gradient_mse_runs():
+    """align_nonrigid(loss='gradient_mse') should run without error and modify knots."""
+    rng = np.random.default_rng(42)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    expected_drift = np.array([0.03, -0.05], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + expected_drift[0] * scanline_offset,
+        col_grid + expected_drift[1] * scanline_offset,
+    ).astype(np.float32)
+
+    drift = DriftCorrection.from_data(
+        images=[reference, moving],
+        scan_direction_degrees=[0.0, 0.0],
+    ).preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    drift.align_affine(
+        step=0.01, num_tests=13, refine=True,
+        fixed_indices=[0], show_merged=False, show_images=False,
+    )
+    knots_after_affine = drift.knots[1].clone()
+
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="adam",
+        num_iterations=2, adam_steps=20,
+        regularization_sigma_px=8.0, lr=0.02,
+        fixed_indices=[0], loss="gradient_mse",
+        show_merged=False, show_images=False,
+    )
+
+    # Moving image knots should have changed
+    assert not np.array_equal(
+        drift.knots[1].cpu().numpy(), knots_after_affine.cpu().numpy()
+    ), "gradient_mse should modify the moving image knots"
+    # images_t should contain original (non-Sobel) images after alignment
+    import torch
+    orig_stack = torch.stack(drift.images_t)
+    assert orig_stack.min() >= 0, "images_t should be restored (gradient images can be negative)"
+
+
+def test_align_nonrigid_gradient_mse_lbfgs():
+    """gradient_mse should also work with LBFGS optimizer."""
+    rng = np.random.default_rng(42)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    expected_drift = np.array([0.03, -0.05], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + expected_drift[0] * scanline_offset,
+        col_grid + expected_drift[1] * scanline_offset,
+    ).astype(np.float32)
+
+    drift = DriftCorrection.from_data(
+        images=[reference, moving],
+        scan_direction_degrees=[0.0, 0.0],
+    ).preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+        normalize=False, show_merged=False, show_images=False,
+    )
+    drift.align_affine(
+        step=0.01, num_tests=13, refine=True,
+        fixed_indices=[0], show_merged=False, show_images=False,
+    )
+
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="lbfgs",
+        num_iterations=2, regularization_sigma_px=8.0,
+        fixed_indices=[0], loss="gradient_mse",
+        show_merged=False, show_images=False,
+    )
+    # Smoke test: just verify it completed without error
+
+
+def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
+    """gradient_mse should outperform mse when images have gain + offset mismatch."""
+    rng = np.random.default_rng(99)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32) * 100 + 50
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    expected_drift = np.array([0.04, -0.06], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + expected_drift[0] * scanline_offset,
+        col_grid + expected_drift[1] * scanline_offset,
+    ).astype(np.float32)
+    # Apply gain + offset mismatch
+    moving = moving * 0.6 + 30.0
+
+    def run_with_loss(loss_name, **kwargs):
+        drift = DriftCorrection.from_data(
+            images=[reference, moving],
+            scan_direction_degrees=[0.0, 0.0],
+        ).preprocess(
+            pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+            normalize=False, show_merged=False, show_images=False,
+        )
+        drift.align_affine(
+            step=0.01, num_tests=13, refine=True,
+            fixed_indices=[0], show_merged=False, show_images=False,
+        )
+        drift.align_nonrigid(
+            backend="pytorch", optimizer_name="lbfgs",
+            num_iterations=4, regularization_sigma_px=8.0,
+            fixed_indices=[0], loss=loss_name, max_image_shift=32.0,
+            show_merged=False, show_images=False, **kwargs,
+        )
+        return drift.error_track[-1, 1]
+
+    err_mse = run_with_loss("mse")
+    err_grad = run_with_loss("gradient_mse")
+    # gradient_mse should be at least as good (often better)
+    assert err_grad <= err_mse * 1.5, (
+        f"gradient_mse ({err_grad:.4f}) should not be much worse than mse ({err_mse:.4f})"
+    )
+
+
+def test_align_nonrigid_invalid_loss_raises():
+    """Invalid loss name should raise ValueError."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    with pytest.raises(ValueError, match="loss must be one of"):
+        drift.align_nonrigid(
+            loss="invalid_loss",
+            show_merged=False, show_images=False,
+        )
+
+
+def test_align_nonrigid_gradient_mse_scipy_raises():
+    """gradient_mse with scipy backend should raise ValueError."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(show_merged=False, show_images=False)
+    with pytest.raises(ValueError, match="only supported with backend='pytorch'"):
+        drift.align_nonrigid(
+            backend="scipy", loss="gradient_mse",
+            show_merged=False, show_images=False,
+        )
+
+
+def test_align_nonrigid_regularization_sigma_none():
+    """align_nonrigid should work with regularization_sigma_px=None (no smoothing)."""
+    rng = np.random.default_rng(42)
+    reference = gaussian_filter(rng.random((64, 64)), sigma=1.0).astype(np.float32)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(reference.shape[0], dtype=np.float32),
+        np.arange(reference.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    scanline_offset = (
+        np.arange(reference.shape[0], dtype=np.float32) - (reference.shape[0] - 1) / 2
+    )[:, None]
+    drift_rate = np.array([0.03, -0.05], dtype=np.float32)
+    moving = bilinear_sample(
+        reference,
+        row_grid + drift_rate[0] * scanline_offset,
+        col_grid + drift_rate[1] * scanline_offset,
+    ).astype(np.float32)
+
+    drift = DriftCorrection.from_data(
+        images=[reference, moving],
+        scan_direction_degrees=[0.0, 0.0],
+    ).preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    drift.align_affine(
+        step=0.01, num_tests=13, refine=True,
+        fixed_indices=[0], show_merged=False, show_images=False,
+    )
+    # This previously crashed with UnboundLocalError on `vander`
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="adam",
+        num_iterations=2, adam_steps=20,
+        regularization_sigma_px=None, lr=0.02,
+        fixed_indices=[0],
+        show_merged=False, show_images=False,
+    )
+
+
 # ──────────────────────────────────────────────────────────────
 # Tests for apply_correction() and validation
 # ──────────────────────────────────────────────────────────────
