@@ -117,9 +117,9 @@ def plot_correction_summary(
     fig : Figure
     axes : np.ndarray of Axes, shape (nrows, 3)
     """
-    ref_np = dc.images[reference_index].array
-    idx = target_index % len(dc.images)
-    raw_np = dc.images[idx].array
+    ref_np = dc.imgs[reference_index].array
+    idx = target_index % len(dc.imgs)
+    raw_np = dc.imgs[idx].array
     if corrected is None:
         corrected = dc.apply_correction(image_index=target_index, mode=mode)
     if isinstance(corrected, torch.Tensor):
@@ -241,8 +241,8 @@ def plot_correction_comparison(
         ``{method_name: (rms, ncc)}``
     """
     idx = target_index % len(dc.knots)
-    ref_np = dc.images[0].array
-    raw_np = dc.images[idx].array
+    ref_np = dc.imgs[0].array
+    raw_np = dc.imgs[idx].array
     s, crop = _center_crop_slice(ref_np, crop)
     has_nonrigid = hasattr(dc, "_knots_after_affine") and not torch.equal(
         dc.knots[idx], dc._knots_after_affine[idx]
@@ -331,8 +331,8 @@ def plot_radial_power(
     ax : Axes
     """
     idx = target_index % len(dc.knots)
-    ref_np = dc.images[0].array
-    raw_np = dc.images[idx].array
+    ref_np = dc.imgs[0].array
+    raw_np = dc.imgs[idx].array
     s, crop = _center_crop_slice(ref_np, crop)
     if methods is None:
         methods = {"HAADF ref": ref_np[s], "raw (drifted)": raw_np[s]}
@@ -616,7 +616,7 @@ def plot_4dstem_correction(
         Pre-computed VDF images.  If ``None``, computed from the cubes
         using *vdf_mask* or a default annular mask.
     ref_image : np.ndarray, optional
-        HAADF reference image.  If ``None``, uses ``dc.images[0].array``.
+        HAADF reference image.  If ``None``, uses ``dc.imgs[0].array``.
     vdf_mask : torch.Tensor, optional
         Boolean mask ``(det_h, det_w)`` for VDF computation.
         Default: annular dark-field (radius > det_h/4).
@@ -641,7 +641,7 @@ def plot_4dstem_correction(
     device = cube_raw.device
 
     if ref_image is None:
-        ref_image = dc.images[0].array
+        ref_image = dc.imgs[0].array
 
     # --- VDF computation (on GPU, transfer only the 2D result) ---
     if vdf_mask is None:

@@ -461,12 +461,12 @@ def backward_warp(
             - shift_col
         )
 
-    grid_r = 2.0 * sample_r / (h - 1) - 1.0
-    grid_c = 2.0 * sample_c / (w - 1) - 1.0
+    grid_row = 2.0 * sample_r / (h - 1) - 1.0
+    grid_col = 2.0 * sample_c / (w - 1) - 1.0
     # Pass as (1, N, H, W) with a single (1, H, W, 2) grid so grid_sample applies
     # one grid to all N channels in one kernel call. The alternative (N, 1, H, W)
     # with (N, H, W, 2) materialises N identical grids — 4096× more memory for EDS.
-    grid = torch.stack([grid_c, grid_r], dim=-1)[None]  # (1, H, W, 2)
+    grid = torch.stack([grid_col, grid_row], dim=-1)[None]  # (1, H, W, 2) — col first per grid_sample convention
 
     out = torch.nn.functional.grid_sample(
         images[None], grid, mode=mode,
@@ -632,28 +632,28 @@ def backward_warp_grid_search(
     all_costs = []
     for chunk_start in range(0, num_candidates, chunk_size):
         chunk_end = min(chunk_start + chunk_size, num_candidates)
-        cs = chunk_end - chunk_start
+        n_chunk = chunk_end - chunk_start
         drift_chunk = drift_vectors[chunk_start:chunk_end]
 
-        dr = drift_chunk[:, 0]  # (cs,)
-        dc = drift_chunk[:, 1]  # (cs,)
+        drift_row_rate = drift_chunk[:, 0]  # (n_chunk,)
+        drift_col_rate = drift_chunk[:, 1]  # (n_chunk,)
 
-        row_shift = dr[:, None] * offset[None, :]  # (cs, H)
-        col_shift = dc[:, None] * offset[None, :]  # (cs, H)
+        row_shift = drift_row_rate[:, None] * offset[None, :]  # (n_chunk, H)
+        col_shift = drift_col_rate[:, None] * offset[None, :]  # (n_chunk, H)
 
-        samp_r = rows[None, :, None].expand(cs, h, w) - row_shift[:, :, None]
-        samp_c = cols[None, None, :].expand(cs, h, w) - col_shift[:, :, None]
+        sample_rows = rows[None, :, None].expand(n_chunk, h, w) - row_shift[:, :, None]
+        sample_cols = cols[None, None, :].expand(n_chunk, h, w) - col_shift[:, :, None]
 
-        grid_y = 2.0 * samp_r / (h - 1) - 1.0
-        grid_x = 2.0 * samp_c / (w - 1) - 1.0
-        grid = torch.stack([grid_x, grid_y], dim=-1)
+        grid_row = 2.0 * sample_rows / (h - 1) - 1.0
+        grid_col = 2.0 * sample_cols / (w - 1) - 1.0
+        grid = torch.stack([grid_col, grid_row], dim=-1)  # col first per grid_sample convention
 
         warped = torch.nn.functional.grid_sample(
-            mov_image[None, None].expand(cs, 1, h, w), grid,
+            mov_image[None, None].expand(n_chunk, 1, h, w), grid,
             mode="bicubic", align_corners=True, padding_mode="border",
         )[:, 0]
 
-        ref_batch = ref_image[None].expand(cs, -1, -1)
+        ref_batch = ref_image[None].expand(n_chunk, -1, -1)
         costs = cross_corr_batch(
             ref_batch, warped, upsample_factor,
             max_shift_mask=shift_mask, freq_grids=freq_grids,
@@ -730,11 +730,11 @@ def gaussian_smooth_1d(
 
 
 def _dft_refine_shifts(
-    cross_corr_fft,
-    peak_row,
-    peak_col,
-    upsample_factor,
-):
+    cross_corr_fft: torch.Tensor,
+    peak_row: torch.Tensor,
+    peak_col: torch.Tensor,
+    upsample_factor: int,
+) -> torch.Tensor:
     """Refine coarse sub-pixel shifts using DFT upsampling + parabolic fit.
 
     After ``_parabolic_peak_2d`` gives a coarse sub-pixel position, this
@@ -868,7 +868,14 @@ def _dft_upsample_batch(
 # ---------------------------------------------------------------------------
 
 
-def _parabolic_peak_2d(cross_corr, peak_row, peak_col, num_rows, num_cols, batch_idx):
+def _parabolic_peak_2d(
+    cross_corr: torch.Tensor,
+    peak_row: torch.Tensor,
+    peak_col: torch.Tensor,
+    num_rows: int,
+    num_cols: int,
+    batch_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Refine an integer cross-correlation peak to sub-pixel precision.
 
     Extracts the 3-point stencil along each axis and fits a parabola.
@@ -906,7 +913,12 @@ def _parabolic_peak_2d(cross_corr, peak_row, peak_col, num_rows, num_cols, batch
     return refined_row, refined_col
 
 
-def _parabolic_sub_pixel(val_m1, val_0, val_p1, mask=None):
+def _parabolic_sub_pixel(
+    val_m1: torch.Tensor,
+    val_0: torch.Tensor,
+    val_p1: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Sub-pixel offset from a 3-point stencil via parabolic interpolation.
 
     Cross-correlation peaks fall on integer pixel positions, but the true
@@ -979,7 +991,7 @@ def _symmetric_pad(
     return field_stack
 
 
-def _gaussian_kernel_1d(sigma, dtype, device, _cache={}):
+def _gaussian_kernel_1d(sigma: float, dtype: torch.dtype, device: torch.device, _cache: dict = {}) -> torch.Tensor:
     """Normalized 1D Gaussian ``exp(-0.5*(x/sigma)^2)``, radius ``4*sigma``.
 
     Cached via mutable default arg - the grid search calls this ~800 times

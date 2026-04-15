@@ -79,7 +79,7 @@ class DriftCorrection(AutoSerialize):
     Instantiate the DriftCorrection class, run preprocessing and alignment, and save/load results:
 
     >>> drift = DriftCorrection.from_data(
-    ...     images=[
+    ...     imgs=[
     ...         image0,  # 2D numpy array or Dataset2d
     ...         image1,
     ...     ],
@@ -142,7 +142,7 @@ class DriftCorrection(AutoSerialize):
 
     def __init__(
         self,
-        images: list[Dataset2d],
+        imgs: list[Dataset2d],
         scan_direction_degrees: NDArray,
         _token: object | None = None,
     ):
@@ -151,7 +151,7 @@ class DriftCorrection(AutoSerialize):
                 "Use DriftCorrection.from_data() or .from_file() to instantiate this class."
             )
 
-        self.images = images
+        self.imgs = imgs
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
 
         device, _ = validate_device(None)
@@ -174,13 +174,13 @@ class DriftCorrection(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
+        imgs: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
-        validated_images = validate_list_of_dataset2d(images)
+        validated_images = validate_list_of_dataset2d(imgs)
 
         return cls(
-            images=validated_images,
+            imgs=validated_images,
             scan_direction_degrees=scan_direction_degrees,
             _token=cls._token,
         )
@@ -247,22 +247,22 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> drift = DriftCorrection.from_data(
-        ...     images=[im0, im1], scan_direction_degrees=[0, 90])
+        ...     imgs=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
 
         For mixed-type images (HAADF + VDF), use normalize:
 
         >>> drift = DriftCorrection.from_data(
-        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
         if normalize:
-            for img in self.images:
+            for img in self.imgs:
                 arr = img.array.astype(np.float32)
                 lo, hi = arr.min(), arr.max()
                 img.array = (arr - lo) / (hi - lo + 1e-8)
         self.pad_fraction = float(pad_fraction)
-        self.pad_value = validate_pad_value(pad_value, self.images)
+        self.pad_value = validate_pad_value(pad_value, self.imgs)
         self.kde_sigma = float(kde_sigma)
         self.number_knots = int(number_knots)
         self.scan_direction = np.deg2rad(self.scan_direction_degrees)
@@ -271,15 +271,15 @@ class DriftCorrection(AutoSerialize):
         self.scan_slow = np.stack(
             [np.cos(-self.scan_direction), -np.sin(-self.scan_direction)], axis=1)
         self.shape = (
-            len(self.images),
-            int(np.round(self.images[0].shape[0] * (1 + self.pad_fraction) / 2) * 2),
-            int(np.round(self.images[0].shape[1] * (1 + self.pad_fraction) / 2) * 2),
+            len(self.imgs),
+            int(np.round(self.imgs[0].shape[0] * (1 + self.pad_fraction) / 2) * 2),
+            int(np.round(self.imgs[0].shape[1] * (1 + self.pad_fraction) / 2) * 2),
         )
         # Initialize knots - each image's scanlines mapped to the padded canvas
         self.knots = [
             torch.tensor(
                 initialize_scanline_knots(
-                    input_shape=self.images[img_idx].shape,
+                    input_shape=self.imgs[img_idx].shape,
                     output_shape=self.shape[1:],
                     scan_fast=self.scan_fast[img_idx],
                     scan_slow=self.scan_slow[img_idx],
@@ -292,7 +292,7 @@ class DriftCorrection(AutoSerialize):
         ]
         self.interpolator = [
             _DriftInterpolator(
-                input_shape=self.images[i].shape,
+                input_shape=self.imgs[i].shape,
                 output_shape=self.shape[1:],
                 scan_fast=self.scan_fast[i],
                 scan_slow=self.scan_slow[i],
@@ -304,8 +304,8 @@ class DriftCorrection(AutoSerialize):
         # Cache source data on GPU and generate initial warped images
         device = self._device
         dtype = self._dtype
-        self.images_t = [
-            torch.tensor(self.images[i].array, dtype=dtype, device=device)
+        self.imgs_t = [
+            torch.tensor(self.imgs[i].array, dtype=dtype, device=device)
             for i in range(self.shape[0])
         ]
         self.scan_fast_t = [
@@ -318,9 +318,9 @@ class DriftCorrection(AutoSerialize):
         warped_t = torch.zeros(self.shape[0], *canvas_shape, dtype=dtype, device=device)
         for img_idx in range(self.shape[0]):
             row_t, col_t = transform_coordinates_single_knot(
-                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.imgs[img_idx].shape)
             warped, weights = bilinear_kde_batch(
-                row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
+                row_t[None], col_t[None], self.imgs_t[img_idx], canvas_shape,
                 self.kde_sigma, self.pad_value[img_idx])
             warped_t[img_idx] = warped[0]
             self.imgs_warped.array[img_idx] = warped[0].cpu().numpy()
@@ -377,7 +377,7 @@ class DriftCorrection(AutoSerialize):
             self.imgs_warped.array[img_idx], self.weights_warped.array[img_idx] = self.interpolator[
                 img_idx
             ].warp_image(
-                self.images[img_idx].array,
+                self.imgs[img_idx].array,
                 self.knots[img_idx].cpu().numpy(),
             )
         kwargs.pop("title", None)
@@ -471,13 +471,13 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> drift = DriftCorrection.from_data(
-        ...     images=[im0, im1], scan_direction_degrees=[0, 90])
+        ...     imgs=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
 
         Single-sided alignment (4D-STEM VDF against a fixed HAADF reference):
 
         >>> drift = DriftCorrection.from_data(
-        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess().align_affine(fixed_indices=[0])
         """
         if self.shape[0] < 2:
@@ -561,7 +561,7 @@ class DriftCorrection(AutoSerialize):
         else:
             self.affine_confidence_margin = coarse_margin
         if verbose:
-            num_rows = self.images[0].shape[0]
+            num_rows = self.imgs[0].shape[0]
             drift_rate = np.sqrt(drift_total[0] ** 2 + drift_total[1] ** 2)
             total_shift = drift_rate * num_rows
             angle_deg = np.degrees(np.arctan2(drift_total[1], drift_total[0]))
@@ -571,9 +571,9 @@ class DriftCorrection(AutoSerialize):
             msg = (f"Drift: ({drift_total[0]:+.4f}, {drift_total[1]:+.4f}) px/line, "
                    f"{drift_rate:.4f} magnitude, {angle_deg:.1f} deg, "
                    f"{total_shift:.1f} px total over {num_rows} lines")
-            if self.images[0].sampling is not None:
-                px_size = self.images[0].sampling[0]
-                unit = self.images[0].units[0] if self.images[0].units else "px"
+            if self.imgs[0].sampling is not None:
+                px_size = self.imgs[0].sampling[0]
+                unit = self.imgs[0].units[0] if self.imgs[0].units else "px"
                 msg += f" = {total_shift * px_size:.2f} {unit}"
             print(msg)
             err = self.error_track
@@ -653,29 +653,29 @@ class DriftCorrection(AutoSerialize):
         # with grid_sample (no canvas, no KDE).
         if fixed_set:
             fixed_idx = sorted(fixed_set)[0]
-            moving_indices = [i for i in range(len(self.images_t)) if i not in fixed_set]
+            moving_indices = [i for i in range(len(self.imgs_t)) if i not in fixed_set]
             if not moving_indices:
                 raise ValueError("All images are fixed — nothing to optimize.")
             total_costs = None
             for mov_idx in moving_indices:
                 _, costs = backward_warp_grid_search(
-                    self.images_t[fixed_idx], self.images_t[mov_idx],
+                    self.imgs_t[fixed_idx], self.imgs_t[mov_idx],
                     drift_vectors_t, upsample_factor, max_image_shift,
                     chunk_size)
                 total_costs = costs if total_costs is None else total_costs + costs
             return torch.argmin(total_costs).item(), total_costs
 
         canvas_shape = (self.shape[1], self.shape[2])
-        n_images = len(self.images_t)
+        n_images = len(self.imgs_t)
         # Base coordinates shared across all candidates
         base_data = []
         for img_idx in range(n_images):
             row_base, col_base = transform_coordinates_single_knot(
-                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.imgs[img_idx].shape)
             num_rows = self.knots[img_idx].shape[1]
             scanline_offset = (torch.arange(num_rows, dtype=dtype, device=device)
                                - (num_rows - 1) / 2)
-            base_data.append((self.images_t[img_idx], row_base, col_base, scanline_offset))
+            base_data.append((self.imgs_t[img_idx], row_base, col_base, scanline_offset))
         # Precompute shift mask and frequency grids (shared across chunks)
         shift_mask = None
         if max_image_shift is not None:
@@ -823,9 +823,9 @@ class DriftCorrection(AutoSerialize):
                 else:
                     knots_img = self.knots[img_idx]
                 row_t, col_t = transform_coordinates_single_knot(
-                    knots_img, self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                    knots_img, self.scan_fast_t[img_idx], self.imgs[img_idx].shape)
                 warped, weights = bilinear_kde_batch(
-                    row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
+                    row_t[None], col_t[None], self.imgs_t[img_idx], canvas_shape,
                     self.kde_sigma, self.pad_value[img_idx])
                 warped_t[img_idx] = warped[0]
                 weights_t[img_idx] = weights[0]
@@ -1100,7 +1100,7 @@ class DriftCorrection(AutoSerialize):
                 [self.knots[i][:, :, 0] for i in range(num_images)]
             ).detach().requires_grad_(True)
             num_rows_knot = knots_batch.shape[2]
-            target_batch = torch.stack(self.images_t)
+            target_batch = torch.stack(self.imgs_t)
             # Build u tensors once and reuse - same scan-position vector projects
             # onto row and col offsets via the per-image scan_fast components.
             u_t = [
@@ -1108,11 +1108,11 @@ class DriftCorrection(AutoSerialize):
                 for i in range(num_images)
             ]
             row_scan_offsets = torch.stack([
-                u_t[i] * (self.interpolator[i].scan_fast[0] * (self.images[i].shape[0] - 1))
+                u_t[i] * (self.interpolator[i].scan_fast[0] * (self.imgs[i].shape[0] - 1))
                 for i in range(num_images)
             ])
             col_scan_offsets = torch.stack([
-                u_t[i] * (self.interpolator[i].scan_fast[1] * (self.images[i].shape[1] - 1))
+                u_t[i] * (self.interpolator[i].scan_fast[1] * (self.imgs[i].shape[1] - 1))
                 for i in range(num_images)
             ])
             row_scale = 2.0 / (canvas_shape[0] - 1)
@@ -1145,10 +1145,10 @@ class DriftCorrection(AutoSerialize):
             # contrast differences between reference and target.
             _original_images_t = None
             if loss == "gradient_mse":
-                _original_images_t = list(self.images_t)
+                _original_images_t = list(self.imgs_t)
                 sobel_batch = self._sobel_gradient_magnitude(
                     target_batch, loss_pre_smooth, device, dtype)
-                self.images_t = [sobel_batch[i] for i in range(num_images)]
+                self.imgs_t = [sobel_batch[i] for i in range(num_images)]
                 target_batch = sobel_batch
             warped_t = self._warp_and_translate_torch(
                 max_image_shift, upsample_factor=8, knots_batch=knots_batch,
@@ -1214,7 +1214,7 @@ class DriftCorrection(AutoSerialize):
             # apply_correction, visualization, and error metrics use the
             # original pixel intensities, not edge-filtered versions.
             if _original_images_t is not None:
-                self.images_t = _original_images_t
+                self.imgs_t = _original_images_t
             self._images_warped_stale = True
             self._max_image_shift_cached = max_image_shift
             if error_buffer:
@@ -1443,7 +1443,7 @@ class DriftCorrection(AutoSerialize):
                               + image_ref[rf + 1, cf] * dr * (1 - dc)
                               + image_ref[rf, cf + 1] * (1 - dr) * dc
                               + image_ref[rf + 1, cf + 1] * dr * dc)
-                    return np.sum((warped - self.images[idx].array[row_ind, :]) ** 2)
+                    return np.sum((warped - self.imgs[idx].array[row_ind, :]) ** 2)
                 result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                 knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
         else:
@@ -1458,7 +1458,7 @@ class DriftCorrection(AutoSerialize):
                           + image_ref[rf + 1, cf] * dr * (1 - dc)
                           + image_ref[rf, cf + 1] * (1 - dr) * dc
                           + image_ref[rf + 1, cf + 1] * dr * dc)
-                return np.sum((warped - self.images[idx].array) ** 2)
+                return np.sum((warped - self.imgs[idx].array) ** 2)
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
@@ -1540,11 +1540,11 @@ class DriftCorrection(AutoSerialize):
 
         for img_idx in range(self.shape[0]):
             row_t, col_t = transform_coordinates_single_knot(
-                self.knots[img_idx], self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                self.knots[img_idx], self.scan_fast_t[img_idx], self.imgs[img_idx].shape)
             warped, weights = bilinear_kde_batch(
                 row_t[None] * upsample_factor,
                 col_t[None] * upsample_factor,
-                self.images_t[img_idx],
+                self.imgs_t[img_idx],
                 canvas_up,
                 kde_sigma * upsample_factor,
                 self.pad_value[img_idx],
@@ -1608,9 +1608,9 @@ class DriftCorrection(AutoSerialize):
         image_corr = Dataset2d.from_array(
             torch.fft.ifft2(image_corr_fft).real.cpu().numpy(),
             name="drift corrected image",
-            origin=self.images[0].origin,
-            sampling=self.images[0].sampling,
-            units=self.images[0].units,
+            origin=self.imgs[0].origin,
+            sampling=self.imgs[0].sampling,
+            units=self.imgs[0].units,
         )
 
         if show_image:
@@ -1653,7 +1653,7 @@ class DriftCorrection(AutoSerialize):
         Examples
         --------
         >>> dc = DriftCorrection.from_data(
-        ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
+        ...     imgs=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> dc.preprocess(normalize=True).align_affine(fixed_indices=[0])
         >>> dc.align_nonrigid(fixed_indices=[0])
         >>> corrected_vdf = dc.apply_correction(mode='bicubic')
@@ -1682,7 +1682,7 @@ class DriftCorrection(AutoSerialize):
         knot_h = drift_per_row.shape[1]
 
         if images is None:
-            images_t = self.images_t[idx]
+            images_t = self.imgs_t[idx]
         elif isinstance(images, np.ndarray):
             images_t = torch.tensor(
                 images, dtype=self._dtype, device=self._device
@@ -1700,9 +1700,10 @@ class DriftCorrection(AutoSerialize):
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
+    @torch.inference_mode()
     def apply_correction_4dstem(
         self,
-        cube: torch.Tensor | np.ndarray,
+        ds_4d: torch.Tensor | np.ndarray,
         image_index: int = -1,
         mode: str = "bicubic",
         chunk_size: int | None = None,
@@ -1718,9 +1719,9 @@ class DriftCorrection(AutoSerialize):
 
         Parameters
         ----------
-        cube : torch.Tensor or np.ndarray
-            3D cube ``(H, W, C)`` for EDX/EELS spectral data, or
-            4D cube ``(H, W, det_h, det_w)`` for 4D-STEM.
+        ds_4d : torch.Tensor or np.ndarray
+            3D array ``(H, W, C)`` for EDX/EELS spectral data, or
+            4D array ``(H, W, det_h, det_w)`` for 4D-STEM.
             The first two axes must be scan rows and columns matching
             the shape used in :meth:`preprocess`.
         image_index : int, default -1
@@ -1752,22 +1753,23 @@ class DriftCorrection(AutoSerialize):
 
         Examples
         --------
-        >>> # EDX spectral cube — auto single-shot
+        >>> # EDX spectral cube - auto single-shot
         >>> corrected = dc.apply_correction_4dstem(cube_eds)
-        >>> # 4D-STEM — keep on GPU for fastest throughput
+        >>> # 4D-STEM - keep on GPU for fastest throughput
         >>> corrected = dc.apply_correction_4dstem(
         ...     cube_4d, output_device="cuda")
         """
-        return_numpy = isinstance(cube, np.ndarray) and output_device is None
-        is_numpy = isinstance(cube, np.ndarray)
+        import torch.nn.functional as F
 
-        original_shape = cube.shape if is_numpy else tuple(cube.shape)
-        input_np_dtype = cube.dtype if is_numpy else None
+        return_numpy = isinstance(ds_4d, np.ndarray) and output_device is None
+        is_numpy = isinstance(ds_4d, np.ndarray)
+        original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
+        input_np_dtype = ds_4d.dtype if is_numpy else None
 
         ndim = len(original_shape)
         if ndim < 3:
             raise ValueError(
-                f"cube must be at least 3D, got shape {original_shape}"
+                f"ds_4d must be at least 3D, got shape {original_shape}"
             )
 
         scan_h, scan_w = original_shape[0], original_shape[1]
@@ -1775,83 +1777,71 @@ class DriftCorrection(AutoSerialize):
         for d in range(2, ndim):
             n_channels *= original_shape[d]
 
-        # ── Decide: single-shot vs chunked ──
-        f32_cube_bytes = n_channels * scan_h * scan_w * 4  # float32
-        # Memory for grid_sample: f32 input (C,H,W) + f32 output (C,H,W).
-        # When input is on GPU as a non-f32 dtype (e.g. uint16 from
-        # quantem.live), the original is managed outside PyTorch's
-        # allocator (CuPy) so mem_get_info already accounts for it.
-        additional_gpu_bytes = f32_cube_bytes * 2
+        device = torch.device(self._device)
 
-        use_single_shot = chunk_size is None
-        if use_single_shot:
-            try:
-                gpu_free, _ = torch.cuda.mem_get_info(self._device)
-                use_single_shot = additional_gpu_bytes < gpu_free * 0.95
-            except RuntimeError:
-                use_single_shot = False
+        # ── Per-row drift from knots ──
+        idx = image_index % len(self.knots)
+        delta = self.knots[idx] - self._initial_knots[idx]   # (2, H_knot, K)
+        drift = delta[:, :, 0].to(device=device, dtype=torch.float32)
 
-        if use_single_shot:
-            return self._apply_cube_single_shot(
-                cube, original_shape, scan_h, scan_w, n_channels,
-                is_numpy, return_numpy, input_np_dtype,
-                image_index, mode, output_dtype, output_device,
+        if drift.shape[1] != scan_h:
+            raise ValueError(
+                f"Drift grid has {drift.shape[1]} rows but ds_4d has "
+                f"{scan_h} scan rows. Ensure reference image and ds_4d "
+                f"have matching scan dimensions (check padding / resize)."
             )
 
-        # ── Chunked fallback ──
-        _cs = chunk_size if chunk_size is not None else 256
-        return self._apply_cube_chunked(
-            cube, original_shape, scan_h, scan_w, n_channels,
-            is_numpy, return_numpy, input_np_dtype,
-            image_index, mode, _cs, output_dtype, output_device,
-            progress,
+        # ── Pre-compute warp grid ONCE (tiny: 1×H×W×2 f32) ──
+        row_coords = torch.arange(scan_h, device=device, dtype=torch.float32)
+        col_coords = torch.arange(scan_w, device=device, dtype=torch.float32)
+        sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift[0][:, None]
+        sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift[1][:, None]
+        warp_grid = torch.stack([
+            2.0 * sample_col / (scan_w - 1) - 1.0,
+            2.0 * sample_row / (scan_h - 1) - 1.0,
+        ], dim=-1).unsqueeze(0)                               # (1, H, W, 2)
+
+        # ── Flatten to (H, W, C) ──
+        flat = (
+            torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
+            if is_numpy
+            else ds_4d.reshape(scan_h, scan_w, n_channels)
         )
 
-    def _apply_cube_single_shot(
-        self,
-        cube,
-        original_shape,
-        scan_h, scan_w, n_channels,
-        is_numpy, return_numpy, input_np_dtype,
-        image_index, mode, output_dtype, output_device,
-    ):
-        """Upload entire cube to GPU → single grid_sample → return."""
-        if is_numpy:
-            cube_chw = torch.from_numpy(cube.reshape(scan_h, scan_w, n_channels)).to(
-                device=self._device, dtype=self._dtype).permute(2, 0, 1)
-        else:
-            cube_chw = cube.reshape(scan_h, scan_w, n_channels).to(
-                device=self._device, dtype=self._dtype).permute(2, 0, 1)
-        result_hwc = self.apply_correction(
-            images=cube_chw, image_index=image_index, mode=mode,
-        ).permute(1, 2, 0)
-        return self._finalize_cube_output(
-            result_hwc, original_shape, is_numpy, return_numpy,
-            input_np_dtype, output_dtype, output_device,
-        )
-
-    def _apply_cube_chunked(
-        self,
-        cube,
-        original_shape,
-        scan_h, scan_w, n_channels,
-        is_numpy, return_numpy, input_np_dtype,
-        image_index, mode, chunk_size, output_dtype, output_device,
-        progress,
-    ):
-        """Process cube in chunks when it doesn't fit on GPU."""
-        flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
-
-        # Allocate output on CPU
-        _out_dt = torch.float32
-        if output_dtype == "same" and not is_numpy:
-            _out_dt = cube.dtype
+        # ── Output dtype ──
+        out_dt = torch.float32
+        if output_dtype == "same":
+            if is_numpy and input_np_dtype is not None:
+                out_dt = torch.from_numpy(np.empty(0, dtype=input_np_dtype)).dtype
+            elif not is_numpy:
+                out_dt = ds_4d.dtype
         elif isinstance(output_dtype, torch.dtype):
-            _out_dt = output_dtype
-        out_hwc = torch.empty(
-            (scan_h, scan_w, n_channels), dtype=_out_dt, device="cpu",
-        )
+            out_dt = output_dtype
 
+        # ── Target device ──
+        if output_device is not None:
+            target = torch.device(output_device)
+            if target.type == "cuda":
+                target = device
+        else:
+            target = torch.device("cpu")
+
+        # ── Chunk size ──
+        if chunk_size is None:
+            bytes_per_ch = scan_h * scan_w * 4
+            try:
+                gpu_free, _ = torch.cuda.mem_get_info(device)
+            except RuntimeError:
+                gpu_free = 0
+            if target.type == "cuda":
+                out_elem = torch.tensor([], dtype=out_dt).element_size()
+                gpu_free = max(0, gpu_free - n_channels * scan_h * scan_w * out_elem)
+            chunk_size = min(n_channels, max(1, int(gpu_free * 0.7 / (bytes_per_ch * 2))))
+
+        # ── Allocate output on target device ──
+        output = torch.empty(scan_h, scan_w, n_channels, dtype=out_dt, device=target)
+
+        # ── Vectorized grid_sample with pre-computed grid ──
         chunks = range(0, n_channels, chunk_size)
         if progress:
             chunks = tqdm(
@@ -1860,66 +1850,21 @@ class DriftCorrection(AutoSerialize):
                 desc="apply_correction_4dstem",
                 unit="chunk",
             )
-
         for start in chunks:
             end = min(start + chunk_size, n_channels)
-            slice_hwc = flat_hwc[:, :, start:end]
-            if is_numpy:
-                chunk_gpu = torch.from_numpy(
-                    np.ascontiguousarray(slice_hwc.transpose(2, 0, 1))
-                ).to(device=self._device, dtype=self._dtype)
-            else:
-                chunk_gpu = slice_hwc.permute(2, 0, 1).to(
-                    device=self._device, dtype=self._dtype
-                )
+            chunk_chw = flat[:, :, start:end].permute(2, 0, 1).contiguous()
+            chunk_f32 = chunk_chw.to(device=device, dtype=torch.float32).unsqueeze(0)
+            warped = F.grid_sample(
+                chunk_f32, warp_grid,
+                mode=mode, align_corners=True, padding_mode="border",
+            )
+            output[:, :, start:end] = warped.squeeze(0).permute(1, 2, 0).to(
+                device=target, dtype=out_dt)
+            del chunk_chw, chunk_f32, warped
 
-            out_hwc[:, :, start:end] = self.apply_correction(
-                images=chunk_gpu, image_index=image_index, mode=mode,
-            ).permute(1, 2, 0).cpu().to(_out_dt)
-
-        result_hwc = out_hwc
-        if output_device is not None:
-            dev = torch.device(output_device)
-            if dev.type == "cuda":
-                result_hwc = result_hwc.to(device=self._device)
-        return self._finalize_cube_output(
-            result_hwc, original_shape, is_numpy, return_numpy,
-            input_np_dtype, output_dtype, output_device,
-        )
-
-    def _finalize_cube_output(
-        self,
-        result_hwc,
-        original_shape,
-        is_numpy, return_numpy, input_np_dtype,
-        output_dtype, output_device,
-    ):
-        """Reshape, cast dtype, move to target device."""
-        # Apply output dtype
-        if output_dtype == "same":
-            if is_numpy and input_np_dtype is not None:
-                # cast to the torch equivalent of the original numpy dtype, then fall through
-                result_hwc = result_hwc.to(dtype=torch.from_numpy(np.empty(0, dtype=input_np_dtype)).dtype)
-        elif output_dtype is not None:
-            result_hwc = result_hwc.to(dtype=output_dtype)
-
-        result = result_hwc.reshape(original_shape)
-
-        # Move to target device
-        if output_device is not None:
-            dev = torch.device(output_device)
-            if dev.type == "cuda" and not result.is_cuda:
-                result = result.to(device=self._device)
-            elif dev.type == "cpu" and result.is_cuda:
-                result = result.cpu()
-            return result
-
+        result = output.reshape(original_shape)
         if return_numpy:
-            if result.is_cuda:
-                result = result.cpu()
-            return result.numpy()
-        if result.is_cuda:
-            result = result.cpu()
+            return result.cpu().numpy() if result.is_cuda else result.numpy()
         return result
 
     def calculate_error(

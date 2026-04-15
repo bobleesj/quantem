@@ -7,7 +7,10 @@ See PR #133 for images: https://github.com/electronmicroscopy/quantem/pull/133
 
 import numpy as np
 import pytest
-from scipy.ndimage import gaussian_filter
+import torch
+import matplotlib
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter, map_coordinates
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
 
@@ -101,7 +104,7 @@ def test_full_pipeline_deterministic():
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     drift = DriftCorrection.from_data(
-        images=[im0, im1],
+        imgs=[im0, im1],
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -127,7 +130,7 @@ def test_full_pipeline_deterministic():
     # Determinism: second run with same seed must match exactly
     im0_2, im1_2, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift2 = DriftCorrection.from_data(
-        images=[im0_2, im1_2],
+        imgs=[im0_2, im1_2],
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -162,7 +165,7 @@ def test_preprocess_single_image_builds_centered_canvas():
     im0, _, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     drift = DriftCorrection.from_data(
-        images=[im0],
+        imgs=[im0],
         scan_direction_degrees=[0.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -196,7 +199,7 @@ def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0
     """Affine on synthetic data must match frozen float32 baseline."""
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -228,7 +231,7 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -269,7 +272,7 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -319,7 +322,7 @@ def test_align_affine_fixed_indices_recovers_known_drift():
 
     # Save initial knots for reference image to verify they don't change
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -359,7 +362,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run without fixed_indices
     drift_a = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_a.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -368,7 +371,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run with explicit fixed_indices=None
     drift_b = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_b.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -394,13 +397,13 @@ def test_preprocess_normalize_scales_to_unit_range():
     im1_scaled = im1 * 1000 + 5000
 
     dc = DriftCorrection.from_data(
-        images=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
     )
     dc.preprocess(normalize=True, show_merged=False, show_images=False)
 
-    for i in range(2):
-        arr = dc.images[i].array
-        assert arr.min() >= -0.01, f"Image {i} min={arr.min()}"
+    for img_idx in range(2):
+        arr = dc.imgs[img_idx].array
+        assert arr.min() >= -0.01, f"Image {img_idx} min={arr.min()}"
         assert arr.max() <= 1.01, f"Image {i} max={arr.max()}"
 
 
@@ -433,7 +436,7 @@ def test_align_nonrigid_fixed_indices_freezes_reference():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -484,7 +487,7 @@ def test_align_nonrigid_fixed_indices_reduces_error():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -515,7 +518,7 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
     """fixed_indices covering all images should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -548,7 +551,7 @@ def test_align_nonrigid_gradient_mse_runs():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -573,8 +576,7 @@ def test_align_nonrigid_gradient_mse_runs():
         drift.knots[1].cpu().numpy(), knots_after_affine.cpu().numpy()
     ), "gradient_mse should modify the moving image knots"
     # images_t should contain original (non-Sobel) images after alignment
-    import torch
-    orig_stack = torch.stack(drift.images_t)
+    orig_stack = torch.stack(drift.imgs_t)
     assert orig_stack.min() >= 0, "images_t should be restored (gradient images can be negative)"
 
 
@@ -598,7 +600,7 @@ def test_align_nonrigid_gradient_mse_lbfgs():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -641,7 +643,7 @@ def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
 
     def run_with_loss(loss_name, **kwargs):
         drift = DriftCorrection.from_data(
-            images=[reference, moving],
+            imgs=[reference, moving],
             scan_direction_degrees=[0.0, 0.0],
         ).preprocess(
             pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -671,7 +673,7 @@ def test_align_nonrigid_invalid_loss_raises():
     """Invalid loss name should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="loss must be one of"):
@@ -685,7 +687,7 @@ def test_align_nonrigid_gradient_mse_scipy_raises():
     """gradient_mse with scipy backend should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+        imgs=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="only supported with backend='pytorch'"):
@@ -715,7 +717,7 @@ def test_align_nonrigid_regularization_sigma_none():
     ).astype(np.float32)
 
     drift = DriftCorrection.from_data(
-        images=[reference, moving],
+        imgs=[reference, moving],
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -742,17 +744,15 @@ def test_align_nonrigid_regularization_sigma_none():
 def _make_single_sided_dc(scan_h=256, drift_rate=(0.05, 0.1), seed=42):
     """Helper: build a DriftCorrection with known single-sided drift."""
     np.random.seed(seed)
-    yy, xx = np.mgrid[:scan_h, :scan_h]
-    ref = np.sin(0.1 * yy + 0.15 * xx).astype(np.float32) * 50 + 100
+    row_coords, col_coords = np.mgrid[:scan_h, :scan_h]
+    ref = np.sin(0.1 * row_coords + 0.15 * col_coords).astype(np.float32) * 50 + 100
     rows = np.arange(scan_h, dtype=np.float32)
-    from scipy.ndimage import map_coordinates
-    rr, cc = np.mgrid[:scan_h, :scan_h]
-    src_r = rr - drift_rate[0] * rows[:, None]
-    src_c = cc - drift_rate[1] * rows[:, None]
-    drifted = map_coordinates(ref, [src_r, src_c], order=3, mode='nearest').astype(np.float32)
+    src_row = row_coords - drift_rate[0] * rows[:, None]
+    src_col = col_coords - drift_rate[1] * rows[:, None]
+    drifted = map_coordinates(ref, [src_row, src_col], order=3, mode='nearest').astype(np.float32)
 
     dc = DriftCorrection.from_data(
-        images=[ref, drifted],
+        imgs=[ref, drifted],
         scan_direction_degrees=[0.0, 0.0],
     )
     dc.preprocess(
@@ -788,7 +788,6 @@ def test_apply_correction_reduces_rms():
 def test_apply_correction_accepts_external_images():
     """apply_correction(images=...) should work on external arrays."""
     dc, ref, drifted = _make_single_sided_dc()
-    import torch
     # Pass external image as numpy
     result_np = dc.apply_correction(images=drifted, mode='bilinear')
     assert result_np.shape == drifted.shape
@@ -819,7 +818,7 @@ def test_apply_correction_wrong_height_raises():
 def test_apply_correction_before_preprocess_raises():
     """apply_correction before preprocess() should raise RuntimeError."""
     dc = DriftCorrection.from_data(
-        images=[np.zeros((64, 64)), np.zeros((64, 64))],
+        imgs=[np.zeros((64, 64)), np.zeros((64, 64))],
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -857,7 +856,6 @@ def test_apply_correction_with_nonrigid():
 
 def test_plot_correction_summary_runs():
     """plot_correction_summary should produce a figure without errors."""
-    import matplotlib
     matplotlib.use('Agg')  # non-interactive backend
     dc, ref, drifted = _make_single_sided_dc()
 
@@ -876,7 +874,6 @@ def test_plot_correction_summary_runs():
     )
     assert fig3 is not None
 
-    import matplotlib.pyplot as plt
     plt.close("all")
 
 
@@ -896,7 +893,7 @@ def test_drift_rate_matches_ground_truth():
 def test_drift_rate_before_align_raises():
     """drift_rate before preprocess/align should raise RuntimeError."""
     dc = DriftCorrection.from_data(
-        images=[np.zeros((32, 32)), np.zeros((32, 32))],
+        imgs=[np.zeros((32, 32)), np.zeros((32, 32))],
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -924,7 +921,6 @@ def test_print_drift_stats_with_nonrigid(capsys):
 
 def test_plot_correction_comparison_runs():
     """plot_correction_comparison should produce fig, axes, metrics."""
-    import matplotlib
     matplotlib.use('Agg')
     dc, _, _ = _make_single_sided_dc()
     # After affine only — should still work (no nonrigid)
@@ -933,13 +929,11 @@ def test_plot_correction_comparison_runs():
     assert "nonrigid bicubic" in metrics
     assert len(metrics) >= 2  # at least raw + nonrigid bicubic
 
-    import matplotlib.pyplot as plt
     plt.close("all")
 
 
 def test_plot_correction_comparison_with_nonrigid():
     """plot_correction_comparison after nonrigid should show all 4 modes."""
-    import matplotlib
     matplotlib.use('Agg')
     dc, _, _ = _make_single_sided_dc()
     dc.align_nonrigid(fixed_indices=[0], show_merged=False, show_images=False)
@@ -951,26 +945,22 @@ def test_plot_correction_comparison_with_nonrigid():
     assert "nonrigid bilinear" in metrics
     assert "nonrigid bicubic" in metrics
 
-    import matplotlib.pyplot as plt
     plt.close("all")
 
 
 def test_plot_radial_power_runs():
     """plot_radial_power should produce a figure."""
-    import matplotlib
     matplotlib.use('Agg')
     dc, _, _ = _make_single_sided_dc()
     fig, ax = dc.plot_radial_power(crop=40)
     assert fig is not None
     assert len(ax.get_lines()) >= 2  # at least ref + one method
 
-    import matplotlib.pyplot as plt
     plt.close("all")
 
 
 def test_plot_radial_power_custom_methods():
     """plot_radial_power with user-provided methods dict."""
-    import matplotlib
     matplotlib.use('Agg')
     dc, ref, drifted = _make_single_sided_dc()
     custom = {"reference": ref, "drifted": drifted}
@@ -978,7 +968,6 @@ def test_plot_radial_power_custom_methods():
     assert fig is not None
     assert len(ax.get_lines()) == 2
 
-    import matplotlib.pyplot as plt
     plt.close("all")
 
 
@@ -1003,15 +992,14 @@ def _apply_drift_to_channels(channels, drift_rate, scan_h):
     drifted : ndarray, shape (N, H, W)
         Drifted channels.
     """
-    from scipy.ndimage import map_coordinates
     rows = np.arange(scan_h, dtype=np.float32)
-    rr, cc = np.mgrid[:scan_h, :channels.shape[2]]
-    src_r = rr - drift_rate[0] * rows[:, None]
-    src_c = cc - drift_rate[1] * rows[:, None]
+    row_grid, col_grid = np.mgrid[:scan_h, :channels.shape[2]]
+    src_row = row_grid - drift_rate[0] * rows[:, None]
+    src_col = col_grid - drift_rate[1] * rows[:, None]
     drifted = np.empty_like(channels)
-    for i in range(channels.shape[0]):
-        drifted[i] = map_coordinates(
-            channels[i], [src_r, src_c], order=3, mode='nearest'
+    for channel_idx in range(channels.shape[0]):
+        drifted[channel_idx] = map_coordinates(
+            channels[channel_idx], [src_row, src_col], order=3, mode='nearest'
         ).astype(np.float32)
     return drifted
 
@@ -1026,27 +1014,28 @@ def _make_diverse_channels(ref, n_channels, seed=99):
     np.random.seed(seed)
     H, W = ref.shape
     channels = np.empty((n_channels, H, W), dtype=np.float32)
-    yy, xx = np.mgrid[:H, :W].astype(np.float32)
+    row_grid, col_grid = np.mgrid[:H, :W].astype(np.float32)
 
-    for i in range(n_channels):
-        if i % 4 == 0:
+    for channel_idx in range(n_channels):
+        if channel_idx % 4 == 0:
             # Localized Gaussian peak at random position
-            cy, cx = np.random.randint(H // 4, 3 * H // 4, size=2)
-            channels[i] = np.exp(-((yy - cy)**2 + (xx - cx)**2) / (2 * 30**2))
-        elif i % 4 == 1:
+            center_row, center_col = np.random.randint(H // 4, 3 * H // 4, size=2)
+            channels[channel_idx] = np.exp(
+                -((row_grid - center_row)**2 + (col_grid - center_col)**2) / (2 * 30**2))
+        elif channel_idx % 4 == 1:
             # Horizontal stripe pattern with different frequency
-            freq = 0.05 + 0.03 * i
-            channels[i] = (np.sin(freq * yy) + 1) * 50
-        elif i % 4 == 2:
+            freq = 0.05 + 0.03 * channel_idx
+            channels[channel_idx] = (np.sin(freq * row_grid) + 1) * 50
+        elif channel_idx % 4 == 2:
             # Masked quadrant of the reference
             mask = np.zeros((H, W), dtype=np.float32)
-            qr, qc = i % 2, (i // 2) % 2
-            mask[qr * H // 2:(qr + 1) * H // 2,
-                 qc * W // 2:(qc + 1) * W // 2] = 1.0
-            channels[i] = ref * mask
+            quad_row, quad_col = channel_idx % 2, (channel_idx // 2) % 2
+            mask[quad_row * H // 2:(quad_row + 1) * H // 2,
+                 quad_col * W // 2:(quad_col + 1) * W // 2] = 1.0
+            channels[channel_idx] = ref * mask
         else:
             # Smoothed + inverted reference
-            channels[i] = gaussian_filter(ref.max() - ref, sigma=3 + i)
+            channels[channel_idx] = gaussian_filter(ref.max() - ref, sigma=3 + channel_idx)
     return channels
 
 
@@ -1128,7 +1117,6 @@ def test_apply_correction_4d_stem_detector():
 
 def test_apply_correction_batch_matches_individual():
     """Batch correction must match per-channel correction exactly."""
-    import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     channels = _make_diverse_channels(ref, 6, seed=400)
@@ -1149,7 +1137,6 @@ def test_apply_correction_batch_matches_individual():
 
 def test_apply_correction_integer_input():
     """apply_correction transparently converts uint8/uint16 to float32."""
-    import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
 
@@ -1179,7 +1166,7 @@ def test_apply_correction_multi_knot_batch_raises():
     ref = np.random.randn(64, 64).astype(np.float32)
     drifted = np.roll(ref, 2, axis=1).astype(np.float32)
     dc = DriftCorrection.from_data(
-        images=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
+        imgs=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
     )
     dc.preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
@@ -1213,7 +1200,7 @@ def test_apply_correction_4dstem_3d_eds():
     cube = channels_drifted.transpose(1, 2, 0)
     assert cube.shape == (scan_h, scan_h, n_energy)
 
-    corrected = dc.apply_correction_4dstem(cube, chunk_size=4)
+    corrected = dc.apply_correction_4dstem(cube)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube.shape
 
@@ -1250,7 +1237,7 @@ def test_apply_correction_4dstem_4d_stem():
     )
     assert cube_4d.shape == (scan_h, scan_h, det_h, det_w)
 
-    corrected = dc.apply_correction_4dstem(cube_4d, chunk_size=8)
+    corrected = dc.apply_correction_4dstem(cube_4d)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube_4d.shape
 
@@ -1274,7 +1261,6 @@ def test_apply_correction_4dstem_4d_stem():
 
 def test_apply_correction_4dstem_matches_manual_chunking():
     """apply_correction_4dstem must produce same results as manual loop."""
-    import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     n_energy = 8
@@ -1284,7 +1270,7 @@ def test_apply_correction_4dstem_matches_manual_chunking():
     cube = drifted.transpose(1, 2, 0)  # (H, W, E)
 
     # apply_correction_4dstem
-    auto = dc.apply_correction_4dstem(cube, chunk_size=3)
+    auto = dc.apply_correction_4dstem(cube)
 
     # Manual chunking (what user had to do before)
     batch = cube.transpose(2, 0, 1)  # (E, H, W)
@@ -1297,13 +1283,12 @@ def test_apply_correction_4dstem_matches_manual_chunking():
 
 def test_apply_correction_4dstem_torch_input():
     """apply_correction_4dstem works with torch.Tensor input."""
-    import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     cube_np = np.random.randn(scan_h, scan_h, 6).astype(np.float32)
     cube_t = torch.from_numpy(cube_np)
 
-    result = dc.apply_correction_4dstem(cube_t, chunk_size=2)
+    result = dc.apply_correction_4dstem(cube_t)
     assert isinstance(result, torch.Tensor)
     assert result.shape == cube_t.shape
 
