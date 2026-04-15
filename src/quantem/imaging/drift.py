@@ -36,6 +36,7 @@ from quantem.imaging.drift_utils import (
 )
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
+import quantem.imaging.drift_viz as drift_viz
 
 
 class DriftCorrection(AutoSerialize):
@@ -104,8 +105,8 @@ class DriftCorrection(AutoSerialize):
     -----
     - Use `align_translation()` for rigid shifts, `align_affine()` for scan-shear or uniform drift,
       and `align_nonrigid()` for flexible per-row or per-image correction.
-    - The class stores resampled images in `self.images_warped` and the control knots in `self.knots`.
-    - Visualization is supported through `plot_merged_images()` and `plot_transformed_images()`.
+    - The class stores resampled images in `self.imgs_warped` and the control knots in `self.knots`.
+    - Visualization is supported through `plot_merged_images()` and `plot_warped_images()`.
 
     Performance
     -----------
@@ -290,7 +291,7 @@ class DriftCorrection(AutoSerialize):
             for img_idx in range(self.shape[0])
         ]
         self.interpolator = [
-            DriftInterpolator(
+            _DriftInterpolator(
                 input_shape=self.images[i].shape,
                 output_shape=self.shape[1:],
                 scan_fast=self.scan_fast[i],
@@ -311,7 +312,7 @@ class DriftCorrection(AutoSerialize):
             torch.tensor(self.scan_fast[i], dtype=dtype, device=device)
             for i in range(self.shape[0])
         ]
-        self.images_warped = Dataset3d.from_shape(self.shape)
+        self.imgs_warped = Dataset3d.from_shape(self.shape)
         self.weights_warped = Dataset3d.from_shape(self.shape)
         canvas_shape = (self.shape[1], self.shape[2])
         warped_t = torch.zeros(self.shape[0], *canvas_shape, dtype=dtype, device=device)
@@ -322,7 +323,7 @@ class DriftCorrection(AutoSerialize):
                 row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
                 self.kde_sigma, self.pad_value[img_idx])
             warped_t[img_idx] = warped[0]
-            self.images_warped.array[img_idx] = warped[0].cpu().numpy()
+            self.imgs_warped.array[img_idx] = warped[0].cpu().numpy()
             self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
         self._initial_knots = [k.clone() for k in self.knots]
         self.calculate_error(0, _warped_t=warped_t)
@@ -330,7 +331,7 @@ class DriftCorrection(AutoSerialize):
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
         if show_images:
-            self.plot_transformed_images(
+            self.plot_warped_images(
                 show_knots=show_knots,
                 title=[f"Image {i}: initial" for i in range(self.shape[0])],
                 **kwargs,
@@ -348,14 +349,14 @@ class DriftCorrection(AutoSerialize):
         **kwargs,
     ):
         """
-        Solve for the translation between all images in DriftCorrection.images_warped
+        Solve for the translation between all images in DriftCorrection.imgs_warped
         """
         shifts = np.zeros((self.shape[0], 2))
-        F_ref = np.fft.fft2(self.images_warped.array[0])
+        F_ref = np.fft.fft2(self.imgs_warped.array[0])
         for img_idx in range(1, self.shape[0]):
             shift, image_shift = cross_correlation_shift(
                 F_ref,
-                np.fft.fft2(self.images_warped.array[img_idx]),
+                np.fft.fft2(self.imgs_warped.array[img_idx]),
                 upsample_factor=upsample_factor,
                 max_shift=max_image_shift,
                 fft_input=True,
@@ -366,13 +367,14 @@ class DriftCorrection(AutoSerialize):
             F_ref = F_ref * img_idx / (img_idx + 1) + image_shift / (img_idx + 1)
         shifts -= np.mean(shifts, axis=0)
         if min_image_shift is not None:
-            if np.linalg.norm(shifts[img_idx]) < min_image_shift:
-                shifts[img_idx] = 0.0
+            for i in range(1, self.shape[0]):
+                if np.linalg.norm(shifts[i]) < min_image_shift:
+                    shifts[i] = 0.0
         for img_idx in range(self.shape[0]):
             self.knots[img_idx][0] += shifts[img_idx, 0]
             self.knots[img_idx][1] += shifts[img_idx, 1]
         for img_idx in range(self.shape[0]):
-            self.images_warped.array[img_idx], self.weights_warped.array[img_idx] = self.interpolator[
+            self.imgs_warped.array[img_idx], self.weights_warped.array[img_idx] = self.interpolator[
                 img_idx
             ].warp_image(
                 self.images[img_idx].array,
@@ -382,14 +384,13 @@ class DriftCorrection(AutoSerialize):
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
         if show_images:
-            self.plot_transformed_images(
+            self.plot_warped_images(
                 show_knots=show_knots,
                 title=[f"Image {i}: translation" for i in range(self.shape[0])],
                 **kwargs,
             )
         return self
 
-    # Affine alignment
     def align_affine(
         self,
         step: float = 0.01,
@@ -591,7 +592,7 @@ class DriftCorrection(AutoSerialize):
                 **kwargs,
             )
         if show_images:
-            self.plot_transformed_images(
+            self.plot_warped_images(
                 show_knots=show_knots,
                 title=[f"Image {i}: affine" for i in range(self.shape[0])],
                 **kwargs,
@@ -780,7 +781,7 @@ class DriftCorrection(AutoSerialize):
 
         Set ``solve_translation=False`` to only warp and sync without
         re-solving translation - used after the nonrigid loop to populate
-        ``self.images_warped`` from final knots.
+        ``self.imgs_warped`` from final knots.
 
         When ``fixed_indices`` is provided, translation shifts are anchored
         to those images (their shifts become zero) so that fixed images
@@ -833,7 +834,7 @@ class DriftCorrection(AutoSerialize):
         weights_t = torch.zeros_like(warped_t)
         _warp_all(warped_t, weights_t)
         if not solve_translation:
-            self.images_warped.array[:] = warped_t.cpu().numpy()
+            self.imgs_warped.array[:] = warped_t.cpu().numpy()
             self.weights_warped.array[:] = weights_t.cpu().numpy()
             return warped_t
         # Solve translation shifts and apply to knots
@@ -855,7 +856,7 @@ class DriftCorrection(AutoSerialize):
         # Re-warp with corrected knots
         _warp_all(warped_t, weights_t)
         if knots_batch is None:
-            self.images_warped.array[:] = warped_t.cpu().numpy()
+            self.imgs_warped.array[:] = warped_t.cpu().numpy()
             self.weights_warped.array[:] = weights_t.cpu().numpy()
         return warped_t
 
@@ -1059,9 +1060,9 @@ class DriftCorrection(AutoSerialize):
 
         Notes
         -----
-        With backend="pytorch", ``self.images_warped`` is left STALE after
+        With backend="pytorch", ``self.imgs_warped`` is left STALE after
         the loop and refreshed lazily on first access via plot methods or
-        ``calculate_error()``. Code that reads ``self.images_warped.array``
+        ``calculate_error()``. Code that reads ``self.imgs_warped.array``
         directly should call ``self._ensure_warped_images()`` first, or
         use ``generate_corrected_image()`` which builds its own warps from
         ``self.knots``.
@@ -1203,7 +1204,7 @@ class DriftCorrection(AutoSerialize):
                 # Per-iter error stays on GPU; sync once after the loop
                 images_mean = warped_t.mean(dim=0)
                 error_buffer.append(torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2)))
-            # Sync knots back; leave images_warped lazy so callers
+            # Sync knots back; leave imgs_warped lazy so callers
             # that never plot avoid the GPU→CPU transfer of the warped stack.
             knots_final = knots_batch.detach()
             for img_idx in range(num_images):
@@ -1235,9 +1236,9 @@ class DriftCorrection(AutoSerialize):
                     if img_idx in fixed_set:
                         continue
                     if fixed_set:
-                        image_ref = self.images_warped.array[fixed_idx_list].mean(axis=0)
+                        image_ref = self.imgs_warped.array[fixed_idx_list].mean(axis=0)
                     else:
-                        image_ref = np.delete(self.images_warped.array, img_idx, axis=0).mean(axis=0)
+                        image_ref = np.delete(self.imgs_warped.array, img_idx, axis=0).mean(axis=0)
                     knots_np = self.knots[img_idx].cpu().numpy()
                     knots_updated = self._optimize_knots_scipy(
                         img_idx, image_ref, knots_np,
@@ -1279,7 +1280,7 @@ class DriftCorrection(AutoSerialize):
             )
 
         if show_images:
-            self.plot_transformed_images(
+            self.plot_warped_images(
                 show_knots=show_knots,
                 title=[f"Image {i}: non-rigid" for i in range(self.shape[0])],
                 **kwargs,
@@ -1461,6 +1462,7 @@ class DriftCorrection(AutoSerialize):
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
+
     def generate_corrected_image(
         self,
         upsample_factor: int = 2,
@@ -1609,14 +1611,8 @@ class DriftCorrection(AutoSerialize):
         )
 
         if show_image:
-            fig, ax = show_2d(image_corr.array, **kwargs)
-            ax_to_draw = kwargs.get("ax", ax)
-            try:
-                ax_to_draw.figure.canvas.draw_idle()
-                if "ax" not in kwargs:
-                    plt.show()
-            except Exception:
-                plt.show()
+            show_2d(image_corr.array, **kwargs)
+            plt.show()
         return image_corr
 
     def apply_correction(
@@ -1701,22 +1697,21 @@ class DriftCorrection(AutoSerialize):
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
-    def apply_correction_cube(
+    def apply_correction_4dstem(
         self,
         cube: torch.Tensor | np.ndarray,
-        channel_axis: int = -1,
         image_index: int = -1,
         mode: str = "bicubic",
-        chunk_size: int = 64,
+        chunk_size: int | None = None,
         output_dtype: torch.dtype | np.dtype | str | None = None,
+        output_device: str | torch.device | None = None,
         progress: bool = False,
     ) -> torch.Tensor | np.ndarray:
-        """Apply drift correction to a 3D or 4D data cube with automatic chunking.
+        """Apply drift correction to a 3D or 4D data cube.
 
-        Designed for large datasets that don't fit in GPU memory.  Only one
-        chunk of ``chunk_size`` channels is on the GPU at a time; the rest
-        stays on CPU (or in the original numpy array) so peak VRAM is
-        ``chunk_size × H × W × 8`` bytes (input + output in float32).
+        Automatically selects a **single-shot GPU path** when the full
+        cube fits in GPU memory (fastest), or falls back to chunked
+        processing for truly enormous datasets.
 
         Parameters
         ----------
@@ -1725,62 +1720,46 @@ class DriftCorrection(AutoSerialize):
             4D cube ``(H, W, det_h, det_w)`` for 4D-STEM.
             The first two axes must be scan rows and columns matching
             the shape used in :meth:`preprocess`.
-        channel_axis : int, default -1
-            Axis (or axes starting from this position) holding channel
-            dimensions. For 3D ``(H, W, E)``, use ``-1``.
-            For 4D ``(H, W, det_h, det_w)``, use ``2`` or ``-2``.
         image_index : int, default -1
             Which image's knot trajectory to use. Default selects the
             last image (target in a ``[reference, target]`` pair).
         mode : str, default "bicubic"
             Interpolation kernel: ``"bicubic"`` or ``"bilinear"``.
-        chunk_size : int, default 64
-            Number of channels to warp per GPU call.  Memory per chunk
-            is approximately ``chunk_size × H × W × 8`` bytes (float32
-            input + output).  For 512×512 scans: 64 → ~134 MB VRAM.
+        chunk_size : int or None
+            Number of channels to warp per GPU call.  When ``None``
+            (default), the method auto-selects: single-shot if the cube
+            fits in GPU memory with headroom, otherwise chunked with a
+            sensible default.  Set explicitly to force chunking.
         output_dtype : dtype, optional
             Cast the output to this dtype. If ``None``, returns float32.
             Use ``"same"`` to match the input dtype.
+        output_device : str or torch.device or None
+            Device for the returned tensor.  ``None`` (default) returns
+            a numpy array if input was numpy, CPU tensor if input was
+            torch.  Set to ``"cuda"`` to keep the result on GPU
+            (eliminates the GPU→CPU download, which is the main
+            bottleneck for large cubes).
         progress : bool, default False
-            Show a tqdm progress bar.
+            Show a tqdm progress bar (chunked path only).
 
         Returns
         -------
         torch.Tensor or np.ndarray
             Corrected cube with the same shape and axis layout as input.
-            Returns np.ndarray if input was np.ndarray, torch.Tensor otherwise.
-
-        Notes
-        -----
-        **Memory budget for a 512×512×192×192 4D-STEM dataset (uint16):**
-
-        ==================  ==========  ====================================
-        Component           Size        Notes
-        ==================  ==========  ====================================
-        Input (CPU)         19.3 GB     Original array, not copied
-        Output (CPU)        38.7 GB     float32; 19.3 GB with ``"same"``
-        GPU per chunk       134 MB      chunk_size=64, 512×512
-        ==================  ==========  ====================================
 
         Examples
         --------
-        >>> # EDX spectral cube
-        >>> corrected = dc.apply_correction_cube(
-        ...     cube_eds, channel_axis=-1, chunk_size=64)
-        >>> # 4D-STEM — keep output as uint16 to halve CPU memory
-        >>> corrected = dc.apply_correction_cube(
-        ...     cube_4d, channel_axis=2, chunk_size=256,
-        ...     output_dtype="same", progress=True)
+        >>> # EDX spectral cube — auto single-shot
+        >>> corrected = dc.apply_correction_4dstem(cube_eds)
+        >>> # 4D-STEM — keep on GPU for fastest throughput
+        >>> corrected = dc.apply_correction_4dstem(
+        ...     cube_4d, output_device="cuda")
         """
-        return_numpy = isinstance(cube, np.ndarray)
-        is_numpy = return_numpy
+        return_numpy = isinstance(cube, np.ndarray) and output_device is None
+        is_numpy = isinstance(cube, np.ndarray)
 
-        if is_numpy:
-            original_shape = cube.shape
-            input_np_dtype = cube.dtype
-        else:
-            original_shape = tuple(cube.shape)
-            input_np_dtype = None
+        original_shape = cube.shape if is_numpy else tuple(cube.shape)
+        input_np_dtype = cube.dtype if is_numpy else None
 
         ndim = len(original_shape)
         if ndim < 3:
@@ -1793,90 +1772,159 @@ class DriftCorrection(AutoSerialize):
         for d in range(2, ndim):
             n_channels *= original_shape[d]
 
-        # Resolve output dtype
-        if output_dtype == "same":
-            out_np_dtype = input_np_dtype if is_numpy else None
-            out_torch_dtype = cube.dtype if not is_numpy else None
-        else:
-            out_np_dtype = None
-            out_torch_dtype = output_dtype if output_dtype is not None else None
+        # ── Decide: single-shot vs chunked ──
+        f32_cube_bytes = n_channels * scan_h * scan_w * 4  # float32
+        # Memory for grid_sample: f32 input (C,H,W) + f32 output (C,H,W).
+        # When input is on GPU as a non-f32 dtype (e.g. uint16 from
+        # quantem.live), the original is managed outside PyTorch's
+        # allocator (CuPy) so mem_get_info already accounts for it.
+        additional_gpu_bytes = f32_cube_bytes * 2
 
-        # Flatten channel dims: work with (H, W, n_channels) view
-        if is_numpy:
-            flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
-        else:
-            flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
+        use_single_shot = chunk_size is None
+        if use_single_shot:
+            try:
+                gpu_free, _ = torch.cuda.mem_get_info(self._device)
+                use_single_shot = additional_gpu_bytes < gpu_free * 0.95
+            except RuntimeError:
+                use_single_shot = False
 
-        # Allocate output on CPU in the target dtype to minimize memory
-        if is_numpy:
-            if out_np_dtype is not None:
-                out_hwc = np.empty(
-                    (scan_h, scan_w, n_channels), dtype=out_np_dtype
-                )
-            else:
-                out_hwc = np.empty(
-                    (scan_h, scan_w, n_channels), dtype=np.float32
-                )
-        else:
-            _out_dt = out_torch_dtype if out_torch_dtype is not None else torch.float32
-            out_hwc = torch.empty(
-                (scan_h, scan_w, n_channels), dtype=_out_dt, device="cpu"
+        if use_single_shot:
+            return self._apply_cube_single_shot(
+                cube, original_shape, scan_h, scan_w, n_channels,
+                is_numpy, return_numpy, input_np_dtype,
+                image_index, mode, output_dtype, output_device,
             )
 
-        # Process chunks — only chunk_size×H×W×4 bytes on GPU at a time
+        # ── Chunked fallback ──
+        _cs = chunk_size if chunk_size is not None else 256
+        return self._apply_cube_chunked(
+            cube, original_shape, scan_h, scan_w, n_channels,
+            is_numpy, return_numpy, input_np_dtype,
+            image_index, mode, _cs, output_dtype, output_device,
+            progress,
+        )
+
+    def _apply_cube_single_shot(
+        self,
+        cube,
+        original_shape,
+        scan_h, scan_w, n_channels,
+        is_numpy, return_numpy, input_np_dtype,
+        image_index, mode, output_dtype, output_device,
+    ):
+        """Upload entire cube to GPU → single grid_sample → return."""
+        if is_numpy:
+            cube_chw = torch.from_numpy(cube.reshape(scan_h, scan_w, n_channels)).to(
+                device=self._device, dtype=self._dtype).permute(2, 0, 1)
+        else:
+            cube_chw = cube.reshape(scan_h, scan_w, n_channels).to(
+                device=self._device, dtype=self._dtype).permute(2, 0, 1)
+        result_hwc = self.apply_correction(
+            images=cube_chw, image_index=image_index, mode=mode,
+        ).permute(1, 2, 0)
+        return self._finalize_cube_output(
+            result_hwc, original_shape, is_numpy, return_numpy,
+            input_np_dtype, output_dtype, output_device,
+        )
+
+    def _apply_cube_chunked(
+        self,
+        cube,
+        original_shape,
+        scan_h, scan_w, n_channels,
+        is_numpy, return_numpy, input_np_dtype,
+        image_index, mode, chunk_size, output_dtype, output_device,
+        progress,
+    ):
+        """Process cube in chunks when it doesn't fit on GPU."""
+        flat_hwc = cube.reshape(scan_h, scan_w, n_channels)
+
+        # Allocate output on CPU
+        _out_dt = torch.float32
+        if output_dtype == "same" and not is_numpy:
+            _out_dt = cube.dtype
+        elif isinstance(output_dtype, torch.dtype):
+            _out_dt = output_dtype
+        out_hwc = torch.empty(
+            (scan_h, scan_w, n_channels), dtype=_out_dt, device="cpu",
+        )
+
         chunks = range(0, n_channels, chunk_size)
         if progress:
             chunks = tqdm(
                 chunks,
                 total=(n_channels + chunk_size - 1) // chunk_size,
-                desc="apply_correction_cube",
+                desc="apply_correction_4dstem",
                 unit="chunk",
             )
 
         for start in chunks:
             end = min(start + chunk_size, n_channels)
-            # Slice from (H, W, C) and transpose to (C, H, W)
+            slice_hwc = flat_hwc[:, :, start:end]
             if is_numpy:
-                chunk_hwc = flat_hwc[:, :, start:end]  # view, no copy
-                chunk_chw = np.ascontiguousarray(
-                    chunk_hwc.transpose(2, 0, 1)
-                )
-                chunk_gpu = torch.tensor(
-                    chunk_chw, dtype=self._dtype, device=self._device
-                )
+                chunk_gpu = torch.from_numpy(
+                    np.ascontiguousarray(slice_hwc.transpose(2, 0, 1))
+                ).to(device=self._device, dtype=self._dtype)
             else:
-                chunk_hwc = flat_hwc[:, :, start:end]
-                chunk_chw = chunk_hwc.permute(2, 0, 1).contiguous()
-                chunk_gpu = chunk_chw.to(
+                chunk_gpu = slice_hwc.permute(2, 0, 1).to(
                     device=self._device, dtype=self._dtype
                 )
 
-            corrected_chunk = self.apply_correction(
+            corrected = self.apply_correction(
                 images=chunk_gpu, image_index=image_index, mode=mode,
             )
+            out_hwc[:, :, start:end] = corrected.permute(1, 2, 0).cpu().to(_out_dt)
+            del chunk_gpu, corrected
 
-            # Write back to output in (H, W, C) layout
-            result_cpu = corrected_chunk.cpu()
-            if is_numpy:
-                result_hwc = result_cpu.numpy().transpose(1, 2, 0)
-                if out_np_dtype is not None:
-                    out_hwc[:, :, start:end] = result_hwc.astype(out_np_dtype)
-                else:
-                    out_hwc[:, :, start:end] = result_hwc
-            else:
-                result_hwc = result_cpu.permute(1, 2, 0)
-                if out_torch_dtype is not None:
-                    out_hwc[:, :, start:end] = result_hwc.to(out_torch_dtype)
-                else:
-                    out_hwc[:, :, start:end] = result_hwc
+        result_hwc = out_hwc
+        if output_device is not None:
+            dev = torch.device(output_device)
+            if dev.type == "cuda":
+                result_hwc = result_hwc.to(device=self._device)
+        return self._finalize_cube_output(
+            result_hwc, original_shape, is_numpy, return_numpy,
+            input_np_dtype, output_dtype, output_device,
+        )
 
-            # Free GPU memory for this chunk
-            del chunk_gpu, corrected_chunk, result_cpu
+    def _finalize_cube_output(
+        self,
+        result_hwc,
+        original_shape,
+        is_numpy, return_numpy, input_np_dtype,
+        output_dtype, output_device,
+    ):
+        """Reshape, cast dtype, move to target device."""
+        # Apply output dtype
+        if output_dtype == "same":
+            if is_numpy and input_np_dtype is not None:
+                # Convert on CPU for numpy output
+                if result_hwc.is_cuda and return_numpy:
+                    result_hwc = result_hwc.cpu()
+                result_hwc = result_hwc.reshape(original_shape)
+                return result_hwc.cpu().numpy().astype(input_np_dtype) if return_numpy else result_hwc
+            elif not is_numpy:
+                pass  # already in original dtype from chunked path
+        elif output_dtype is not None and output_dtype != "same":
+            result_hwc = result_hwc.to(dtype=output_dtype)
 
-        # Reshape back to original layout
-        if is_numpy:
-            return out_hwc.reshape(original_shape)
-        return out_hwc.reshape(original_shape)
+        result = result_hwc.reshape(original_shape)
+
+        # Move to target device
+        if output_device is not None:
+            dev = torch.device(output_device)
+            if dev.type == "cuda" and not result.is_cuda:
+                result = result.to(device=self._device)
+            elif dev.type == "cpu" and result.is_cuda:
+                result = result.cpu()
+            return result
+
+        if return_numpy:
+            if result.is_cuda:
+                result = result.cpu()
+            return result.numpy()
+        if result.is_cuda:
+            result = result.cpu()
+        return result
 
     def calculate_error(
         self,
@@ -1905,9 +1953,9 @@ class DriftCorrection(AutoSerialize):
             ).cpu().numpy()
         else:
             self._ensure_warped_images()
-            images_mean = np.mean(self.images_warped.array, axis=0)
+            images_mean = np.mean(self.imgs_warped.array, axis=0)
             sig_diff = np.mean(
-                np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
+                np.abs(self.imgs_warped.array - images_mean[None, :, :]), axis=(1, 2)
             )
 
         error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
@@ -1926,7 +1974,7 @@ class DriftCorrection(AutoSerialize):
             self._images_warped_stale = False
 
     # ##################################################################### #
-    #                          Plotting methods                              #
+    #   Plotting methods (see drift_viz.py for implementations)  #
     # ##################################################################### #
 
     def plot_correction_summary(
@@ -1942,212 +1990,12 @@ class DriftCorrection(AutoSerialize):
         axsize: tuple[float, float] = (3.5, 3.5),
         **kwargs,
     ):
-        """One-liner before/after comparison of drift correction.
-
-        Shows the reference, raw (drifted) input, and corrected image
-        side by side with RMS and NCC metrics.  Optionally appends rows
-        for FFT magnitudes and difference maps.
-
-        The image and FFT rows are rendered via :func:`show_2d`, so all
-        of its keyword arguments (``cmap``, ``norm``, ``scalebar``,
-        ``cbar``, ``show_ticks``, …) are forwarded and can be used to
-        customise the panels.
-
-        Parameters
-        ----------
-        corrected : torch.Tensor or np.ndarray, optional
-            Pre-computed corrected image.  If *None*, calls
-            ``apply_correction(mode=mode)`` automatically.
-        reference_index : int, default 0
-            Index of the reference image (typically the fixed HAADF).
-        target_index : int, default -1
-            Index of the target image (the one being corrected).
-        crop : int, optional
-            Center-crop size in pixels.  If *None*, uses 80 % of the
-            shorter dimension to avoid edge artifacts.
-        mode : str, default "bicubic"
-            Interpolation mode if *corrected* is not provided.
-        show_fft : bool, default True
-            Append a row with log-FFT magnitudes.
-        show_diff : bool, default True
-            Append a row with difference maps (``seismic`` colourmap).
-        fft_mask_radius : int, default 5
-            Pixel radius of the zero-frequency mask in FFT panels.
-        axsize : tuple, default (3.5, 3.5)
-            Size of each subplot panel (passed to ``show_2d``).
-        **kwargs
-            Extra keyword arguments forwarded to ``show_2d`` for the
-            image and FFT rows (e.g. ``cmap``, ``norm``, ``scalebar``,
-            ``cbar``, ``show_ticks``).
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            The figure object for further customisation.
-        axes : np.ndarray
-            2-D array of ``Axes`` objects (shape ``(nrows, 3)``).
-        """
-        ref_np = self.images[reference_index].array
-        idx = target_index % len(self.images)
-        raw_np = self.images[idx].array
-
-        if corrected is None:
-            corrected = self.apply_correction(
-                image_index=target_index, mode=mode
-            )
-        if isinstance(corrected, torch.Tensor):
-            corrected_np = corrected.cpu().numpy()
-        else:
-            corrected_np = np.asarray(corrected)
-
-        # --- centre crop ---
-        s, crop = self._center_crop_slice(ref_np, crop)
-        h, w = ref_np.shape
-
-        ref_c = ref_np[s].astype(np.float32)
-        raw_c = raw_np[s].astype(np.float32)
-        cor_c = corrected_np[s].astype(np.float32)
-
-        # --- metrics ---
-        raw_rms = self._rms(raw_c, ref_c)
-        cor_rms = self._rms(cor_c, ref_c)
-        raw_ncc = self._ncc(raw_c, ref_c)
-        cor_ncc = self._ncc(cor_c, ref_c)
-
-        # --- build grid of rows ---
-        nrows = 1 + int(show_fft) + int(show_diff)
-        ncols = 3
-
-        # Row 0 — images via show_2d
-        img_titles = [
-            "Reference",
-            f"Raw (RMS={raw_rms:.3f}, NCC={raw_ncc:.3f})",
-            f"Corrected (RMS={cor_rms:.3f}, NCC={cor_ncc:.3f})",
-        ]
-
-        if not show_fft and not show_diff:
-            # Single row — delegate entirely to show_2d
-            fig, axs = show_2d(
-                [ref_c, raw_c, cor_c],
-                title=img_titles,
-                axsize=axsize,
-                **kwargs,
-            )
-            if not isinstance(axs, np.ndarray):
-                axs = np.array([[axs]])
-            elif axs.ndim == 1:
-                axs = axs.reshape(1, -1)
-        else:
-            # Multi-row: create figure, use show_2d with figax for
-            # the image row, then manually handle FFT / diff rows.
-            fw, fh = axsize
-            fig, axes_grid = plt.subplots(
-                nrows, ncols,
-                figsize=(fw * ncols, fh * nrows),
-                squeeze=False,
-            )
-
-            # Image row via show_2d (respects user kwargs like cmap, norm, …)
-            show_2d(
-                [ref_c, raw_c, cor_c],
-                title=img_titles,
-                figax=(fig, axes_grid[0]),
-                axsize=axsize,
-                **kwargs,
-            )
-
-            row = 1
-
-            if show_fft:
-                fft_titles = ["FFT: Reference", "FFT: Raw", "FFT: Corrected"]
-                fft_kwargs = {k: v for k, v in kwargs.items()
-                              if k not in ("cmap",)}
-                fft_fn = lambda img: self._log_fft(img, fft_mask_radius)
-                show_2d(
-                    [fft_fn(ref_c), fft_fn(raw_c), fft_fn(cor_c)],
-                    title=fft_titles,
-                    figax=(fig, axes_grid[row]),
-                    axsize=axsize,
-                    **fft_kwargs,
-                )
-                row += 1
-
-            if show_diff:
-                ref_n = self._znorm(ref_c)
-                diff_raw = self._znorm(raw_c) - ref_n
-                diff_cor = self._znorm(cor_c) - ref_n
-                vmax = float(
-                    max(np.abs(diff_raw).max(), np.abs(diff_cor).max()) * 0.8
-                )
-                axes_grid[row][0].axis("off")
-                axes_grid[row][0].text(
-                    0.5, 0.5,
-                    f"Crop: {crop}\u00d7{crop}\nfrom {h}\u00d7{w}",
-                    transform=axes_grid[row][0].transAxes,
-                    ha="center", va="center", fontsize=10, color="gray",
-                )
-                show_2d(
-                    [diff_raw, diff_cor],
-                    title=[
-                        f"Raw \u2212 Ref (RMS={raw_rms:.3f})",
-                        f"Corrected \u2212 Ref (RMS={cor_rms:.3f})",
-                    ],
-                    cmap="seismic",
-                    figax=(fig, axes_grid[row, 1:]),
-                    axsize=axsize,
-                    vmin=-vmax, vmax=vmax,
-                )
-
-            fig.tight_layout()
-            axs = axes_grid
-
-        # --- summary table ---
-        print(f"{'':>12s}   RMS     NCC")
-        print("-" * 35)
-        print(f"{'Raw':>12s}  {raw_rms:.4f}  {raw_ncc:.4f}")
-        print(f"{'Corrected':>12s}  {cor_rms:.4f}  {cor_ncc:.4f}")
-        reduction = (1 - cor_rms / raw_rms) * 100 if raw_rms > 0 else 0
-        print(f"  RMS reduction: {reduction:.1f}%")
-
-        return fig, axs
-
-    @staticmethod
-    def _znorm(a: np.ndarray) -> np.ndarray:
-        a = a.astype(np.float32)
-        return (a - a.mean()) / (a.std() + 1e-8)
-
-    @staticmethod
-    def _rms(a: np.ndarray, b: np.ndarray) -> float:
-        return float(np.sqrt(((DriftCorrection._znorm(a)
-                                - DriftCorrection._znorm(b)) ** 2).mean()))
-
-    @staticmethod
-    def _ncc(a: np.ndarray, b: np.ndarray) -> float:
-        an = DriftCorrection._znorm(a)
-        bn = DriftCorrection._znorm(b)
-        return float(np.corrcoef(an.ravel(), bn.ravel())[0, 1])
-
-    @staticmethod
-    def _log_fft(
-        img: np.ndarray, mask_radius: int = 5,
-    ) -> np.ndarray:
-        n_h, n_w = img.shape
-        hann = np.outer(np.hanning(n_h), np.hanning(n_w))
-        f = np.fft.fftshift(np.fft.fft2(img * hann))
-        mag = np.log1p(np.abs(f))
-        cy, cx = n_h // 2, n_w // 2
-        yy, xx = np.ogrid[-cy:n_h - cy, -cx:n_w - cx]
-        mag[yy ** 2 + xx ** 2 < mask_radius ** 2] = 0
-        return mag
-
-    def _center_crop_slice(
-        self, ref_np: np.ndarray, crop: int | None,
-    ) -> tuple[tuple[slice, slice], int]:
-        h, w = ref_np.shape
-        if crop is None:
-            crop = int(min(h, w) * 0.8) // 2 * 2
-        r0, c0 = (h - crop) // 2, (w - crop) // 2
-        return (slice(r0, r0 + crop), slice(c0, c0 + crop)), crop
+        return drift_viz.plot_correction_summary(
+            self, corrected=corrected, reference_index=reference_index,
+            target_index=target_index, crop=crop, mode=mode,
+            show_fft=show_fft, show_diff=show_diff,
+            fft_mask_radius=fft_mask_radius, axsize=axsize, **kwargs,
+        )
 
     @property
     def drift_rate(self) -> tuple[float, float]:
@@ -2201,114 +2049,10 @@ class DriftCorrection(AutoSerialize):
         show_fft: bool = True,
         **kwargs,
     ):
-        """Compare all correction modes in a single figure.
-
-        Automatically applies affine-only and nonrigid corrections with
-        both ``bilinear`` and ``bicubic`` interpolation, then shows them
-        alongside the reference in a grid with RMS / NCC metrics.
-
-        Requires :meth:`align_affine` (and optionally
-        :meth:`align_nonrigid`) to have been called.
-
-        Parameters
-        ----------
-        crop : int, optional
-            Center-crop size.  *None* → 80 % of shorter dimension.
-        target_index : int, default -1
-            Which image to correct.
-        axsize : tuple, default (3.5, 3.5)
-            Size of each panel.
-        show_fft : bool, default True
-            Show FFT magnitude row below the images.
-        **kwargs
-            Forwarded to :func:`show_2d`.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-        axes : np.ndarray
-        metrics : dict
-            ``{method_name: (rms, ncc)}``
-        """
-        idx = target_index % len(self.knots)
-        ref_np = self.images[0].array
-        raw_np = self.images[idx].array
-        s, crop = self._center_crop_slice(ref_np, crop)
-
-        # Compute corrections
-        has_nonrigid = hasattr(self, "_knots_after_affine") and not torch.equal(
-            self.knots[idx], self._knots_after_affine[idx]
+        return drift_viz.plot_correction_comparison(
+            self, crop=crop, target_index=target_index,
+            axsize=axsize, show_fft=show_fft, **kwargs,
         )
-        saved_knots = self.knots[idx].clone()
-        results = {}
-
-        if has_nonrigid:
-            # Affine-only
-            self.knots[idx] = self._knots_after_affine[idx]
-            results["affine bilinear"] = self.apply_correction(
-                image_index=target_index, mode="bilinear").cpu().numpy()
-            results["affine bicubic"] = self.apply_correction(
-                image_index=target_index, mode="bicubic").cpu().numpy()
-            # Restore nonrigid knots
-            self.knots[idx] = saved_knots
-
-        results["nonrigid bilinear"] = self.apply_correction(
-            image_index=target_index, mode="bilinear").cpu().numpy()
-        results["nonrigid bicubic"] = self.apply_correction(
-            image_index=target_index, mode="bicubic").cpu().numpy()
-
-        # Metrics
-        ref_c = ref_np[s].astype(np.float32)
-        metrics = {}
-        labels = ["HAADF ref", "raw (drifted)"]
-        panels = [ref_c, raw_np[s].astype(np.float32)]
-        for name, img in results.items():
-            labels.append(name)
-            panels.append(img[s].astype(np.float32))
-            metrics[name] = (self._rms(img[s], ref_c),
-                             self._ncc(img[s], ref_c))
-
-        raw_rms, raw_ncc = self._rms(raw_np[s], ref_c), self._ncc(raw_np[s], ref_c)
-        metrics["raw (drifted)"] = (raw_rms, raw_ncc)
-
-        # Titles
-        titles = ["HAADF ref"]
-        titles.append(f"raw (RMS={raw_rms:.3f})")
-        for name in list(results.keys()):
-            r, n = metrics[name]
-            titles.append(f"{name}\nRMS={r:.3f} NCC={n:.3f}")
-
-        # Build grid
-        nrows = 1 + int(show_fft)
-        ncols = len(panels)
-        fw, fh = axsize
-        fig, axes_grid = plt.subplots(
-            nrows, ncols, figsize=(fw * ncols, fh * nrows), squeeze=False,
-        )
-
-        show_2d(panels, title=titles,
-                figax=(fig, axes_grid[0]), axsize=axsize, **kwargs)
-
-        if show_fft:
-            fft_panels = [self._log_fft(p) for p in panels]
-            fft_titles = [f"FFT: {l}" for l in labels]
-            fft_kw = {k: v for k, v in kwargs.items() if k != "cmap"}
-            show_2d(fft_panels, title=fft_titles,
-                    figax=(fig, axes_grid[1]), axsize=axsize, **fft_kw)
-
-        fig.tight_layout()
-
-        # Print table
-        h, w = ref_np.shape
-        print(f"--- RMS / NCC vs reference (center {crop}×{crop} "
-              f"crop from {h}×{w}) ---")
-        print(f"{'Method':>20s}   RMS    NCC")
-        print("-" * 45)
-        for name in ["raw (drifted)"] + list(results.keys()):
-            r, n = metrics[name]
-            print(f"{name:>20s}  {r:.4f}  {n:.4f}")
-
-        return fig, axes_grid, metrics
 
     def plot_radial_power(
         self,
@@ -2317,259 +2061,31 @@ class DriftCorrection(AutoSerialize):
         target_index: int = -1,
         figsize: tuple[float, float] = (10, 6),
     ):
-        """Radial FFT power spectrum comparing correction methods.
-
-        Higher power at high spatial frequencies indicates sharper
-        features.  Useful for verifying that drift correction preserves
-        (or recovers) lattice fringe resolution.
-
-        Parameters
-        ----------
-        methods : dict, optional
-            ``{label: image_ndarray}``.  If *None*, auto-generates from
-            the current pipeline state (raw, affine, nonrigid).
-        crop : int, optional
-            Center-crop size.  *None* → 80 % of shorter dimension.
-        target_index : int, default -1
-            Which image to correct when auto-generating methods.
-        figsize : tuple, default (10, 6)
-            Figure size.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-        ax : matplotlib.axes.Axes
-        """
-        idx = target_index % len(self.knots)
-        ref_np = self.images[0].array
-        raw_np = self.images[idx].array
-        s, crop = self._center_crop_slice(ref_np, crop)
-
-        if methods is None:
-            methods = {"HAADF ref": ref_np[s], "raw (drifted)": raw_np[s]}
-            has_nonrigid = (
-                hasattr(self, "_knots_after_affine")
-                and not torch.equal(
-                    self.knots[idx], self._knots_after_affine[idx])
-            )
-            saved = self.knots[idx].clone()
-            if has_nonrigid:
-                self.knots[idx] = self._knots_after_affine[idx]
-                methods["affine bicubic"] = self.apply_correction(
-                    image_index=target_index, mode="bicubic"
-                ).cpu().numpy()[s]
-                self.knots[idx] = saved
-            methods["nonrigid bicubic"] = self.apply_correction(
-                image_index=target_index, mode="bicubic"
-            ).cpu().numpy()[s]
-        else:
-            methods = {k: v[s] if v.shape != (crop, crop) else v
-                       for k, v in methods.items()}
-
-        def _radial(img: np.ndarray):
-            n = img.shape[0]
-            hann = np.outer(np.hanning(n), np.hanning(n))
-            f = np.fft.fftshift(np.fft.fft2(img.astype(np.float32) * hann))
-            power = np.abs(f) ** 2
-            cy, cx = n // 2, n // 2
-            yy, xx = np.ogrid[-cy:n - cy, -cx:n - cx]
-            r = np.sqrt(yy ** 2 + xx ** 2).astype(int)
-            max_r = min(cy, cx)
-            radial = np.zeros(max_r)
-            for ri in range(max_r):
-                mask = r == ri
-                if mask.any():
-                    radial[ri] = power[mask].mean()
-            freqs = np.arange(max_r) / n
-            return freqs, radial
-
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-        for label, img in methods.items():
-            freqs, power = _radial(img)
-            ax.semilogy(freqs[1:], power[1:], label=label, alpha=0.8)
-        ax.set_xlabel("Spatial frequency (cycles/pixel)")
-        ax.set_ylabel("Power (log scale)")
-        ax.set_title("Radial FFT power spectrum")
-        ax.legend()
-        ax.set_xlim(0, 0.5)
-        fig.tight_layout()
-
-        return fig, ax
-
-    def plot_transformed_images(self, show_knots: bool = True, **kwargs):
-        self._ensure_warped_images()
-        fig, ax = show_2d(
-            list(self.images_warped.array),
-            **kwargs,
+        return drift_viz.plot_radial_power(
+            self, methods=methods, crop=crop,
+            target_index=target_index, figsize=figsize,
         )
-        if show_knots:
-            for img_idx in range(self.shape[0]):
-                knots_np = self.knots[img_idx].cpu().numpy()
-                x = knots_np[0]
-                y = knots_np[1]
-                ax[img_idx].plot(
-                    y,
-                    x,
-                    color="r",
-                )
+
+    def plot_warped_images(self, show_knots: bool = True, **kwargs):
+        return drift_viz.plot_warped_images(self, show_knots=show_knots, **kwargs)
 
     def plot_convergence(
         self,
         figsize=(8, 3),
         **kwargs,
     ):
-        """
-        Plot the convergence of the drift correction.
-        """
-        is_nonrigid = self.error_track[:, 0] == 2
-        error = self.error_track[:, 1]
-        it = np.arange(error.shape[0])
-
-        from matplotlib.ticker import FormatStrFormatter, MaxNLocator
-
-        fig, ax = plt.subplots(1, 2, figsize=figsize)
-        color = (1, 0, 0)  # red
-
-        # Plot Affine
-        if np.any(~is_nonrigid):
-            ax[0].plot(
-                it[~is_nonrigid],
-                100 * error[~is_nonrigid],
-                marker="o",
-                color=color,
-                linestyle="-",
-                label="Affine",
-                **kwargs,
-            )
-            ax[0].set_xlabel("Affine Iterations")
-            ax[0].set_ylabel("Mean Error [%]")
-            ax[0].xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax[0].yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
-        else:
-            ax[0].axis("off")
-
-        # Plot Non-Rigid
-        if np.any(is_nonrigid):
-            first_true = np.argmax(is_nonrigid)
-            if first_true > 0:
-                is_nonrigid[first_true - 1] = True
-
-            ax[1].plot(
-                it[is_nonrigid],
-                100 * error[is_nonrigid],
-                marker="o",
-                color=color,
-                linestyle="-",
-                label="Non-Rigid",
-                **kwargs,
-            )
-            ax[1].set_xlabel("Non-Rigid Iterations")
-            ax[1].xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax[1].yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
-        else:
-            ax[1].axis("off")
-
-        plt.tight_layout()
-
-        return self
+        return drift_viz.plot_convergence(self, figsize=figsize, **kwargs)
 
     def plot_merged_images(self, show_knots: bool = True, **kwargs):
-        """
-        Plot the current transformed images, with knot overlays.
-        """
-        self._ensure_warped_images()
-        fig, ax = show_2d(
-            self.images_warped.array.mean(0),
-            **kwargs,
-        )
-        if show_knots:
-            for img_idx in range(self.shape[0]):
-                knots_np = self.knots[img_idx].cpu().numpy()
-                x = knots_np[0]
-                y = knots_np[1]
-                ax.plot(
-                    y,
-                    x,
-                )
+        return drift_viz.plot_merged_images(self, show_knots=show_knots, **kwargs)
 
     def plot_knots(
-        self, figsize: tuple[int, int] | None = None
+        self, figsize: tuple[int, int] | None = None,
     ) -> tuple:
-        """Plot knot trajectories before and after correction plus the per-scanline delta field.
-
-        Two panels per image:
-        - Top: mean warped image with initial knots (dashed) and corrected knots (solid)
-          overlaid. A third dotted line shows the affine-only state when available, so
-          the affine vs. nonrigid contributions are visible side by side.
-        - Bottom: per-scanline correction delta (row and col components) in pixels.
-          A smooth curve means the correction field is physically reasonable. Rapid
-          oscillations indicate regularization_sigma_px is too small and the optimizer
-          is fitting noise rather than real drift.
-
-        Parameters
-        ----------
-        figsize : (width, height), optional
-            Figure size in inches. Defaults to (7 * num_images, 6).
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-        axes : ndarray of Axes, shape (2, num_images)
-        """
-        self._ensure_warped_images()
-        num_images = self.shape[0]
-        merged = self.images_warped.array.mean(0)
-        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        if figsize is None:
-            figsize = (7 * num_images, 6)
-        fig, axes = plt.subplots(
-            2, num_images, figsize=figsize,
-            gridspec_kw={"height_ratios": [2, 1]},
-        )
-        if num_images == 1:
-            axes = axes[:, None]   # ensure (2, N) indexing for all cases
-        scanlines = np.arange(self.knots[0].shape[1])
-        for img_idx in range(num_images):
-            color = colors[img_idx % len(colors)]
-            initial = self._initial_knots[img_idx].cpu().numpy()  # (2, H, n_knots)
-            current = self.knots[img_idx].cpu().numpy()
-            delta = current - initial
-            # top panel: knot trajectory overlaid on merged image
-            ax_img = axes[0, img_idx]
-            ax_img.imshow(merged, cmap="gray", origin="upper", aspect="equal",
-                          vmin=float(merged.min()), vmax=float(merged.max()))
-            ax_img.plot(initial[1, :, 0], initial[0, :, 0],
-                        "--", color=color, lw=1.2, alpha=0.7, label="initial")
-            ax_img.plot(current[1, :, 0], current[0, :, 0],
-                        "-", color=color, lw=1.5, label="corrected")
-            if hasattr(self, "_knots_after_affine"):
-                affine_np = self._knots_after_affine[img_idx].cpu().numpy()
-                ax_img.plot(affine_np[1, :, 0], affine_np[0, :, 0],
-                            ":", color=color, lw=1.0, alpha=0.6, label="after affine")
-            ax_img.legend(fontsize=8, loc="upper right")
-            ax_img.set_title(f"image {img_idx} — knot trajectory", fontsize=10)
-            ax_img.axis("off")
-            # bottom panel: per-scanline correction delta
-            ax_delta = axes[1, img_idx]
-            ax_delta.plot(scanlines, delta[0, :, 0], lw=1.2, label="row \u0394")
-            ax_delta.plot(scanlines, delta[1, :, 0], lw=1.2, label="col \u0394")
-            if hasattr(self, "_knots_after_affine"):
-                aff_delta = affine_np - initial
-                ax_delta.plot(scanlines, aff_delta[0, :, 0],
-                              ":", lw=1.0, alpha=0.6, label="affine row \u0394")
-                ax_delta.plot(scanlines, aff_delta[1, :, 0],
-                              ":", lw=1.0, alpha=0.6, label="affine col \u0394")
-            ax_delta.axhline(0, color="k", lw=0.5, ls="--")
-            ax_delta.set_xlabel("scanline")
-            ax_delta.set_ylabel("correction (px)")
-            ax_delta.set_title(f"image {img_idx} — delta field", fontsize=10)
-            ax_delta.legend(fontsize=8)
-            ax_delta.grid(alpha=0.3)
-        plt.tight_layout()
-        return fig, axes
+        return drift_viz.plot_knots(self, figsize=figsize)
 
 
-class DriftInterpolator:
+class _DriftInterpolator:
     def __init__(
         self,
         input_shape,

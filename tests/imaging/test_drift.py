@@ -175,8 +175,8 @@ def test_preprocess_single_image_builds_centered_canvas():
 
     assert drift.shape == (1, 160, 160)
     assert drift.knots[0].shape == (2, 128, 1)
-    assert drift.images_warped.array.shape == (1, 160, 160)
-    assert not np.isnan(drift.images_warped.array).any()
+    assert drift.imgs_warped.array.shape == (1, 160, 160)
+    assert not np.isnan(drift.imgs_warped.array).any()
 
 
 # Baseline values from float32 torch path, captured once and frozen.
@@ -1197,11 +1197,11 @@ def test_apply_correction_multi_knot_batch_raises():
 
 
 # ──────────────────────────────────────────────────────────────
-# Tests for apply_correction_cube() — chunked 3D/4D correction
+# Tests for apply_correction_4dstem() — 3D/4D correction
 # ──────────────────────────────────────────────────────────────
 
-def test_apply_correction_cube_3d_eds():
-    """apply_correction_cube on a 3D (H, W, E) EDX cube."""
+def test_apply_correction_4dstem_3d_eds():
+    """apply_correction_4dstem on a 3D (H, W, E) EDX cube."""
     scan_h = 128
     drift_rate = (0.05, 0.1)
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
@@ -1213,7 +1213,7 @@ def test_apply_correction_cube_3d_eds():
     cube = channels_drifted.transpose(1, 2, 0)
     assert cube.shape == (scan_h, scan_h, n_energy)
 
-    corrected = dc.apply_correction_cube(cube, channel_axis=-1, chunk_size=4)
+    corrected = dc.apply_correction_4dstem(cube, chunk_size=4)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube.shape
 
@@ -1234,8 +1234,8 @@ def test_apply_correction_cube_3d_eds():
         )
 
 
-def test_apply_correction_cube_4d_stem():
-    """apply_correction_cube on a 4D (H, W, det_h, det_w) STEM cube."""
+def test_apply_correction_4dstem_4d_stem():
+    """apply_correction_4dstem on a 4D (H, W, det_h, det_w) STEM cube."""
     scan_h = 128
     drift_rate = (0.05, 0.1)
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
@@ -1250,7 +1250,7 @@ def test_apply_correction_cube_4d_stem():
     )
     assert cube_4d.shape == (scan_h, scan_h, det_h, det_w)
 
-    corrected = dc.apply_correction_cube(cube_4d, channel_axis=2, chunk_size=8)
+    corrected = dc.apply_correction_4dstem(cube_4d, chunk_size=8)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube_4d.shape
 
@@ -1272,8 +1272,8 @@ def test_apply_correction_cube_4d_stem():
         )
 
 
-def test_apply_correction_cube_matches_manual_chunking():
-    """apply_correction_cube must produce same results as manual loop."""
+def test_apply_correction_4dstem_matches_manual_chunking():
+    """apply_correction_4dstem must produce same results as manual loop."""
     import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
@@ -1283,8 +1283,8 @@ def test_apply_correction_cube_matches_manual_chunking():
     drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
     cube = drifted.transpose(1, 2, 0)  # (H, W, E)
 
-    # apply_correction_cube
-    auto = dc.apply_correction_cube(cube, chunk_size=3)
+    # apply_correction_4dstem
+    auto = dc.apply_correction_4dstem(cube, chunk_size=3)
 
     # Manual chunking (what user had to do before)
     batch = cube.transpose(2, 0, 1)  # (E, H, W)
@@ -1295,33 +1295,33 @@ def test_apply_correction_cube_matches_manual_chunking():
                                err_msg="Cube method must match manual batch")
 
 
-def test_apply_correction_cube_torch_input():
-    """apply_correction_cube works with torch.Tensor input."""
+def test_apply_correction_4dstem_torch_input():
+    """apply_correction_4dstem works with torch.Tensor input."""
     import torch
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     cube_np = np.random.randn(scan_h, scan_h, 6).astype(np.float32)
     cube_t = torch.from_numpy(cube_np)
 
-    result = dc.apply_correction_cube(cube_t, chunk_size=2)
+    result = dc.apply_correction_4dstem(cube_t, chunk_size=2)
     assert isinstance(result, torch.Tensor)
     assert result.shape == cube_t.shape
 
 
-def test_apply_correction_cube_output_dtype_same():
-    """apply_correction_cube with output_dtype='same' preserves input dtype."""
+def test_apply_correction_4dstem_output_dtype_same():
+    """apply_correction_4dstem with output_dtype='same' preserves input dtype."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
 
     cube_u16 = (np.random.rand(scan_h, scan_h, 4) * 1000).astype(np.uint16)
-    result = dc.apply_correction_cube(cube_u16, output_dtype="same")
+    result = dc.apply_correction_4dstem(cube_u16, output_dtype="same")
     assert result.dtype == np.uint16
     assert result.shape == cube_u16.shape
 
 
-def test_apply_correction_cube_2d_raises():
-    """apply_correction_cube rejects 2D input."""
+def test_apply_correction_4dstem_2d_raises():
+    """apply_correction_4dstem rejects 2D input."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     with pytest.raises(ValueError, match="at least 3D"):
-        dc.apply_correction_cube(ref)
+        dc.apply_correction_4dstem(ref)
