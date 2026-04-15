@@ -980,3 +980,348 @@ def test_plot_radial_power_custom_methods():
 
     import matplotlib.pyplot as plt
     plt.close("all")
+
+
+# ──────────────────────────────────────────────────────────────
+# Tests for 3D spectral cube and 4D-STEM detector correction
+# ──────────────────────────────────────────────────────────────
+
+def _apply_drift_to_channels(channels, drift_rate, scan_h):
+    """Apply known per-row linear drift to a stack of 2D channels.
+
+    Parameters
+    ----------
+    channels : ndarray, shape (N, H, W)
+        Clean channel images.
+    drift_rate : tuple (row_rate, col_rate)
+        Pixels per scan row of linear drift.
+    scan_h : int
+        Number of scan rows.
+
+    Returns
+    -------
+    drifted : ndarray, shape (N, H, W)
+        Drifted channels.
+    """
+    from scipy.ndimage import map_coordinates
+    rows = np.arange(scan_h, dtype=np.float32)
+    rr, cc = np.mgrid[:scan_h, :channels.shape[2]]
+    src_r = rr - drift_rate[0] * rows[:, None]
+    src_c = cc - drift_rate[1] * rows[:, None]
+    drifted = np.empty_like(channels)
+    for i in range(channels.shape[0]):
+        drifted[i] = map_coordinates(
+            channels[i], [src_r, src_c], order=3, mode='nearest'
+        ).astype(np.float32)
+    return drifted
+
+
+def _make_diverse_channels(ref, n_channels, seed=99):
+    """Create spatially distinct channels from a reference image.
+
+    Returns channels with genuinely different spatial structure —
+    localized peaks, filtered bands, masked regions — not just
+    scaled copies.
+    """
+    np.random.seed(seed)
+    H, W = ref.shape
+    channels = np.empty((n_channels, H, W), dtype=np.float32)
+    yy, xx = np.mgrid[:H, :W].astype(np.float32)
+
+    for i in range(n_channels):
+        if i % 4 == 0:
+            # Localized Gaussian peak at random position
+            cy, cx = np.random.randint(H // 4, 3 * H // 4, size=2)
+            channels[i] = np.exp(-((yy - cy)**2 + (xx - cx)**2) / (2 * 30**2))
+        elif i % 4 == 1:
+            # Horizontal stripe pattern with different frequency
+            freq = 0.05 + 0.03 * i
+            channels[i] = (np.sin(freq * yy) + 1) * 50
+        elif i % 4 == 2:
+            # Masked quadrant of the reference
+            mask = np.zeros((H, W), dtype=np.float32)
+            qr, qc = i % 2, (i // 2) % 2
+            mask[qr * H // 2:(qr + 1) * H // 2,
+                 qc * W // 2:(qc + 1) * W // 2] = 1.0
+            channels[i] = ref * mask
+        else:
+            # Smoothed + inverted reference
+            channels[i] = gaussian_filter(ref.max() - ref, sigma=3 + i)
+    return channels
+
+
+def test_apply_correction_3d_spectral_cube():
+    """Batch-correct an EDX-like spectral cube (H, W, E) → permute → correct."""
+    scan_h = 128
+    drift_rate = (0.05, 0.1)
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
+    n_energy = 8
+
+    # Build cube in natural (H, W, E) layout
+    channels_clean = _make_diverse_channels(ref, n_energy, seed=200)
+    channels_drifted = _apply_drift_to_channels(channels_clean, drift_rate, scan_h)
+    cube_drifted = channels_drifted.transpose(1, 2, 0)  # (H, W, E)
+    assert cube_drifted.shape == (scan_h, scan_h, n_energy)
+
+    # Permute to (E, H, W) for apply_correction — this is the real user workflow
+    batch = cube_drifted.transpose(2, 0, 1)  # (E, H, W)
+    corrected = dc.apply_correction(images=batch, mode='bicubic')
+    assert corrected.shape == (n_energy, scan_h, scan_h)
+
+    corrected_np = corrected.cpu().numpy()
+    crop = 15
+    s = slice(crop, -crop)
+    for ch in range(n_energy):
+        gt = channels_clean[ch][s, s]
+        gt_norm = (gt - gt.mean()) / (gt.std() + 1e-8)
+        raw = channels_drifted[ch][s, s]
+        raw_norm = (raw - raw.mean()) / (raw.std() + 1e-8)
+        cor = corrected_np[ch][s, s]
+        cor_norm = (cor - cor.mean()) / (cor.std() + 1e-8)
+        raw_rms = float(np.sqrt(((raw_norm - gt_norm)**2).mean()))
+        cor_rms = float(np.sqrt(((cor_norm - gt_norm)**2).mean()))
+        assert cor_rms < raw_rms * 0.90, (
+            f"Channel {ch}: correction should reduce RMS "
+            f"(raw={raw_rms:.4f}, corrected={cor_rms:.4f})"
+        )
+
+
+def test_apply_correction_4d_stem_detector():
+    """Batch-correct 4D-STEM detector pixels (H, W, det_h, det_w) → reshape → correct."""
+    scan_h = 128
+    drift_rate = (0.05, 0.1)
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
+    det_h, det_w = 4, 4
+    n_det = det_h * det_w  # 16 detector pixels
+
+    # Build 4D cube in natural (H, W, det_h, det_w) layout
+    channels_clean = _make_diverse_channels(ref, n_det, seed=300)
+    channels_drifted = _apply_drift_to_channels(channels_clean, drift_rate, scan_h)
+    cube_4d_drifted = channels_drifted.reshape(n_det, scan_h, scan_h)
+    cube_4d_drifted = cube_4d_drifted.transpose(1, 2, 0)  # (H, W, n_det)
+    cube_4d_drifted = cube_4d_drifted.reshape(scan_h, scan_h, det_h, det_w)
+    assert cube_4d_drifted.shape == (scan_h, scan_h, det_h, det_w)
+
+    # Reshape to (det_h*det_w, H, W) — the 4D-STEM user workflow
+    batch = cube_4d_drifted.reshape(scan_h, scan_h, -1).transpose(2, 0, 1)
+    assert batch.shape == (n_det, scan_h, scan_h)
+
+    corrected = dc.apply_correction(images=batch, mode='bicubic')
+    assert corrected.shape == (n_det, scan_h, scan_h)
+
+    corrected_np = corrected.cpu().numpy()
+    crop = 15
+    s = slice(crop, -crop)
+    for ch in range(n_det):
+        gt = channels_clean[ch][s, s]
+        gt_norm = (gt - gt.mean()) / (gt.std() + 1e-8)
+        raw_norm = (channels_drifted[ch][s, s] - channels_drifted[ch][s, s].mean()) / (channels_drifted[ch][s, s].std() + 1e-8)
+        cor = corrected_np[ch][s, s]
+        cor_norm = (cor - cor.mean()) / (cor.std() + 1e-8)
+        raw_rms = float(np.sqrt(((raw_norm - gt_norm)**2).mean()))
+        cor_rms = float(np.sqrt(((cor_norm - gt_norm)**2).mean()))
+        assert cor_rms < raw_rms * 0.90, (
+            f"Detector pixel {ch}: correction should reduce RMS "
+            f"(raw={raw_rms:.4f}, corrected={cor_rms:.4f})"
+        )
+
+
+def test_apply_correction_batch_matches_individual():
+    """Batch correction must match per-channel correction exactly."""
+    import torch
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    channels = _make_diverse_channels(ref, 6, seed=400)
+    drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
+
+    # Batch
+    batch_result = dc.apply_correction(images=drifted, mode='bicubic')
+
+    # Individual
+    for ch in range(drifted.shape[0]):
+        single = dc.apply_correction(images=drifted[ch], mode='bicubic')
+        torch.testing.assert_close(
+            batch_result[ch], single,
+            atol=1e-4, rtol=1e-4,
+            msg=f"Channel {ch}: batch vs individual mismatch",
+        )
+
+
+def test_apply_correction_integer_input():
+    """apply_correction transparently converts uint8/uint16 to float32."""
+    import torch
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+
+    # uint8 input
+    img_u8 = (ref / ref.max() * 200).astype(np.uint8)
+    result_u8 = dc.apply_correction(images=img_u8, mode='bilinear')
+    assert result_u8.dtype == torch.float32
+    assert result_u8.shape == img_u8.shape
+
+    # uint16 input
+    img_u16 = (ref * 100).astype(np.uint16)
+    result_u16 = dc.apply_correction(images=img_u16, mode='bilinear')
+    assert result_u16.dtype == torch.float32
+    assert result_u16.shape == img_u16.shape
+
+    # float32 reference — results should match the float path
+    img_f32 = img_u8.astype(np.float32)
+    result_f32 = dc.apply_correction(images=img_f32, mode='bilinear')
+    torch.testing.assert_close(
+        result_u8, result_f32, atol=0.6, rtol=1e-3,
+        msg="uint8 path should match float32 path (values are discretized)",
+    )
+
+
+def test_apply_correction_multi_knot_batch_raises():
+    """apply_correction rejects batched input when number_knots > 1."""
+    ref = np.random.randn(64, 64).astype(np.float32)
+    drifted = np.roll(ref, 2, axis=1).astype(np.float32)
+    dc = DriftCorrection.from_data(
+        images=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
+        number_knots=3, normalize=True,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=9, refine=False,
+        fixed_indices=[0], max_image_shift=32,
+        show_merged=False, show_images=False,
+    )
+    batch = np.random.randn(4, 64, 64).astype(np.float32)
+    with pytest.raises(NotImplementedError, match="number_knots=1"):
+        dc.apply_correction(images=batch)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tests for apply_correction_cube() — chunked 3D/4D correction
+# ──────────────────────────────────────────────────────────────
+
+def test_apply_correction_cube_3d_eds():
+    """apply_correction_cube on a 3D (H, W, E) EDX cube."""
+    scan_h = 128
+    drift_rate = (0.05, 0.1)
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
+    n_energy = 12
+
+    channels_clean = _make_diverse_channels(ref, n_energy, seed=500)
+    channels_drifted = _apply_drift_to_channels(channels_clean, drift_rate, scan_h)
+    # Natural EDX layout: (H, W, E)
+    cube = channels_drifted.transpose(1, 2, 0)
+    assert cube.shape == (scan_h, scan_h, n_energy)
+
+    corrected = dc.apply_correction_cube(cube, channel_axis=-1, chunk_size=4)
+    assert isinstance(corrected, np.ndarray)
+    assert corrected.shape == cube.shape
+
+    crop = 15
+    s = slice(crop, -crop)
+    for ch in range(n_energy):
+        gt = channels_clean[ch][s, s]
+        gt_n = (gt - gt.mean()) / (gt.std() + 1e-8)
+        cor = corrected[s, s, ch]
+        cor_n = (cor - cor.mean()) / (cor.std() + 1e-8)
+        raw = cube[s, s, ch]
+        raw_n = (raw - raw.mean()) / (raw.std() + 1e-8)
+        raw_rms = float(np.sqrt(((raw_n - gt_n)**2).mean()))
+        cor_rms = float(np.sqrt(((cor_n - gt_n)**2).mean()))
+        assert cor_rms < raw_rms * 0.95, (
+            f"Energy channel {ch}: cube correction should reduce RMS "
+            f"(raw={raw_rms:.4f}, corrected={cor_rms:.4f})"
+        )
+
+
+def test_apply_correction_cube_4d_stem():
+    """apply_correction_cube on a 4D (H, W, det_h, det_w) STEM cube."""
+    scan_h = 128
+    drift_rate = (0.05, 0.1)
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
+    det_h, det_w = 4, 4
+    n_det = det_h * det_w
+
+    channels_clean = _make_diverse_channels(ref, n_det, seed=600)
+    channels_drifted = _apply_drift_to_channels(channels_clean, drift_rate, scan_h)
+    # Natural 4D layout: (H, W, det_h, det_w)
+    cube_4d = channels_drifted.transpose(1, 2, 0).reshape(
+        scan_h, scan_h, det_h, det_w
+    )
+    assert cube_4d.shape == (scan_h, scan_h, det_h, det_w)
+
+    corrected = dc.apply_correction_cube(cube_4d, channel_axis=2, chunk_size=8)
+    assert isinstance(corrected, np.ndarray)
+    assert corrected.shape == cube_4d.shape
+
+    cor_flat = corrected.reshape(scan_h, scan_h, -1).transpose(2, 0, 1)
+    crop = 15
+    s = slice(crop, -crop)
+    for ch in range(n_det):
+        gt = channels_clean[ch][s, s]
+        gt_n = (gt - gt.mean()) / (gt.std() + 1e-8)
+        cor = cor_flat[ch][s, s]
+        cor_n = (cor - cor.mean()) / (cor.std() + 1e-8)
+        raw = channels_drifted[ch][s, s]
+        raw_n = (raw - raw.mean()) / (raw.std() + 1e-8)
+        raw_rms = float(np.sqrt(((raw_n - gt_n)**2).mean()))
+        cor_rms = float(np.sqrt(((cor_n - gt_n)**2).mean()))
+        assert cor_rms < raw_rms * 0.95, (
+            f"Detector pixel {ch}: cube correction should reduce RMS "
+            f"(raw={raw_rms:.4f}, corrected={cor_rms:.4f})"
+        )
+
+
+def test_apply_correction_cube_matches_manual_chunking():
+    """apply_correction_cube must produce same results as manual loop."""
+    import torch
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    n_energy = 8
+
+    channels = _make_diverse_channels(ref, n_energy, seed=700)
+    drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
+    cube = drifted.transpose(1, 2, 0)  # (H, W, E)
+
+    # apply_correction_cube
+    auto = dc.apply_correction_cube(cube, chunk_size=3)
+
+    # Manual chunking (what user had to do before)
+    batch = cube.transpose(2, 0, 1)  # (E, H, W)
+    manual = dc.apply_correction(images=batch, mode='bicubic').cpu().numpy()
+    manual = manual.transpose(1, 2, 0)  # (H, W, E)
+
+    np.testing.assert_allclose(auto, manual, atol=1e-4, rtol=1e-4,
+                               err_msg="Cube method must match manual batch")
+
+
+def test_apply_correction_cube_torch_input():
+    """apply_correction_cube works with torch.Tensor input."""
+    import torch
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    cube_np = np.random.randn(scan_h, scan_h, 6).astype(np.float32)
+    cube_t = torch.from_numpy(cube_np)
+
+    result = dc.apply_correction_cube(cube_t, chunk_size=2)
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == cube_t.shape
+
+
+def test_apply_correction_cube_output_dtype_same():
+    """apply_correction_cube with output_dtype='same' preserves input dtype."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+
+    cube_u16 = (np.random.rand(scan_h, scan_h, 4) * 1000).astype(np.uint16)
+    result = dc.apply_correction_cube(cube_u16, output_dtype="same")
+    assert result.dtype == np.uint16
+    assert result.shape == cube_u16.shape
+
+
+def test_apply_correction_cube_2d_raises():
+    """apply_correction_cube rejects 2D input."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    with pytest.raises(ValueError, match="at least 3D"):
+        dc.apply_correction_cube(ref)

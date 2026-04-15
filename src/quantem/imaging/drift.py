@@ -1701,6 +1701,114 @@ class DriftCorrection(AutoSerialize):
 
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
+    def apply_correction_cube(
+        self,
+        cube: torch.Tensor | np.ndarray,
+        channel_axis: int = -1,
+        image_index: int = -1,
+        mode: str = "bicubic",
+        chunk_size: int = 64,
+        output_dtype: torch.dtype | np.dtype | str | None = None,
+    ) -> torch.Tensor | np.ndarray:
+        """Apply drift correction to a 3D or 4D data cube with automatic chunking.
+
+        Processes the cube in GPU-friendly chunks to avoid out-of-memory errors
+        on large datasets (e.g. 4D-STEM with 512×512×192×192 detector pixels).
+
+        Parameters
+        ----------
+        cube : torch.Tensor or np.ndarray
+            3D cube ``(H, W, C)`` for EDX/EELS spectral data, or
+            4D cube ``(H, W, det_h, det_w)`` for 4D-STEM.
+            The first two axes must be scan rows and columns matching
+            the shape used in :meth:`preprocess`.
+        channel_axis : int, default -1
+            Axis (or axes starting from this position) holding channel
+            dimensions. For 3D ``(H, W, E)``, use ``-1``.
+            For 4D ``(H, W, det_h, det_w)``, use ``2`` or ``-2``.
+        image_index : int, default -1
+            Which image's knot trajectory to use. Default selects the
+            last image (target in a ``[reference, target]`` pair).
+        mode : str, default "bicubic"
+            Interpolation kernel: ``"bicubic"`` or ``"bilinear"``.
+        chunk_size : int, default 64
+            Number of channels to warp per GPU call. Lower values use
+            less VRAM. For 512×512 scans: 64 → ~67 MB, 1024 → ~1 GB.
+        output_dtype : dtype, optional
+            Cast the output to this dtype. If ``None``, returns float32.
+            Use ``"same"`` to match the input dtype.
+
+        Returns
+        -------
+        torch.Tensor or np.ndarray
+            Corrected cube with the same shape and axis layout as input.
+            Returns np.ndarray if input was np.ndarray, torch.Tensor otherwise.
+
+        Examples
+        --------
+        >>> # EDX spectral cube
+        >>> corrected = dc.apply_correction_cube(
+        ...     cube_eds, channel_axis=-1, chunk_size=64)
+        >>> # 4D-STEM
+        >>> corrected = dc.apply_correction_cube(
+        ...     cube_4d, channel_axis=2, chunk_size=256)
+        """
+        return_numpy = isinstance(cube, np.ndarray)
+        if return_numpy:
+            input_np_dtype = cube.dtype
+            cube_t = torch.from_numpy(cube)
+        else:
+            input_np_dtype = None
+            cube_t = cube
+
+        original_shape = cube_t.shape
+        ndim = cube_t.dim()
+        if ndim < 3:
+            raise ValueError(
+                f"cube must be at least 3D, got shape {original_shape}"
+            )
+
+        scan_h, scan_w = original_shape[0], original_shape[1]
+        # Collapse all channel dims into one
+        channel_dims = list(range(2, ndim))
+        n_channels = 1
+        for d in channel_dims:
+            n_channels *= original_shape[d]
+
+        # Reshape to (n_channels, scan_h, scan_w)
+        flat = cube_t.reshape(scan_h, scan_w, n_channels).permute(2, 0, 1)
+        flat = flat.contiguous()
+
+        # Allocate output on CPU to avoid GPU OOM for large cubes
+        out_flat = torch.empty_like(flat)
+
+        for start in range(0, n_channels, chunk_size):
+            end = min(start + chunk_size, n_channels)
+            chunk = flat[start:end]  # (chunk, H, W)
+            corrected_chunk = self.apply_correction(
+                images=chunk, image_index=image_index, mode=mode,
+            )
+            out_flat[start:end] = corrected_chunk.to(out_flat.device)
+
+        # Reshape back to original layout
+        result = out_flat.permute(1, 2, 0).reshape(original_shape)
+
+        # Handle output dtype
+        if output_dtype == "same":
+            if return_numpy:
+                result = result.to(torch.float32)
+            else:
+                result = result.to(cube.dtype)
+        elif output_dtype is not None:
+            result = result.to(output_dtype)
+
+        if return_numpy:
+            result_np = result.cpu().numpy()
+            if output_dtype == "same":
+                result_np = result_np.astype(input_np_dtype)
+            return result_np
+        return result
+
     def calculate_error(
         self,
         mode: int,
@@ -2314,6 +2422,82 @@ class DriftCorrection(AutoSerialize):
                     y,
                     x,
                 )
+
+    def plot_knots(
+        self, figsize: tuple[int, int] | None = None
+    ) -> tuple:
+        """Plot knot trajectories before and after correction plus the per-scanline delta field.
+
+        Two panels per image:
+        - Top: mean warped image with initial knots (dashed) and corrected knots (solid)
+          overlaid. A third dotted line shows the affine-only state when available, so
+          the affine vs. nonrigid contributions are visible side by side.
+        - Bottom: per-scanline correction delta (row and col components) in pixels.
+          A smooth curve means the correction field is physically reasonable. Rapid
+          oscillations indicate regularization_sigma_px is too small and the optimizer
+          is fitting noise rather than real drift.
+
+        Parameters
+        ----------
+        figsize : (width, height), optional
+            Figure size in inches. Defaults to (7 * num_images, 6).
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        axes : ndarray of Axes, shape (2, num_images)
+        """
+        self._ensure_warped_images()
+        num_images = self.shape[0]
+        merged = self.images_warped.array.mean(0)
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        if figsize is None:
+            figsize = (7 * num_images, 6)
+        fig, axes = plt.subplots(
+            2, num_images, figsize=figsize,
+            gridspec_kw={"height_ratios": [2, 1]},
+        )
+        if num_images == 1:
+            axes = axes[:, None]   # ensure (2, N) indexing for all cases
+        scanlines = np.arange(self.knots[0].shape[1])
+        for img_idx in range(num_images):
+            color = colors[img_idx % len(colors)]
+            initial = self._initial_knots[img_idx].cpu().numpy()  # (2, H, n_knots)
+            current = self.knots[img_idx].cpu().numpy()
+            delta = current - initial
+            # top panel: knot trajectory overlaid on merged image
+            ax_img = axes[0, img_idx]
+            ax_img.imshow(merged, cmap="gray", origin="upper", aspect="equal",
+                          vmin=float(merged.min()), vmax=float(merged.max()))
+            ax_img.plot(initial[1, :, 0], initial[0, :, 0],
+                        "--", color=color, lw=1.2, alpha=0.7, label="initial")
+            ax_img.plot(current[1, :, 0], current[0, :, 0],
+                        "-", color=color, lw=1.5, label="corrected")
+            if hasattr(self, "_knots_after_affine"):
+                affine_np = self._knots_after_affine[img_idx].cpu().numpy()
+                ax_img.plot(affine_np[1, :, 0], affine_np[0, :, 0],
+                            ":", color=color, lw=1.0, alpha=0.6, label="after affine")
+            ax_img.legend(fontsize=8, loc="upper right")
+            ax_img.set_title(f"image {img_idx} — knot trajectory", fontsize=10)
+            ax_img.axis("off")
+            # bottom panel: per-scanline correction delta
+            ax_delta = axes[1, img_idx]
+            ax_delta.plot(scanlines, delta[0, :, 0], lw=1.2, label="row \u0394")
+            ax_delta.plot(scanlines, delta[1, :, 0], lw=1.2, label="col \u0394")
+            if hasattr(self, "_knots_after_affine"):
+                aff_delta = affine_np - initial
+                ax_delta.plot(scanlines, aff_delta[0, :, 0],
+                              ":", lw=1.0, alpha=0.6, label="affine row \u0394")
+                ax_delta.plot(scanlines, aff_delta[1, :, 0],
+                              ":", lw=1.0, alpha=0.6, label="affine col \u0394")
+            ax_delta.axhline(0, color="k", lw=0.5, ls="--")
+            ax_delta.set_xlabel("scanline")
+            ax_delta.set_ylabel("correction (px)")
+            ax_delta.set_title(f"image {img_idx} — delta field", fontsize=10)
+            ax_delta.legend(fontsize=8)
+            ax_delta.grid(alpha=0.3)
+        plt.tight_layout()
+        return fig, axes
 
 
 class DriftInterpolator:
