@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Self
 
 import matplotlib.pyplot as plt
@@ -38,6 +39,38 @@ from quantem.imaging.drift_utils import (
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 import quantem.imaging.drift_viz as drift_viz
+
+
+@dataclass
+class PairedCorrectionResult:
+    """Result of paired orthogonal-scan cube correction.
+
+    Returned by :meth:`DriftCorrection.generate_corrected_cubes`.
+
+    Attributes
+    ----------
+    merged : np.ndarray or None
+        Average of ``corrected_a`` and the rotated ``corrected_b``.
+        ``None`` when ``merge=False``.
+    corrected_a : np.ndarray
+        Drift-corrected first scan, same shape as input ``cube_a``.
+    corrected_b : np.ndarray
+        Drift-corrected second scan, **rotated** into the first scan's
+        coordinate frame.
+    drift : DriftCorrection
+        The alignment object (for plots, knot inspection, etc.).
+    vdf_a : np.ndarray
+        Virtual dark-field image used for alignment (scan A).
+    vdf_b : np.ndarray
+        Virtual dark-field image used for alignment (scan B).
+    """
+
+    merged: np.ndarray | None
+    corrected_a: np.ndarray
+    corrected_b: np.ndarray
+    drift: "DriftCorrection"
+    vdf_a: np.ndarray
+    vdf_b: np.ndarray
 
 
 class DriftCorrection(AutoSerialize):
@@ -153,6 +186,7 @@ class DriftCorrection(AutoSerialize):
             )
 
         self._frames: list[Self] | None = None
+        self._cubes: list[np.ndarray] | None = None
         self.imgs = imgs
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
 
@@ -167,6 +201,7 @@ class DriftCorrection(AutoSerialize):
         """Construct a series wrapper around pre-built single-pair frames."""
         obj = cls.__new__(cls)
         obj._frames = frames
+        obj._cubes = None
         obj.scan_direction_degrees = frames[0].scan_direction_degrees
         obj._device = frames[0]._device
         obj._dtype = frames[0]._dtype
@@ -176,6 +211,11 @@ class DriftCorrection(AutoSerialize):
     def is_series(self) -> bool:
         """True if this instance wraps a multi-frame series."""
         return self._frames is not None
+
+    @property
+    def is_4dstem(self) -> bool:
+        """True if this instance was created from 4-D data cubes."""
+        return getattr(self, "_cubes", None) is not None
 
     @property
     def n_frames(self) -> int:
@@ -227,10 +267,77 @@ class DriftCorrection(AutoSerialize):
         cls,
         images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
+        alignment_images: list[NDArray] | None = None,
     ) -> Self:
-        # Detect series: a list/tuple of 3-D stacks or Dataset3d objects
+        """Create a DriftCorrection from data arrays.
+
+        Accepts 2-D images (standard paired scan), 3-D stacks (series),
+        or 4-D cubes (4D-STEM / EDX).  When 4-D arrays are given the
+        cubes are stored internally and virtual dark-field images are
+        extracted automatically for alignment.
+
+        Parameters
+        ----------
+        images : list
+            Input data.  Each element may be:
+
+            * **2-D** ``(H, W)`` — standard paired-image mode.
+            * **3-D** ``(N, H, W)`` — tilt-series mode (N frames).
+            * **4-D** ``(H, W, det_h, det_w)`` — 4D-STEM cube mode.
+              Cubes are stored and VDFs extracted for alignment.
+        scan_direction_degrees : list of float
+            Scan angle for each image, e.g. ``[0, -90]``.
+        alignment_images : list of 2-D arrays, optional
+            Custom alignment images (e.g. pre-computed VDFs).  Only used
+            in 4-D cube mode.  When ``None``, VDFs are computed by
+            averaging over the non-scan dimensions.
+        """
         if isinstance(images, (list, tuple)) and len(images) >= 2:
             first = images[0]
+
+            # ── 4-D cube mode (4D-STEM / EDX) ──
+            is_4d = isinstance(first, np.ndarray) and first.ndim >= 4
+            if is_4d:
+                cubes: list[np.ndarray] = []
+                for i, img in enumerate(images):
+                    if not isinstance(img, np.ndarray) or img.ndim < 4:
+                        raise TypeError(
+                            "For 4D-STEM mode all images must be ≥4-D arrays "
+                            f"(H, W, ...), got ndim={getattr(img, 'ndim', '?')} "
+                            f"for images[{i}]"
+                        )
+                    cubes.append(img)
+
+                # Early rotation validation
+                sd = np.asarray(scan_direction_degrees, dtype=float)
+                if sd.size == 2:
+                    delta = float((sd[1] - sd[0]) % 360)
+                    rot_k = round(delta / 90)
+                    if abs(delta - rot_k * 90) > 1.0:
+                        raise ValueError(
+                            f"Scan angle difference ({sd[1]} - {sd[0]} = "
+                            f"{sd[1] - sd[0]}°) must be a multiple of 90°. "
+                            f"Arbitrary rotations are not supported for "
+                            f"4D-STEM cube merging."
+                        )
+
+                # Build alignment images (VDFs)
+                if alignment_images is not None:
+                    if len(alignment_images) != len(cubes):
+                        raise ValueError(
+                            f"alignment_images has {len(alignment_images)} "
+                            f"entries but {len(cubes)} cubes were given"
+                        )
+                    vdfs = [np.asarray(v) for v in alignment_images]
+                else:
+                    vdfs = [cls.compute_vdf(c) for c in cubes]
+
+                # Recurse with 2-D VDFs to create a normal instance
+                instance = cls.from_data(vdfs, scan_direction_degrees)
+                instance._cubes = cubes  # store references (no copy)
+                return instance
+
+            # ── Series mode: list of 3-D stacks or Dataset3d ──
             is_3d = (isinstance(first, np.ndarray) and first.ndim == 3) or isinstance(first, Dataset3d)
             if is_3d:
                 stacks = []
@@ -1985,7 +2092,7 @@ class DriftCorrection(AutoSerialize):
     @torch.inference_mode()
     def apply_correction_4dstem(
         self,
-        ds_4d: torch.Tensor | np.ndarray,
+        ds_4d: torch.Tensor | np.ndarray | None = None,
         image_index: int = -1,
         mode: str = "bicubic",
         chunk_size: int | None = None,
@@ -1995,6 +2102,10 @@ class DriftCorrection(AutoSerialize):
         progress: bool = False,
     ) -> torch.Tensor | np.ndarray:
         """Apply drift correction to a 3D or 4D data cube.
+
+        When *ds_4d* is ``None`` and this instance was created from 4-D
+        cubes via :meth:`from_data`, the stored cube for *image_index*
+        is used automatically.
 
         Automatically selects a **single-shot GPU path** when the full
         cube fits in GPU memory (fastest), or falls back to chunked
@@ -2055,6 +2166,25 @@ class DriftCorrection(AutoSerialize):
         >>> dc.apply_correction_4dstem(cube, output=out)
         """
         self._ensure_single("apply_correction_4dstem")
+
+        # Resolve cube from stored data when not provided explicitly
+        if ds_4d is None:
+            cubes = getattr(self, "_cubes", None)
+            if cubes is None:
+                raise ValueError(
+                    "No cube provided and no stored cubes. Either pass "
+                    "ds_4d explicitly, or create this instance with "
+                    "from_data([4d_cube_a, 4d_cube_b], ...)."
+                )
+            if image_index < 0:
+                image_index = len(cubes) + image_index
+            if image_index < 0 or image_index >= len(cubes):
+                raise IndexError(
+                    f"image_index={image_index} out of range for "
+                    f"{len(cubes)} stored cubes"
+                )
+            ds_4d = cubes[image_index]
+
         is_numpy = isinstance(ds_4d, np.ndarray)
         original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
         input_np_dtype = ds_4d.dtype if is_numpy else None
@@ -2217,6 +2347,120 @@ class DriftCorrection(AutoSerialize):
         if return_numpy:
             return result.cpu().numpy() if result.is_cuda else result.numpy()
         return result
+
+    def generate_corrected_cubes(
+        self,
+        *,
+        mode: str = "bicubic",
+        chunk_size: int | None = None,
+        merge: bool = True,
+        progress: bool = False,
+        output_a: np.ndarray | None = None,
+        output_b: np.ndarray | None = None,
+    ) -> PairedCorrectionResult:
+        """Apply learned correction to the stored 4-D cubes.
+
+        Only available when this instance was created from 4-D arrays via
+        :meth:`from_data`.  Applies the correction to both cubes,
+        rotates ``cube_b`` into ``cube_a``'s coordinate frame, and
+        optionally merges them.
+
+        Parameters
+        ----------
+        mode : str
+            Interpolation mode (``"bicubic"`` or ``"bilinear"``).
+        chunk_size : int or None
+            GPU channel chunk size (``None`` = auto).
+        merge : bool
+            If ``True`` (default), average the two corrected cubes.
+        progress : bool
+            Show tqdm progress bars.
+        output_a, output_b : np.ndarray or None
+            Pre-allocated output arrays (e.g. ``np.memmap``).
+            Forwarded to :meth:`apply_correction_4dstem`.
+
+        Returns
+        -------
+        PairedCorrectionResult
+
+        Examples
+        --------
+        >>> dc = DriftCorrection.from_data(
+        ...     [cube_0deg, cube_90deg],
+        ...     scan_direction_degrees=[0, -90],
+        ... )
+        >>> dc.preprocess(pad_fraction=0.25, kde_sigma=0.5)
+        >>> dc.align_affine(step=0.02, num_tests=11)
+        >>> result = dc.generate_corrected_cubes()
+        >>> result.merged.shape
+        """
+        self._ensure_single("generate_corrected_cubes")
+        cubes = getattr(self, "_cubes", None)
+        if cubes is None:
+            raise TypeError(
+                "generate_corrected_cubes requires 4-D cube data. "
+                "Create this instance with from_data([cube_a, cube_b], ...)."
+            )
+        if len(cubes) < 2:
+            raise ValueError(
+                f"Need at least 2 cubes for paired correction, "
+                f"got {len(cubes)}"
+            )
+
+        corrected_a = self.apply_correction_4dstem(
+            image_index=0, mode=mode, chunk_size=chunk_size,
+            progress=progress, output=output_a,
+        )
+        corrected_b = self.apply_correction_4dstem(
+            image_index=1, mode=mode, chunk_size=chunk_size,
+            progress=progress, output=output_b,
+        )
+
+        # Rotate cube_b into cube_a's coordinate frame
+        sd = self.scan_direction_degrees
+        delta = float((sd[1] - sd[0]) % 360)
+        rot_k = round(delta / 90) % 4
+        if rot_k != 0:
+            corrected_b = np.rot90(corrected_b, k=rot_k, axes=(0, 1)).copy()
+
+        merged = None
+        if merge:
+            if corrected_a.shape != corrected_b.shape:
+                raise ValueError(
+                    f"Cannot merge: corrected_a shape {corrected_a.shape} "
+                    f"!= rotated corrected_b shape {corrected_b.shape}. "
+                    f"Paired scans must have compatible scan dimensions "
+                    f"after rotation."
+                )
+            merged = (
+                (corrected_a.astype(np.float64) + corrected_b.astype(np.float64))
+                / 2
+            ).astype(np.float32)
+
+        # Extract VDFs from the stored alignment images
+        vdf_a = np.asarray(self.imgs[0].array)
+        vdf_b = np.asarray(self.imgs[1].array)
+
+        return PairedCorrectionResult(
+            merged=merged,
+            corrected_a=corrected_a,
+            corrected_b=corrected_b,
+            drift=self,
+            vdf_a=vdf_a,
+            vdf_b=vdf_b,
+        )
+
+    # -- serialization -------------------------------------------------------
+
+    def save(self, path, mode="w", store="auto", skip=(), compression_level=4):
+        """Save alignment state (cubes are excluded — too large)."""
+        if isinstance(skip, (str, type)):
+            skip = [skip]
+        skip = list(skip) + ["_cubes"]
+        super().save(
+            path, mode=mode, store=store, skip=skip,
+            compression_level=compression_level,
+        )
 
     def calculate_error(
         self,
@@ -2393,207 +2637,6 @@ class DriftCorrection(AutoSerialize):
             self, cube_raw, cube_corrected, **kwargs,
         )
 
-
-from dataclasses import dataclass
-
-
-@dataclass
-class PairedCorrectionResult:
-    """Result returned by :func:`correct_4dstem_paired`.
-
-    Attributes
-    ----------
-    merged : np.ndarray or None
-        Average of ``corrected_a`` and the rotated ``corrected_b``.
-        ``None`` when ``merge=False``.
-    corrected_a : np.ndarray
-        Drift-corrected first scan, same shape as ``cube_a``.
-    corrected_b : np.ndarray
-        Drift-corrected second scan, **rotated** into the first scan's
-        coordinate frame.  Same shape as ``corrected_a`` for square scans.
-    drift : DriftCorrection
-        The fitted alignment object (for plots, knot inspection, etc.).
-    vdf_a : np.ndarray
-        Virtual dark-field image used for alignment (scan A).
-    vdf_b : np.ndarray
-        Virtual dark-field image used for alignment (scan B).
-    """
-
-    merged: np.ndarray | None
-    corrected_a: np.ndarray
-    corrected_b: np.ndarray
-    drift: DriftCorrection
-    vdf_a: np.ndarray
-    vdf_b: np.ndarray
-
-
-def correct_4dstem_paired(
-    cube_a: np.ndarray,
-    cube_b: np.ndarray,
-    scan_direction_degrees: list[float],
-    *,
-    vdf_a: np.ndarray | None = None,
-    vdf_b: np.ndarray | None = None,
-    preprocess: dict | None = None,
-    align_affine: dict | None = None,
-    align_nonrigid: dict | bool = False,
-    mode: str = "bicubic",
-    chunk_size: int | None = None,
-    merge: bool = True,
-    progress: bool = False,
-) -> PairedCorrectionResult:
-    """Drift-correct paired orthogonal-scan data cubes end-to-end.
-
-    Handles the full workflow: VDF extraction → alignment → correction
-    → frame rotation → merge.  Works for 4D-STEM ``(H, W, det_h, det_w)``
-    and 3D EDX/EELS ``(H, W, E)`` cubes alike.
-
-    For memory-constrained workloads (cubes too large for RAM), use the
-    lower-level API directly::
-
-        dc = DriftCorrection.from_data([vdf_a, vdf_b], ...)
-        dc.preprocess(...).align_affine(...)
-        dc.apply_correction_4dstem(cube_a, image_index=0, output=mmap_a)
-        del cube_a                          # release
-        dc.apply_correction_4dstem(cube_b, image_index=1, output=mmap_b)
-        del cube_b                          # release
-
-    Parameters
-    ----------
-    cube_a, cube_b : np.ndarray
-        Data cubes with shape ``(H, W, ...)`` where the first two axes are
-        scan rows and columns.  Typically collected at orthogonal scan
-        angles (e.g. 0° and 90°).
-    scan_direction_degrees : list of float
-        Scan direction for each cube, e.g. ``[0, -90]``.
-    vdf_a, vdf_b : np.ndarray or None
-        Pre-computed virtual dark-field images ``(H, W)``.  When ``None``
-        (default), VDFs are computed automatically by averaging over
-        the non-scan dimensions.
-    preprocess : dict or None
-        Kwargs forwarded to :meth:`DriftCorrection.preprocess`.
-        ``number_knots`` defaults to 1 if not specified.
-    align_affine : dict or None
-        Kwargs forwarded to :meth:`DriftCorrection.align_affine`.
-    align_nonrigid : dict, bool, or False
-        ``False`` (default): skip.  ``True``: run with defaults.
-        ``dict``: run with the given kwargs.
-    mode : str
-        Interpolation mode for ``apply_correction_4dstem``.
-    chunk_size : int or None
-        GPU channel chunk size (``None`` = auto).
-    merge : bool
-        If ``True`` (default), average the two corrected cubes.
-    progress : bool
-        Show tqdm progress bars.
-
-    Returns
-    -------
-    PairedCorrectionResult
-        Dataclass with ``merged``, ``corrected_a``, ``corrected_b``,
-        ``drift``, ``vdf_a``, ``vdf_b``.
-
-    Examples
-    --------
-    >>> result = correct_4dstem_paired(
-    ...     cube_0deg, cube_90deg,
-    ...     scan_direction_degrees=[0, -90],
-    ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-    ...     align_affine=dict(step=0.02, num_tests=11),
-    ... )
-    >>> result.merged.shape   # (H, W, det_h, det_w)
-    >>> result.drift.plot_merged_images()
-    """
-    cube_a = np.asarray(cube_a)
-    cube_b = np.asarray(cube_b)
-    if cube_a.ndim < 3:
-        raise ValueError(
-            f"cube_a must be at least 3-D (H, W, ...), got {cube_a.ndim}-D"
-        )
-    if cube_b.ndim < 3:
-        raise ValueError(
-            f"cube_b must be at least 3-D (H, W, ...), got {cube_b.ndim}-D"
-        )
-    if len(scan_direction_degrees) != 2:
-        raise ValueError(
-            "scan_direction_degrees must have exactly 2 entries, "
-            f"got {len(scan_direction_degrees)}"
-        )
-
-    # ── Rotation validation (only multiples of 90°) ──
-    theta_a, theta_b = scan_direction_degrees
-    delta = (theta_b - theta_a) % 360
-    rot_k = round(delta / 90)
-    if abs(delta - rot_k * 90) > 1.0:
-        raise ValueError(
-            f"Scan angle difference ({theta_b} - {theta_a} = "
-            f"{theta_b - theta_a}°) must be a multiple of 90°. "
-            f"Arbitrary rotations are not supported."
-        )
-    rot_k = rot_k % 4  # normalize to 0-3
-
-    # ── Extract VDFs ──
-    if vdf_a is None:
-        vdf_a = DriftCorrection.compute_vdf(cube_a)
-    if vdf_b is None:
-        vdf_b = DriftCorrection.compute_vdf(cube_b)
-
-    # ── Align VDFs ──
-    pp_kw: dict = dict(show_merged=False, show_images=False, number_knots=1)
-    if preprocess is not None:
-        pp_kw.update(preprocess)
-
-    dc = DriftCorrection.from_data(
-        [vdf_a, vdf_b], scan_direction_degrees,
-    )
-    dc.preprocess(**pp_kw)
-
-    aa_kw: dict = dict(show_merged=False, show_images=False)
-    if align_affine is not None:
-        aa_kw.update(align_affine)
-    dc.align_affine(**aa_kw)
-
-    if align_nonrigid is not False:
-        nr_kw: dict = dict(show_merged=False, show_images=False)
-        if isinstance(align_nonrigid, dict):
-            nr_kw.update(align_nonrigid)
-        dc.align_nonrigid(**nr_kw)
-
-    # ── Apply correction to both cubes ──
-    corr_a = dc.apply_correction_4dstem(
-        cube_a, image_index=0, mode=mode,
-        chunk_size=chunk_size, progress=progress,
-    )
-    corr_b = dc.apply_correction_4dstem(
-        cube_b, image_index=1, mode=mode,
-        chunk_size=chunk_size, progress=progress,
-    )
-
-    # ── Rotate cube_b to cube_a's coordinate frame ──
-    if rot_k != 0:
-        corr_b = np.rot90(corr_b, k=rot_k, axes=(0, 1)).copy()
-
-    # ── Merge ──
-    merged = None
-    if merge:
-        if corr_a.shape != corr_b.shape:
-            raise ValueError(
-                f"Cannot merge: corrected_a shape {corr_a.shape} != "
-                f"rotated corrected_b shape {corr_b.shape}. "
-                f"Paired scans must have compatible scan dimensions "
-                f"after rotation."
-            )
-        merged = (corr_a.astype(np.float64) + corr_b.astype(np.float64))
-        merged = (merged / 2).astype(np.float32)
-
-    return PairedCorrectionResult(
-        merged=merged,
-        corrected_a=corr_a,
-        corrected_b=corr_b,
-        drift=dc,
-        vdf_a=vdf_a,
-        vdf_b=vdf_b,
-    )
 
 
 def correct_series(

@@ -16,7 +16,6 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import (
     DriftCorrection,
     PairedCorrectionResult,
-    correct_4dstem_paired,
     correct_series,
 )
 
@@ -1501,7 +1500,7 @@ def test_compute_vdf_3d():
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#   correct_4dstem_paired  tests
+#   4D-STEM class integration tests (from_data with 4D cubes)
 # ═════════════════════════════════════════════════════════════════════════
 
 def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
@@ -1512,10 +1511,8 @@ def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
     dimensions mimic VDF images from ``make_synthetic_drift_data``.
     """
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=seed)
-    # Crop to scan_size
     im0 = im0[:scan_size, :scan_size]
     im1 = im1[:scan_size, :scan_size]
-    # Create 4D cubes by tiling the VDF into small detector dimensions
     rng = np.random.RandomState(seed)
     cube_a = np.empty((scan_size, scan_size, det_size, det_size), dtype=np.float32)
     cube_b = np.empty_like(cube_a)
@@ -1526,15 +1523,58 @@ def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
     return cube_a, cube_b
 
 
-def test_correct_4dstem_paired_basic():
-    """correct_4dstem_paired returns correct shapes and types."""
+def test_from_data_detects_4d():
+    """from_data with 4D arrays creates a 4D-STEM instance."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
     )
+    assert dc.is_4dstem
+    assert not dc.is_series
+    # VDFs were extracted automatically — alignment images are 2D
+    assert dc.imgs[0].array.shape == (32, 32)
+    assert dc.imgs[1].array.shape == (32, 32)
+
+
+def test_from_data_4d_alignment_images():
+    """Custom alignment_images override auto-VDF extraction."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    custom_a = cube_a[:, :, 0, 0].copy()
+    custom_b = cube_b[:, :, 0, 0].copy()
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+        alignment_images=[custom_a, custom_b],
+    )
+    assert dc.is_4dstem
+    np.testing.assert_array_equal(dc.imgs[0].array, custom_a)
+    np.testing.assert_array_equal(dc.imgs[1].array, custom_b)
+
+
+def test_from_data_4d_bad_rotation_early():
+    """Non-multiple-of-90° angles are rejected at from_data time."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    with pytest.raises(ValueError, match="multiple of 90"):
+        DriftCorrection.from_data(
+            [cube_a, cube_b], scan_direction_degrees=[0, -45],
+        )
+
+
+def test_generate_corrected_cubes_basic():
+    """Full pipeline: from_data → preprocess → align → generate_corrected_cubes."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected_cubes()
+
     assert isinstance(result, PairedCorrectionResult)
     assert result.merged is not None
     assert result.merged.shape == cube_a.shape
@@ -1546,111 +1586,105 @@ def test_correct_4dstem_paired_basic():
     assert result.vdf_b.shape == (32, 32)
 
 
-def test_correct_4dstem_paired_no_merge():
-    """merge=False leaves merged as None."""
+def test_generate_corrected_cubes_no_merge():
+    """merge=False returns None for merged."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
-        merge=False,
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
     )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected_cubes(merge=False)
     assert result.merged is None
     assert result.corrected_a.shape == cube_a.shape
     assert result.corrected_b.shape == cube_a.shape
 
 
-def test_correct_4dstem_paired_precomputed_vdf():
-    """Precomputed VDFs are used instead of auto-computed ones."""
+def test_generate_corrected_cubes_nonrigid():
+    """Nonrigid alignment works in the 4D pipeline."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    vdf_a = cube_a[:, :, 0, 0].copy()
-    vdf_b = cube_b[:, :, 0, 0].copy()
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        vdf_a=vdf_a, vdf_b=vdf_b,
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
     )
-    np.testing.assert_array_equal(result.vdf_a, vdf_a)
-    np.testing.assert_array_equal(result.vdf_b, vdf_b)
-
-
-def test_correct_4dstem_paired_3d_cubes():
-    """Works with 3D cubes (H, W, C) like EDX/EELS data."""
-    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    scan_size = 32
-    n_channels = 12
-    rng = np.random.RandomState(42)
-    cube_a = np.stack([im0[:scan_size, :scan_size] + rng.randn(scan_size, scan_size) * 0.01
-                       for _ in range(n_channels)], axis=-1).astype(np.float32)
-    cube_b = np.stack([im1[:scan_size, :scan_size] + rng.randn(scan_size, scan_size) * 0.01
-                       for _ in range(n_channels)], axis=-1).astype(np.float32)
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
     )
-    assert result.merged.shape == (scan_size, scan_size, n_channels)
-    assert result.merged.dtype == np.float32
-
-
-def test_correct_4dstem_paired_nonrigid():
-    """align_nonrigid=True runs the nonrigid stage."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
-        align_nonrigid=True,
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
     )
+    dc.align_nonrigid(show_merged=False, show_images=False)
+    result = dc.generate_corrected_cubes()
     assert result.merged is not None
     assert result.merged.shape == cube_a.shape
 
 
-def test_correct_4dstem_paired_nonrigid_dict():
-    """align_nonrigid with custom dict params."""
+def test_apply_correction_4dstem_uses_stored_cube():
+    """apply_correction_4dstem with no cube arg uses stored cube."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    result = correct_4dstem_paired(
-        cube_a, cube_b,
-        scan_direction_degrees=[0, -90],
-        preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-        align_affine=dict(step=0.02, num_tests=11),
-        align_nonrigid=dict(step=0.01, num_tests=5),
+    dc = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
     )
-    assert result.merged is not None
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    corrected_0 = dc.apply_correction_4dstem(image_index=0)
+    assert corrected_0.shape == cube_a.shape
 
 
-def test_correct_4dstem_paired_bad_rotation():
-    """Non-multiple-of-90° scan angle difference raises ValueError."""
+def test_apply_correction_4dstem_no_cube_no_stored_raises():
+    """apply_correction_4dstem without cube or stored cubes raises."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1)
+    dc = DriftCorrection.from_data(
+        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    with pytest.raises(ValueError, match="No cube provided"):
+        dc.apply_correction_4dstem()
+
+
+def test_generate_corrected_cubes_requires_4d():
+    """generate_corrected_cubes raises on 2D instances."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1)
+    dc = DriftCorrection.from_data(
+        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    )
+    with pytest.raises(TypeError, match="4-D cube data"):
+        dc.generate_corrected_cubes()
+
+
+def test_is_4dstem_property():
+    """is_4dstem reflects whether cubes are stored."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1)
+    dc_2d = DriftCorrection.from_data(
+        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    )
+    assert not dc_2d.is_4dstem
+
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    with pytest.raises(ValueError, match="multiple of 90"):
-        correct_4dstem_paired(
-            cube_a, cube_b,
-            scan_direction_degrees=[0, -45],
-            preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-            align_affine=dict(step=0.02, num_tests=11),
-        )
-
-
-def test_correct_4dstem_paired_bad_ndim():
-    """2-D inputs are rejected."""
-    flat = np.zeros((32, 32), dtype=np.float32)
-    cube = np.zeros((32, 32, 4, 4), dtype=np.float32)
-    with pytest.raises(ValueError, match="at least 3-D"):
-        correct_4dstem_paired(flat, cube, scan_direction_degrees=[0, -90])
-    with pytest.raises(ValueError, match="at least 3-D"):
-        correct_4dstem_paired(cube, flat, scan_direction_degrees=[0, -90])
-
-
-def test_correct_4dstem_paired_wrong_direction_count():
-    """scan_direction_degrees must have exactly 2 entries."""
-    cube = np.zeros((32, 32, 4, 4), dtype=np.float32)
-    with pytest.raises(ValueError, match="exactly 2"):
-        correct_4dstem_paired(cube, cube, scan_direction_degrees=[0, -90, 45])
+    dc_4d = DriftCorrection.from_data(
+        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    )
+    assert dc_4d.is_4dstem
 
 
 def test_generate_corrected_image_strip_padding():
