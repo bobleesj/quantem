@@ -179,7 +179,6 @@ class DriftCorrection(AutoSerialize):
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
         validated_images = validate_list_of_dataset2d(images)
-
         return cls(
             imgs=validated_images,
             scan_direction_degrees=scan_direction_degrees,
@@ -297,7 +296,6 @@ class DriftCorrection(AutoSerialize):
                 input_shape=self.imgs[i].shape,
                 output_shape=self.shape[1:],
                 scan_fast=self.scan_fast[i],
-                scan_slow=self.scan_slow[i],
                 pad_value=self.pad_value[i],
                 kde_sigma=self.kde_sigma,
             )
@@ -1485,36 +1483,34 @@ class DriftCorrection(AutoSerialize):
         """SciPy L-BFGS optimization for one image."""
         shape_knots = knots_init.shape
         options = {"maxiter": max_optimize_iterations} if max_optimize_iterations else {}
+
+        def _bilinear_warp(row_coords, col_coords):
+            rf = np.clip(np.floor(row_coords).astype(int), 0, self.shape[1] - 2)
+            cf = np.clip(np.floor(col_coords).astype(int), 0, self.shape[2] - 2)
+            dr, dc = row_coords - rf, col_coords - cf
+            return (image_ref[rf, cf] * (1 - dr) * (1 - dc)
+                    + image_ref[rf + 1, cf] * dr * (1 - dc)
+                    + image_ref[rf, cf + 1] * (1 - dr) * dc
+                    + image_ref[rf + 1, cf + 1] * dr * dc)
+
         if solve_individual_rows:
             knots_updated = np.zeros_like(knots_init)
             for row_ind in range(knots_init.shape[1]):
                 x0 = knots_init[:, row_ind, :].ravel()
                 def cost_function(x):
-                    knots_row = x.reshape(shape_knots[0], shape_knots[2])
-                    row_coords, col_coords = self.interpolator[idx].transform_rows(knots_row)
-                    rf = np.clip(np.floor(row_coords).astype(int), 0, self.shape[1] - 2)
-                    cf = np.clip(np.floor(col_coords).astype(int), 0, self.shape[2] - 2)
-                    dr, dc = row_coords - rf, col_coords - cf
-                    warped = (image_ref[rf, cf] * (1 - dr) * (1 - dc)
-                              + image_ref[rf + 1, cf] * dr * (1 - dc)
-                              + image_ref[rf, cf + 1] * (1 - dr) * dc
-                              + image_ref[rf + 1, cf + 1] * dr * dc)
-                    return np.sum((warped - self.imgs[idx].array[row_ind, :]) ** 2)
+                    row_coords, col_coords = self.interpolator[idx].transform_rows(
+                        x.reshape(shape_knots[0], shape_knots[2]))
+                    return np.sum((_bilinear_warp(row_coords, col_coords)
+                                   - self.imgs[idx].array[row_ind, :]) ** 2)
                 result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                 knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
         else:
             x0 = knots_init.ravel()
             def cost_function(x):
-                knots = x.reshape(shape_knots)
-                row_coords, col_coords = self.interpolator[idx].transform_coordinates(knots)
-                rf = np.clip(np.floor(row_coords).astype(int), 0, self.shape[1] - 2)
-                cf = np.clip(np.floor(col_coords).astype(int), 0, self.shape[2] - 2)
-                dr, dc = row_coords - rf, col_coords - cf
-                warped = (image_ref[rf, cf] * (1 - dr) * (1 - dc)
-                          + image_ref[rf + 1, cf] * dr * (1 - dc)
-                          + image_ref[rf, cf + 1] * (1 - dr) * dc
-                          + image_ref[rf + 1, cf + 1] * dr * dc)
-                return np.sum((warped - self.imgs[idx].array) ** 2)
+                row_coords, col_coords = self.interpolator[idx].transform_coordinates(
+                    x.reshape(shape_knots))
+                return np.sum((_bilinear_warp(row_coords, col_coords)
+                               - self.imgs[idx].array) ** 2)
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
@@ -2098,13 +2094,188 @@ class DriftCorrection(AutoSerialize):
         )
 
 
+def _validate_stage_kwargs(method, kwargs, stage_name):
+    """Raise TypeError if *kwargs* contains keys not in *method*'s signature."""
+    import inspect
+
+    sig = inspect.signature(method)
+    valid = {
+        p.name
+        for p in sig.parameters.values()
+        if p.name != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
+    }
+    unknown = set(kwargs) - valid
+    if unknown:
+        raise TypeError(
+            f"correct_series(): unexpected keyword arguments for "
+            f"{stage_name}: {', '.join(sorted(unknown))}. "
+            f"Valid keys: {', '.join(sorted(valid))}"
+        )
+
+
+def correct_series(
+    images_a: NDArray,
+    images_b: NDArray,
+    scan_direction_degrees: list[float],
+    *,
+    preprocess: dict | None = None,
+    align_affine: dict | None = None,
+    align_nonrigid: dict | bool = False,
+    generate: dict | None = None,
+) -> tuple[np.ndarray, list[DriftCorrection]]:
+    """Drift-correct a paired image series frame by frame.
+
+    Wraps the standard ``DriftCorrection`` pipeline (preprocess → affine →
+    optional nonrigid → generate) and runs it over N frame pairs.  Each
+    stage is configured through a keyword dictionary whose keys are the same
+    as the corresponding ``DriftCorrection`` method parameters, giving full
+    access to every tuning knob without the wrapper having to enumerate them.
+
+    Parameters
+    ----------
+    images_a : (N, H, W) ndarray
+        First scan direction image stack (e.g. 0-deg scans).
+    images_b : (N, H, W) ndarray
+        Second scan direction image stack (e.g. 90-deg scans).
+    scan_direction_degrees : list of float
+        Scan direction angles, e.g. ``[0, -90]``.
+    preprocess : dict or None
+        Keyword arguments forwarded to
+        :meth:`DriftCorrection.preprocess`.  ``None`` uses method defaults.
+    align_affine : dict or None
+        Keyword arguments forwarded to
+        :meth:`DriftCorrection.align_affine`.  ``None`` uses method defaults.
+        The series wrapper sets ``show_merged=False, show_images=False`` by
+        default; pass them explicitly to override.
+    align_nonrigid : dict, bool, or False
+        Controls nonrigid alignment after affine:
+
+        - ``False`` (default): skip nonrigid alignment.
+        - ``True``: run :meth:`DriftCorrection.align_nonrigid` with its
+          defaults.
+        - ``dict``: run nonrigid with the given keyword arguments
+          (e.g. ``dict(regularization_sigma_px=4.0, num_iterations=8)``).
+
+        The series wrapper sets ``show_merged=False, show_images=False`` by
+        default; pass them explicitly to override.
+    generate : dict or None
+        Keyword arguments forwarded to
+        :meth:`DriftCorrection.generate_corrected_image`.  ``None`` uses
+        method defaults.  The series wrapper sets ``strip_padding=True,
+        show_image=False`` by default; pass them explicitly to override.
+
+    Returns
+    -------
+    corrected : (N, H', W') float32 ndarray
+        Stack of drift-corrected images.  With the default
+        ``strip_padding=True`` this has the same spatial dimensions as the
+        input scans.
+    drift_objects : list of DriftCorrection
+        One object per frame for post-hoc inspection (knots, plots, etc.).
+
+    Examples
+    --------
+    Minimal call with all defaults:
+
+    >>> corrected, objs = correct_series(
+    ...     images_a, images_b, scan_direction_degrees=[0, -90])
+
+    Typical usage with explicit stage parameters:
+
+    >>> corrected, objs = correct_series(
+    ...     images_0deg, images_90deg,
+    ...     scan_direction_degrees=[0, -90],
+    ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5, number_knots=1),
+    ...     align_affine=dict(step=0.02, num_tests=11),
+    ...     generate=dict(upsample_factor=1, kde_sigma=0.5),
+    ... )
+
+    With nonrigid alignment:
+
+    >>> corrected, objs = correct_series(
+    ...     images_0deg, images_90deg,
+    ...     scan_direction_degrees=[0, -90],
+    ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
+    ...     align_affine=dict(step=0.02, num_tests=11),
+    ...     align_nonrigid=dict(regularization_sigma_px=4.0, num_iterations=8),
+    ...     generate=dict(upsample_factor=2),
+    ... )
+    """
+    images_a = np.asarray(images_a)
+    images_b = np.asarray(images_b)
+    if images_a.ndim != 3:
+        raise ValueError(
+            f"images_a must be 3-D (N, H, W), got shape {images_a.shape}"
+        )
+    if images_b.ndim != 3:
+        raise ValueError(
+            f"images_b must be 3-D (N, H, W), got shape {images_b.shape}"
+        )
+    if images_a.shape != images_b.shape:
+        raise ValueError(
+            f"Shape mismatch: images_a {images_a.shape} != "
+            f"images_b {images_b.shape}"
+        )
+
+    # --- build per-stage kwargs with series-specific defaults ------------
+    preprocess_kw = dict(**(preprocess or {}))
+
+    affine_kw = dict(show_merged=False, show_images=False)
+    if align_affine is not None:
+        affine_kw.update(align_affine)
+
+    run_nonrigid = align_nonrigid is not False
+    nonrigid_kw: dict = {}
+    if run_nonrigid:
+        nonrigid_kw = dict(show_merged=False, show_images=False)
+        if isinstance(align_nonrigid, dict):
+            nonrigid_kw.update(align_nonrigid)
+
+    generate_kw = dict(strip_padding=True, show_image=False)
+    if generate is not None:
+        generate_kw.update(generate)
+
+    # --- validate keys eagerly so typos fail before the first frame ------
+    _validate_stage_kwargs(
+        DriftCorrection.preprocess, preprocess_kw, "preprocess"
+    )
+    _validate_stage_kwargs(
+        DriftCorrection.align_affine, affine_kw, "align_affine"
+    )
+    if run_nonrigid:
+        _validate_stage_kwargs(
+            DriftCorrection.align_nonrigid, nonrigid_kw, "align_nonrigid"
+        )
+    _validate_stage_kwargs(
+        DriftCorrection.generate_corrected_image, generate_kw, "generate"
+    )
+
+    # --- frame-by-frame correction ---------------------------------------
+    n = images_a.shape[0]
+    results: list[np.ndarray] = []
+    drift_objects: list[DriftCorrection] = []
+
+    for i in tqdm(range(n), desc="Correcting series"):
+        d = DriftCorrection.from_data(
+            [images_a[i], images_b[i]], scan_direction_degrees
+        )
+        d.preprocess(**preprocess_kw)
+        d.align_affine(**affine_kw)
+        if run_nonrigid:
+            d.align_nonrigid(**nonrigid_kw)
+        results.append(d.generate_corrected_image(**generate_kw).array)
+        drift_objects.append(d)
+
+    corrected = np.stack(results).astype(np.float32)
+    return corrected, drift_objects
+
+
 class _DriftInterpolator:
     def __init__(
         self,
         input_shape,
         output_shape,
         scan_fast,
-        scan_slow,  # noqa: unused — kept for call-site compatibility; needed if multi-knot slow-scan is added
         pad_value,
         kde_sigma,
     ):
@@ -2167,32 +2338,17 @@ class _DriftInterpolator:
         self,
         image: NDArray,
         knots: NDArray,  # shape: (2, rows, num_knots)
-        kde_sigma=None,
-        output_shape=None,
-        pad_value=None,
-        upsample_factor=None,
     ) -> NDArray:
         row_coords, col_coords = self.transform_coordinates(knots)
-
-        if kde_sigma is None:
-            kde_sigma = self.kde_sigma
-        if output_shape is None:
-            output_shape = self.output_shape
-        if pad_value is None:
-            pad_value = self.pad_value
-        if upsample_factor is None:
-            upsample_factor = 1.0
-
         image_interp, weight_interp = bilinear_kde(
-            xa=row_coords * upsample_factor,
-            ya=col_coords * upsample_factor,
+            xa=row_coords,
+            ya=col_coords,
             values=image,
-            output_shape=np.round(np.array(output_shape) * upsample_factor).astype("int"),
-            kde_sigma=kde_sigma * upsample_factor,
-            pad_value=pad_value,
+            output_shape=self.output_shape,
+            kde_sigma=self.kde_sigma,
+            pad_value=self.pad_value,
             return_pix_count=True,
         )
-
         return image_interp, weight_interp
 
 

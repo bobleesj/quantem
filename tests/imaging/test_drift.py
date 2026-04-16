@@ -13,7 +13,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter, map_coordinates
 from quantem.core.datastructures.dataset2d import Dataset2d
-from quantem.imaging.drift import DriftCorrection
+from quantem.imaging.drift import DriftCorrection, correct_series
 
 
 def make_synthetic_drift_data(scale=1, seed=42):
@@ -1501,3 +1501,140 @@ def test_sobel_gradient_magnitude_znorm():
         std = result[i].std().item()
         assert abs(mean) < 0.01, f"Image {i} mean={mean}, expected ~0"
         assert abs(std - 1.0) < 0.05, f"Image {i} std={std}, expected ~1.0"
+
+
+# ── correct_series tests ─────────────────────────────────────────────────
+
+
+def _make_series_pair(n_frames=3, size=128, seed=42):
+    """Create a small (N, H, W) pair of image stacks for series tests."""
+    rng = np.random.default_rng(seed)
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=seed)
+    a = np.stack([im0 + rng.normal(0, 0.01, im0.shape) for _ in range(n_frames)])
+    b = np.stack([im1 + rng.normal(0, 0.01, im1.shape) for _ in range(n_frames)])
+    return a.astype(np.float32), b.astype(np.float32)
+
+
+@pytest.fixture
+def series_pair():
+    return _make_series_pair(n_frames=2)
+
+
+class TestCorrectSeries:
+    """Tests for the correct_series() standalone function."""
+
+    def test_defaults(self, series_pair):
+        """All-defaults call should produce (N, H, W) float32 output."""
+        a, b = series_pair
+        corrected, objs = correct_series(a, b, scan_direction_degrees=[0, -90])
+        assert corrected.ndim == 3
+        assert corrected.shape[0] == a.shape[0]
+        assert corrected.dtype == np.float32
+        assert len(objs) == a.shape[0]
+        assert all(isinstance(o, DriftCorrection) for o in objs)
+
+    def test_stage_kwargs_forwarded(self, series_pair):
+        """Stage dicts should be forwarded to the underlying methods."""
+        a, b = series_pair
+        corrected, objs = correct_series(
+            a, b,
+            scan_direction_degrees=[0, -90],
+            preprocess=dict(pad_fraction=0.3, kde_sigma=0.8, number_knots=1),
+            align_affine=dict(step=0.05, num_tests=5),
+            generate=dict(upsample_factor=1, kde_sigma=0.8),
+        )
+        assert corrected.shape[0] == a.shape[0]
+        assert corrected.dtype == np.float32
+
+    def test_nonrigid_true(self, series_pair):
+        """align_nonrigid=True should run nonrigid with defaults."""
+        a, b = series_pair
+        corrected, objs = correct_series(
+            a, b,
+            scan_direction_degrees=[0, -90],
+            align_nonrigid=True,
+            generate=dict(upsample_factor=1),
+        )
+        assert corrected.shape[0] == a.shape[0]
+        for obj in objs:
+            assert (obj.error_track[:, 0] == 2.0).any(), "nonrigid stage not found"
+
+    def test_nonrigid_dict(self, series_pair):
+        """align_nonrigid=dict(...) should forward params to align_nonrigid."""
+        a, b = series_pair
+        corrected, objs = correct_series(
+            a, b,
+            scan_direction_degrees=[0, -90],
+            align_nonrigid=dict(num_iterations=2, adam_steps=5),
+            generate=dict(upsample_factor=1),
+        )
+        assert corrected.shape[0] == a.shape[0]
+        for obj in objs:
+            assert (obj.error_track[:, 0] == 2.0).any(), "nonrigid stage not found"
+
+    def test_nonrigid_false_skips(self, series_pair):
+        """align_nonrigid=False (default) should skip nonrigid."""
+        a, b = series_pair
+        _, objs = correct_series(
+            a, b,
+            scan_direction_degrees=[0, -90],
+            generate=dict(upsample_factor=1),
+        )
+        for obj in objs:
+            assert not (obj.error_track[:, 0] == 2.0).any(), "nonrigid should be skipped"
+
+    def test_invalid_key_raises(self, series_pair):
+        """Typo in stage dict key should raise TypeError."""
+        a, b = series_pair
+        with pytest.raises(TypeError, match="unexpected keyword arguments.*preprocess"):
+            correct_series(
+                a, b,
+                scan_direction_degrees=[0, -90],
+                preprocess=dict(pad_fration=0.25),  # typo
+            )
+
+    def test_invalid_affine_key_raises(self, series_pair):
+        """Typo in align_affine dict should raise TypeError."""
+        a, b = series_pair
+        with pytest.raises(TypeError, match="unexpected keyword arguments.*align_affine"):
+            correct_series(
+                a, b,
+                scan_direction_degrees=[0, -90],
+                align_affine=dict(num_test=11),  # typo: should be num_tests
+            )
+
+    def test_invalid_nonrigid_key_raises(self, series_pair):
+        """Typo in align_nonrigid dict should raise TypeError."""
+        a, b = series_pair
+        with pytest.raises(TypeError, match="unexpected keyword arguments.*align_nonrigid"):
+            correct_series(
+                a, b,
+                scan_direction_degrees=[0, -90],
+                align_nonrigid=dict(regularisation_sigma_px=4.0),  # British spelling
+            )
+
+    def test_shape_mismatch_raises(self):
+        """Mismatched image shapes should raise ValueError."""
+        a = np.zeros((3, 64, 64))
+        b = np.zeros((3, 64, 32))
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            correct_series(a, b, scan_direction_degrees=[0, -90])
+
+    def test_2d_input_raises(self):
+        """2-D input should raise ValueError."""
+        a = np.zeros((64, 64))
+        b = np.zeros((64, 64))
+        with pytest.raises(ValueError, match="must be 3-D"):
+            correct_series(a, b, scan_direction_degrees=[0, -90])
+
+    def test_drift_objects_are_inspectable(self, series_pair):
+        """Returned DriftCorrection objects should support standard inspection."""
+        a, b = series_pair
+        _, objs = correct_series(
+            a, b,
+            scan_direction_degrees=[0, -90],
+            generate=dict(upsample_factor=1),
+        )
+        for obj in objs:
+            assert hasattr(obj, "knots")
+            assert hasattr(obj, "drift_rate")
