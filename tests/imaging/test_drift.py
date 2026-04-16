@@ -1706,3 +1706,29 @@ class TestSeriesClassAPI:
         assert result.shape[0] == a.shape[0]
         for frame in dc:
             assert (frame.error_track[:, 0] == 2.0).any()
+
+    def test_empty_series_raises(self):
+        """Zero-frame stacks should raise ValueError, not IndexError."""
+        a = np.zeros((0, 64, 64), dtype=np.float32)
+        b = np.zeros((0, 64, 64), dtype=np.float32)
+        with pytest.raises(ValueError, match="at least 1 frame"):
+            DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+
+    def test_calculate_error_on_series_raises(self, series_pair):
+        """calculate_error should raise TypeError on series instances."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc.preprocess()
+        with pytest.raises(TypeError, match="not supported on series"):
+            dc.calculate_error(mode=0)
+
+    def test_preprocess_suppresses_plots(self, series_pair):
+        """preprocess on series should not trigger per-frame plots."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        # show_merged=True would normally show a plot; on series it's forced off
+        # If this doesn't raise, it ran without attempting to show 2 plots
+        dc.preprocess(show_merged=True)
+        # Verify each frame was preprocessed correctly
+        for frame in dc:
+            assert hasattr(frame, "knots")

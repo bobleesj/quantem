@@ -245,6 +245,11 @@ class DriftCorrection(AutoSerialize):
                             f"(N, H, W), got ndim={getattr(img, 'ndim', '?')}"
                         )
                 n = stacks[0].shape[0]
+                if n == 0:
+                    raise ValueError(
+                        "Series stacks must contain at least 1 frame, "
+                        f"got shape {stacks[0].shape}"
+                    )
                 for i, s in enumerate(stacks):
                     if s.shape[0] != n:
                         raise ValueError(
@@ -338,6 +343,8 @@ class DriftCorrection(AutoSerialize):
         if self._frames is not None:
             kw = {k: v for k, v in locals().items() if k != "self"}
             kw.update(kw.pop("kwargs"))
+            kw["show_merged"] = False
+            kw["show_images"] = False
             for f in tqdm(self._frames, desc="Preprocessing series"):
                 f.preprocess(**kw)
             return self
@@ -2073,6 +2080,7 @@ class DriftCorrection(AutoSerialize):
             If provided, compute error from this tensor directly,
             avoiding a GPU-to-CPU round-trip.
         """
+        self._ensure_single("calculate_error")
         if _warped_t is not None:
             images_mean = _warped_t.mean(dim=0)
             sig_diff = torch.mean(
