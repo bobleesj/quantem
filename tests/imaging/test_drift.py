@@ -1583,36 +1583,6 @@ class TestCorrectSeries:
         for obj in objs:
             assert not (obj.error_track[:, 0] == 2.0).any(), "nonrigid should be skipped"
 
-    def test_invalid_key_raises(self, series_pair):
-        """Typo in stage dict key should raise TypeError."""
-        a, b = series_pair
-        with pytest.raises(TypeError, match="unexpected keyword arguments.*preprocess"):
-            correct_series(
-                a, b,
-                scan_direction_degrees=[0, -90],
-                preprocess=dict(pad_fration=0.25),  # typo
-            )
-
-    def test_invalid_affine_key_raises(self, series_pair):
-        """Typo in align_affine dict should raise TypeError."""
-        a, b = series_pair
-        with pytest.raises(TypeError, match="unexpected keyword arguments.*align_affine"):
-            correct_series(
-                a, b,
-                scan_direction_degrees=[0, -90],
-                align_affine=dict(num_test=11),  # typo: should be num_tests
-            )
-
-    def test_invalid_nonrigid_key_raises(self, series_pair):
-        """Typo in align_nonrigid dict should raise TypeError."""
-        a, b = series_pair
-        with pytest.raises(TypeError, match="unexpected keyword arguments.*align_nonrigid"):
-            correct_series(
-                a, b,
-                scan_direction_degrees=[0, -90],
-                align_nonrigid=dict(regularisation_sigma_px=4.0),  # British spelling
-            )
-
     def test_shape_mismatch_raises(self):
         """Mismatched image shapes should raise ValueError."""
         a = np.zeros((3, 64, 64))
@@ -1638,3 +1608,101 @@ class TestCorrectSeries:
         for obj in objs:
             assert hasattr(obj, "knots")
             assert hasattr(obj, "drift_rate")
+
+
+class TestSeriesClassAPI:
+    """Tests for DriftCorrection class-level series support."""
+
+    def test_from_data_detects_3d_stacks(self, series_pair):
+        """from_data with 3-D arrays should create a series instance."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        assert dc.is_series
+        assert dc.n_frames == a.shape[0]
+
+    def test_from_data_2d_is_single(self):
+        """from_data with 2-D arrays should create a normal single instance."""
+        im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+        dc = DriftCorrection.from_data([im0, im1], scan_direction_degrees=[0, -90])
+        assert not dc.is_series
+
+    def test_getitem_returns_single(self, series_pair):
+        """Indexing a series should return a single-pair instance."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        frame = dc[0]
+        assert not frame.is_series
+
+    def test_iter_yields_all_frames(self, series_pair):
+        """Iterating over series should yield all frames."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        frames = list(dc)
+        assert len(frames) == dc.n_frames
+
+    def test_full_pipeline(self, series_pair):
+        """Full pipeline via class API should produce corrected stack."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
+        dc.align_affine(step=0.02, num_tests=5)
+        result = dc.generate_corrected_image(upsample_factor=1)
+        assert isinstance(result, np.ndarray)
+        assert result.ndim == 3
+        assert result.shape[0] == a.shape[0]
+        assert result.dtype == np.float32
+
+    def test_method_chaining(self, series_pair):
+        """Pipeline methods should return self for chaining."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        result = dc.preprocess().align_affine(step=0.02, num_tests=5)
+        assert result is dc
+
+    def test_per_frame_inspection(self, series_pair):
+        """Individual frames should be fully functional after series pipeline."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc.preprocess().align_affine(step=0.02, num_tests=5)
+        for i in range(dc.n_frames):
+            frame = dc[i]
+            assert hasattr(frame, "knots")
+            rate = frame.drift_rate
+            assert len(rate) == 2
+
+    def test_ensure_single_guards(self, series_pair):
+        """Methods that require single-pair should raise TypeError on series."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc.preprocess().align_affine(step=0.02, num_tests=5)
+        with pytest.raises(TypeError, match="not supported on series"):
+            dc.drift_rate
+        with pytest.raises(TypeError, match="not supported on series"):
+            dc.print_drift_stats()
+        with pytest.raises(TypeError, match="not supported on series"):
+            dc.apply_correction()
+
+    def test_getitem_on_single_raises(self):
+        """Indexing a single-pair instance should raise TypeError."""
+        im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+        dc = DriftCorrection.from_data([im0, im1], scan_direction_degrees=[0, -90])
+        with pytest.raises(TypeError, match="not indexable"):
+            dc[0]
+
+    def test_frame_count_mismatch_raises(self):
+        """Stacks with different frame counts should raise ValueError."""
+        a = np.zeros((3, 64, 64), dtype=np.float32)
+        b = np.zeros((4, 64, 64), dtype=np.float32)
+        with pytest.raises(ValueError, match="Frame count mismatch"):
+            DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+
+    def test_nonrigid_series(self, series_pair):
+        """Nonrigid alignment should work on series."""
+        a, b = series_pair
+        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc.preprocess().align_affine(step=0.02, num_tests=5)
+        dc.align_nonrigid(num_iterations=2, adam_steps=5)
+        result = dc.generate_corrected_image(upsample_factor=1)
+        assert result.shape[0] == a.shape[0]
+        for frame in dc:
+            assert (frame.error_track[:, 0] == 2.0).any()

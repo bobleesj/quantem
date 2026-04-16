@@ -152,12 +152,62 @@ class DriftCorrection(AutoSerialize):
                 "Use DriftCorrection.from_data() or .from_file() to instantiate this class."
             )
 
+        self._frames: list[Self] | None = None
         self.imgs = imgs
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
 
         device, _ = validate_device(None)
         self._device = device
         self._dtype = torch.float32
+
+    # -- series helpers ---------------------------------------------------
+
+    @classmethod
+    def _from_frames(cls, frames: list[Self]) -> Self:
+        """Construct a series wrapper around pre-built single-pair frames."""
+        obj = cls.__new__(cls)
+        obj._frames = frames
+        obj.scan_direction_degrees = frames[0].scan_direction_degrees
+        obj._device = frames[0]._device
+        obj._dtype = frames[0]._dtype
+        return obj
+
+    @property
+    def is_series(self) -> bool:
+        """True if this instance wraps a multi-frame series."""
+        return self._frames is not None
+
+    @property
+    def n_frames(self) -> int:
+        """Number of frames in a series (raises TypeError for single pair)."""
+        if self._frames is None:
+            raise TypeError(
+                "n_frames is only available on series instances. "
+                "Create one with from_data([stack_a, stack_b], ...)."
+            )
+        return len(self._frames)
+
+    def __getitem__(self, idx: int) -> Self:
+        """Access the *idx*-th frame of a series for per-frame inspection."""
+        if self._frames is None:
+            raise TypeError(
+                "Single-pair DriftCorrection is not indexable. "
+                "Use from_data with 3-D stacks for series mode."
+            )
+        return self._frames[idx]
+
+    def __iter__(self):
+        if self._frames is None:
+            raise TypeError("Single-pair DriftCorrection is not iterable.")
+        return iter(self._frames)
+
+    def _ensure_single(self, name: str) -> None:
+        """Raise TypeError if called on a series instance."""
+        if self._frames is not None:
+            raise TypeError(
+                f"{name} is not supported on series instances. "
+                f"Use drift[i].{name} for individual frames."
+            )
 
     @classmethod
     def from_file(
@@ -178,6 +228,35 @@ class DriftCorrection(AutoSerialize):
         images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
+        # Detect series: a list/tuple of 3-D stacks or Dataset3d objects
+        if isinstance(images, (list, tuple)) and len(images) >= 2:
+            first = images[0]
+            is_3d = (isinstance(first, np.ndarray) and first.ndim == 3) or isinstance(first, Dataset3d)
+            if is_3d:
+                stacks = []
+                for img in images:
+                    if isinstance(img, Dataset3d):
+                        stacks.append(img.array)
+                    elif isinstance(img, np.ndarray) and img.ndim == 3:
+                        stacks.append(img)
+                    else:
+                        raise TypeError(
+                            "For series mode all images must be 3-D stacks "
+                            f"(N, H, W), got ndim={getattr(img, 'ndim', '?')}"
+                        )
+                n = stacks[0].shape[0]
+                for i, s in enumerate(stacks):
+                    if s.shape[0] != n:
+                        raise ValueError(
+                            f"Frame count mismatch: images[0] has {n} frames "
+                            f"but images[{i}] has {s.shape[0]}"
+                        )
+                frames = [
+                    cls.from_data([s[j] for s in stacks], scan_direction_degrees)
+                    for j in range(n)
+                ]
+                return cls._from_frames(frames)
+
         validated_images = validate_list_of_dataset2d(images)
         return cls(
             imgs=validated_images,
@@ -256,6 +335,13 @@ class DriftCorrection(AutoSerialize):
         ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
+        if self._frames is not None:
+            kw = {k: v for k, v in locals().items() if k != "self"}
+            kw.update(kw.pop("kwargs"))
+            for f in tqdm(self._frames, desc="Preprocessing series"):
+                f.preprocess(**kw)
+            return self
+
         self._normalized = bool(normalize)
         if normalize:
             for img in self.imgs:
@@ -351,6 +437,15 @@ class DriftCorrection(AutoSerialize):
         """
         Solve for the translation between all images in DriftCorrection.imgs_warped
         """
+        if self._frames is not None:
+            kw = {k: v for k, v in locals().items() if k != "self"}
+            kw.update(kw.pop("kwargs"))
+            kw["show_merged"] = False
+            kw["show_images"] = False
+            for f in tqdm(self._frames, desc="Aligning translation"):
+                f.align_translation(**kw)
+            return self
+
         shifts = np.zeros((self.shape[0], 2))
         F_ref = np.fft.fft2(self.imgs_warped.array[0])
         for img_idx in range(1, self.shape[0]):
@@ -480,6 +575,15 @@ class DriftCorrection(AutoSerialize):
         ...     images=[haadf_ref, vdf], scan_direction_degrees=[0, 0])
         >>> drift.preprocess().align_affine(fixed_indices=[0])
         """
+        if self._frames is not None:
+            kw = {k: v for k, v in locals().items() if k != "self"}
+            kw.update(kw.pop("kwargs"))
+            kw["show_merged"] = False
+            kw["show_images"] = False
+            for f in tqdm(self._frames, desc="Aligning affine"):
+                f.align_affine(**kw)
+            return self
+
         if self.shape[0] < 2:
             raise ValueError(
                 f"align_affine requires at least 2 images (got {self.shape[0]}). "
@@ -1090,6 +1194,15 @@ class DriftCorrection(AutoSerialize):
         use ``generate_corrected_image()`` which builds its own warps from
         ``self.knots``.
         """
+        if self._frames is not None:
+            kw = {k: v for k, v in locals().items() if k != "self"}
+            kw.update(kw.pop("kwargs"))
+            kw["show_merged"] = False
+            kw["show_images"] = False
+            for f in tqdm(self._frames, desc="Aligning nonrigid"):
+                f.align_nonrigid(**kw)
+            return self
+
         if not hasattr(self, "knots"):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
@@ -1582,6 +1695,15 @@ class DriftCorrection(AutoSerialize):
           on their scan angles, utilizing a bounded sine sigmoid for smooth transition.
         - Upsampling enhances interpolation precision but may increase computational cost.
         """
+        if self._frames is not None:
+            kw = {k: v for k, v in locals().items() if k != "self"}
+            kw.update(kw.pop("kwargs"))
+            kw["show_image"] = False
+            results = []
+            for f in tqdm(self._frames, desc="Generating corrected images"):
+                results.append(f.generate_corrected_image(**kw))
+            return np.stack([r.array for r in results], axis=0).astype(np.float32)
+
         device = self._device
         dtype = self._dtype
 
@@ -1725,6 +1847,7 @@ class DriftCorrection(AutoSerialize):
         >>> dc.align_nonrigid(fixed_indices=[0])
         >>> corrected_vdf = dc.apply_correction(mode='bicubic')
         """
+        self._ensure_single("apply_correction")
         if not hasattr(self, "_initial_knots"):
             msg = "Call preprocess() before apply_correction()"
             raise RuntimeError(msg)
@@ -1826,6 +1949,7 @@ class DriftCorrection(AutoSerialize):
         >>> corrected = dc.apply_correction_4dstem(
         ...     cube_4d, output_device="cuda")
         """
+        self._ensure_single("apply_correction_4dstem")
         return_numpy = isinstance(ds_4d, np.ndarray) and output_device is None
         is_numpy = isinstance(ds_4d, np.ndarray)
         original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
@@ -1993,6 +2117,7 @@ class DriftCorrection(AutoSerialize):
         axsize: tuple[float, float] = (3.5, 3.5),
         **kwargs,
     ):
+        self._ensure_single("plot_correction_summary")
         return drift_viz.plot_correction_summary(
             self, corrected=corrected, reference_index=reference_index,
             target_index=target_index, crop=crop, mode=mode,
@@ -2008,6 +2133,7 @@ class DriftCorrection(AutoSerialize):
         image relative to the first.  Only meaningful after
         :meth:`align_affine`.
         """
+        self._ensure_single("drift_rate")
         if not hasattr(self, "_initial_knots"):
             raise RuntimeError("Call preprocess() then align_affine() first.")
         idx = len(self.knots) - 1
@@ -2027,6 +2153,7 @@ class DriftCorrection(AutoSerialize):
         Reports the linear drift rate, total displacement, and nonrigid
         correction magnitude (if :meth:`align_nonrigid` was run).
         """
+        self._ensure_single("print_drift_stats")
         idx = target_index % len(self.knots)
         rate = self.drift_rate
         n = self.knots[idx].shape[1]
@@ -2052,6 +2179,7 @@ class DriftCorrection(AutoSerialize):
         show_fft: bool = True,
         **kwargs,
     ):
+        self._ensure_single("plot_correction_comparison")
         return drift_viz.plot_correction_comparison(
             self, crop=crop, target_index=target_index,
             axsize=axsize, show_fft=show_fft, **kwargs,
@@ -2064,12 +2192,14 @@ class DriftCorrection(AutoSerialize):
         target_index: int = -1,
         figsize: tuple[float, float] = (10, 6),
     ):
+        self._ensure_single("plot_radial_power")
         return drift_viz.plot_radial_power(
             self, methods=methods, crop=crop,
             target_index=target_index, figsize=figsize,
         )
 
     def plot_warped_images(self, show_knots: bool = True, **kwargs):
+        self._ensure_single("plot_warped_images")
         return drift_viz.plot_warped_images(self, show_knots=show_knots, **kwargs)
 
     def plot_convergence(
@@ -2077,39 +2207,24 @@ class DriftCorrection(AutoSerialize):
         figsize=(8, 3),
         **kwargs,
     ):
+        self._ensure_single("plot_convergence")
         return drift_viz.plot_convergence(self, figsize=figsize, **kwargs)
 
     def plot_merged_images(self, show_knots: bool = True, **kwargs):
+        self._ensure_single("plot_merged_images")
         return drift_viz.plot_merged_images(self, show_knots=show_knots, **kwargs)
 
     def plot_knots(
         self, figsize: tuple[int, int] | None = None,
     ) -> tuple:
+        self._ensure_single("plot_knots")
         return drift_viz.plot_knots(self, figsize=figsize)
 
     def plot_4dstem_correction(self, cube_raw, cube_corrected, **kwargs):
         """Visualize 4D-STEM correction: VDF, mean DP, CBED comparisons."""
+        self._ensure_single("plot_4dstem_correction")
         return drift_viz.plot_4dstem_correction(
             self, cube_raw, cube_corrected, **kwargs,
-        )
-
-
-def _validate_stage_kwargs(method, kwargs, stage_name):
-    """Raise TypeError if *kwargs* contains keys not in *method*'s signature."""
-    import inspect
-
-    sig = inspect.signature(method)
-    valid = {
-        p.name
-        for p in sig.parameters.values()
-        if p.name != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
-    }
-    unknown = set(kwargs) - valid
-    if unknown:
-        raise TypeError(
-            f"correct_series(): unexpected keyword arguments for "
-            f"{stage_name}: {', '.join(sorted(unknown))}. "
-            f"Valid keys: {', '.join(sorted(valid))}"
         )
 
 
@@ -2125,11 +2240,10 @@ def correct_series(
 ) -> tuple[np.ndarray, list[DriftCorrection]]:
     """Drift-correct a paired image series frame by frame.
 
-    Wraps the standard ``DriftCorrection`` pipeline (preprocess → affine →
-    optional nonrigid → generate) and runs it over N frame pairs.  Each
-    stage is configured through a keyword dictionary whose keys are the same
-    as the corresponding ``DriftCorrection`` method parameters, giving full
-    access to every tuning knob without the wrapper having to enumerate them.
+    Convenience wrapper around
+    ``DriftCorrection.from_data([stack_a, stack_b], ...)``.  Each stage is
+    configured through a keyword dictionary whose keys are the same as the
+    corresponding ``DriftCorrection`` method parameters.
 
     Parameters
     ----------
@@ -2145,60 +2259,32 @@ def correct_series(
     align_affine : dict or None
         Keyword arguments forwarded to
         :meth:`DriftCorrection.align_affine`.  ``None`` uses method defaults.
-        The series wrapper sets ``show_merged=False, show_images=False`` by
-        default; pass them explicitly to override.
     align_nonrigid : dict, bool, or False
         Controls nonrigid alignment after affine:
 
         - ``False`` (default): skip nonrigid alignment.
-        - ``True``: run :meth:`DriftCorrection.align_nonrigid` with its
-          defaults.
-        - ``dict``: run nonrigid with the given keyword arguments
-          (e.g. ``dict(regularization_sigma_px=4.0, num_iterations=8)``).
-
-        The series wrapper sets ``show_merged=False, show_images=False`` by
-        default; pass them explicitly to override.
+        - ``True``: run :meth:`DriftCorrection.align_nonrigid` with defaults.
+        - ``dict``: run nonrigid with the given keyword arguments.
     generate : dict or None
         Keyword arguments forwarded to
         :meth:`DriftCorrection.generate_corrected_image`.  ``None`` uses
-        method defaults.  The series wrapper sets ``strip_padding=True,
-        show_image=False`` by default; pass them explicitly to override.
+        method defaults.  ``strip_padding=True`` is set by default.
 
     Returns
     -------
     corrected : (N, H', W') float32 ndarray
-        Stack of drift-corrected images.  With the default
-        ``strip_padding=True`` this has the same spatial dimensions as the
-        input scans.
+        Stack of drift-corrected images.
     drift_objects : list of DriftCorrection
         One object per frame for post-hoc inspection (knots, plots, etc.).
 
     Examples
     --------
-    Minimal call with all defaults:
-
-    >>> corrected, objs = correct_series(
-    ...     images_a, images_b, scan_direction_degrees=[0, -90])
-
-    Typical usage with explicit stage parameters:
-
     >>> corrected, objs = correct_series(
     ...     images_0deg, images_90deg,
     ...     scan_direction_degrees=[0, -90],
     ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5, number_knots=1),
     ...     align_affine=dict(step=0.02, num_tests=11),
     ...     generate=dict(upsample_factor=1, kde_sigma=0.5),
-    ... )
-
-    With nonrigid alignment:
-
-    >>> corrected, objs = correct_series(
-    ...     images_0deg, images_90deg,
-    ...     scan_direction_degrees=[0, -90],
-    ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
-    ...     align_affine=dict(step=0.02, num_tests=11),
-    ...     align_nonrigid=dict(regularization_sigma_px=4.0, num_iterations=8),
-    ...     generate=dict(upsample_factor=2),
     ... )
     """
     images_a = np.asarray(images_a)
@@ -2217,57 +2303,23 @@ def correct_series(
             f"images_b {images_b.shape}"
         )
 
-    # --- build per-stage kwargs with series-specific defaults ------------
-    preprocess_kw = dict(**(preprocess or {}))
+    dc = DriftCorrection.from_data(
+        [images_a, images_b], scan_direction_degrees
+    )
 
-    affine_kw = dict(show_merged=False, show_images=False)
-    if align_affine is not None:
-        affine_kw.update(align_affine)
+    dc.preprocess(**(preprocess or {}))
+    dc.align_affine(**(align_affine or {}))
 
-    run_nonrigid = align_nonrigid is not False
-    nonrigid_kw: dict = {}
-    if run_nonrigid:
-        nonrigid_kw = dict(show_merged=False, show_images=False)
-        if isinstance(align_nonrigid, dict):
-            nonrigid_kw.update(align_nonrigid)
+    if align_nonrigid is not False:
+        nr_kw = align_nonrigid if isinstance(align_nonrigid, dict) else {}
+        dc.align_nonrigid(**nr_kw)
 
-    generate_kw = dict(strip_padding=True, show_image=False)
+    gen_kw = dict(strip_padding=True)
     if generate is not None:
-        generate_kw.update(generate)
+        gen_kw.update(generate)
+    corrected = dc.generate_corrected_image(**gen_kw)
 
-    # --- validate keys eagerly so typos fail before the first frame ------
-    _validate_stage_kwargs(
-        DriftCorrection.preprocess, preprocess_kw, "preprocess"
-    )
-    _validate_stage_kwargs(
-        DriftCorrection.align_affine, affine_kw, "align_affine"
-    )
-    if run_nonrigid:
-        _validate_stage_kwargs(
-            DriftCorrection.align_nonrigid, nonrigid_kw, "align_nonrigid"
-        )
-    _validate_stage_kwargs(
-        DriftCorrection.generate_corrected_image, generate_kw, "generate"
-    )
-
-    # --- frame-by-frame correction ---------------------------------------
-    n = images_a.shape[0]
-    results: list[np.ndarray] = []
-    drift_objects: list[DriftCorrection] = []
-
-    for i in tqdm(range(n), desc="Correcting series"):
-        d = DriftCorrection.from_data(
-            [images_a[i], images_b[i]], scan_direction_degrees
-        )
-        d.preprocess(**preprocess_kw)
-        d.align_affine(**affine_kw)
-        if run_nonrigid:
-            d.align_nonrigid(**nonrigid_kw)
-        results.append(d.generate_corrected_image(**generate_kw).array)
-        drift_objects.append(d)
-
-    corrected = np.stack(results).astype(np.float32)
-    return corrected, drift_objects
+    return corrected, list(dc)
 
 
 class _DriftInterpolator:
