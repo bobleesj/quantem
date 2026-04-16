@@ -1814,6 +1814,43 @@ class DriftCorrection(AutoSerialize):
             plt.show()
         return image_corr
 
+    def _canvas_to_raw_drift(
+        self,
+        drift_canvas: torch.Tensor,
+        idx: int,
+        scan_h: int,
+        scan_w: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert canvas-space knot delta to raw-frame pixel drift.
+
+        The knots live on a common padded canvas whose axes align with the
+        physical specimen.  When the scan direction is non-zero the raw image
+        axes are rotated relative to the canvas, so applying canvas deltas
+        directly to raw pixels gives wrong results.
+
+        The mapping from raw pixel ``(i, j)`` to canvas is::
+
+            canvas_row = center + i·slow[0]  + (j/(W-1))·fast[0]·(H-1)
+            canvas_col = center + i·slow[1]  + (j/(W-1))·fast[1]·(W-1)
+
+        We invert this Jacobian to convert a canvas displacement back to
+        raw-pixel displacement.  For square images (H == W) this reduces
+        to a simple rotation by the scan angle.
+        """
+        device = drift_canvas.device
+        dtype = drift_canvas.dtype
+        slow = torch.tensor(self.scan_slow[idx], device=device, dtype=dtype)
+        fast = torch.tensor(self.scan_fast[idx], device=device, dtype=dtype)
+        alpha = float(scan_h - 1) / float(scan_w - 1) if scan_w > 1 else 1.0
+        det = slow[0] * fast[1] - fast[0] * alpha * slow[1]
+        drift_row = (
+            fast[1] * drift_canvas[0] - fast[0] * alpha * drift_canvas[1]
+        ) / det
+        drift_col = (
+            -slow[1] * drift_canvas[0] + slow[0] * drift_canvas[1]
+        ) / det
+        return drift_row, drift_col
+
     def apply_correction(
         self,
         images: torch.Tensor | np.ndarray | None = None,
@@ -1875,8 +1912,8 @@ class DriftCorrection(AutoSerialize):
             )
 
         delta = self.knots[idx] - self._initial_knots[idx]  # (2, H, 1)
-        drift_per_row = delta[:, :, 0]  # (2, H)
-        knot_h = drift_per_row.shape[1]
+        drift_canvas = delta[:, :, 0]  # (2, H) — canvas-space drift
+        knot_h = drift_canvas.shape[1]
 
         if images is None:
             images_t = self.imgs_t[idx]
@@ -1888,6 +1925,7 @@ class DriftCorrection(AutoSerialize):
             images_t = images.to(device=self._device, dtype=self._dtype)
 
         img_h = images_t.shape[-2]
+        img_w = images_t.shape[-1]
         if img_h != knot_h:
             raise ValueError(
                 f"Image height ({img_h}) does not match knot grid "
@@ -1895,6 +1933,11 @@ class DriftCorrection(AutoSerialize):
                 f"number of scan rows as the data used in preprocess()."
             )
 
+        # Rotate canvas drift → raw-frame drift
+        drift_row, drift_col = self._canvas_to_raw_drift(
+            drift_canvas, idx, img_h, img_w,
+        )
+        drift_per_row = torch.stack([drift_row, drift_col])  # (2, H)
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
     @torch.inference_mode()
@@ -1975,23 +2018,35 @@ class DriftCorrection(AutoSerialize):
 
         device = torch.device(self._device)
 
-        # ── Per-row drift from knots ──
+        # ── Per-row drift from knots (canvas → raw frame) ──
         idx = image_index % len(self.knots)
-        delta = self.knots[idx] - self._initial_knots[idx]   # (2, H_knot, K)
-        drift = delta[:, :, 0].to(device=device, dtype=torch.float32)
+        num_knots = self.knots[idx].shape[2]
+        if num_knots != 1:
+            raise NotImplementedError(
+                f"apply_correction_4dstem only supports number_knots=1 "
+                f"(got {num_knots}). Use generate_corrected_image() "
+                f"for multi-knot setups."
+            )
 
-        if drift.shape[1] != scan_h:
+        delta = self.knots[idx] - self._initial_knots[idx]   # (2, H_knot, 1)
+        drift_canvas = delta[:, :, 0].to(device=device, dtype=torch.float32)
+
+        if drift_canvas.shape[1] != scan_h:
             raise ValueError(
-                f"Drift grid has {drift.shape[1]} rows but ds_4d has "
+                f"Drift grid has {drift_canvas.shape[1]} rows but ds_4d has "
                 f"{scan_h} scan rows. Ensure reference image and ds_4d "
                 f"have matching scan dimensions (check padding / resize)."
             )
 
+        drift_row, drift_col = self._canvas_to_raw_drift(
+            drift_canvas, idx, scan_h, scan_w,
+        )
+
         # ── Pre-compute warp grid ONCE (tiny: 1×H×W×2 f32) ──
         row_coords = torch.arange(scan_h, device=device, dtype=torch.float32)
         col_coords = torch.arange(scan_w, device=device, dtype=torch.float32)
-        sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift[0][:, None]
-        sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift[1][:, None]
+        sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift_row[:, None]
+        sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift_col[:, None]
         warp_grid = torch.stack([
             2.0 * sample_col / (scan_w - 1) - 1.0,
             2.0 * sample_row / (scan_h - 1) - 1.0,

@@ -1318,6 +1318,86 @@ def test_apply_correction_4dstem_2d_raises():
         dc.apply_correction_4dstem(ref)
 
 
+def test_canvas_to_raw_drift_identity_for_zero_angle():
+    """For 0° scan, _canvas_to_raw_drift returns the input unchanged."""
+    dc, _, _ = _make_single_sided_dc(scan_h=64)
+    # Image 0 and 1 are both at 0° in _make_single_sided_dc
+    drift_canvas = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # (2, 2) toy
+    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=0, scan_h=64, scan_w=64)
+    torch.testing.assert_close(drift_row, drift_canvas[0], atol=1e-6, rtol=0)
+    torch.testing.assert_close(drift_col, drift_canvas[1], atol=1e-6, rtol=0)
+
+
+def test_canvas_to_raw_drift_rotation_for_90():
+    """For scan_direction_degrees=90, canvas drift rotates by 90°."""
+    scan_h = 64
+    np.random.seed(0)
+    ref = np.random.rand(scan_h, scan_h).astype(np.float32)
+    dc = DriftCorrection.from_data(
+        images=[ref, ref.copy()],
+        scan_direction_degrees=[0.0, 90.0],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
+        number_knots=1, show_merged=False, show_images=False,
+    )
+    # For scan_direction_degrees=90: scan_fast=[-1,0], scan_slow=[0,1]
+    # M = [[0, -α], [1, 0]] (α=1 for square) → M^(-1) = [[0, 1], [-1, 0]]
+    # drift_raw = M^(-1) @ drift_canvas = [δc, -δr]
+    drift_canvas = torch.tensor([[5.0], [3.0]])  # δr=5, δc=3
+    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=1, scan_h=64, scan_w=64)
+    torch.testing.assert_close(drift_row, torch.tensor([3.0]), atol=1e-5, rtol=0)
+    torch.testing.assert_close(drift_col, torch.tensor([-5.0]), atol=1e-5, rtol=0)
+
+
+def test_canvas_to_raw_drift_rotation_for_neg90():
+    """For scan_direction_degrees=-90, canvas drift rotates by -90°."""
+    scan_h = 64
+    np.random.seed(0)
+    ref = np.random.rand(scan_h, scan_h).astype(np.float32)
+    dc = DriftCorrection.from_data(
+        images=[ref, ref.copy()],
+        scan_direction_degrees=[0.0, -90.0],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
+        number_knots=1, show_merged=False, show_images=False,
+    )
+    # For scan_direction_degrees=-90: scan_fast=[1,0], scan_slow=[0,-1]
+    # M = [[0, α], [-1, 0]] (α=1) → M^(-1) = [[0, -1], [1, 0]]
+    # drift_raw = M^(-1) @ [δr, δc] = [-δc, δr]
+    drift_canvas = torch.tensor([[5.0], [3.0]])
+    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=1, scan_h=64, scan_w=64)
+    torch.testing.assert_close(drift_row, torch.tensor([-3.0]), atol=1e-5, rtol=0)
+    torch.testing.assert_close(drift_col, torch.tensor([5.0]), atol=1e-5, rtol=0)
+
+
+def test_apply_correction_4dstem_matches_apply_correction_paired():
+    """apply_correction_4dstem and apply_correction agree for paired 0/90° scans."""
+    im0, im1, _ = make_synthetic_drift_data()
+    dc = DriftCorrection.from_data(
+        images=[im0, im1],
+        scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    # Correct image 1 (90° scan) with both methods
+    corrected_2d = dc.apply_correction(images=im1.astype(np.float32), image_index=1)
+    corrected_2d_np = corrected_2d.cpu().numpy()
+    cube_3d = im1[:, :, None].astype(np.float32)
+    corrected_3d = dc.apply_correction_4dstem(cube_3d, image_index=1)
+    np.testing.assert_allclose(
+        corrected_3d[:, :, 0], corrected_2d_np, atol=1e-4,
+        err_msg="apply_correction and apply_correction_4dstem must agree for 90° scan",
+    )
+
+
 def test_generate_corrected_image_strip_padding():
     """strip_padding=True returns original scan dimensions, not padded canvas."""
     dc, ref, _ = _make_single_sided_dc(scan_h=128)
