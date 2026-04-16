@@ -1940,6 +1940,48 @@ class DriftCorrection(AutoSerialize):
         drift_per_row = torch.stack([drift_row, drift_col])  # (2, H)
         return backward_warp(images_t, drift=drift_per_row, mode=mode)
 
+    @staticmethod
+    def compute_vdf(
+        ds_4d: np.ndarray,
+        chunk_rows: int | None = None,
+    ) -> np.ndarray:
+        """Compute a virtual dark-field image from a 4D-STEM dataset.
+
+        Averages over the detector dimensions to produce a 2D scan image.
+        Supports memory-mapped inputs — when *chunk_rows* is set, only a
+        few scan rows are loaded at a time, keeping host RAM usage low.
+
+        Parameters
+        ----------
+        ds_4d : np.ndarray, shape ``(H, W, det_h, det_w)``
+            4D-STEM dataset.  Can be a ``np.memmap``.
+        chunk_rows : int or None
+            Number of scan rows to process at a time.  ``None`` loads
+            everything at once (fastest for in-memory arrays).
+
+        Returns
+        -------
+        np.ndarray, shape ``(H, W)``, dtype float32
+        """
+        H, W = ds_4d.shape[:2]
+        det_pixels = 1
+        for d in range(2, ds_4d.ndim):
+            det_pixels *= ds_4d.shape[d]
+
+        if chunk_rows is None:
+            return ds_4d.reshape(H, W, det_pixels).mean(axis=2).astype(
+                np.float32
+            )
+
+        vdf = np.empty((H, W), dtype=np.float32)
+        for start in range(0, H, chunk_rows):
+            end = min(start + chunk_rows, H)
+            chunk = np.asarray(ds_4d[start:end])
+            vdf[start:end] = chunk.reshape(end - start, W, det_pixels).mean(
+                axis=2
+            )
+        return vdf
+
     @torch.inference_mode()
     def apply_correction_4dstem(
         self,
@@ -1949,6 +1991,7 @@ class DriftCorrection(AutoSerialize):
         chunk_size: int | None = None,
         output_dtype: torch.dtype | np.dtype | str | None = None,
         output_device: str | torch.device | None = None,
+        output: np.ndarray | None = None,
         progress: bool = False,
     ) -> torch.Tensor | np.ndarray:
         """Apply drift correction to a 3D or 4D data cube.
@@ -1963,7 +2006,9 @@ class DriftCorrection(AutoSerialize):
             3D array ``(H, W, C)`` for EDX/EELS spectral data, or
             4D array ``(H, W, det_h, det_w)`` for 4D-STEM.
             The first two axes must be scan rows and columns matching
-            the shape used in :meth:`preprocess`.
+            the shape used in :meth:`preprocess`.  Can be a
+            ``np.memmap`` — only the channels being processed are
+            paged in.
         image_index : int, default -1
             Which image's knot trajectory to use. Default selects the
             last image (target in a ``[reference, target]`` pair).
@@ -1983,6 +2028,14 @@ class DriftCorrection(AutoSerialize):
             torch.  Set to ``"cuda"`` to keep the result on GPU
             (eliminates the GPU→CPU download, which is the main
             bottleneck for large cubes).
+        output : np.ndarray or None
+            Pre-allocated numpy array (or ``np.memmap``) with the same
+            shape as *ds_4d*.  When provided, corrected data is written
+            directly into this array chunk-by-chunk and returned —
+            no extra host-memory copy is made.  This enables
+            process-and-release workflows where you never hold both
+            the input and a separate output copy in RAM.  When set,
+            *output_device* is ignored.
         progress : bool, default False
             Show a tqdm progress bar (chunked path only).
 
@@ -1990,20 +2043,39 @@ class DriftCorrection(AutoSerialize):
         -------
         torch.Tensor or np.ndarray
             Corrected cube with the same shape and axis layout as input.
+            When *output* is provided, returns that same array.
 
         Examples
         --------
         >>> # EDX spectral cube - auto single-shot
         >>> corrected = dc.apply_correction_4dstem(cube_eds)
-        >>> # 4D-STEM - keep on GPU for fastest throughput
-        >>> corrected = dc.apply_correction_4dstem(
-        ...     cube_4d, output_device="cuda")
+        >>> # 4D-STEM with pre-allocated output (memory-mapped)
+        >>> out = np.memmap('corrected.dat', dtype='float32',
+        ...                 mode='w+', shape=cube.shape)
+        >>> dc.apply_correction_4dstem(cube, output=out)
         """
         self._ensure_single("apply_correction_4dstem")
-        return_numpy = isinstance(ds_4d, np.ndarray) and output_device is None
         is_numpy = isinstance(ds_4d, np.ndarray)
         original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
         input_np_dtype = ds_4d.dtype if is_numpy else None
+        use_external_output = output is not None
+
+        if use_external_output:
+            if not isinstance(output, np.ndarray):
+                raise TypeError(
+                    "output must be a numpy ndarray (or np.memmap), "
+                    f"got {type(output).__name__}"
+                )
+            if tuple(output.shape) != tuple(original_shape):
+                raise ValueError(
+                    f"output shape {output.shape} does not match "
+                    f"ds_4d shape {original_shape}"
+                )
+
+        return_numpy = (
+            use_external_output
+            or (is_numpy and output_device is None)
+        )
 
         ndim = len(original_shape)
         if ndim < 3:
@@ -2052,45 +2124,64 @@ class DriftCorrection(AutoSerialize):
             2.0 * sample_row / (scan_h - 1) - 1.0,
         ], dim=-1)[None]                                       # (1, H, W, 2)
 
-        # ── Flatten to (H, W, C) ──
+        # ── Flatten input to (H, W, C) view ──
         flat = (
             torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
             if is_numpy
             else ds_4d.reshape(scan_h, scan_w, n_channels)
         )
 
-        # ── Output dtype ──
+        # ── Output dtype (for GPU intermediates) ──
         out_dt = torch.float32
         if output_dtype == "same":
             if is_numpy and input_np_dtype is not None:
-                out_dt = torch.from_numpy(np.empty(0, dtype=input_np_dtype)).dtype
+                out_dt = torch.from_numpy(
+                    np.empty(0, dtype=input_np_dtype)
+                ).dtype
             elif not is_numpy:
                 out_dt = ds_4d.dtype
         elif isinstance(output_dtype, torch.dtype):
             out_dt = output_dtype
 
         # ── Target device ──
-        if output_device is not None:
+        if use_external_output:
+            target = torch.device("cpu")
+        elif output_device is not None:
             target = torch.device(output_device)
             if target.type == "cuda":
                 target = device
         else:
             target = torch.device("cpu")
 
-        # ── Chunk size ──
+        # ── Chunk size (auto-fit within GPU memory) ──
         if chunk_size is None:
             bytes_per_ch = scan_h * scan_w * 4
             try:
                 gpu_free, _ = torch.cuda.mem_get_info(device)
             except RuntimeError:
                 gpu_free = 0
-            if target.type == "cuda":
+            if target.type == "cuda" and not use_external_output:
                 out_elem = torch.tensor([], dtype=out_dt).element_size()
-                gpu_free = max(0, gpu_free - n_channels * scan_h * scan_w * out_elem)
-            chunk_size = min(n_channels, max(1, int(gpu_free * 0.7 / (bytes_per_ch * 2))))
+                gpu_free = max(
+                    0,
+                    gpu_free - n_channels * scan_h * scan_w * out_elem,
+                )
+            chunk_size = min(
+                n_channels,
+                max(1, int(gpu_free * 0.7 / (bytes_per_ch * 2))),
+            )
 
-        # ── Allocate output on target device ──
-        output = torch.empty(scan_h, scan_w, n_channels, dtype=out_dt, device=target)
+        # ── Allocate output ──
+        if use_external_output:
+            out_flat = output.reshape(scan_h, scan_w, n_channels)
+        else:
+            internal_output = torch.empty(
+                scan_h, scan_w, n_channels, dtype=out_dt, device=target,
+            )
+
+        # ── Numpy dtype for external output conversion ──
+        if use_external_output:
+            _out_np_dtype = output.dtype
 
         # ── Vectorized grid_sample with pre-computed grid ──
         chunks = range(0, n_channels, chunk_size)
@@ -2103,14 +2194,26 @@ class DriftCorrection(AutoSerialize):
             )
         for start in chunks:
             end = min(start + chunk_size, n_channels)
-            output[:, :, start:end] = F.grid_sample(
+            warped = F.grid_sample(
                 flat[:, :, start:end].permute(2, 0, 1).contiguous()
                 .to(device=device, dtype=torch.float32)[None],
                 warp_grid,
                 mode=mode, align_corners=True, padding_mode="border",
-            )[0].permute(1, 2, 0).to(device=target, dtype=out_dt)
+            )[0].permute(1, 2, 0)
 
-        result = output.reshape(original_shape)
+            if use_external_output:
+                out_flat[:, :, start:end] = (
+                    warped.cpu().numpy().astype(_out_np_dtype)
+                )
+            else:
+                internal_output[:, :, start:end] = warped.to(
+                    device=target, dtype=out_dt,
+                )
+
+        if use_external_output:
+            return output
+
+        result = internal_output.reshape(original_shape)
         if return_numpy:
             return result.cpu().numpy() if result.is_cuda else result.numpy()
         return result

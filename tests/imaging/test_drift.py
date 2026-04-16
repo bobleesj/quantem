@@ -1398,6 +1398,103 @@ def test_apply_correction_4dstem_matches_apply_correction_paired():
     )
 
 
+def test_apply_correction_4dstem_output_parameter():
+    """output= writes directly to a pre-allocated numpy array."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    n_energy = 8
+    channels = _make_diverse_channels(ref, n_energy, seed=800)
+    drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
+    cube = drifted.transpose(1, 2, 0)  # (H, W, E)
+
+    # Without output= (baseline)
+    auto = dc.apply_correction_4dstem(cube)
+
+    # With output= pre-allocated
+    out_buf = np.empty_like(auto)
+    returned = dc.apply_correction_4dstem(cube, output=out_buf)
+    assert returned is out_buf, "Should return the same array object"
+    np.testing.assert_allclose(out_buf, auto, atol=1e-5,
+                               err_msg="output= must match default path")
+
+
+def test_apply_correction_4dstem_output_memmap(tmp_path):
+    """output= works with np.memmap for disk-backed writes."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    cube = np.random.rand(scan_h, scan_h, 4, 4).astype(np.float32)
+    shape = cube.shape
+
+    mmap_path = tmp_path / "corrected.dat"
+    out_mmap = np.memmap(str(mmap_path), dtype="float32", mode="w+", shape=shape)
+    returned = dc.apply_correction_4dstem(cube, output=out_mmap)
+    assert returned is out_mmap
+    assert returned.shape == shape
+
+    # Verify data was actually written to disk
+    out_mmap.flush()
+    loaded = np.memmap(str(mmap_path), dtype="float32", mode="r", shape=shape)
+    np.testing.assert_allclose(loaded, out_mmap, atol=1e-6)
+
+    # Verify it matches the default path
+    auto = dc.apply_correction_4dstem(cube)
+    np.testing.assert_allclose(loaded, auto, atol=1e-5,
+                               err_msg="memmap output must match default path")
+
+
+def test_apply_correction_4dstem_output_shape_mismatch():
+    """output= with wrong shape raises ValueError."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    cube = np.random.rand(scan_h, scan_h, 6).astype(np.float32)
+    wrong = np.empty((scan_h, scan_h, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="does not match"):
+        dc.apply_correction_4dstem(cube, output=wrong)
+
+
+def test_apply_correction_4dstem_output_type_error():
+    """output= with non-numpy type raises TypeError."""
+    scan_h = 128
+    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
+    cube = np.random.rand(scan_h, scan_h, 6).astype(np.float32)
+    with pytest.raises(TypeError, match="numpy ndarray"):
+        dc.apply_correction_4dstem(cube, output=[1, 2, 3])
+
+
+# ──────────────────────────────────────────────────────────────
+# Tests for compute_vdf() — VDF extraction from 4D-STEM
+# ──────────────────────────────────────────────────────────────
+
+def test_compute_vdf_basic():
+    """compute_vdf returns correct mean over detector dimensions."""
+    H, W, dh, dw = 32, 32, 4, 4
+    cube = np.random.rand(H, W, dh, dw).astype(np.float32)
+    vdf = DriftCorrection.compute_vdf(cube)
+    assert vdf.shape == (H, W)
+    assert vdf.dtype == np.float32
+    expected = cube.reshape(H, W, -1).mean(axis=2)
+    np.testing.assert_allclose(vdf, expected, atol=1e-6)
+
+
+def test_compute_vdf_chunked():
+    """compute_vdf with chunk_rows matches non-chunked result."""
+    H, W, dh, dw = 64, 64, 8, 8
+    cube = np.random.rand(H, W, dh, dw).astype(np.float32)
+    vdf_full = DriftCorrection.compute_vdf(cube)
+    vdf_chunked = DriftCorrection.compute_vdf(cube, chunk_rows=16)
+    np.testing.assert_allclose(vdf_chunked, vdf_full, atol=1e-6)
+
+
+def test_compute_vdf_3d():
+    """compute_vdf works on 3D (H, W, C) data too."""
+    H, W, C = 32, 32, 12
+    cube = np.random.rand(H, W, C).astype(np.float32)
+    vdf = DriftCorrection.compute_vdf(cube)
+    assert vdf.shape == (H, W)
+    expected = cube.mean(axis=2)
+    np.testing.assert_allclose(vdf, expected, atol=1e-6)
+
+
 def test_generate_corrected_image_strip_padding():
     """strip_padding=True returns original scan dimensions, not padded canvas."""
     dc, ref, _ = _make_single_sided_dc(scan_h=128)
