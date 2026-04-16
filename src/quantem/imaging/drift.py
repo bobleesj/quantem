@@ -2394,6 +2394,208 @@ class DriftCorrection(AutoSerialize):
         )
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class PairedCorrectionResult:
+    """Result returned by :func:`correct_4dstem_paired`.
+
+    Attributes
+    ----------
+    merged : np.ndarray or None
+        Average of ``corrected_a`` and the rotated ``corrected_b``.
+        ``None`` when ``merge=False``.
+    corrected_a : np.ndarray
+        Drift-corrected first scan, same shape as ``cube_a``.
+    corrected_b : np.ndarray
+        Drift-corrected second scan, **rotated** into the first scan's
+        coordinate frame.  Same shape as ``corrected_a`` for square scans.
+    drift : DriftCorrection
+        The fitted alignment object (for plots, knot inspection, etc.).
+    vdf_a : np.ndarray
+        Virtual dark-field image used for alignment (scan A).
+    vdf_b : np.ndarray
+        Virtual dark-field image used for alignment (scan B).
+    """
+
+    merged: np.ndarray | None
+    corrected_a: np.ndarray
+    corrected_b: np.ndarray
+    drift: DriftCorrection
+    vdf_a: np.ndarray
+    vdf_b: np.ndarray
+
+
+def correct_4dstem_paired(
+    cube_a: np.ndarray,
+    cube_b: np.ndarray,
+    scan_direction_degrees: list[float],
+    *,
+    vdf_a: np.ndarray | None = None,
+    vdf_b: np.ndarray | None = None,
+    preprocess: dict | None = None,
+    align_affine: dict | None = None,
+    align_nonrigid: dict | bool = False,
+    mode: str = "bicubic",
+    chunk_size: int | None = None,
+    merge: bool = True,
+    progress: bool = False,
+) -> PairedCorrectionResult:
+    """Drift-correct paired orthogonal-scan data cubes end-to-end.
+
+    Handles the full workflow: VDF extraction → alignment → correction
+    → frame rotation → merge.  Works for 4D-STEM ``(H, W, det_h, det_w)``
+    and 3D EDX/EELS ``(H, W, E)`` cubes alike.
+
+    For memory-constrained workloads (cubes too large for RAM), use the
+    lower-level API directly::
+
+        dc = DriftCorrection.from_data([vdf_a, vdf_b], ...)
+        dc.preprocess(...).align_affine(...)
+        dc.apply_correction_4dstem(cube_a, image_index=0, output=mmap_a)
+        del cube_a                          # release
+        dc.apply_correction_4dstem(cube_b, image_index=1, output=mmap_b)
+        del cube_b                          # release
+
+    Parameters
+    ----------
+    cube_a, cube_b : np.ndarray
+        Data cubes with shape ``(H, W, ...)`` where the first two axes are
+        scan rows and columns.  Typically collected at orthogonal scan
+        angles (e.g. 0° and 90°).
+    scan_direction_degrees : list of float
+        Scan direction for each cube, e.g. ``[0, -90]``.
+    vdf_a, vdf_b : np.ndarray or None
+        Pre-computed virtual dark-field images ``(H, W)``.  When ``None``
+        (default), VDFs are computed automatically by averaging over
+        the non-scan dimensions.
+    preprocess : dict or None
+        Kwargs forwarded to :meth:`DriftCorrection.preprocess`.
+        ``number_knots`` defaults to 1 if not specified.
+    align_affine : dict or None
+        Kwargs forwarded to :meth:`DriftCorrection.align_affine`.
+    align_nonrigid : dict, bool, or False
+        ``False`` (default): skip.  ``True``: run with defaults.
+        ``dict``: run with the given kwargs.
+    mode : str
+        Interpolation mode for ``apply_correction_4dstem``.
+    chunk_size : int or None
+        GPU channel chunk size (``None`` = auto).
+    merge : bool
+        If ``True`` (default), average the two corrected cubes.
+    progress : bool
+        Show tqdm progress bars.
+
+    Returns
+    -------
+    PairedCorrectionResult
+        Dataclass with ``merged``, ``corrected_a``, ``corrected_b``,
+        ``drift``, ``vdf_a``, ``vdf_b``.
+
+    Examples
+    --------
+    >>> result = correct_4dstem_paired(
+    ...     cube_0deg, cube_90deg,
+    ...     scan_direction_degrees=[0, -90],
+    ...     preprocess=dict(pad_fraction=0.25, kde_sigma=0.5),
+    ...     align_affine=dict(step=0.02, num_tests=11),
+    ... )
+    >>> result.merged.shape   # (H, W, det_h, det_w)
+    >>> result.drift.plot_merged_images()
+    """
+    cube_a = np.asarray(cube_a)
+    cube_b = np.asarray(cube_b)
+    if cube_a.ndim < 3:
+        raise ValueError(
+            f"cube_a must be at least 3-D (H, W, ...), got {cube_a.ndim}-D"
+        )
+    if cube_b.ndim < 3:
+        raise ValueError(
+            f"cube_b must be at least 3-D (H, W, ...), got {cube_b.ndim}-D"
+        )
+    if len(scan_direction_degrees) != 2:
+        raise ValueError(
+            "scan_direction_degrees must have exactly 2 entries, "
+            f"got {len(scan_direction_degrees)}"
+        )
+
+    # ── Rotation validation (only multiples of 90°) ──
+    theta_a, theta_b = scan_direction_degrees
+    delta = (theta_b - theta_a) % 360
+    rot_k = round(delta / 90)
+    if abs(delta - rot_k * 90) > 1.0:
+        raise ValueError(
+            f"Scan angle difference ({theta_b} - {theta_a} = "
+            f"{theta_b - theta_a}°) must be a multiple of 90°. "
+            f"Arbitrary rotations are not supported."
+        )
+    rot_k = rot_k % 4  # normalize to 0-3
+
+    # ── Extract VDFs ──
+    if vdf_a is None:
+        vdf_a = DriftCorrection.compute_vdf(cube_a)
+    if vdf_b is None:
+        vdf_b = DriftCorrection.compute_vdf(cube_b)
+
+    # ── Align VDFs ──
+    pp_kw: dict = dict(show_merged=False, show_images=False, number_knots=1)
+    if preprocess is not None:
+        pp_kw.update(preprocess)
+
+    dc = DriftCorrection.from_data(
+        [vdf_a, vdf_b], scan_direction_degrees,
+    )
+    dc.preprocess(**pp_kw)
+
+    aa_kw: dict = dict(show_merged=False, show_images=False)
+    if align_affine is not None:
+        aa_kw.update(align_affine)
+    dc.align_affine(**aa_kw)
+
+    if align_nonrigid is not False:
+        nr_kw: dict = dict(show_merged=False, show_images=False)
+        if isinstance(align_nonrigid, dict):
+            nr_kw.update(align_nonrigid)
+        dc.align_nonrigid(**nr_kw)
+
+    # ── Apply correction to both cubes ──
+    corr_a = dc.apply_correction_4dstem(
+        cube_a, image_index=0, mode=mode,
+        chunk_size=chunk_size, progress=progress,
+    )
+    corr_b = dc.apply_correction_4dstem(
+        cube_b, image_index=1, mode=mode,
+        chunk_size=chunk_size, progress=progress,
+    )
+
+    # ── Rotate cube_b to cube_a's coordinate frame ──
+    if rot_k != 0:
+        corr_b = np.rot90(corr_b, k=rot_k, axes=(0, 1)).copy()
+
+    # ── Merge ──
+    merged = None
+    if merge:
+        if corr_a.shape != corr_b.shape:
+            raise ValueError(
+                f"Cannot merge: corrected_a shape {corr_a.shape} != "
+                f"rotated corrected_b shape {corr_b.shape}. "
+                f"Paired scans must have compatible scan dimensions "
+                f"after rotation."
+            )
+        merged = (corr_a.astype(np.float64) + corr_b.astype(np.float64))
+        merged = (merged / 2).astype(np.float32)
+
+    return PairedCorrectionResult(
+        merged=merged,
+        corrected_a=corr_a,
+        corrected_b=corr_b,
+        drift=dc,
+        vdf_a=vdf_a,
+        vdf_b=vdf_b,
+    )
+
+
 def correct_series(
     images_a: NDArray,
     images_b: NDArray,
