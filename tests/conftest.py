@@ -1,6 +1,11 @@
 import matplotlib
 import pytest
 
+# Pre-load quantem.core.io before any test imports `quantem.imaging.*`
+# to side-step a circular import (Dataset → io.serialize → io → file_readers →
+# Dataset) that fires when the imaging tree is the first to touch core.
+import quantem.core.io  # noqa: F401
+
 matplotlib.use("Agg")
 
 

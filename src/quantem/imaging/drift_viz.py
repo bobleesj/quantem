@@ -5,19 +5,12 @@ argument (``dc``).  ``DriftCorrection`` delegates its ``plot_*`` methods
 to these functions via one-line wrappers in ``drift.py``, keeping
 alignment logic and visualization code in separate files.
 """
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from matplotlib.ticker import FormatStrFormatter, MaxNLocator
-
-if TYPE_CHECKING:
-    from quantem.imaging.drift import DriftCorrection
 
 from quantem.core.visualization import show_2d
 
@@ -64,7 +57,7 @@ def _center_crop_slice(
 # --- public plot functions ---------------------------------------------------
 
 def plot_correction_summary(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     corrected: torch.Tensor | np.ndarray | None = None,
     reference_index: int = 0,
     target_index: int = -1,
@@ -203,7 +196,7 @@ def plot_correction_summary(
 
 
 def plot_correction_comparison(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     crop: int | None = None,
     target_index: int = -1,
     axsize: tuple[float, float] = (3.5, 3.5),
@@ -301,7 +294,7 @@ def plot_correction_comparison(
 
 
 def plot_radial_power(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     methods: dict[str, np.ndarray] | None = None,
     crop: int | None = None,
     target_index: int = -1,
@@ -385,7 +378,7 @@ def plot_radial_power(
 
 
 def plot_warped_images(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     show_knots: bool = True,
     **kwargs,
 ) -> tuple[Figure, np.ndarray]:
@@ -414,7 +407,7 @@ def plot_warped_images(
 
 
 def plot_convergence(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     figsize: tuple[float, float] = (8, 3),
     **kwargs,
 ) -> tuple[Figure, np.ndarray]:
@@ -469,7 +462,7 @@ def plot_convergence(
 
 
 def plot_merged_images(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     show_knots: bool = True,
     **kwargs,
 ) -> tuple[Figure, Axes]:
@@ -497,8 +490,29 @@ def plot_merged_images(
     return fig, ax
 
 
+def print_drift_stats(dc: "DriftCorrection", image_index: int = -1) -> None:
+    """Print a concise summary of the drift estimation: linear rate, total
+    displacement, nonrigid correction magnitude (if :meth:`align_nonrigid`
+    was run), and affine grid-search confidence margin.
+    """
+    idx = image_index % len(dc.knots)
+    rate = dc.drift_rate
+    n = dc.knots[idx].shape[1]
+    print(f"Drift rate:  ({rate[0]:+.4f}, {rate[1]:+.4f}) px/line")
+    print(f"Total drift: ({rate[0]*n:.1f}, {rate[1]*n:.1f}) px over {n} lines")
+    if hasattr(dc, "_knots_after_affine"):
+        delta_aff = dc._knots_after_affine[idx] - dc._initial_knots[idx]
+        delta_nr = dc._knot_delta_canvas(idx)
+        nr_max = float((delta_nr - delta_aff).abs().max())
+        print(f"Nonrigid max correction: {nr_max:.2f} px")
+    if hasattr(dc, "affine_confidence_margin"):
+        m = dc.affine_confidence_margin
+        tag = "high" if m > 5 else "low" if m < 2 else "moderate"
+        print(f"Affine confidence: {m:.1f}% ({tag})")
+
+
 def plot_knots(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     figsize: tuple[int, int] | None = None,
 ) -> tuple[Figure, np.ndarray]:
     """Plot knot trajectories before and after correction plus the per-scanline delta field.
@@ -578,9 +592,9 @@ def plot_knots(
 
 
 def plot_4dstem_correction(
-    dc: DriftCorrection,
-    cube_raw: torch.Tensor,
-    cube_corrected: torch.Tensor,
+    dc: "DriftCorrection",
+    ds_raw: torch.Tensor,
+    ds_corrected: torch.Tensor,
     vdf_raw: np.ndarray | None = None,
     vdf_corrected: np.ndarray | None = None,
     ref_image: np.ndarray | None = None,
@@ -608,12 +622,12 @@ def plot_4dstem_correction(
     ----------
     dc : DriftCorrection
         Must have ``align_nonrigid`` completed.
-    cube_raw : torch.Tensor
+    ds_raw : torch.Tensor
         Raw 4D-STEM data ``(H, W, det_h, det_w)`` on GPU.
-    cube_corrected : torch.Tensor
+    ds_corrected : torch.Tensor
         Drift-corrected data ``(H, W, det_h, det_w)`` on GPU.
     vdf_raw, vdf_corrected : np.ndarray, optional
-        Pre-computed VDF images.  If ``None``, computed from the cubes
+        Pre-computed VDF images.  If ``None``, computed from the datasets
         using *vdf_mask* or a default annular mask.
     ref_image : np.ndarray, optional
         HAADF reference image.  If ``None``, uses ``dc.imgs[0].array``.
@@ -636,9 +650,9 @@ def plot_4dstem_correction(
     metrics : dict
         ``{'vdf_raw_ncc': float, 'vdf_corrected_ncc': float, ...}``
     """
-    scan_h, scan_w = cube_raw.shape[:2]
-    det_h, det_w = cube_raw.shape[2], cube_raw.shape[3]
-    device = cube_raw.device
+    scan_h, scan_w = ds_raw.shape[:2]
+    det_h, det_w = ds_raw.shape[2], ds_raw.shape[3]
+    device = ds_raw.device
 
     if ref_image is None:
         ref_image = dc.imgs[0].array
@@ -653,13 +667,13 @@ def plot_4dstem_correction(
         vdf_mask = (qy ** 2 + qx ** 2) > (det_h // 4) ** 2
 
     if vdf_raw is None:
-        vdf_raw = _compute_vdf(cube_raw, vdf_mask)
+        vdf_raw = _compute_vdf(ds_raw, vdf_mask)
     if vdf_corrected is None:
-        vdf_corrected = _compute_vdf(cube_corrected, vdf_mask)
+        vdf_corrected = _compute_vdf(ds_corrected, vdf_mask)
 
     # --- Mean diffraction pattern (GPU reduction → small 2D) ---
-    mean_dp_raw = cube_raw.float().mean(dim=(0, 1)).cpu().numpy()
-    mean_dp_corr = cube_corrected.float().mean(dim=(0, 1)).cpu().numpy()
+    mean_dp_raw = ds_raw.float().mean(dim=(0, 1)).cpu().numpy()
+    mean_dp_corr = ds_corrected.float().mean(dim=(0, 1)).cpu().numpy()
 
     # --- Sample positions ---
     if sample_positions is None:
@@ -670,8 +684,8 @@ def plot_4dstem_correction(
     # --- Extract CBEDs (small: just n_samples × det_h × det_w) ---
     cbeds_raw, cbeds_corr = [], []
     for r, c in sample_positions:
-        cbeds_raw.append(cube_raw[r, c].float().cpu().numpy())
-        cbeds_corr.append(cube_corrected[r, c].float().cpu().numpy())
+        cbeds_raw.append(ds_raw[r, c].float().cpu().numpy())
+        cbeds_corr.append(ds_corrected[r, c].float().cpu().numpy())
 
     # --- Crop for VDF panels ---
     s, crop_val = _center_crop_slice(ref_image, crop)
@@ -796,7 +810,7 @@ def _compute_vdf(
 
 
 def _auto_sample_positions(
-    dc: DriftCorrection,
+    dc: "DriftCorrection",
     scan_h: int,
     scan_w: int,
     n_samples: int,
@@ -809,13 +823,13 @@ def _auto_sample_positions(
     positions = [(scan_h // 2, scan_w // 2)]
 
     # Row with maximum drift magnitude
-    try:
+    if hasattr(dc, "_initial_knots"):
         idx = -1 % len(dc.knots)
-        delta = (dc.knots[idx] - dc._initial_knots[idx]).cpu().numpy()
+        delta = dc._knot_delta_canvas(idx).cpu().numpy()
         drift_mag = np.sqrt(delta[0, :, 0] ** 2 + delta[1, :, 0] ** 2)
         max_row = int(np.argmax(drift_mag))
         positions.append((max_row, scan_w // 2))
-    except Exception:
+    else:
         positions.append((scan_h - scan_h // 4, scan_w // 2))
 
     # Fill remaining with evenly spaced positions

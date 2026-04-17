@@ -5,10 +5,13 @@ from typing import Any
 
 import h5py
 
-from quantem.core.datastructures import Dataset as Dataset
-from quantem.core.datastructures import Dataset2d as Dataset2d
-from quantem.core.datastructures import Dataset3d as Dataset3d
-from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
+# Import from submodules (not the package) to avoid a circular import:
+# quantem.core.datastructures.__init__ imports dataset → io.serialize → io →
+# file_readers, which would re-enter datastructures mid-load.
+from quantem.core.datastructures.dataset import Dataset as Dataset
+from quantem.core.datastructures.dataset2d import Dataset2d as Dataset2d
+from quantem.core.datastructures.dataset3d import Dataset3d as Dataset3d
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem as Dataset4dstem
 
 
 def read_4dstem(

@@ -13,10 +13,10 @@ import matplotlib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter, map_coordinates
 from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.imaging.drift import (
     DriftCorrection,
     PairedCorrectionResult,
-    correct_series,
 )
 
 
@@ -108,8 +108,8 @@ def test_full_pipeline_deterministic():
     """Full pipeline produces correct, deterministic, low-error results."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
 
-    drift = DriftCorrection.from_data(
-        images=[im0, im1],
+    drift = DriftCorrection(
+        im0, im1,
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -127,7 +127,7 @@ def test_full_pipeline_deterministic():
         show_merged=False,
         show_images=False,
     )
-    img_corr = drift.generate_corrected_image(upsample_factor=1, show_image=False)
+    img_corr = drift.generate_corrected(upsample_factor=1, show_merged=False)
 
     assert isinstance(img_corr, Dataset2d)
     assert not np.isnan(img_corr.array).any()
@@ -135,8 +135,8 @@ def test_full_pipeline_deterministic():
 
     # Determinism: second run with same seed must match exactly
     im0_2, im1_2, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift2 = DriftCorrection.from_data(
-        images=[im0_2, im1_2],
+    drift2 = DriftCorrection(
+        im0_2, im1_2,
         scan_direction_degrees=[0.0, 90.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -154,7 +154,7 @@ def test_full_pipeline_deterministic():
         show_merged=False,
         show_images=False,
     )
-    img_corr2 = drift2.generate_corrected_image(upsample_factor=1, show_image=False)
+    img_corr2 = drift2.generate_corrected(upsample_factor=1, show_merged=False)
 
     np.testing.assert_array_almost_equal(
         img_corr.array, img_corr2.array, decimal=10,
@@ -163,30 +163,11 @@ def test_full_pipeline_deterministic():
 
 
 
-def test_preprocess_single_image_builds_centered_canvas():
-    """Preprocess should support a single image for geometry-only reuse.
-
-    This is the setup used by the single-sided 4D-STEM workflow: reuse the
-    scanline model and initial warp without invoking the pairwise aligners.
-    """
+def test_constructor_requires_at_least_two_datasets():
+    """DriftCorrection requires ≥2 datasets - single-image construction is not supported."""
     im0, _, _ = make_synthetic_drift_data(scale=1, seed=42)
-
-    drift = DriftCorrection.from_data(
-        images=[im0],
-        scan_direction_degrees=[0.0],
-    ).preprocess(
-        pad_fraction=0.25,
-        pad_value="median",
-        kde_sigma=0.5,
-        number_knots=1,
-        show_merged=False,
-        show_images=False,
-    )
-
-    assert drift.shape == (1, 160, 160)
-    assert drift.knots[0].shape == (2, 128, 1)
-    assert drift.imgs_warped.array.shape == (1, 160, 160)
-    assert not np.isnan(drift.imgs_warped.array).any()
+    with pytest.raises(TypeError, match="at least 2 datasets"):
+        DriftCorrection(im0, scan_direction_degrees=[0.0])
 
 
 # Baseline values from float32 torch path, captured once and frozen.
@@ -205,8 +186,8 @@ AFFINE_BASELINES = [
 def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0, expected_k1):
     """Affine on synthetic data must match frozen float32 baseline."""
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -237,15 +218,15 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
     these baselines catch it immediately.
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
         show_merged=False, show_images=False,
     )
     drift.align_nonrigid(
-        backend="pytorch", num_iterations=2, adam_steps=50,
+        num_iterations=2, adam_steps=50,
         regularization_sigma_px=16.0,
         # Pin lr to the value the baselines were captured at - the public
         # default is now auto-derived from max_image_shift, but the frozen
@@ -279,15 +260,15 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     numerically deterministic and that LBFGS doesn't silently regress.
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
         show_merged=False, show_images=False,
     )
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="lbfgs",
+        optimizer_name="lbfgs",
         num_iterations=2, lbfgs_max_iter=20,
         regularization_sigma_px=16.0,
         loss="mse",
@@ -330,8 +311,8 @@ def test_align_affine_fixed_indices_recovers_known_drift():
     ).astype(np.float32)
 
     # Save initial knots for reference image to verify they don't change
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25,
@@ -370,8 +351,8 @@ def test_align_affine_fixed_indices_none_matches_default():
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     # Run without fixed_indices
-    drift_a = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift_a = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_a.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -379,8 +360,8 @@ def test_align_affine_fixed_indices_none_matches_default():
     )
 
     # Run with explicit fixed_indices=None
-    drift_b = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift_b = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_b.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -405,8 +386,8 @@ def test_preprocess_normalize_scales_to_unit_range():
     # Artificially scale im1 to a very different range
     im1_scaled = im1 * 1000 + 5000
 
-    dc = DriftCorrection.from_data(
-        images=[im0, im1_scaled], scan_direction_degrees=[0.0, 90.0],
+    dc = DriftCorrection(
+        im0, im1_scaled, scan_direction_degrees=[0.0, 90.0],
     )
     dc.preprocess(normalize=True, show_merged=False, show_images=False)
 
@@ -444,8 +425,8 @@ def test_align_nonrigid_fixed_indices_freezes_reference():
         col_grid + expected_drift[1] * scanline_offset,
     ).astype(np.float32)
 
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -458,7 +439,7 @@ def test_align_nonrigid_fixed_indices_freezes_reference():
     knots0_after_affine = drift.knots[0].clone()
 
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="adam",
+        optimizer_name="adam",
         num_iterations=2, adam_steps=20,
         regularization_sigma_px=8.0, lr=0.02,
         fixed_indices=[0],
@@ -495,8 +476,8 @@ def test_align_nonrigid_fixed_indices_reduces_error():
         col_grid + expected_drift[1] * scanline_offset,
     ).astype(np.float32)
 
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -509,7 +490,7 @@ def test_align_nonrigid_fixed_indices_reduces_error():
     error_after_affine = drift.error_track[-1, 1]
 
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="adam",
+        optimizer_name="adam",
         num_iterations=2, adam_steps=20,
         regularization_sigma_px=8.0, lr=0.02,
         fixed_indices=[0],
@@ -527,8 +508,8 @@ def test_align_nonrigid_fixed_indices_reduces_error():
 def test_align_nonrigid_fixed_indices_all_fixed_raises():
     """fixed_indices covering all images should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -536,7 +517,7 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
     )
     with pytest.raises(ValueError, match="All images are fixed"):
         drift.align_nonrigid(
-            backend="pytorch", fixed_indices=[0, 1],
+            fixed_indices=[0, 1],
             show_merged=False, show_images=False,
         )
 
@@ -560,8 +541,8 @@ def test_align_nonrigid_gradient_mse_runs():
         col_grid + expected_drift[1] * scanline_offset,
     ).astype(np.float32)
 
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -574,7 +555,7 @@ def test_align_nonrigid_gradient_mse_runs():
     knots_after_affine = drift.knots[1].clone()
 
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="adam",
+        optimizer_name="adam",
         num_iterations=2, adam_steps=20,
         regularization_sigma_px=8.0, lr=0.02,
         fixed_indices=[0], loss="gradient_mse",
@@ -609,8 +590,8 @@ def test_align_nonrigid_gradient_mse_lbfgs():
         col_grid + expected_drift[1] * scanline_offset,
     ).astype(np.float32)
 
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -622,7 +603,7 @@ def test_align_nonrigid_gradient_mse_lbfgs():
     )
 
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="lbfgs",
+        optimizer_name="lbfgs",
         num_iterations=2, regularization_sigma_px=8.0,
         fixed_indices=[0], loss="gradient_mse",
         show_merged=False, show_images=False,
@@ -652,8 +633,8 @@ def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
     moving = moving * 0.6 + 30.0
 
     def run_with_loss(loss_name, **kwargs):
-        drift = DriftCorrection.from_data(
-            images=[reference, moving],
+        drift = DriftCorrection(
+            reference, moving,
             scan_direction_degrees=[0.0, 0.0],
         ).preprocess(
             pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -664,7 +645,7 @@ def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
             fixed_indices=[0], show_merged=False, show_images=False,
         )
         drift.align_nonrigid(
-            backend="pytorch", optimizer_name="lbfgs",
+            optimizer_name="lbfgs",
             num_iterations=4, regularization_sigma_px=8.0,
             fixed_indices=[0], loss=loss_name, max_image_shift=32.0,
             show_merged=False, show_images=False, **kwargs,
@@ -682,27 +663,13 @@ def test_align_nonrigid_gradient_mse_beats_mse_with_gain_offset():
 def test_align_nonrigid_invalid_loss_raises():
     """Invalid loss name should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="loss must be one of"):
         drift.align_nonrigid(
             loss="invalid_loss",
-            show_merged=False, show_images=False,
-        )
-
-
-def test_align_nonrigid_gradient_mse_scipy_raises():
-    """gradient_mse with scipy backend should raise ValueError."""
-    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
-    ).preprocess(show_merged=False, show_images=False)
-    drift.align_affine(show_merged=False, show_images=False)
-    with pytest.raises(ValueError, match="only supported with backend='pytorch'"):
-        drift.align_nonrigid(
-            backend="scipy", loss="gradient_mse",
             show_merged=False, show_images=False,
         )
 
@@ -726,8 +693,8 @@ def test_align_nonrigid_regularization_sigma_none():
         col_grid + drift_rate[1] * scanline_offset,
     ).astype(np.float32)
 
-    drift = DriftCorrection.from_data(
-        images=[reference, moving],
+    drift = DriftCorrection(
+        reference, moving,
         scan_direction_degrees=[0.0, 0.0],
     ).preprocess(
         pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5, number_knots=1,
@@ -739,7 +706,7 @@ def test_align_nonrigid_regularization_sigma_none():
     )
     # This previously crashed with UnboundLocalError on `vander`
     drift.align_nonrigid(
-        backend="pytorch", optimizer_name="adam",
+        optimizer_name="adam",
         num_iterations=2, adam_steps=20,
         regularization_sigma_px=None, lr=0.02,
         fixed_indices=[0],
@@ -761,8 +728,8 @@ def _make_single_sided_dc(scan_h=256, drift_rate=(0.05, 0.1), seed=42):
     src_col = col_coords - drift_rate[1] * rows[:, None]
     drifted = map_coordinates(ref, [src_row, src_col], order=3, mode='nearest').astype(np.float32)
 
-    dc = DriftCorrection.from_data(
-        images=[ref, drifted],
+    dc = DriftCorrection(
+        ref, drifted,
         scan_direction_degrees=[0.0, 0.0],
     )
     dc.preprocess(
@@ -796,14 +763,14 @@ def test_apply_correction_reduces_rms():
 
 
 def test_apply_correction_accepts_external_images():
-    """apply_correction(images=...) should work on external arrays."""
+    """apply_correction(data=...) should work on external arrays."""
     dc, ref, drifted = _make_single_sided_dc()
     # Pass external image as numpy
-    result_np = dc.apply_correction(images=drifted, mode='bilinear')
+    result_np = dc.apply_correction(data=drifted, mode='bilinear')
     assert result_np.shape == drifted.shape
     # Pass external image as tensor
     t = torch.tensor(drifted, device=dc._device, dtype=torch.float32)
-    result_t = dc.apply_correction(images=t, mode='bilinear')
+    result_t = dc.apply_correction(data=t, mode='bilinear')
     assert result_t.shape == t.shape
     # Both should produce same output
     diff = float((result_np - result_t).abs().max())
@@ -821,14 +788,14 @@ def test_apply_correction_wrong_height_raises():
     """apply_correction with mismatched image height should raise."""
     dc, _, _ = _make_single_sided_dc()
     wrong_size = np.zeros((32, 256), dtype=np.float32)
-    with pytest.raises(ValueError, match="Image height"):
-        dc.apply_correction(images=wrong_size)
+    with pytest.raises(ValueError, match="scan-row axis"):
+        dc.apply_correction(data=wrong_size)
 
 
 def test_apply_correction_before_preprocess_raises():
     """apply_correction before preprocess() should raise RuntimeError."""
-    dc = DriftCorrection.from_data(
-        images=[np.zeros((64, 64)), np.zeros((64, 64))],
+    dc = DriftCorrection(
+        np.zeros((64, 64)), np.zeros((64, 64)),
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -902,8 +869,8 @@ def test_drift_rate_matches_ground_truth():
 
 def test_drift_rate_before_align_raises():
     """drift_rate before preprocess/align should raise RuntimeError."""
-    dc = DriftCorrection.from_data(
-        images=[np.zeros((32, 32)), np.zeros((32, 32))],
+    dc = DriftCorrection(
+        np.zeros((32, 32)), np.zeros((32, 32)),
         scan_direction_degrees=[0.0, 0.0],
     )
     with pytest.raises(RuntimeError, match="preprocess"):
@@ -1064,7 +1031,7 @@ def test_apply_correction_3d_spectral_cube():
 
     # Permute to (E, H, W) for apply_correction — this is the real user workflow
     batch = cube_drifted.transpose(2, 0, 1)  # (E, H, W)
-    corrected = dc.apply_correction(images=batch, mode='bicubic')
+    corrected = dc.apply_correction(data=batch, mode='bicubic')
     assert corrected.shape == (n_energy, scan_h, scan_h)
 
     corrected_np = corrected.cpu().numpy()
@@ -1105,7 +1072,7 @@ def test_apply_correction_4d_stem_detector():
     batch = cube_4d_drifted.reshape(scan_h, scan_h, -1).transpose(2, 0, 1)
     assert batch.shape == (n_det, scan_h, scan_h)
 
-    corrected = dc.apply_correction(images=batch, mode='bicubic')
+    corrected = dc.apply_correction(data=batch, mode='bicubic')
     assert corrected.shape == (n_det, scan_h, scan_h)
 
     corrected_np = corrected.cpu().numpy()
@@ -1133,11 +1100,11 @@ def test_apply_correction_batch_matches_individual():
     drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
 
     # Batch
-    batch_result = dc.apply_correction(images=drifted, mode='bicubic')
+    batch_result = dc.apply_correction(data=drifted, mode='bicubic')
 
     # Individual
     for ch in range(drifted.shape[0]):
-        single = dc.apply_correction(images=drifted[ch], mode='bicubic')
+        single = dc.apply_correction(data=drifted[ch], mode='bicubic')
         torch.testing.assert_close(
             batch_result[ch], single,
             atol=1e-4, rtol=1e-4,
@@ -1152,53 +1119,145 @@ def test_apply_correction_integer_input():
 
     # uint8 input
     img_u8 = (ref / ref.max() * 200).astype(np.uint8)
-    result_u8 = dc.apply_correction(images=img_u8, mode='bilinear')
+    result_u8 = dc.apply_correction(data=img_u8, mode='bilinear')
     assert result_u8.dtype == torch.float32
     assert result_u8.shape == img_u8.shape
 
     # uint16 input
     img_u16 = (ref * 100).astype(np.uint16)
-    result_u16 = dc.apply_correction(images=img_u16, mode='bilinear')
+    result_u16 = dc.apply_correction(data=img_u16, mode='bilinear')
     assert result_u16.dtype == torch.float32
     assert result_u16.shape == img_u16.shape
 
     # float32 reference — results should match the float path
     img_f32 = img_u8.astype(np.float32)
-    result_f32 = dc.apply_correction(images=img_f32, mode='bilinear')
+    result_f32 = dc.apply_correction(data=img_f32, mode='bilinear')
     torch.testing.assert_close(
         result_u8, result_f32, atol=0.6, rtol=1e-3,
         msg="uint8 path should match float32 path (values are discretized)",
     )
 
 
-def test_apply_correction_multi_knot_batch_raises():
-    """apply_correction rejects batched input when number_knots > 1."""
+def test_preprocess_rejects_nonsquare_with_multi_direction():
+    """Multi-direction paired scans require square images (the canvas geometry
+    assumes a single scanline length)."""
+    np.random.seed(0)
+    im0 = np.random.rand(96, 64).astype(np.float32)  # non-square
+    im1 = np.random.rand(96, 64).astype(np.float32)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0])
+    with pytest.raises(ValueError, match="square images"):
+        dc.preprocess(pad_fraction=0.25, kde_sigma=0.5,
+                      show_merged=False, show_images=False)
+
+
+def test_preprocess_allows_nonsquare_with_single_direction():
+    """Same scan direction → non-square is fine (consistent canvas geometry)."""
+    np.random.seed(0)
+    im0 = np.random.rand(96, 64).astype(np.float32)
+    im1 = np.random.rand(96, 64).astype(np.float32)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 0.0])
+    dc.preprocess(pad_fraction=0.25, kde_sigma=0.5,
+                  show_merged=False, show_images=False)  # should not raise
+
+
+def test_preprocess_rejects_zero_knots():
+    """preprocess() requires number_knots >= 1 (negative / zero is meaningless)."""
     ref = np.random.randn(64, 64).astype(np.float32)
     drifted = np.roll(ref, 2, axis=1).astype(np.float32)
-    dc = DriftCorrection.from_data(
-        images=[ref, drifted], scan_direction_degrees=[0.0, 0.0],
-    )
-    dc.preprocess(
-        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
-        number_knots=3, normalize=True,
-        show_merged=False, show_images=False,
-    )
-    dc.align_affine(
-        step=0.02, num_tests=9, refine=False,
-        fixed_indices=[0], max_image_shift=32,
-        show_merged=False, show_images=False,
-    )
-    batch = np.random.randn(4, 64, 64).astype(np.float32)
-    with pytest.raises(NotImplementedError, match="number_knots=1"):
-        dc.apply_correction(images=batch)
+    dc = DriftCorrection(ref, drifted, scan_direction_degrees=[0.0, 0.0])
+    with pytest.raises(ValueError, match="number_knots"):
+        dc.preprocess(number_knots=0, show_merged=False, show_images=False)
 
 
 # ──────────────────────────────────────────────────────────────
-# Tests for apply_correction_4dstem() — 3D/4D correction
+# Multi-knot (K>1) tests — knot grid spans intra-row drift
 # ──────────────────────────────────────────────────────────────
 
-def test_apply_correction_4dstem_3d_eds():
-    """apply_correction_4dstem on a 3D (H, W, E) EDX cube."""
+
+def test_multi_knot_initial_warp_matches_single_knot():
+    """K=1 and K=2 with default knot grids produce identical initial warps
+    on square images (both encode the same straight-scanline geometry)."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    dc1 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False)
+    dc2 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        show_merged=False, show_images=False)
+    assert dc2.knots[0].shape == (2, 128, 2)
+    assert dc2.knots[1].shape == (2, 128, 2)
+    np.testing.assert_allclose(
+        dc1.imgs_warped.array, dc2.imgs_warped.array, atol=1e-5,
+        err_msg="K=2 with default initial knots should match K=1 initial warp")
+
+
+def test_multi_knot_full_pipeline_runs():
+    """Full preprocess + align_affine + align_nonrigid + generate_corrected
+    pipeline runs to completion with K=2 and reduces alignment error."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        show_merged=False, show_images=False)
+    initial_error = float(dc.error_track[-1, 1])
+    dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
+    dc.align_nonrigid(num_iterations=2, regularization_sigma_px=0.5,
+                      loss="mse", show_merged=False, show_images=False)
+    final_error = float(dc.error_track[-1, 1])
+    assert final_error < initial_error, (
+        f"K=2 nonrigid should reduce error: {initial_error=} {final_error=}")
+    img_corr = dc.generate_corrected(upsample_factor=1, show_merged=False)
+    assert isinstance(img_corr, Dataset2d)
+    assert not np.isnan(img_corr.array).any()
+
+
+def test_multi_knot_apply_correction_returns_correct_shape():
+    """apply_correction on K=2 routes through DriftKnot and
+    yields a per-pixel drift tensor of the right shape."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
+    drift_pixel = dc._drift(1)
+    assert drift_pixel.shape == (2, 128, 128)
+    corrected = dc.apply_correction(image_index=1)
+    assert corrected.shape == (128, 128)
+    assert not torch.isnan(corrected).any()
+
+
+def test_multi_knot_lbfgs_runs():
+    """LBFGS optimizer also handles K>1 (parallel dispatch path)."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
+    dc.align_nonrigid(optimizer_name="lbfgs", num_iterations=2,
+                      regularization_sigma_px=0.5, loss="mse",
+                      show_merged=False, show_images=False)
+    assert dc.knots[0].shape[2] == 2
+
+
+def test_multi_knot_inconsistent_K_rejected():
+    """All images must use the same K — mismatched knot tensors should raise."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
+    # Tamper: replace image 1's knots with a single-knot grid.
+    dc.knots[1] = dc.knots[1][:, :, :1].clone()
+    with pytest.raises(ValueError, match="same number of knots"):
+        dc.align_nonrigid(num_iterations=1, regularization_sigma_px=0.5,
+                          loss="mse", show_merged=False, show_images=False)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tests for apply_correction() — 3D/4D correction
+# ──────────────────────────────────────────────────────────────
+
+def test_apply_correction_3d_eds():
+    """apply_correction on a 3D (H, W, E) EDX cube."""
     scan_h = 128
     drift_rate = (0.05, 0.1)
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
@@ -1210,7 +1269,7 @@ def test_apply_correction_4dstem_3d_eds():
     cube = channels_drifted.transpose(1, 2, 0)
     assert cube.shape == (scan_h, scan_h, n_energy)
 
-    corrected = dc.apply_correction_4dstem(cube)
+    corrected = dc.apply_correction(cube)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube.shape
 
@@ -1231,8 +1290,8 @@ def test_apply_correction_4dstem_3d_eds():
         )
 
 
-def test_apply_correction_4dstem_4d_stem():
-    """apply_correction_4dstem on a 4D (H, W, det_h, det_w) STEM cube."""
+def test_apply_correction_4d_stem():
+    """apply_correction on a 4D (H, W, det_h, det_w) STEM cube."""
     scan_h = 128
     drift_rate = (0.05, 0.1)
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h, drift_rate=drift_rate)
@@ -1247,7 +1306,7 @@ def test_apply_correction_4dstem_4d_stem():
     )
     assert cube_4d.shape == (scan_h, scan_h, det_h, det_w)
 
-    corrected = dc.apply_correction_4dstem(cube_4d)
+    corrected = dc.apply_correction(cube_4d)
     assert isinstance(corrected, np.ndarray)
     assert corrected.shape == cube_4d.shape
 
@@ -1269,8 +1328,8 @@ def test_apply_correction_4dstem_4d_stem():
         )
 
 
-def test_apply_correction_4dstem_matches_manual_chunking():
-    """apply_correction_4dstem must produce same results as manual loop."""
+def test_apply_correction_matches_manual_chunking():
+    """apply_correction must produce same results as manual loop."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     n_energy = 8
@@ -1279,108 +1338,46 @@ def test_apply_correction_4dstem_matches_manual_chunking():
     drifted = _apply_drift_to_channels(channels, (0.05, 0.1), scan_h)
     cube = drifted.transpose(1, 2, 0)  # (H, W, E)
 
-    # apply_correction_4dstem
-    auto = dc.apply_correction_4dstem(cube)
+    # apply_correction
+    auto = dc.apply_correction(cube)
 
     # Manual chunking (what user had to do before)
     batch = cube.transpose(2, 0, 1)  # (E, H, W)
-    manual = dc.apply_correction(images=batch, mode='bicubic').cpu().numpy()
+    manual = dc.apply_correction(data=batch, mode='bicubic').cpu().numpy()
     manual = manual.transpose(1, 2, 0)  # (H, W, E)
 
     np.testing.assert_allclose(auto, manual, atol=1e-4, rtol=1e-4,
                                err_msg="Cube method must match manual batch")
 
 
-def test_apply_correction_4dstem_torch_input():
-    """apply_correction_4dstem works with torch.Tensor input."""
+def test_apply_correction_torch_input():
+    """apply_correction works with torch.Tensor input."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     cube_np = np.random.randn(scan_h, scan_h, 6).astype(np.float32)
     cube_t = torch.from_numpy(cube_np)
 
-    result = dc.apply_correction_4dstem(cube_t)
+    result = dc.apply_correction(cube_t)
     assert isinstance(result, torch.Tensor)
     assert result.shape == cube_t.shape
 
 
-def test_apply_correction_4dstem_output_dtype_same():
-    """apply_correction_4dstem with output_dtype='same' preserves input dtype."""
+def test_apply_correction_output_dtype_same():
+    """apply_correction with output_dtype='same' preserves input dtype."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
 
     cube_u16 = (np.random.rand(scan_h, scan_h, 4) * 1000).astype(np.uint16)
-    result = dc.apply_correction_4dstem(cube_u16, output_dtype="same")
+    result = dc.apply_correction(cube_u16, output_dtype="same")
     assert result.dtype == np.uint16
     assert result.shape == cube_u16.shape
 
 
-def test_apply_correction_4dstem_2d_raises():
-    """apply_correction_4dstem rejects 2D input."""
-    scan_h = 128
-    dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
-    with pytest.raises(ValueError, match="at least 3D"):
-        dc.apply_correction_4dstem(ref)
-
-
-def test_canvas_to_raw_drift_identity_for_zero_angle():
-    """For 0° scan, _canvas_to_raw_drift returns the input unchanged."""
-    dc, _, _ = _make_single_sided_dc(scan_h=64)
-    # Image 0 and 1 are both at 0° in _make_single_sided_dc
-    drift_canvas = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # (2, 2) toy
-    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=0, scan_h=64, scan_w=64)
-    torch.testing.assert_close(drift_row, drift_canvas[0], atol=1e-6, rtol=0)
-    torch.testing.assert_close(drift_col, drift_canvas[1], atol=1e-6, rtol=0)
-
-
-def test_canvas_to_raw_drift_rotation_for_90():
-    """For scan_direction_degrees=90, canvas drift rotates by 90°."""
-    scan_h = 64
-    np.random.seed(0)
-    ref = np.random.rand(scan_h, scan_h).astype(np.float32)
-    dc = DriftCorrection.from_data(
-        images=[ref, ref.copy()],
-        scan_direction_degrees=[0.0, 90.0],
-    )
-    dc.preprocess(
-        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
-        number_knots=1, show_merged=False, show_images=False,
-    )
-    # For scan_direction_degrees=90: scan_fast=[-1,0], scan_slow=[0,1]
-    # M = [[0, -α], [1, 0]] (α=1 for square) → M^(-1) = [[0, 1], [-1, 0]]
-    # drift_raw = M^(-1) @ drift_canvas = [δc, -δr]
-    drift_canvas = torch.tensor([[5.0], [3.0]])  # δr=5, δc=3
-    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=1, scan_h=64, scan_w=64)
-    torch.testing.assert_close(drift_row, torch.tensor([3.0]), atol=1e-5, rtol=0)
-    torch.testing.assert_close(drift_col, torch.tensor([-5.0]), atol=1e-5, rtol=0)
-
-
-def test_canvas_to_raw_drift_rotation_for_neg90():
-    """For scan_direction_degrees=-90, canvas drift rotates by -90°."""
-    scan_h = 64
-    np.random.seed(0)
-    ref = np.random.rand(scan_h, scan_h).astype(np.float32)
-    dc = DriftCorrection.from_data(
-        images=[ref, ref.copy()],
-        scan_direction_degrees=[0.0, -90.0],
-    )
-    dc.preprocess(
-        pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
-        number_knots=1, show_merged=False, show_images=False,
-    )
-    # For scan_direction_degrees=-90: scan_fast=[1,0], scan_slow=[0,-1]
-    # M = [[0, α], [-1, 0]] (α=1) → M^(-1) = [[0, -1], [1, 0]]
-    # drift_raw = M^(-1) @ [δr, δc] = [-δc, δr]
-    drift_canvas = torch.tensor([[5.0], [3.0]])
-    drift_row, drift_col = dc._canvas_to_raw_drift(drift_canvas, idx=1, scan_h=64, scan_w=64)
-    torch.testing.assert_close(drift_row, torch.tensor([-3.0]), atol=1e-5, rtol=0)
-    torch.testing.assert_close(drift_col, torch.tensor([5.0]), atol=1e-5, rtol=0)
-
-
-def test_apply_correction_4dstem_matches_apply_correction_paired():
-    """apply_correction_4dstem and apply_correction agree for paired 0/90° scans."""
+def test_apply_correction_matches_apply_correction_paired():
+    """apply_correction and apply_correction agree for paired 0/90° scans."""
     im0, im1, _ = make_synthetic_drift_data()
-    dc = DriftCorrection.from_data(
-        images=[im0, im1],
+    dc = DriftCorrection(
+        im0, im1,
         scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
@@ -1392,17 +1389,17 @@ def test_apply_correction_4dstem_matches_apply_correction_paired():
         show_merged=False, show_images=False,
     )
     # Correct image 1 (90° scan) with both methods
-    corrected_2d = dc.apply_correction(images=im1.astype(np.float32), image_index=1)
+    corrected_2d = dc.apply_correction(data=im1.astype(np.float32), image_index=1)
     corrected_2d_np = corrected_2d.cpu().numpy()
     cube_3d = im1[:, :, None].astype(np.float32)
-    corrected_3d = dc.apply_correction_4dstem(cube_3d, image_index=1)
+    corrected_3d = dc.apply_correction(cube_3d, image_index=1)
     np.testing.assert_allclose(
         corrected_3d[:, :, 0], corrected_2d_np, atol=1e-4,
-        err_msg="apply_correction and apply_correction_4dstem must agree for 90° scan",
+        err_msg="apply_correction and apply_correction must agree for 90° scan",
     )
 
 
-def test_apply_correction_4dstem_output_parameter():
+def test_apply_correction_output_parameter():
     """output= writes directly to a pre-allocated numpy array."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
@@ -1412,17 +1409,17 @@ def test_apply_correction_4dstem_output_parameter():
     cube = drifted.transpose(1, 2, 0)  # (H, W, E)
 
     # Without output= (baseline)
-    auto = dc.apply_correction_4dstem(cube)
+    auto = dc.apply_correction(cube)
 
     # With output= pre-allocated
     out_buf = np.empty_like(auto)
-    returned = dc.apply_correction_4dstem(cube, output=out_buf)
+    returned = dc.apply_correction(cube, output=out_buf)
     assert returned is out_buf, "Should return the same array object"
     np.testing.assert_allclose(out_buf, auto, atol=1e-5,
                                err_msg="output= must match default path")
 
 
-def test_apply_correction_4dstem_output_memmap(tmp_path):
+def test_apply_correction_output_memmap(tmp_path):
     """output= works with np.memmap for disk-backed writes."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
@@ -1431,7 +1428,7 @@ def test_apply_correction_4dstem_output_memmap(tmp_path):
 
     mmap_path = tmp_path / "corrected.dat"
     out_mmap = np.memmap(str(mmap_path), dtype="float32", mode="w+", shape=shape)
-    returned = dc.apply_correction_4dstem(cube, output=out_mmap)
+    returned = dc.apply_correction(cube, output=out_mmap)
     assert returned is out_mmap
     assert returned.shape == shape
 
@@ -1441,28 +1438,28 @@ def test_apply_correction_4dstem_output_memmap(tmp_path):
     np.testing.assert_allclose(loaded, out_mmap, atol=1e-6)
 
     # Verify it matches the default path
-    auto = dc.apply_correction_4dstem(cube)
+    auto = dc.apply_correction(cube)
     np.testing.assert_allclose(loaded, auto, atol=1e-5,
                                err_msg="memmap output must match default path")
 
 
-def test_apply_correction_4dstem_output_shape_mismatch():
+def test_apply_correction_output_shape_mismatch():
     """output= with wrong shape raises ValueError."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     cube = np.random.rand(scan_h, scan_h, 6).astype(np.float32)
     wrong = np.empty((scan_h, scan_h, 3), dtype=np.float32)
     with pytest.raises(ValueError, match="does not match"):
-        dc.apply_correction_4dstem(cube, output=wrong)
+        dc.apply_correction(cube, output=wrong)
 
 
-def test_apply_correction_4dstem_output_type_error():
+def test_apply_correction_output_type_error():
     """output= with non-numpy type raises TypeError."""
     scan_h = 128
     dc, ref, _ = _make_single_sided_dc(scan_h=scan_h)
     cube = np.random.rand(scan_h, scan_h, 6).astype(np.float32)
     with pytest.raises(TypeError, match="numpy ndarray"):
-        dc.apply_correction_4dstem(cube, output=[1, 2, 3])
+        dc.apply_correction(cube, output=[1, 2, 3])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1500,7 +1497,7 @@ def test_compute_vdf_3d():
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#   4D-STEM class integration tests (from_data with 4D cubes)
+#   4D-STEM class integration tests (from_4dstem with 4D cubes)
 # ═════════════════════════════════════════════════════════════════════════
 
 def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
@@ -1523,11 +1520,11 @@ def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
     return cube_a, cube_b
 
 
-def test_from_data_detects_4d():
-    """from_data with 4D arrays creates a 4D-STEM instance."""
+def test_from_4dstem_detects_4d():
+    """from_4dstem with 4D arrays creates a 4D-STEM instance."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     assert dc.is_4dstem
     assert not dc.is_series
@@ -1536,34 +1533,119 @@ def test_from_data_detects_4d():
     assert dc.imgs[1].array.shape == (32, 32)
 
 
-def test_from_data_4d_alignment_images():
-    """Custom alignment_images override auto-VDF extraction."""
+def test_from_pair_4dstem_bad_rotation_early():
+    """Non-multiple-of-90° angles are rejected for paired 4-D inputs."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    custom_a = cube_a[:, :, 0, 0].copy()
-    custom_b = cube_b[:, :, 0, 0].copy()
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
-        alignment_images=[custom_a, custom_b],
-    )
-    assert dc.is_4dstem
-    np.testing.assert_array_equal(dc.imgs[0].array, custom_a)
-    np.testing.assert_array_equal(dc.imgs[1].array, custom_b)
-
-
-def test_from_data_4d_bad_rotation_early():
-    """Non-multiple-of-90° angles are rejected at from_data time."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    with pytest.raises(ValueError, match="multiple of 90"):
-        DriftCorrection.from_data(
-            [cube_a, cube_b], scan_direction_degrees=[0, -45],
+    with pytest.raises(ValueError, match="multiple-of-90"):
+        DriftCorrection(
+            cube_a, cube_b, scan_direction_degrees=[0, -45],
         )
 
 
-def test_generate_corrected_cubes_basic():
-    """Full pipeline: from_data → preprocess → align → generate_corrected_cubes."""
+def test_from_pair_4dstem_alignment_image_rejected_in_paired_mode():
+    """alignment_image= is only valid in reference mode, not paired 4D-STEM."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    custom_vdf = cube_a[:, :, 0, 0].copy()
+    with pytest.raises(TypeError, match="only meaningful in reference mode"):
+        DriftCorrection(
+            cube_a, cube_b, scan_direction_degrees=[0, -90],
+            alignment_image=custom_vdf,
+        )
+
+
+# ---
+# Tests for from_reference (single-sided HAADF + drifted cube)
+# ---
+
+def _make_reference_pair(scan_h=64, det_size=4, kind="3d", seed=0):
+    rng = np.random.default_rng(seed)
+    ref = rng.random((scan_h, scan_h), dtype=np.float32)
+    if kind == "2d":
+        drifted = rng.random((scan_h, scan_h), dtype=np.float32)
+    elif kind == "3d":
+        drifted = rng.random((scan_h, scan_h, det_size), dtype=np.float32)
+    else:
+        drifted = rng.random((scan_h, scan_h, det_size, det_size), dtype=np.float32)
+    return ref, drifted
+
+
+def test_from_reference_3d_eds_returns_dataset3d():
+    """from_reference + 3-D drifted → generate_corrected returns Dataset3d."""
+    ref, eds = _make_reference_pair(scan_h=32, det_size=4, kind="3d")
+    dc = DriftCorrection(ref, eds)
+    dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5,
+                    show_merged=False, show_images=False)
+    result = dc.generate_corrected(show_merged=False)
+    assert isinstance(result, Dataset3d)
+    assert result.array.shape == eds.shape
+
+
+def test_from_reference_4d_stem_returns_dataset4d():
+    """from_reference + 4-D drifted → generate_corrected returns Dataset4d."""
+    from quantem.core.datastructures.dataset4d import Dataset4d
+    ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
+    dc = DriftCorrection(ref, cube)
+    dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5,
+                    show_merged=False, show_images=False)
+    result = dc.generate_corrected(show_merged=False)
+    assert isinstance(result, Dataset4d)
+    assert result.array.shape == cube.shape
+
+
+def test_from_reference_2d_returns_dataset2d():
+    """from_reference + 2-D drifted → generate_corrected returns Dataset2d.
+
+    Same scan angle (0, 0) signals reference mode rather than orthogonal pair."""
+    ref, drifted = _make_reference_pair(scan_h=32, kind="2d")
+    dc = DriftCorrection(ref, drifted, scan_direction_degrees=0)
+    dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5,
+                    show_merged=False, show_images=False)
+    result = dc.generate_corrected(show_merged=False)
+    assert isinstance(result, Dataset2d)
+    assert result.array.shape == drifted.shape
+
+
+def test_from_reference_auto_anchors_reference():
+    """In reference mode, align_affine and align_nonrigid auto-set
+    fixed_indices=[0] so reference knots stay anchored."""
+    ref, eds = _make_reference_pair(scan_h=32, det_size=4, kind="3d")
+    dc = DriftCorrection(ref, eds)
+    dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    knots_ref_initial = dc._initial_knots[0].clone()
+    dc.align_affine(step=0.02, num_tests=5,
+                    show_merged=False, show_images=False)
+    # Reference image (idx 0) should be unchanged after affine.
+    assert torch.allclose(dc.knots[0], knots_ref_initial, atol=1e-6)
+
+
+def test_from_reference_shape_mismatch_raises():
+    """reference shape must match leading 2 axes of drifted."""
+    ref = np.zeros((32, 32), dtype=np.float32)
+    drifted = np.zeros((40, 32, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="leading two axes"):
+        DriftCorrection(ref, drifted)
+
+
+def test_from_reference_alignment_image_override():
+    """alignment_image= bypasses the auto VDF computation."""
+    ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
+    custom_vdf = np.ones((32, 32), dtype=np.float32) * 0.5
+    dc = DriftCorrection(ref, cube, alignment_image=custom_vdf)
+    np.testing.assert_array_equal(dc.imgs[1].array, custom_vdf)
+
+
+def test_generate_corrected_basic():
+    """Full pipeline: from_4dstem → preprocess → align → generate_corrected."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1573,7 +1655,7 @@ def test_generate_corrected_cubes_basic():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    result = dc.generate_corrected_cubes()
+    result = dc.generate_corrected()
 
     assert isinstance(result, PairedCorrectionResult)
     assert result.merged is not None
@@ -1586,11 +1668,11 @@ def test_generate_corrected_cubes_basic():
     assert result.vdf_b.shape == (32, 32)
 
 
-def test_generate_corrected_cubes_no_merge():
+def test_generate_corrected_no_merge():
     """merge=False returns None for merged."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1600,17 +1682,17 @@ def test_generate_corrected_cubes_no_merge():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    result = dc.generate_corrected_cubes(merge=False)
+    result = dc.generate_corrected(merge=False)
     assert result.merged is None
     assert result.corrected_a.shape == cube_a.shape
     assert result.corrected_b.shape == cube_a.shape
 
 
-def test_generate_corrected_cubes_nonrigid():
+def test_generate_corrected_nonrigid():
     """Nonrigid alignment works in the 4D pipeline."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1621,16 +1703,16 @@ def test_generate_corrected_cubes_nonrigid():
         show_merged=False, show_images=False,
     )
     dc.align_nonrigid(show_merged=False, show_images=False)
-    result = dc.generate_corrected_cubes()
+    result = dc.generate_corrected()
     assert result.merged is not None
     assert result.merged.shape == cube_a.shape
 
 
-def test_apply_correction_4dstem_uses_stored_cube():
-    """apply_correction_4dstem with no cube arg uses stored cube."""
+def test_apply_correction_uses_stored_cube():
+    """apply_correction with no cube arg uses stored cube."""
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1640,15 +1722,15 @@ def test_apply_correction_4dstem_uses_stored_cube():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    corrected_0 = dc.apply_correction_4dstem(image_index=0)
+    corrected_0 = dc.apply_correction(image_index=0)
     assert corrected_0.shape == cube_a.shape
 
 
-def test_apply_correction_4dstem_no_cube_no_stored_raises():
-    """apply_correction_4dstem without cube or stored cubes raises."""
+def test_apply_correction_pair_mode_uses_stored_image():
+    """apply_correction() with no args on a pair-mode dc warps the stored image."""
     im0, im1, _ = make_synthetic_drift_data(scale=1)
-    dc = DriftCorrection.from_data(
-        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1658,45 +1740,63 @@ def test_apply_correction_4dstem_no_cube_no_stored_raises():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    with pytest.raises(ValueError, match="No cube provided"):
-        dc.apply_correction_4dstem()
+    result = dc.apply_correction()
+    assert result.shape == (32, 32)
 
 
-def test_generate_corrected_cubes_requires_4d():
-    """generate_corrected_cubes raises on 2D instances."""
+def test_generate_corrected_pair_mode_returns_dataset2d():
+    """generate_corrected on pair-mode dc returns Dataset2d."""
+    from quantem.core.datastructures.dataset2d import Dataset2d
     im0, im1, _ = make_synthetic_drift_data(scale=1)
-    dc = DriftCorrection.from_data(
-        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    dc = DriftCorrection(
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
     )
-    with pytest.raises(TypeError, match="4-D cube data"):
-        dc.generate_corrected_cubes()
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected(show_merged=False)
+    assert isinstance(result, Dataset2d)
 
 
 def test_is_4dstem_property():
     """is_4dstem reflects whether cubes are stored."""
     im0, im1, _ = make_synthetic_drift_data(scale=1)
-    dc_2d = DriftCorrection.from_data(
-        [im0[:32, :32], im1[:32, :32]], scan_direction_degrees=[0, -90],
+    dc_2d = DriftCorrection(
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
     )
     assert not dc_2d.is_4dstem
 
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc_4d = DriftCorrection.from_data(
-        [cube_a, cube_b], scan_direction_degrees=[0, -90],
+    dc_4d = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     assert dc_4d.is_4dstem
 
 
-def test_generate_corrected_image_strip_padding():
-    """strip_padding=True returns original scan dimensions, not padded canvas."""
-    dc, ref, _ = _make_single_sided_dc(scan_h=128)
-    scan_h, scan_w = ref.shape
+def test_generate_corrected_strip_padding():
+    """strip_padding=True returns original scan dimensions, not padded canvas.
 
-    padded = dc.generate_corrected_image(
-        mask_output=False, strip_padding=False, show_image=False,
+    Uses a true paired (0°/90°) alignment so generate_corrected goes through
+    the merge-on-canvas path where padding is visible (reference mode warps
+    on the scan grid directly, so strip_padding has no effect there)."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=0)
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0, 90])
+    dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=11,
+                    show_merged=False, show_images=False)
+    scan_h, scan_w = im0.shape
+
+    padded = dc.generate_corrected(
+        mask_output=False, strip_padding=False, show_merged=False,
     )
-    stripped = dc.generate_corrected_image(
-        mask_output=False, strip_padding=True, show_image=False,
+    stripped = dc.generate_corrected(
+        mask_output=False, strip_padding=True, show_merged=False,
     )
 
     canvas_h, canvas_w = dc.shape[1], dc.shape[2]
@@ -1717,31 +1817,16 @@ def test_generate_corrected_image_strip_padding():
 def test_align_nonrigid_loss_auto_resolves_pytorch():
     """loss='auto' should resolve to 'gradient_mse' for pytorch backend."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     # Should not raise — auto resolves to gradient_mse for pytorch
     drift.align_nonrigid(
-        backend="pytorch", loss="auto", num_iterations=2,
+        loss="auto", num_iterations=2,
         show_merged=False, show_images=False,
     )
     # Verify it completed without error
-    assert drift.error_track is not None
-
-
-def test_align_nonrigid_loss_auto_resolves_scipy():
-    """loss='auto' should resolve to 'mse' for scipy backend."""
-    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
-    ).preprocess(show_merged=False, show_images=False)
-    drift.align_affine(show_merged=False, show_images=False)
-    # Should not raise — auto resolves to mse for scipy
-    drift.align_nonrigid(
-        backend="scipy", loss="auto", num_iterations=1,
-        show_merged=False, show_images=False,
-    )
     assert drift.error_track is not None
 
 
@@ -1753,8 +1838,8 @@ def test_align_nonrigid_loss_auto_resolves_scipy():
 def test_align_nonrigid_early_stopping():
     """Early stopping should terminate before max iterations on easy data."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -1784,8 +1869,8 @@ def test_align_nonrigid_early_stopping():
 def test_align_nonrigid_early_stopping_disabled():
     """Setting patience >= num_iterations disables early stopping."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -1812,8 +1897,8 @@ def test_align_nonrigid_early_stopping_disabled():
 def test_align_nonrigid_lbfgs_normalize_warns():
     """LBFGS with normalize=True should emit a warning."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(normalize=True, show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with warnings.catch_warnings(record=True) as w:
@@ -1832,8 +1917,8 @@ def test_align_nonrigid_lbfgs_normalize_warns():
 def test_align_nonrigid_adam_normalize_no_warning():
     """Adam with normalize=True should NOT emit a warning."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    drift = DriftCorrection.from_data(
-        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    drift = DriftCorrection(
+        im0, im1, scan_direction_degrees=[0.0, 90.0],
     ).preprocess(normalize=True, show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with warnings.catch_warnings(record=True) as w:
@@ -1855,12 +1940,13 @@ def test_align_nonrigid_adam_normalize_no_warning():
 
 
 def test_sobel_gradient_magnitude_znorm():
-    """_sobel_gradient_magnitude should z-score normalize each image."""
+    """sobel_gradient_magnitude should z-score normalize each image."""
+    from quantem.imaging.drift_optimize import sobel_gradient_magnitude
     images = torch.randn(3, 64, 64)
     # Scale each image differently to test gain invariance
     images[1] *= 10.0
     images[2] *= 0.01
-    result = DriftCorrection._sobel_gradient_magnitude(
+    result = sobel_gradient_magnitude(
         images, pre_smooth=1.0, device=images.device, dtype=images.dtype,
     )
     assert result.shape == (3, 64, 64)
@@ -1872,7 +1958,7 @@ def test_sobel_gradient_magnitude_znorm():
         assert abs(std - 1.0) < 0.05, f"Image {i} std={std}, expected ~1.0"
 
 
-# ── correct_series tests ─────────────────────────────────────────────────
+# ── series correction tests (inlined from removed correct_series helper) ─
 
 
 def _make_series_pair(n_frames=3, size=128, seed=42):
@@ -1884,18 +1970,44 @@ def _make_series_pair(n_frames=3, size=128, seed=42):
     return a.astype(np.float32), b.astype(np.float32)
 
 
+def _correct_series_inline(
+    images_a, images_b, *, scan_direction_degrees,
+    preprocess=None, align_affine=None, align_nonrigid=False, generate=None,
+):
+    """Inlined replacement for the removed correct_series() helper."""
+    dc = DriftCorrection(
+        images_a, images_b, scan_direction_degrees=scan_direction_degrees,
+    )
+    dc.preprocess(**(preprocess or {}))
+    dc.align_affine(**(align_affine or {}))
+    if align_nonrigid:
+        dc.align_nonrigid(
+            **(align_nonrigid if isinstance(align_nonrigid, dict) else {})
+        )
+    corrected_ds = dc.generate_corrected(
+        **dict(strip_padding=True, **(generate or {}))
+    )
+    corrected = (
+        corrected_ds.array if hasattr(corrected_ds, "array") else corrected_ds
+    )
+    objects = list(dc)
+    return corrected, objects
+
+
 @pytest.fixture
 def series_pair():
     return _make_series_pair(n_frames=2)
 
 
 class TestCorrectSeries:
-    """Tests for the correct_series() standalone function."""
+    """Tests for the inlined correct_series workflow on DriftCorrection."""
 
     def test_defaults(self, series_pair):
         """All-defaults call should produce (N, H, W) float32 output."""
         a, b = series_pair
-        corrected, objs = correct_series(a, b, scan_direction_degrees=[0, -90])
+        corrected, objs = _correct_series_inline(
+            a, b, scan_direction_degrees=[0, -90]
+        )
         assert corrected.ndim == 3
         assert corrected.shape[0] == a.shape[0]
         assert corrected.dtype == np.float32
@@ -1905,7 +2017,7 @@ class TestCorrectSeries:
     def test_stage_kwargs_forwarded(self, series_pair):
         """Stage dicts should be forwarded to the underlying methods."""
         a, b = series_pair
-        corrected, objs = correct_series(
+        corrected, objs = _correct_series_inline(
             a, b,
             scan_direction_degrees=[0, -90],
             preprocess=dict(pad_fraction=0.3, kde_sigma=0.8, number_knots=1),
@@ -1918,7 +2030,7 @@ class TestCorrectSeries:
     def test_nonrigid_true(self, series_pair):
         """align_nonrigid=True should run nonrigid with defaults."""
         a, b = series_pair
-        corrected, objs = correct_series(
+        corrected, objs = _correct_series_inline(
             a, b,
             scan_direction_degrees=[0, -90],
             align_nonrigid=True,
@@ -1931,7 +2043,7 @@ class TestCorrectSeries:
     def test_nonrigid_dict(self, series_pair):
         """align_nonrigid=dict(...) should forward params to align_nonrigid."""
         a, b = series_pair
-        corrected, objs = correct_series(
+        corrected, objs = _correct_series_inline(
             a, b,
             scan_direction_degrees=[0, -90],
             align_nonrigid=dict(num_iterations=2, adam_steps=5),
@@ -1944,7 +2056,7 @@ class TestCorrectSeries:
     def test_nonrigid_false_skips(self, series_pair):
         """align_nonrigid=False (default) should skip nonrigid."""
         a, b = series_pair
-        _, objs = correct_series(
+        _, objs = _correct_series_inline(
             a, b,
             scan_direction_degrees=[0, -90],
             generate=dict(upsample_factor=1),
@@ -1952,24 +2064,17 @@ class TestCorrectSeries:
         for obj in objs:
             assert not (obj.error_track[:, 0] == 2.0).any(), "nonrigid should be skipped"
 
-    def test_shape_mismatch_raises(self):
-        """Mismatched image shapes should raise ValueError."""
-        a = np.zeros((3, 64, 64))
-        b = np.zeros((3, 64, 32))
-        with pytest.raises(ValueError, match="Shape mismatch"):
-            correct_series(a, b, scan_direction_degrees=[0, -90])
-
-    def test_2d_input_raises(self):
-        """2-D input should raise ValueError."""
-        a = np.zeros((64, 64))
-        b = np.zeros((64, 64))
-        with pytest.raises(ValueError, match="must be 3-D"):
-            correct_series(a, b, scan_direction_degrees=[0, -90])
+    def test_2d_input_makes_paired_not_series(self):
+        """2-D inputs build a paired-mode (not series) instance."""
+        a = np.zeros((64, 64), dtype=np.float32)
+        b = np.zeros((64, 64), dtype=np.float32)
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
+        assert not dc.is_series
 
     def test_drift_objects_are_inspectable(self, series_pair):
         """Returned DriftCorrection objects should support standard inspection."""
         a, b = series_pair
-        _, objs = correct_series(
+        _, objs = _correct_series_inline(
             a, b,
             scan_direction_degrees=[0, -90],
             generate=dict(upsample_factor=1),
@@ -1982,56 +2087,56 @@ class TestCorrectSeries:
 class TestSeriesClassAPI:
     """Tests for DriftCorrection class-level series support."""
 
-    def test_from_data_detects_3d_stacks(self, series_pair):
-        """from_data with 3-D arrays should create a series instance."""
+    def test_from_series_detects_3d_stacks(self, series_pair):
+        """from_series with 3-D arrays should create a series instance."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         assert dc.is_series
         assert dc.n_frames == a.shape[0]
 
-    def test_from_data_2d_is_single(self):
-        """from_data with 2-D arrays should create a normal single instance."""
+    def test_from_pair_2d_is_single(self):
+        """from_pair with 2-D arrays should create a normal single instance."""
         im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-        dc = DriftCorrection.from_data([im0, im1], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(im0, im1, scan_direction_degrees=[0, -90])
         assert not dc.is_series
 
     def test_getitem_returns_single(self, series_pair):
         """Indexing a series should return a single-pair instance."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         frame = dc[0]
         assert not frame.is_series
 
     def test_iter_yields_all_frames(self, series_pair):
         """Iterating over series should yield all frames."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         frames = list(dc)
         assert len(frames) == dc.n_frames
 
     def test_full_pipeline(self, series_pair):
-        """Full pipeline via class API should produce corrected stack."""
+        """Full pipeline via class API should produce corrected Dataset3d."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
         dc.align_affine(step=0.02, num_tests=5)
-        result = dc.generate_corrected_image(upsample_factor=1)
-        assert isinstance(result, np.ndarray)
-        assert result.ndim == 3
-        assert result.shape[0] == a.shape[0]
-        assert result.dtype == np.float32
+        result = dc.generate_corrected(upsample_factor=1)
+        assert isinstance(result, Dataset3d)
+        assert result.array.ndim == 3
+        assert result.array.shape[0] == a.shape[0]
+        assert result.array.dtype == np.float32
 
     def test_method_chaining(self, series_pair):
         """Pipeline methods should return self for chaining."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         result = dc.preprocess().align_affine(step=0.02, num_tests=5)
         assert result is dc
 
     def test_per_frame_inspection(self, series_pair):
         """Individual frames should be fully functional after series pipeline."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         dc.preprocess().align_affine(step=0.02, num_tests=5)
         for i in range(dc.n_frames):
             frame = dc[i]
@@ -2042,7 +2147,7 @@ class TestSeriesClassAPI:
     def test_ensure_single_guards(self, series_pair):
         """Methods that require single-pair should raise TypeError on series."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         dc.preprocess().align_affine(step=0.02, num_tests=5)
         with pytest.raises(TypeError, match="not supported on series"):
             dc.drift_rate
@@ -2054,7 +2159,7 @@ class TestSeriesClassAPI:
     def test_getitem_on_single_raises(self):
         """Indexing a single-pair instance should raise TypeError."""
         im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-        dc = DriftCorrection.from_data([im0, im1], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(im0, im1, scan_direction_degrees=[0, -90])
         with pytest.raises(TypeError, match="not indexable"):
             dc[0]
 
@@ -2063,15 +2168,15 @@ class TestSeriesClassAPI:
         a = np.zeros((3, 64, 64), dtype=np.float32)
         b = np.zeros((4, 64, 64), dtype=np.float32)
         with pytest.raises(ValueError, match="Frame count mismatch"):
-            DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+            DriftCorrection(a, b, scan_direction_degrees=[0, -90])
 
     def test_nonrigid_series(self, series_pair):
         """Nonrigid alignment should work on series."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         dc.preprocess().align_affine(step=0.02, num_tests=5)
         dc.align_nonrigid(num_iterations=2, adam_steps=5)
-        result = dc.generate_corrected_image(upsample_factor=1)
+        result = dc.generate_corrected(upsample_factor=1)
         assert result.shape[0] == a.shape[0]
         for frame in dc:
             assert (frame.error_track[:, 0] == 2.0).any()
@@ -2080,13 +2185,13 @@ class TestSeriesClassAPI:
         """Zero-frame stacks should raise ValueError, not IndexError."""
         a = np.zeros((0, 64, 64), dtype=np.float32)
         b = np.zeros((0, 64, 64), dtype=np.float32)
-        with pytest.raises(ValueError, match="at least 1 frame"):
-            DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        with pytest.raises(ValueError, match="≥1 frame"):
+            DriftCorrection(a, b, scan_direction_degrees=[0, -90])
 
     def test_calculate_error_on_series_raises(self, series_pair):
         """calculate_error should raise TypeError on series instances."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         dc.preprocess()
         with pytest.raises(TypeError, match="not supported on series"):
             dc.calculate_error(mode=0)
@@ -2094,10 +2199,125 @@ class TestSeriesClassAPI:
     def test_preprocess_suppresses_plots(self, series_pair):
         """preprocess on series should not trigger per-frame plots."""
         a, b = series_pair
-        dc = DriftCorrection.from_data([a, b], scan_direction_degrees=[0, -90])
+        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
         # show_merged=True would normally show a plot; on series it's forced off
         # If this doesn't raise, it ran without attempting to show 2 plots
         dc.preprocess(show_merged=True)
         # Verify each frame was preprocessed correctly
         for frame in dc:
             assert hasattr(frame, "knots")
+
+
+# ---------------------------------------------------------------------------
+# Tests for serialization round-trip after the n_frames property fix
+# ---------------------------------------------------------------------------
+
+def test_save_load_roundtrip_paired():
+    """save() then load() should round-trip a paired DriftCorrection.
+
+    Previously broken because the n_frames property raised TypeError on
+    non-series instances and serialize.py only caught (AttributeError,
+    RuntimeError, ValueError, KeyError).
+    """
+    import tempfile
+    from pathlib import Path
+    from quantem.core.io.serialize import load
+    rng = np.random.default_rng(0)
+    a = rng.random((64, 64), dtype=np.float32)
+    b = rng.random((64, 64), dtype=np.float32)
+    dc = DriftCorrection(a, b, scan_direction_degrees=(0, 90))
+    dc.preprocess(show_merged=False, show_images=False)
+    dc.align_affine(num_tests=5, show_merged=False, show_images=False)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "dc.zip"
+        dc.save(str(p))
+        loaded = load(str(p))
+        assert isinstance(loaded, DriftCorrection)
+        assert loaded.n_frames == 0  # paired instance, not a series
+
+
+def test_save_load_roundtrip_4dstem_clear_error():
+    """4D-STEM mode: save() drops the heavy _datasets; on reload, calling
+    apply_correction() without re-attaching them must raise a clear error."""
+    import tempfile
+    from pathlib import Path
+    from quantem.core.io.serialize import load
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=[0, -90])
+    dc.preprocess(kde_sigma=0.5, number_knots=1,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=5,
+                    show_merged=False, show_images=False)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "dc.zip"
+        dc.save(str(p))
+        loaded = load(str(p))
+        # The cubes are intentionally dropped on save (too large to serialize).
+        # Calling apply_correction() with no data should error clearly.
+        assert getattr(loaded, "_datasets", None) is None
+        with pytest.raises((TypeError, ValueError, AttributeError)):
+            loaded.apply_correction()
+
+
+# ---------------------------------------------------------------------------
+# Tests for tightened dispatch validation
+# ---------------------------------------------------------------------------
+
+def test_4dstem_rotation_05_degrees_rejected():
+    """4D-STEM merge with sub-degree off-axis rotation should not silently merge."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    with pytest.raises(ValueError, match="multiple-of-90"):
+        DriftCorrection(cube_a, cube_b, scan_direction_degrees=[0, 0.5])
+
+
+def test_multi_angle_three_image_dispatch():
+    """N=3 paired-2D dispatch (the *more_images branch) builds a single instance."""
+    rng = np.random.default_rng(0)
+    im0 = rng.random((48, 48), dtype=np.float32)
+    im45 = rng.random((48, 48), dtype=np.float32)
+    im90 = rng.random((48, 48), dtype=np.float32)
+    dc = DriftCorrection(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
+    assert len(dc.imgs) == 3
+    assert tuple(dc.scan_direction_degrees) == (0, 45, 90)
+
+
+def test_paired_3d_same_angle_rejected():
+    """3D + 3D at the same scan angle is not a valid series — reject explicitly."""
+    rng = np.random.default_rng(0)
+    a = rng.random((4, 32, 32), dtype=np.float32)
+    b = rng.random((4, 32, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="different scan angles"):
+        DriftCorrection(a, b, scan_direction_degrees=(0, 0))
+
+
+def test_paired_4dstem_scan_dim_mismatch_rejected():
+    """4D + 4D with mismatched (scan_h, scan_w) should error before alignment."""
+    rng = np.random.default_rng(0)
+    a = rng.random((32, 32, 4, 4), dtype=np.float32)
+    b = rng.random((32, 40, 4, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="scan dims"):
+        DriftCorrection(a, b, scan_direction_degrees=(0, 90))
+
+
+def test_canvas_to_raw_drift_nonsquare_integration():
+    """End-to-end paired correction on a non-square scan exercises the
+    alpha = (H-1)/(W-1) Jacobian factor that square tests don't reach."""
+    np.random.seed(0)
+    H, W = 96, 64  # non-square
+    row_coords, col_coords = np.mgrid[:H, :W]
+    ref = np.sin(0.1 * row_coords + 0.15 * col_coords).astype(np.float32) * 50 + 100
+    rows = np.arange(H, dtype=np.float32)
+    src_row = row_coords - 0.05 * rows[:, None]
+    src_col = col_coords - 0.10 * rows[:, None]
+    drifted = map_coordinates(ref, [src_row, src_col], order=3, mode='nearest').astype(np.float32)
+    dc = DriftCorrection(ref, drifted, scan_direction_degrees=(0, 0))
+    dc.preprocess(pad_fraction=0.25, pad_value=0.0, kde_sigma=0.5,
+                  show_merged=False, show_images=False)
+    dc.align_affine(step=0.02, num_tests=11,
+                    show_merged=False, show_images=False)
+    corrected = dc.apply_correction()
+    if hasattr(corrected, "cpu"):
+        corrected = corrected.cpu().numpy()
+    raw_rms = float(np.sqrt(((ref - drifted) ** 2).mean()))
+    cor_rms = float(np.sqrt(((ref - corrected) ** 2).mean()))
+    assert cor_rms < raw_rms, f"non-square correction should reduce RMSE: {raw_rms=}, {cor_rms=}"

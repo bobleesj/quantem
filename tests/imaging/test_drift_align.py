@@ -1,4 +1,4 @@
-"""Parity tests for drift_utils.py torch functions.
+"""Parity tests for drift_knot.py + drift_align.py.
 
 Tests the core building blocks against numpy/scipy equivalents.
 The full pipeline is covered by frozen baselines in test_drift.py.
@@ -10,18 +10,20 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde
-from quantem.imaging.drift_utils import (
-    _parabolic_peak_2d,
-    _parabolic_sub_pixel,
+from quantem.imaging.drift_knot import (
+    DriftKnot,
     _symmetric_pad,
-    backward_warp,
-    backward_warp_grid_search,
     bilinear_kde_batch,
-    cross_corr_batch,
-    fourier_shift_warp,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
     initialize_scanline_knots,
+)
+from quantem.imaging.drift_align import (
+    _parabolic_peak_2d,
+    _parabolic_sub_pixel,
+    backward_warp,
+    backward_warp_grid_search,
+    cross_corr_batch,
 )
 
 
@@ -304,84 +306,6 @@ def test_backward_warp_reverses_known_drift():
     )
 
 
-# ---------------------------------------------------------------------------
-# fourier_shift_warp
-# ---------------------------------------------------------------------------
-
-
-def test_fourier_shift_warp_identity():
-    """Zero drift + zero rigid shift should return the input unchanged."""
-    img = torch.randn(64, 64, dtype=torch.float32)
-    out = fourier_shift_warp(img, drift=(0.0, 0.0))
-    torch.testing.assert_close(out, img, atol=1e-5, rtol=1e-5)
-
-
-def test_fourier_shift_warp_reverses_known_drift():
-    """Fourier warp should recover a Fourier-drifted image with near-zero error.
-
-    Unlike backward_warp (bilinear/bicubic), the column-direction shift
-    is exact — the only error comes from row-direction linear mixing.
-    """
-    n = 128
-    rng = np.random.default_rng(42)
-    from scipy.ndimage import gaussian_filter as gf
-    original = gf(rng.random((n, n)).astype(np.float32), sigma=4)
-
-    drift_col = 0.05  # 0.05 px/line → 6.4 px total
-    offset = np.arange(n) - (n - 1) / 2
-
-    # Forward drift: shift each scanline's columns via Fourier (exact)
-    drifted = np.zeros_like(original)
-    for r in range(n):
-        shift = drift_col * offset[r]
-        k = np.fft.fftfreq(n)
-        row_fft = np.fft.fft(original[r])
-        drifted[r] = np.real(np.fft.ifft(row_fft * np.exp(-2j * np.pi * k * shift)))
-
-    corrected = fourier_shift_warp(
-        torch.tensor(drifted), drift=(0.0, drift_col),
-    ).numpy()
-
-    # Column-only drift → Fourier correction should be near-exact
-    c = 15
-    np.testing.assert_allclose(
-        corrected[c:-c, c:-c], original[c:-c, c:-c], atol=0.01,
-    )
-
-
-def test_fourier_shift_warp_beats_bilinear_on_high_freq():
-    """Fourier roundtrip preserves high-frequency content better than bilinear.
-
-    Drift a high-freq image, correct with each method, compare to original.
-    Fourier should be more accurate because it doesn't attenuate frequencies.
-    """
-    n = 256
-    x = np.arange(n, dtype=np.float32)
-    # Integer cycles for perfect periodicity (avoids Fourier boundary artifacts)
-    cycles = int(0.4 * n)  # 102 full cycles
-    img = np.sin(2 * np.pi * cycles / n * x)[None, :].repeat(n, axis=0).astype(np.float32)
-
-    drift_col = 0.03  # 0.03 px/line → ~3.8 px total
-    offset = np.arange(n) - (n - 1) / 2
-
-    # Forward drift: shift each scanline's columns via Fourier (exact)
-    drifted = np.zeros_like(img)
-    for r in range(n):
-        shift = drift_col * offset[r]
-        k = np.fft.fftfreq(n)
-        row_fft = np.fft.fft(img[r])
-        drifted[r] = np.real(np.fft.ifft(row_fft * np.exp(-2j * np.pi * k * shift)))
-
-    drifted_t = torch.tensor(drifted)
-    bilinear_out = backward_warp(drifted_t, drift=(0.0, drift_col), mode="bilinear").numpy()
-    fourier_out = fourier_shift_warp(drifted_t, drift=(0.0, drift_col)).numpy()
-
-    c = 20
-    err_bilinear = np.sqrt(np.mean((bilinear_out[c:-c, c:-c] - img[c:-c, c:-c]) ** 2))
-    err_fourier = np.sqrt(np.mean((fourier_out[c:-c, c:-c] - img[c:-c, c:-c]) ** 2))
-    assert err_fourier < err_bilinear, (
-        f"Fourier ({err_fourier:.6f}) should beat bilinear ({err_bilinear:.6f})"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +392,163 @@ def test_backward_warp_grid_search_true_drift_beats_zero():
         f"True drift cost ({costs_np[1]:.6f}) should be lower than "
         f"zero drift cost ({costs_np[0]:.6f})"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# DriftKnot — direct unit tests of the K-aware dispatch class
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _build_geometry(K, scan_fast=(0.0, 1.0), scan_slow=(1.0, 0.0),
+                    input_shape=(64, 64), seed=0):
+    """Build a DriftKnot from initial knots for the given K (no drift)."""
+    H, W = input_shape
+    fast = np.asarray(scan_fast, dtype=np.float32)
+    slow = np.asarray(scan_slow, dtype=np.float32)
+    knots_np = initialize_scanline_knots(
+        input_shape=input_shape,
+        output_shape=input_shape,
+        scan_fast=fast,
+        scan_slow=slow,
+        number_knots=K,
+    )
+    knots = torch.tensor(knots_np, dtype=torch.float32)
+    geom = DriftKnot(
+        knots,
+        torch.tensor(fast, dtype=torch.float32),
+        torch.tensor(slow, dtype=torch.float32),
+        input_shape,
+    )
+    return geom
+
+
+def test_knot_geometry_to_canvas_K1_K2_match_at_initial_knots():
+    """Square image: K=1 walk and K=2 lerp at default knot grid produce
+    the same per-pixel canvas coordinates (scanline endpoints align)."""
+    geom1 = _build_geometry(K=1, input_shape=(64, 64))
+    geom2 = _build_geometry(K=2, input_shape=(64, 64))
+    r1, c1 = geom1.to_canvas()
+    r2, c2 = geom2.to_canvas()
+    torch.testing.assert_close(r1, r2, atol=1e-5, rtol=0)
+    torch.testing.assert_close(c1, c2, atol=1e-5, rtol=0)
+
+
+def test_knot_geometry_multi_knot_to_canvas_endpoints_at_knots():
+    """K=3 to_canvas at fast_fraction=0/0.5/1 returns exactly the K knot positions."""
+    geom = _build_geometry(K=3, input_shape=(8, 5))  # K-1=2 segments → fractions 0.0/0.5/1.0
+    r, c = geom.to_canvas()  # (H, W) each
+    # cols 0, 2, 4 correspond to knots 0, 1, 2 (linspace 0..1 with W=5)
+    for col, k in [(0, 0), (2, 1), (4, 2)]:
+        torch.testing.assert_close(r[:, col], geom.knots[0, :, k], atol=1e-5, rtol=0)
+        torch.testing.assert_close(c[:, col], geom.knots[1, :, k], atol=1e-5, rtol=0)
+
+
+def test_knot_geometry_drift_raw_K1_per_row_shape():
+    """K=1 drift_raw returns (2, H) per-row shifts."""
+    geom = _build_geometry(K=1, input_shape=(32, 32))
+    initial = geom.knots.clone()
+    geom.knots = initial + torch.tensor([0.5, 1.0])[:, None, None]  # uniform shift
+    out = geom.drift_raw(initial)
+    assert out.shape == (2, 32)
+
+
+def test_knot_geometry_drift_raw_K2_per_pixel_shape():
+    """K>=2 drift_raw returns (2, H, W) per-pixel drift."""
+    geom = _build_geometry(K=2, input_shape=(32, 24))
+    initial = geom.knots.clone()
+    geom.knots = initial + torch.tensor([0.5, 1.0])[:, None, None]
+    out = geom.drift_raw(initial)
+    assert out.shape == (2, 32, 24)
+
+
+def test_knot_geometry_apply_affine_shift_centered_at_middle_row():
+    """apply_affine_shift adds drift_vec * (i - (H-1)/2) per scanline; row (H-1)/2 stays put."""
+    geom = _build_geometry(K=1, input_shape=(11, 11))
+    snapshot = geom.knots.clone()
+    drift_vec = torch.tensor([1.0, 2.0])
+    geom.apply_affine_shift(drift_vec)
+    delta = geom.knots - snapshot
+    # The centered scanline (idx 5 for H=11) should not move
+    assert torch.allclose(delta[:, 5, 0], torch.zeros(2), atol=1e-6)
+    # Endpoints should shift by drift_vec * ±5
+    torch.testing.assert_close(delta[:, 0, 0], -5.0 * drift_vec, atol=1e-5, rtol=0)
+    torch.testing.assert_close(delta[:, -1, 0], 5.0 * drift_vec, atol=1e-5, rtol=0)
+
+
+def test_knot_geometry_warp_to_canvas_round_trip():
+    """warp_to_canvas of an image at zero drift returns a recognizable copy on the canvas."""
+    np.random.seed(0)
+    H = W = 32
+    image = torch.tensor(np.random.rand(H, W).astype(np.float32))
+    geom = _build_geometry(K=1, input_shape=(H, W))
+    canvas_shape = (H, W)
+    warped, weights = geom.warp_to_canvas(image, canvas_shape, kde_sigma=0.5, pad_value=0.0)
+    assert warped.shape == canvas_shape
+    assert weights.shape == canvas_shape
+    # Center region (where weights are highest) should resemble the input intensity range
+    cy, cx = H // 2, W // 2
+    assert weights[cy, cx] > 0.5  # adequate coverage at center
+    assert warped[cy, cx].item() > 0.0
+
+
+def _interp_with_drift(scan_fast, scan_slow, input_shape, drift_canvas):
+    """Build a DriftKnot whose ``drift(initial)`` equals ``drift_canvas``.
+
+    The pure rotation tests below feed synthetic deltas directly so we can
+    pin the canvas → raw Jacobian without running a full preprocess pipeline.
+    """
+    H = drift_canvas.shape[1]
+    initial = torch.zeros(2, H, 1, dtype=drift_canvas.dtype)
+    knots = initial.clone()
+    knots[:, :, 0] = drift_canvas
+    interp = DriftKnot(
+        knots, torch.tensor(scan_fast, dtype=drift_canvas.dtype),
+        torch.tensor(scan_slow, dtype=drift_canvas.dtype), input_shape)
+    return interp, initial
+
+
+def test_drift_raw_identity_for_zero_angle():
+    """0° scan: drift_raw returns the canvas drift unchanged."""
+    drift_canvas = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # (2, 2)
+    interp, initial = _interp_with_drift(
+        scan_fast=[0.0, 1.0], scan_slow=[1.0, 0.0],
+        input_shape=(2, 2), drift_canvas=drift_canvas)
+    out = interp.drift_raw(initial)
+    torch.testing.assert_close(out[0], drift_canvas[0], atol=1e-6, rtol=0)
+    torch.testing.assert_close(out[1], drift_canvas[1], atol=1e-6, rtol=0)
+
+
+def test_drift_raw_rotation_for_90():
+    """scan_direction=90°: canvas drift rotates by 90°."""
+    drift_canvas = torch.tensor([[5.0], [3.0]])  # δr=5, δc=3
+    interp, initial = _interp_with_drift(
+        scan_fast=[-1.0, 0.0], scan_slow=[0.0, 1.0],
+        input_shape=(64, 64), drift_canvas=drift_canvas)
+    out = interp.drift_raw(initial)
+    torch.testing.assert_close(out[0], torch.tensor([3.0]), atol=1e-5, rtol=0)
+    torch.testing.assert_close(out[1], torch.tensor([-5.0]), atol=1e-5, rtol=0)
+
+
+def test_drift_raw_rotation_for_neg90():
+    """scan_direction=-90°: canvas drift rotates by -90°."""
+    drift_canvas = torch.tensor([[5.0], [3.0]])
+    interp, initial = _interp_with_drift(
+        scan_fast=[1.0, 0.0], scan_slow=[0.0, -1.0],
+        input_shape=(64, 64), drift_canvas=drift_canvas)
+    out = interp.drift_raw(initial)
+    torch.testing.assert_close(out[0], torch.tensor([-3.0]), atol=1e-5, rtol=0)
+    torch.testing.assert_close(out[1], torch.tensor([5.0]), atol=1e-5, rtol=0)
+
+
+def test_drift_raw_nonsquare_90_uses_alpha():
+    """Non-square scans carry the aspect-ratio Jacobian factor — without the
+    alpha term the row drift would be returned unscaled."""
+    scan_h, scan_w = 128, 64
+    alpha = (scan_h - 1) / (scan_w - 1)
+    drift_canvas = torch.tensor([[5.0], [3.0]])
+    interp, initial = _interp_with_drift(
+        scan_fast=[-1.0, 0.0], scan_slow=[0.0, 1.0],
+        input_shape=(scan_h, scan_w), drift_canvas=drift_canvas)
+    out = interp.drift_raw(initial)
+    torch.testing.assert_close(out[0], torch.tensor([3.0]), atol=1e-5, rtol=0)
+    torch.testing.assert_close(out[1], torch.tensor([-5.0 / alpha]), atol=1e-5, rtol=0)
