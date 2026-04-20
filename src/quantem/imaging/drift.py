@@ -35,23 +35,24 @@ import quantem.imaging.drift_optimize as _optimize
 import quantem.imaging.drift_viz as drift_viz
 
 
-def _as_array(x) -> np.ndarray:
-    """Extract a numpy ndarray from an input dataset.
+def _as_array(x):
+    """Extract the array from an input dataset.
 
-    Accepts a numpy ``ndarray`` (returned as-is) or any ``Dataset``-like
-    wrapper exposing a ``.array`` attribute (e.g. ``Dataset2d``,
-    ``Dataset3d``, ``Dataset4d``). Raises ``TypeError`` for paths or
-    other inputs - load files yourself with ``Dataset_X.from_file()``
-    and pass the resulting Dataset object.
+    Accepts a numpy ``ndarray`` (returned as-is), a ``torch.Tensor``
+    (returned as-is, so device tensors stay in place through
+    apply_correction), or any ``Dataset``-like wrapper exposing a
+    ``.array`` attribute.  Raises ``TypeError`` for paths or other
+    inputs: load files yourself with ``Dataset_X.from_file()`` and
+    pass the resulting Dataset object.
     """
-    if isinstance(x, np.ndarray):
+    if isinstance(x, (np.ndarray, torch.Tensor)):
         return x
     arr = getattr(x, "array", None)
     if isinstance(arr, np.ndarray):
         return arr
     raise TypeError(
-        f"DriftCorrection accepts ndarray or Dataset objects, got "
-        f"{type(x).__name__}. To load from disk, call "
+        f"DriftCorrection accepts ndarray, torch.Tensor, or Dataset "
+        f"objects; got {type(x).__name__}. To load from disk, call "
         f"Dataset2d.from_file(path) (or Dataset4d.from_file) first.")
 
 
@@ -187,31 +188,56 @@ class DriftCorrection(AutoSerialize):
             reference mode.  When ``None``, computed automatically via
             :meth:`compute_vdf`.
 
+        Five supported use cases (the dispatch picks one by input shapes
+        and angles)
+        --------------------------------------------------------------------
+        ===  ===================================  =============================  ============================  ===============================
+        #    Use case                             Inputs                         Returns from                  Demo notebook
+                                                                                  ``generate_corrected``
+        ===  ===================================  =============================  ============================  ===============================
+        1    Paired 2-D HAADF                     2× ``(H, W)``                  :class:`Dataset2d`            ``api/01_from_pair.ipynb``
+        2    Paired 2-D series                    2× ``(N, H, W)``               :class:`Dataset3d`            ``api/02_from_series.ipynb``
+        3    Paired 4-D STEM                      2× ``(H, W, D_h, D_w)``        :class:`PairedCorrectionResult`  ``api/03_from_4dstem.ipynb``
+        4    Reference + drifted 4-D STEM         ``(H, W)`` + ``(H, W, D_h, D_w)``  :class:`Dataset4d`        ``api/04_from_reference_4dstem.ipynb``
+        5    Reference + drifted 3-D EDS / EELS   ``(H, W)`` + ``(H, W, n_E)``   :class:`Dataset3d`            ``api/05_from_reference_eds.ipynb``
+        ===  ===================================  =============================  ============================  ===============================
+
+        Cases 1-3 are *paired* (two scans of the same area, typically at
+        orthogonal angles); cases 4-5 are *reference-mode* (one HAADF
+        reference + one drifted dataset of the same scan, single-sided).
+        Multi-angle HAADF (3+ inputs at different angles) follows the
+        case-1 dispatch with ``len(datasets) > 2``.
+
         Examples
         --------
-        Paired 0°/90° HAADF:
+        Case 1: paired 2-D HAADF (0° / 90°):
 
         >>> dc = DriftCorrection(im0, im90, scan_direction_degrees=(0, 90))
 
-        Paired tilt series (two 3-D ``(N, H, W)`` stacks):
+        Case 2: paired tilt series (two 3-D ``(N, H, W)`` stacks):
 
         >>> dc = DriftCorrection(stack_0, stack_90, scan_direction_degrees=(0, -90))
 
-        Paired 4D-STEM (orthogonal datasets):
+        Case 3: paired 4-D STEM:
 
         >>> dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=(0, -90))
 
-        HAADF reference + drifted EDS spectral cube (single-sided):
+        Case 4: HAADF reference + drifted 4-D STEM (single-sided):
+
+        >>> dc = DriftCorrection(haadf, cube_drifted, scan_direction_degrees=0)
+
+        Case 5: HAADF reference + drifted EDS spectral cube:
 
         >>> dc = DriftCorrection(haadf, eds_cube, scan_direction_degrees=0)
 
-        Multi-angle HAADF (e.g. 0° / 45° / 90°):
+        Multi-angle HAADF (e.g. 0° / 45° / 90°, follows case 1):
 
         >>> dc = DriftCorrection(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
         """
         # Core state (always set so all code paths can rely on these).
         self._frames: list[Self] | None = None
         self._datasets: list[np.ndarray | None] | None = None
+        self._datasets_consumed: bool = False
         self._normalized: bool = False
         self._reference_mode: bool = False
         device, _ = validate_device(None)
@@ -364,8 +390,19 @@ class DriftCorrection(AutoSerialize):
 
     @property
     def is_4dstem(self) -> bool:
-        """True if this instance was created from 4D-STEM data."""
+        """True if this instance holds ≥3-D dataset(s) for correction.
+
+        Covers both paired 4D-STEM mode (two cubes at orthogonal scan
+        angles) *and* reference mode (one reference image + one drifted
+        cube).  Use :attr:`is_paired_4dstem` to distinguish from
+        reference mode.
+        """
         return self._datasets is not None
+
+    @property
+    def is_paired_4dstem(self) -> bool:
+        """True only for paired 4D-STEM (two cubes, not reference mode)."""
+        return self._datasets is not None and not self._reference_mode
 
     @property
     def n_frames(self) -> int:
@@ -1417,12 +1454,14 @@ class DriftCorrection(AutoSerialize):
         weight_thresh: float = 0.1,
         show_merged: bool = True,
         *,
-        mode: str = "bicubic",
+        mode: str = "bilinear",
         chunk_size: int | None = None,
         merge: bool = True,
         verbose: bool = False,
         output_a: np.ndarray | None = None,
         output_b: np.ndarray | None = None,
+        output_dtype: torch.dtype | np.dtype | str | None = None,
+        output_device: str | torch.device | None = None,
         **kwargs,
     ):
         """Produce the canonical drift-corrected output for this instance.
@@ -1521,6 +1560,7 @@ class DriftCorrection(AutoSerialize):
             return self._generate_corrected_paired_datasets(
                 mode=mode, chunk_size=chunk_size, merge=merge,
                 verbose=verbose, output_a=output_a, output_b=output_b,
+                output_dtype=output_dtype, output_device=output_device,
             )
         if self._frames is not None:
             results = self._dispatch_to_frames(
@@ -1632,7 +1672,7 @@ class DriftCorrection(AutoSerialize):
         data: torch.Tensor | np.ndarray | None = None,
         image_index: int = -1,
         *,
-        mode: str = "bicubic",
+        mode: str = "bilinear",
         chunk_size: int | None = None,
         output_dtype: torch.dtype | np.dtype | str | None = None,
         output_device: str | torch.device | None = None,

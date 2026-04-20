@@ -42,48 +42,82 @@ class PairedCorrectionResult:
 
     Attributes
     ----------
-    corrected_a, corrected_b : np.ndarray
+    corrected_a, corrected_b : np.ndarray | torch.Tensor
         Per-side drift-corrected datasets, scan-axis-leading layout.
+        Type matches the input (numpy when the source arrays were numpy,
+        torch when ``output_device`` was specified or inputs were tensors).
     vdf_a, vdf_b : np.ndarray
         Pre-correction virtual-detector images, ``(scan_h, scan_w)``.
-    merged : np.ndarray | None
+    merged : np.ndarray | torch.Tensor | None
         Half-sum of corrected_a + corrected_b in dataset A's frame.
+        Always a *distinct* array/tensor from ``corrected_a``.
         ``None`` when ``merge=False`` (heavy-data callers that defer
         the merge to disk).
     drift : DriftCorrection
         Back-reference for plotting / introspection (``result.drift.knots``,
         ``result.drift.print_drift_stats()``, etc.).
     """
-    corrected_a: np.ndarray
-    corrected_b: np.ndarray
+    corrected_a: np.ndarray | torch.Tensor
+    corrected_b: np.ndarray | torch.Tensor
     vdf_a: np.ndarray
     vdf_b: np.ndarray
     drift: object  # DriftCorrection — typed via TYPE_CHECKING above
-    merged: np.ndarray | None = field(default=None)
+    merged: np.ndarray | torch.Tensor | None = field(default=None)
 
 
 def compute_vdf(
-    ds_4d: np.ndarray,
+    ds_4d,
     chunk_rows: int | None = None,
 ) -> np.ndarray:
     """Compute a virtual dark-field image from a 4D-STEM dataset.
 
     Averages over the detector dimensions to produce a 2D scan image.
-    Supports memory-mapped inputs — when *chunk_rows* is set, only a
-    few scan rows are loaded at a time, keeping host RAM usage low.
+    Accepts ``np.ndarray`` / ``np.memmap`` (CPU path) or ``torch.Tensor``
+    on device (computes the reduction in place, then syncs back as a
+    small float32 numpy array).  The torch path is preferred when the
+    cube is already on device: avoids a multi-GB device-to-host transfer
+    just to compute a megabyte-scale summary.
 
     Parameters
     ----------
-    ds_4d : np.ndarray, shape ``(H, W, det_h, det_w)``
-        4D-STEM dataset.  Can be a ``np.memmap``.
+    ds_4d : np.ndarray or torch.Tensor, shape ``(H, W, det_h, det_w)``
+        4D-STEM dataset.  numpy can be a ``np.memmap``.
     chunk_rows : int or None
-        Number of scan rows to process at a time.  ``None`` loads
-        everything at once (fastest for in-memory arrays).
+        Number of scan rows to process at a time (numpy path only).
+        ``None`` loads everything at once (fastest for in-memory).
 
     Returns
     -------
     np.ndarray, shape ``(H, W)``, dtype float32
     """
+    if isinstance(ds_4d, torch.Tensor):
+        H, W = ds_4d.shape[:2]
+        det_pixels = 1
+        for d in range(2, ds_4d.ndim):
+            det_pixels *= ds_4d.shape[d]
+        # Widen the accumulator just enough to avoid overflow in the
+        # per-pixel detector sum.  int8/int16/uint8 fit safely in int32
+        # for det_pixels up to ~65k; wider integer inputs need int64.
+        if torch.is_floating_point(ds_4d):
+            sum_dtype = torch.float64
+        elif ds_4d.dtype in (torch.int8, torch.int16, torch.uint8):
+            sum_dtype = torch.int32
+        else:
+            sum_dtype = torch.int64
+        # torch's .sum(dtype=...) materializes a widened copy of the
+        # full input in some builds; chunking caps the transient at one
+        # row-block instead of the whole cube.
+        if chunk_rows is None:
+            # Cap transient at ~1 GB per chunk in the chosen accumulator.
+            bytes_per_row = W * det_pixels * sum_dtype.itemsize
+            chunk_rows = max(1, int(1e9 / bytes_per_row))
+        totals = torch.empty(H, W, dtype=torch.float32, device=ds_4d.device)
+        for i in range(0, H, chunk_rows):
+            j = min(i + chunk_rows, H)
+            chunk = ds_4d[i:j].reshape(j - i, W, det_pixels)
+            totals[i:j] = chunk.sum(dim=2, dtype=sum_dtype).to(torch.float32) / det_pixels
+        return totals.cpu().numpy()
+
     H, W = ds_4d.shape[:2]
     det_pixels = 1
     for d in range(2, ds_4d.ndim):
@@ -109,7 +143,7 @@ def apply_correction_to_dataset(
     dc: "DriftCorrection",
     ds_4d: torch.Tensor | np.ndarray | None = None,
     image_index: int = -1,
-    mode: str = "bicubic",
+    mode: str = "bilinear",
     chunk_size: int | None = None,
     output_dtype: torch.dtype | np.dtype | str | None = None,
     output_device: str | torch.device | None = None,
@@ -157,11 +191,6 @@ def apply_correction_to_dataset(
                 f"output shape {output.shape} does not match "
                 f"ds_4d shape {original_shape}"
             )
-
-    return_numpy = (
-        use_external_output
-        or (is_numpy and output_device is None)
-    )
 
     ndim = len(original_shape)
     if ndim < 3:
@@ -225,14 +254,22 @@ def apply_correction_to_dataset(
         out_dt = output_dtype
 
     # ── Target device ──
+    # Default the output to the input's device so the pipeline stays
+    # in place; explicit ``output_device`` overrides.
     if use_external_output:
         target = torch.device("cpu")
     elif output_device is not None:
         target = torch.device(output_device)
         if target.type == "cuda":
             target = device
+    elif isinstance(ds_4d, torch.Tensor) and ds_4d.is_cuda:
+        target = device
     else:
         target = torch.device("cpu")
+    return_numpy = (
+        use_external_output
+        or (is_numpy and output_device is None)
+    )
 
     # ── Chunk size (auto-fit within GPU memory) ──
     if chunk_size is None:
@@ -303,12 +340,14 @@ def apply_correction_to_dataset(
 def generate_corrected_paired_datasets(
     dc: "DriftCorrection",
     *,
-    mode: str = "bicubic",
+    mode: str = "bilinear",
     chunk_size: int | None = None,
     merge: bool = True,
     verbose: bool = False,
     output_a: np.ndarray | None = None,
     output_b: np.ndarray | None = None,
+    output_dtype: torch.dtype | np.dtype | str | None = None,
+    output_device: str | torch.device | None = None,
 ) -> PairedCorrectionResult:
     """Internal worker for the 4D-STEM branch of ``generate_corrected``.
 
@@ -316,27 +355,55 @@ def generate_corrected_paired_datasets(
     into the first scan's coordinate frame, and optionally merges them.
     """
     datasets = dc._datasets
+    if dc._datasets_consumed:
+        raise RuntimeError(
+            "Raw datasets were already released to free device memory "
+            "during a prior generate_corrected call. Construct a new "
+            "DriftCorrection to re-correct."
+        )
     if len(datasets) < 2:
         raise ValueError(
             f"Need at least 2 datasets for paired correction, "
             f"got {len(datasets)}"
         )
 
-    corrected_a = apply_correction_to_dataset(
-        dc, None, image_index=0, mode=mode, chunk_size=chunk_size,
-        output=output_a, verbose=verbose,
-    )
-    corrected_b = apply_correction_to_dataset(
-        dc, None, image_index=1, mode=mode, chunk_size=chunk_size,
-        output=output_b, verbose=verbose,
+    # When inputs are device-resident, release each raw cube as soon as
+    # its corrected output exists; otherwise we hold four full cubes
+    # simultaneously, which exceeds device memory for paired multi-GB scans.
+    inputs_on_device = (
+        isinstance(datasets[0], torch.Tensor) and datasets[0].is_cuda
+        and isinstance(datasets[1], torch.Tensor) and datasets[1].is_cuda
     )
 
-    # Rotate dataset B into dataset A's coordinate frame
+    corrected_a = apply_correction_to_dataset(
+        dc, None, image_index=0, mode=mode, chunk_size=chunk_size,
+        output_dtype=output_dtype, output_device=output_device,
+        output=output_a, verbose=verbose,
+    )
+    if inputs_on_device:
+        dc._datasets[0] = None
+        torch.cuda.empty_cache()
+    corrected_b = apply_correction_to_dataset(
+        dc, None, image_index=1, mode=mode, chunk_size=chunk_size,
+        output_dtype=output_dtype, output_device=output_device,
+        output=output_b, verbose=verbose,
+    )
+    if inputs_on_device:
+        dc._datasets[1] = None
+        dc._datasets_consumed = True
+        torch.cuda.empty_cache()
+
+    # Rotate dataset B into dataset A's coordinate frame.
     sd = dc.scan_direction_degrees
     delta = float((sd[1] - sd[0]) % 360)
     rot_k = round(delta / 90) % 4
     if rot_k != 0:
-        corrected_b = np.rot90(corrected_b, k=rot_k, axes=(0, 1)).copy()
+        if isinstance(corrected_b, torch.Tensor):
+            # rot90 returns a strided view; add_ below reads it directly,
+            # so we skip the full-size .contiguous() write.
+            corrected_b = torch.rot90(corrected_b, k=rot_k, dims=(0, 1))
+        else:
+            corrected_b = np.rot90(corrected_b, k=rot_k, axes=(0, 1)).copy()
 
     merged = None
     if merge:
@@ -347,10 +414,18 @@ def generate_corrected_paired_datasets(
                 f"Paired scans must have compatible scan dimensions "
                 f"after rotation."
             )
-        # In-place to avoid float64 promotion of multi-GB arrays.
-        merged = np.empty_like(corrected_a, dtype=np.float32)
-        np.add(corrected_a, corrected_b, out=merged, dtype=np.float32)
-        merged *= 0.5
+        if isinstance(corrected_a, torch.Tensor):
+            merged = (corrected_a.float() + corrected_b.float()) * 0.5
+            if corrected_a.dtype not in (torch.float32, torch.float64):
+                merged = merged.round().clamp_(
+                    0, torch.iinfo(corrected_a.dtype).max
+                ).to(corrected_a.dtype)
+            else:
+                merged = merged.to(corrected_a.dtype)
+        else:
+            merged = np.empty_like(corrected_a, dtype=np.float32)
+            np.add(corrected_a, corrected_b, out=merged, dtype=np.float32)
+            merged *= 0.5
 
     # Extract VDFs from the stored alignment images
     vdf_a = np.asarray(dc.imgs[0].array)

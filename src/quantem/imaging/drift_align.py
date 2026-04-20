@@ -188,7 +188,7 @@ def backward_warp(
     images: torch.Tensor,
     drift: tuple[float, float] | torch.Tensor,
     rigid_shift: tuple[float, float] = (0.0, 0.0),
-    mode: str = "bicubic",
+    mode: str = "bilinear",
 ) -> torch.Tensor:
     """Apply drift correction via backward interpolation (``grid_sample``).
 
@@ -213,11 +213,8 @@ def backward_warp(
         form suffices.  *rigid_shift* is ignored in tensor mode.
     rigid_shift : tuple[float, float], default (0.0, 0.0)
         Global ``(row, col)`` translation to apply (affine mode only).
-    mode : str, default "bicubic"
+    mode : str, default "bilinear"
         Interpolation kernel passed to ``grid_sample``.
-        ``"bicubic"`` preserves more high-frequency content than
-        ``"bilinear"`` (e.g. retains ~93% at 0.3× Nyquist vs ~69%
-        for bilinear with a 0.3 px sub-pixel shift).
 
     Returns
     -------

@@ -1343,7 +1343,7 @@ def test_apply_correction_matches_manual_chunking():
 
     # Manual chunking (what user had to do before)
     batch = cube.transpose(2, 0, 1)  # (E, H, W)
-    manual = dc.apply_correction(data=batch, mode='bicubic').cpu().numpy()
+    manual = dc.apply_correction(data=batch).cpu().numpy()
     manual = manual.transpose(1, 2, 0)  # (H, W, E)
 
     np.testing.assert_allclose(auto, manual, atol=1e-4, rtol=1e-4,
@@ -1770,12 +1770,40 @@ def test_is_4dstem_property():
         im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
     )
     assert not dc_2d.is_4dstem
+    assert not dc_2d.is_paired_4dstem
 
     cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
     dc_4d = DriftCorrection(
         cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     assert dc_4d.is_4dstem
+    assert dc_4d.is_paired_4dstem
+
+
+def test_is_paired_4dstem_false_for_reference_mode():
+    """Reference mode sets is_4dstem=True but is_paired_4dstem=False."""
+    ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
+    dc = DriftCorrection(ref, cube)
+    assert dc.is_4dstem
+    assert not dc.is_paired_4dstem
+
+
+def test_generate_corrected_merged_is_distinct_from_corrected_a():
+    """merged must be a separate array from corrected_a (no aliasing)."""
+    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    dc = DriftCorrection(
+        cube_a, cube_b, scan_direction_degrees=[0, -90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected()
+    assert result.merged is not result.corrected_a
 
 
 def test_generate_corrected_strip_padding():
