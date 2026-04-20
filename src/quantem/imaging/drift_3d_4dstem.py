@@ -416,12 +416,12 @@ def generate_corrected_paired_datasets(
             )
         if isinstance(corrected_a, torch.Tensor):
             merged = (corrected_a.float() + corrected_b.float()) * 0.5
-            if corrected_a.dtype not in (torch.float32, torch.float64):
+            if corrected_a.is_floating_point():
+                merged = merged.to(corrected_a.dtype)
+            else:
                 merged = merged.round().clamp_(
                     0, torch.iinfo(corrected_a.dtype).max
                 ).to(corrected_a.dtype)
-            else:
-                merged = merged.to(corrected_a.dtype)
         else:
             merged = np.empty_like(corrected_a, dtype=np.float32)
             np.add(corrected_a, corrected_b, out=merged, dtype=np.float32)
