@@ -4,6 +4,7 @@ from typing import Self
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.fft import fftfreq
 import warnings
 from numpy.typing import NDArray
@@ -151,6 +152,7 @@ class DriftCorrection(AutoSerialize):
 
         self.images = images
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
+        self._frames: list[Self] | None = None
 
         device, _ = validate_device(None)
         self._device = device
@@ -175,6 +177,44 @@ class DriftCorrection(AutoSerialize):
         images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
+        if isinstance(images, list) and len(images) >= 2:
+            stack_arrays: list[NDArray] = []
+            if all(isinstance(im, Dataset3d) for im in images):
+                stack_arrays = [im.array for im in images]
+            elif all(isinstance(im, np.ndarray) and im.ndim == 3 for im in images):
+                stack_arrays = [ensure_valid_array(im, ndim=3) for im in images]
+
+            if stack_arrays:
+                n_frames = stack_arrays[0].shape[0]
+                frame_shape = stack_arrays[0].shape[1:]
+                if n_frames == 0:
+                    raise ValueError("Series inputs must contain at least 1 frame.")
+                for idx, stack in enumerate(stack_arrays[1:], start=1):
+                    if stack.shape[0] != n_frames:
+                        raise ValueError(
+                            f"Series frame count mismatch: stack 0 has {n_frames} frames "
+                            f"but stack {idx} has {stack.shape[0]}."
+                        )
+                    if stack.shape[1:] != frame_shape:
+                        raise ValueError(
+                            f"Series frame shape mismatch: stack 0 has frame shape {frame_shape} "
+                            f"but stack {idx} has {stack.shape[1:]}."
+                        )
+
+                drift = cls(
+                    images=[],
+                    scan_direction_degrees=scan_direction_degrees,
+                    _token=cls._token,
+                )
+                drift._frames = [
+                    cls.from_data(
+                        images=[stack[frame_idx] for stack in stack_arrays],
+                        scan_direction_degrees=scan_direction_degrees,
+                    )
+                    for frame_idx in range(n_frames)
+                ]
+                return drift
+
         validated_images = validate_list_of_dataset2d(images)
 
         return cls(
@@ -182,6 +222,77 @@ class DriftCorrection(AutoSerialize):
             scan_direction_degrees=scan_direction_degrees,
             _token=cls._token,
         )
+
+    @property
+    def is_series(self) -> bool:
+        return self._frames is not None
+
+    @property
+    def n_frames(self) -> int:
+        return len(self._frames) if self._frames is not None else 0
+
+    def __getitem__(self, idx: int) -> Self:
+        if self._frames is None:
+            raise TypeError("Single-pair DriftCorrection is not indexable.")
+        return self._frames[idx]
+
+    def __iter__(self):
+        if self._frames is None:
+            raise TypeError("Single-pair DriftCorrection is not iterable.")
+        return iter(self._frames)
+
+    def _ensure_torch_caches(self) -> None:
+        """Rebuild cached tensors on the active device after serialization reloads."""
+        if not hasattr(self, "scan_fast") or not hasattr(self, "shape"):
+            raise RuntimeError("Call .preprocess() before running torch-based drift operations.")
+
+        device, _ = validate_device(self._device)
+        self._device = device
+        target_device = torch.device(device)
+        dtype = self._dtype
+
+        images_t = getattr(self, "images_t", None)
+        scan_fast_t = getattr(self, "scan_fast_t", None)
+        needs_refresh = (
+            not isinstance(images_t, list)
+            or not isinstance(scan_fast_t, list)
+            or len(images_t) != self.shape[0]
+            or len(scan_fast_t) != self.shape[0]
+            or any(
+                not isinstance(t, torch.Tensor) or t.device != target_device or t.dtype != dtype
+                for t in images_t
+            )
+            or any(
+                not isinstance(t, torch.Tensor) or t.device != target_device or t.dtype != dtype
+                for t in scan_fast_t
+            )
+        )
+
+        if not needs_refresh:
+            return
+
+        self.images_t = [
+            torch.as_tensor(self.images[i].array, dtype=dtype, device=target_device)
+            for i in range(self.shape[0])
+        ]
+        self.scan_fast_t = [
+            torch.as_tensor(self.scan_fast[i], dtype=dtype, device=target_device)
+            for i in range(self.shape[0])
+        ]
+
+    def _dispatch_to_frames(self, method_name: str, desc: str, collect: bool = False, **method_kwargs):
+        if self._frames is None:
+            raise TypeError(f"{method_name} is only dispatchable for series instances.")
+        method_kwargs = dict(method_kwargs)
+        for key in ("show_merged", "show_images", "show_image"):
+            if key in method_kwargs:
+                method_kwargs[key] = False
+        results = [] if collect else None
+        for frame in tqdm(self._frames, desc=desc):
+            output = getattr(frame, method_name)(**method_kwargs)
+            if collect:
+                results.append(output)
+        return results if collect else self
 
     def preprocess(
         self,
@@ -241,6 +352,19 @@ class DriftCorrection(AutoSerialize):
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
         """
+        if self._frames is not None:
+            return self._dispatch_to_frames(
+                "preprocess",
+                "Preprocessing series",
+                pad_fraction=pad_fraction,
+                pad_value=pad_value,
+                kde_sigma=kde_sigma,
+                number_knots=number_knots,
+                show_merged=show_merged,
+                show_images=show_images,
+                show_knots=show_knots,
+                **kwargs,
+            )
         self.pad_fraction = float(pad_fraction)
         self.pad_value = validate_pad_value(pad_value, self.images)
         self.kde_sigma = float(kde_sigma)
@@ -444,6 +568,22 @@ class DriftCorrection(AutoSerialize):
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
         """
+        if self._frames is not None:
+            return self._dispatch_to_frames(
+                "align_affine",
+                "Aligning affine",
+                step=step,
+                num_tests=num_tests,
+                refine=refine,
+                upsample_factor=upsample_factor,
+                max_image_shift=max_image_shift,
+                chunk_size=chunk_size,
+                show_merged=show_merged,
+                show_images=show_images,
+                show_knots=show_knots,
+                verbose=verbose,
+                **kwargs,
+            )
         if self.shape[0] < 2:
             raise ValueError(
                 f"align_affine requires at least 2 images (got {self.shape[0]}). "
@@ -556,6 +696,7 @@ class DriftCorrection(AutoSerialize):
             cost tensor of shape ``(N,)`` for all candidates (used by
             verbose mode to rank runner-ups).
         """
+        self._ensure_torch_caches()
         device = self._device
         dtype = self._dtype
         num_candidates = drift_vectors.shape[0]
@@ -658,6 +799,7 @@ class DriftCorrection(AutoSerialize):
         upsample_factor: int = 8,
         knots_batch: torch.Tensor | None = None,
         solve_translation: bool = True,
+        images_t_override: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Regenerate warped images and solve translation on GPU.
 
@@ -688,10 +830,12 @@ class DriftCorrection(AutoSerialize):
         torch.Tensor
             Warped images on GPU, shape ``(num_images, H, W)``.
         """
+        self._ensure_torch_caches()
         device = self._device
         dtype = self._dtype
         num_images = self.shape[0]
         canvas_shape = (self.shape[1], self.shape[2])
+        images_t = images_t_override if images_t_override is not None else self.images_t
 
         def _warp_all(warped_t, weights_t):
             """Warp all images onto the canvas using current knots."""
@@ -704,7 +848,7 @@ class DriftCorrection(AutoSerialize):
                 row_t, col_t = transform_coordinates_single_knot(
                     knots_img, self.scan_fast_t[img_idx], self.images[img_idx].shape)
                 warped, weights = bilinear_kde_batch(
-                    row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
+                    row_t[None], col_t[None], images_t[img_idx], canvas_shape,
                     self.kde_sigma, self.pad_value[img_idx])
                 warped_t[img_idx] = warped[0]
                 weights_t[img_idx] = weights[0]
@@ -747,6 +891,11 @@ class DriftCorrection(AutoSerialize):
         lbfgs_max_iter: int = 20,
         max_optimize_iterations: int = 10,
         regularization_max_image_shift_px: float | None = None,
+        loss: str = "auto",
+        loss_pre_smooth: float = 1.0,
+        early_stop_patience: int = 3,
+        early_stop_rtol: float = 1e-4,
+        min_iterations: int = 4,
         solve_individual_rows: bool = True,
         show_merged: bool = True,
         show_images: bool = False,
@@ -865,6 +1014,18 @@ class DriftCorrection(AutoSerialize):
             Maximum L-BFGS iterations per row.
         regularization_max_image_shift_px : float, optional
             Maximum allowed shift per iteration.
+        loss : str, default "auto"
+            Loss used by the PyTorch solver. ``"auto"`` resolves to
+            ``"gradient_mse"`` to match the Cedric/memory-branch behavior.
+            ``"mse"`` remains available for synthetic-data and parity runs.
+        loss_pre_smooth : float, default 1.0
+            Gaussian sigma applied before Sobel when ``loss="gradient_mse"``.
+        early_stop_patience : int, default 3
+            Stop when this many iterations fail to improve by ``early_stop_rtol``.
+        early_stop_rtol : float, default 1e-4
+            Minimum relative improvement to count as progress.
+        min_iterations : int, default 4
+            Minimum outer iterations before early stopping can trigger.
         solve_individual_rows : bool, default True
             If True, optimize each row independently.
 
@@ -886,11 +1047,46 @@ class DriftCorrection(AutoSerialize):
         use ``generate_corrected_image()`` which builds its own warps from
         ``self.knots``.
         """
+        if self._frames is not None:
+            return self._dispatch_to_frames(
+                "align_nonrigid",
+                "Aligning nonrigid",
+                backend=backend,
+                optimizer_name=optimizer_name,
+                num_iterations=num_iterations,
+                regularization_sigma_px=regularization_sigma_px,
+                regularization_update_step_size=regularization_update_step_size,
+                regularization_poly_order=regularization_poly_order,
+                max_image_shift=max_image_shift,
+                adam_steps=adam_steps,
+                lr=lr,
+                lbfgs_max_iter=lbfgs_max_iter,
+                max_optimize_iterations=max_optimize_iterations,
+                regularization_max_image_shift_px=regularization_max_image_shift_px,
+                loss=loss,
+                loss_pre_smooth=loss_pre_smooth,
+                early_stop_patience=early_stop_patience,
+                early_stop_rtol=early_stop_rtol,
+                min_iterations=min_iterations,
+                solve_individual_rows=solve_individual_rows,
+                show_merged=show_merged,
+                show_images=show_images,
+                show_knots=show_knots,
+                **kwargs,
+            )
         if not hasattr(self, "knots"):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
             )
         if backend == "pytorch":
+            if loss == "auto":
+                loss = "gradient_mse"
+            valid_losses = ("mse", "gradient_mse")
+            if loss not in valid_losses:
+                raise ValueError(
+                    f"loss must be one of {valid_losses!r} or 'auto', got {loss!r}"
+                )
+            self._ensure_torch_caches()
             device = self._device
             dtype = self._dtype
             num_images = self.shape[0]
@@ -939,10 +1135,30 @@ class DriftCorrection(AutoSerialize):
                 x_knot = torch.arange(num_rows_knot, dtype=dtype, device=device)
                 x_norm = (x_knot - x_knot.mean()) / x_knot.std()
                 vander = torch.stack([x_norm ** p for p in range(regularization_poly_order + 1)], dim=1)
+            else:
+                vander = None
+            if loss == "gradient_mse":
+                sobel_batch = self._sobel_gradient_magnitude(
+                    target_batch,
+                    loss_pre_smooth,
+                    device,
+                    dtype,
+                )
+                target_batch = sobel_batch
+                images_t_override = [sobel_batch[i] for i in range(num_images)]
+            else:
+                images_t_override = None
             warped_t = self._warp_and_translate_torch(
-                max_image_shift, upsample_factor=8, knots_batch=knots_batch)
+                max_image_shift,
+                upsample_factor=8,
+                knots_batch=knots_batch,
+                images_t_override=images_t_override,
+            )
             error_buffer = []
-            for _ in tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({optimizer_name})"):
+            best_error = float("inf")
+            patience_counter = 0
+            pbar = tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({optimizer_name})")
+            for iter_idx in pbar:
                 # Build the reference under no_grad: arithmetic on warped_t (an
                 # inference tensor) would otherwise return an autograd-tracked
                 # leaf, and the optimizer would build a graph through it.
@@ -969,10 +1185,27 @@ class DriftCorrection(AutoSerialize):
                     regularization_sigma_px,
                     regularization_update_step_size)
                 warped_t = self._warp_and_translate_torch(
-                    max_image_shift, upsample_factor=8, knots_batch=knots_batch)
+                    max_image_shift,
+                    upsample_factor=8,
+                    knots_batch=knots_batch,
+                    images_t_override=images_t_override,
+                )
                 # Per-iter error stays on GPU; sync once after the loop
                 images_mean = warped_t.mean(dim=0)
-                error_buffer.append(torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2)))
+                iter_error = torch.mean(torch.abs(warped_t - images_mean[None]), dim=(1, 2))
+                error_buffer.append(iter_error)
+                current_error = float(iter_error.mean())
+                if current_error < best_error * (1 - early_stop_rtol):
+                    best_error = current_error
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if (
+                    iter_idx >= min_iterations - 1
+                    and patience_counter >= early_stop_patience
+                ):
+                    pbar.set_postfix_str(f"converged at iter {iter_idx + 1}")
+                    break
             # Sync knots back to numpy; leave images_warped lazy so callers
             # that never plot avoid the GPU→CPU transfer of the warped stack.
             knots_final = knots_batch.detach().cpu().numpy()
@@ -1041,6 +1274,43 @@ class DriftCorrection(AutoSerialize):
             )
 
         return self
+
+    @staticmethod
+    def _sobel_gradient_magnitude(
+        images: torch.Tensor,
+        pre_smooth: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute per-image Sobel gradient magnitude with optional pre-smoothing."""
+        img = images[:, None]
+        if pre_smooth > 0:
+            ks = max(3, int(6 * pre_smooth) | 1)
+            x = torch.arange(ks, dtype=dtype, device=device) - ks // 2
+            g = torch.exp(-0.5 * (x / max(pre_smooth, 1e-6)) ** 2)
+            g = g / g.sum()
+            pad_h = ks // 2
+            img = F.pad(img, (pad_h, pad_h, 0, 0), mode="reflect")
+            img = F.conv2d(img, g.reshape(1, 1, 1, -1))
+            img = F.pad(img, (0, 0, pad_h, pad_h), mode="reflect")
+            img = F.conv2d(img, g.reshape(1, 1, -1, 1))
+        sx = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=dtype,
+            device=device,
+        ).reshape(1, 1, 3, 3)
+        sy = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=dtype,
+            device=device,
+        ).reshape(1, 1, 3, 3)
+        img_pad = F.pad(img, (1, 1, 1, 1), mode="reflect")
+        gx = F.conv2d(img_pad, sx)
+        gy = F.conv2d(img_pad, sy)
+        grad_mag = (gx**2 + gy**2).sqrt()[:, 0]
+        mean = grad_mag.mean(dim=(-2, -1), keepdim=True)
+        std = grad_mag.std(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        return (grad_mag - mean) / std
 
     def _optimize_knots_adam(
         self, ref_batch, target_batch, knots_batch,
@@ -1166,7 +1436,7 @@ class DriftCorrection(AutoSerialize):
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
-    def generate_corrected_image(
+    def _generate_corrected_image_numpy(
         self,
         upsample_factor: int = 2,
         output_original_shape: bool = True,
@@ -1179,52 +1449,6 @@ class DriftCorrection(AutoSerialize):
         show_image: bool = True,
         **kwargs,
     ):
-        """
-        Generate the final drift-corrected image after aligning a stack of input images.
-
-        Parameters
-        ----------
-        upsample_factor : int, default 2
-            Factor to upsample the output image for enhanced interpolation accuracy.
-        output_original_shape : bool, default True
-            If True, crop the output image back to the original input dimensions after processing.
-        mask_output : bool, default True
-            If true, mask the output using the probe position weights
-        mask_edge_blend : float, default 8.0
-            Value in pixels to blend from the edge of the mask (where we have data)
-        fourier_filter : bool, default True
-            Whether to apply Fourier-based directional filtering to merge corrected images.
-        filter_midpoint : float, default 0.5
-            Midpoint for the sigmoid-based Fourier weighting filter, determining transition smoothness.
-            Setting this to a low value close to 0 will include more signal but also more slow scan artifacts.
-            If using 2 images at 0 and 90 degrees scan angles, any value >0.75 will be unstable.
-            Only use larger values (close to 1.0) if multiple images covering many scan angles are used.
-        kde_sigma : float, default 0.5
-            Standard deviation for kernel density estimation used during image interpolation. Defaults
-            to the object's stored kde_sigma if set to None.
-        weight_thresh: float, default 0.1
-            This value sets the threshold for masking the outputs.
-            For very large jitter artifacts this value can be lowered.
-        show_image : bool, default True
-            Whether to display the final corrected image after processing.
-        **kwargs : dict
-            Additional keyword arguments passed to the plotting function when displaying the image.
-
-        Returns
-        -------
-        image_corr : Dataset2d
-            The final drift-corrected output image encapsulated in a Dataset2d object.
-
-        Notes
-        -----
-        - The function applies per-frame warping using knot-based interpolation and optionally
-          performs directional Fourier filtering to blend multiple warped images.
-        - The Fourier filter suppresses directional artifacts by weighting image contributions based
-          on their scan angles, utilizing a bounded sine sigmoid for smooth transition.
-        - Upsampling enhances interpolation precision but may increase computational cost.
-        """
-
-        # init
         stack_corr = np.zeros(
             (
                 self.shape[0],
@@ -1343,6 +1567,189 @@ class DriftCorrection(AutoSerialize):
                 # Fallback: if backend is odd, try a blocking show
                 plt.show()
         return image_corr
+
+    @torch.inference_mode()
+    def generate_corrected(
+        self,
+        upsample_factor: int = 2,
+        output_original_shape: bool = True,
+        strip_padding: bool = False,
+        mask_output: bool = True,
+        mask_edge_blend: float = 8.0,
+        fourier_filter: bool = True,
+        filter_midpoint: float = 0.5,
+        kde_sigma: float | None = 0.5,
+        weight_thresh: float = 0.1,
+        show_merged: bool = True,
+        **kwargs,
+    ):
+        if self._frames is not None:
+            results = self._dispatch_to_frames(
+                "generate_corrected",
+                "Generating corrected images",
+                collect=True,
+                upsample_factor=upsample_factor,
+                output_original_shape=output_original_shape,
+                strip_padding=strip_padding,
+                mask_output=mask_output,
+                mask_edge_blend=mask_edge_blend,
+                fourier_filter=fourier_filter,
+                filter_midpoint=filter_midpoint,
+                kde_sigma=kde_sigma,
+                weight_thresh=weight_thresh,
+                show_merged=show_merged,
+                **kwargs,
+            )
+            stack = np.stack([result.array for result in results], axis=0).astype(np.float32, copy=False)
+            return Dataset3d.from_array(stack, name="drift corrected image stack")
+
+        if not hasattr(self, "knots"):
+            raise RuntimeError(
+                "No knots found. Call .preprocess() before generating the corrected image."
+            )
+
+        if any(knots.shape[2] != 1 for knots in self.knots):
+            return self._generate_corrected_image_numpy(
+                upsample_factor=upsample_factor,
+                output_original_shape=output_original_shape,
+                mask_output=mask_output,
+                mask_edge_blend=mask_edge_blend,
+                fourier_filter=fourier_filter,
+                filter_midpoint=filter_midpoint,
+                kde_sigma=kde_sigma,
+                weight_thresh=weight_thresh,
+                show_image=show_merged,
+                **kwargs,
+            )
+
+        self._ensure_torch_caches()
+        device = self._device
+        dtype = self._dtype
+        up_h = round(self.shape[1] * upsample_factor)
+        up_w = round(self.shape[2] * upsample_factor)
+        canvas_shape = (up_h, up_w)
+
+        if kde_sigma is None:
+            kde_sigma = self.kde_sigma
+
+        stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
+        weight_corr = torch.zeros_like(stack_corr)
+        for img_idx in range(self.shape[0]):
+            knots_t = torch.as_tensor(self.knots[img_idx], dtype=dtype, device=device)
+            row_t, col_t = transform_coordinates_single_knot(
+                knots_t,
+                self.scan_fast_t[img_idx],
+                self.images[img_idx].shape,
+            )
+            warped, weights = bilinear_kde_batch(
+                row_t[None] * upsample_factor,
+                col_t[None] * upsample_factor,
+                self.images_t[img_idx],
+                canvas_shape,
+                kde_sigma * upsample_factor,
+                self.pad_value[img_idx],
+            )
+            stack_corr[img_idx] = warped[0]
+            weight_corr[img_idx] = weights[0]
+
+        if fourier_filter:
+            freq_row = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
+            freq_col = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
+            freq_angle = torch.atan2(freq_col, freq_row)
+            stack_fft = torch.fft.fft2(stack_corr)
+            weights = torch.zeros_like(stack_corr)
+            for img_idx in range(self.shape[0]):
+                weights[img_idx] = torch.abs(
+                    torch.remainder(
+                        (freq_angle - self.scan_direction[img_idx]) / np.pi + 0.5,
+                        1.0,
+                    ) - 0.5
+                ) / 0.5
+                weights[img_idx, 0, 0] = 1.0
+                weights[img_idx] = _bounded_sine_sigmoid_torch(
+                    weights[img_idx],
+                    midpoint=filter_midpoint,
+                )
+                stack_fft[img_idx] *= weights[img_idx]
+            weights_sum = weights.sum(0)
+            fft_sum = stack_fft.sum(0)
+            image_corr_fft = torch.where(
+                weights_sum > 0.0,
+                fft_sum / weights_sum.clamp(min=1e-8),
+                torch.zeros_like(fft_sum),
+            )
+        else:
+            image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
+
+        if mask_output:
+            weight_np = weight_corr.cpu().numpy()
+            mask_edge = np.prod(weight_np >= (weight_thresh / upsample_factor**2), axis=0)
+            mask_edge[:, 0] = False
+            mask_edge[:, -1] = False
+            mask_edge[0, :] = False
+            mask_edge[-1, :] = False
+            mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
+            mask_np = (
+                np.cos(
+                    (np.pi / 2)
+                    * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
+                )
+                ** 2
+            )
+            mask_t = torch.as_tensor(mask_np, dtype=dtype, device=device)
+            pad_value_mean = float(np.mean(self.pad_value))
+            image_corr_fft = torch.fft.fft2(
+                torch.fft.ifft2(image_corr_fft).real * mask_t + pad_value_mean * (1 - mask_t)
+            )
+
+        if output_original_shape:
+            image_corr_fft = _fourier_crop_torch(image_corr_fft, self.shape[-2:]) / upsample_factor**2
+
+        corr_np = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
+        if strip_padding and output_original_shape:
+            scan_h, scan_w = self.images[0].shape[:2]
+            canvas_h, canvas_w = corr_np.shape[:2]
+            pad_h = (canvas_h - scan_h) // 2
+            pad_w = (canvas_w - scan_w) // 2
+            corr_np = corr_np[pad_h:pad_h + scan_h, pad_w:pad_w + scan_w]
+
+        image_corr = Dataset2d.from_array(
+            corr_np,
+            name="drift corrected image",
+            origin=self.images[0].origin,
+            sampling=self.images[0].sampling,
+            units=self.images[0].units,
+        )
+        if show_merged:
+            show_2d(image_corr.array, **kwargs)
+            plt.show()
+        return image_corr
+
+    def generate_corrected_image(
+        self,
+        upsample_factor: int = 2,
+        output_original_shape: bool = True,
+        mask_output: bool = True,
+        mask_edge_blend: float = 8.0,
+        fourier_filter: bool = True,
+        filter_midpoint: float = 0.5,
+        kde_sigma: float | None = 0.5,
+        weight_thresh=0.1,
+        show_image: bool = True,
+        **kwargs,
+    ):
+        return self.generate_corrected(
+            upsample_factor=upsample_factor,
+            output_original_shape=output_original_shape,
+            mask_output=mask_output,
+            mask_edge_blend=mask_edge_blend,
+            fourier_filter=fourier_filter,
+            filter_midpoint=filter_midpoint,
+            kde_sigma=kde_sigma,
+            weight_thresh=weight_thresh,
+            show_merged=show_image,
+            **kwargs,
+        )
 
     def calculate_error(
         self,
@@ -1645,3 +2052,32 @@ def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
     y[in_band] = np.sin(t * np.pi / 2) ** 2
     y[x > right] = 1.0
     return y
+
+
+def _bounded_sine_sigmoid_torch(
+    x: torch.Tensor,
+    midpoint: float = 0.5,
+    width: float = 1.0,
+) -> torch.Tensor:
+    width = min(width, 2 * midpoint, 2 * (1 - midpoint))
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+    t = ((x - left) / width).clamp(0.0, 1.0)
+    return torch.where(x > right, torch.ones_like(x), torch.sin(t * (np.pi / 2)) ** 2)
+
+
+def _fourier_crop_torch(
+    fft_array: torch.Tensor,
+    crop_shape: tuple[int, int],
+) -> torch.Tensor:
+    crop_h, crop_w = crop_shape
+    h1 = crop_h // 2
+    h2 = crop_h - h1
+    w1 = crop_w // 2
+    w2 = crop_w - w1
+    result = torch.zeros(crop_shape, dtype=fft_array.dtype, device=fft_array.device)
+    result[:h1, :w1] = fft_array[:h1, :w1]
+    result[:h1, -w2:] = fft_array[:h1, -w2:]
+    result[-h2:, :w1] = fft_array[-h2:, :w1]
+    result[-h2:, -w2:] = fft_array[-h2:, -w2:]
+    return result
