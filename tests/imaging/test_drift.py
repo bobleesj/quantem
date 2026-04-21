@@ -11,7 +11,6 @@ import torch
 from scipy.ndimage import gaussian_filter
 from quantem.core.io import load
 from quantem.core.datastructures.dataset2d import Dataset2d
-from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.imaging.drift import DriftCorrection
 
 
@@ -271,15 +270,6 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     )
 
 
-def make_synthetic_series_pair(n_frames=2, seed=42):
-    """Create a small paired stack for series-mode drift correction tests."""
-    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=seed)
-    rng = np.random.default_rng(seed)
-    stack0 = np.stack([im0 + rng.normal(0, 0.01, im0.shape) for _ in range(n_frames)])
-    stack1 = np.stack([im1 + rng.normal(0, 0.01, im1.shape) for _ in range(n_frames)])
-    return stack0.astype(np.float32), stack1.astype(np.float32)
-
-
 def test_generate_corrected_matches_numpy_reference():
     """New generate_corrected path should match the legacy NumPy implementation."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
@@ -317,49 +307,14 @@ def test_generate_corrected_matches_numpy_reference():
     )
 
 
-def test_from_data_detects_series_stacks():
-    """Passing paired 3D stacks should create a series wrapper."""
-    stack0, stack1 = make_synthetic_series_pair(n_frames=2)
-    drift = DriftCorrection.from_data(
-        images=[stack0, stack1],
-        scan_direction_degrees=[0.0, 90.0],
-    )
+def test_from_data_rejects_series_stacks():
+    """Series stacks should be handled outside DriftCorrection, not inside it."""
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    stack0 = np.stack([im0, im0]).astype(np.float32)
+    stack1 = np.stack([im1, im1]).astype(np.float32)
 
-    assert drift.is_series
-    assert drift.n_frames == 2
-    assert not drift[0].is_series
-
-
-def test_series_pipeline_returns_dataset3d():
-    """Series-mode pipeline should return a corrected image stack."""
-    stack0, stack1 = make_synthetic_series_pair(n_frames=2)
-    drift = DriftCorrection.from_data(
-        images=[stack0, stack1],
-        scan_direction_degrees=[0.0, 90.0],
-    ).preprocess(
-        show_merged=False,
-        show_images=False,
-    )
-    drift.align_affine(
-        step=0.02,
-        num_tests=5,
-        refine=False,
-        show_merged=False,
-        show_images=False,
-    )
-    drift.align_nonrigid(
-        num_iterations=1,
-        regularization_sigma_px=0.5,
-        loss="mse",
-        show_merged=False,
-        show_images=False,
-    )
-    corrected = drift.generate_corrected(
-        upsample_factor=1,
-        strip_padding=True,
-        show_merged=False,
-    )
-
-    assert isinstance(corrected, Dataset3d)
-    assert corrected.shape == stack0.shape
-    assert np.isfinite(corrected.array).all()
+    with pytest.raises(TypeError, match="outside the class"):
+        DriftCorrection.from_data(
+            images=[stack0, stack1],
+            scan_direction_degrees=[0.0, 90.0],
+        )

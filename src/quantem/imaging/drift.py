@@ -43,9 +43,9 @@ class DriftCorrection(AutoSerialize):
     DriftCorrection provides translation, affine, and non-rigid drift correction for
     sequential 2D images using scan direction metadata and flexible spatial interpolation.
 
-    This class supports input data as numpy arrays, Dataset2d, or Dataset3d instances,
-    with various padding strategies and configurable spline interpolation of scanline
-    trajectories via Bézier knot control.
+    This class supports one drift solve over a single set of 2D images,
+    with various padding strategies and configurable spline interpolation of
+    scanline trajectories via Bézier knot control.
 
     Features
     --------
@@ -57,8 +57,8 @@ class DriftCorrection(AutoSerialize):
 
     Parameters (via `from_data` or `from_file`)
     -------------------------------------------
-    images : list of 2D arrays, Dataset2d, Dataset3d, or file names, or a 3D numpy array
-        The image stack to correct for drift.
+    images : list of 2D arrays, Dataset2d, or file names
+        The 2D images to correct for drift.
     scan_direction_degrees : list of float
         The scan direction angle (in degrees) for each image, measured relative to vertical.
     pad_fraction : float, default 0.25
@@ -152,7 +152,6 @@ class DriftCorrection(AutoSerialize):
 
         self.images = images
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
-        self._frames: list[Self] | None = None
 
         device, _ = validate_device(None)
         self._device = device
@@ -177,69 +176,28 @@ class DriftCorrection(AutoSerialize):
         images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
     ) -> Self:
-        if isinstance(images, list) and len(images) >= 2:
-            stack_arrays: list[NDArray] = []
-            if all(isinstance(im, Dataset3d) for im in images):
-                stack_arrays = [im.array for im in images]
-            elif all(isinstance(im, np.ndarray) and im.ndim == 3 for im in images):
-                stack_arrays = [ensure_valid_array(im, ndim=3) for im in images]
+        if isinstance(images, Dataset3d) or (
+            isinstance(images, np.ndarray) and images.ndim == 3
+        ):
+            raise TypeError(
+                "DriftCorrection.from_data() only supports one 2D image set at a time. "
+                "Loop over stack frames outside the class for series workflows."
+            )
 
-            if stack_arrays:
-                n_frames = stack_arrays[0].shape[0]
-                frame_shape = stack_arrays[0].shape[1:]
-                if n_frames == 0:
-                    raise ValueError("Series inputs must contain at least 1 frame.")
-                for idx, stack in enumerate(stack_arrays[1:], start=1):
-                    if stack.shape[0] != n_frames:
-                        raise ValueError(
-                            f"Series frame count mismatch: stack 0 has {n_frames} frames "
-                            f"but stack {idx} has {stack.shape[0]}."
-                        )
-                    if stack.shape[1:] != frame_shape:
-                        raise ValueError(
-                            f"Series frame shape mismatch: stack 0 has frame shape {frame_shape} "
-                            f"but stack {idx} has {stack.shape[1:]}."
-                        )
-
-                drift = cls(
-                    images=[],
-                    scan_direction_degrees=scan_direction_degrees,
-                    _token=cls._token,
-                )
-                drift._frames = [
-                    cls.from_data(
-                        images=[stack[frame_idx] for stack in stack_arrays],
-                        scan_direction_degrees=scan_direction_degrees,
-                    )
-                    for frame_idx in range(n_frames)
-                ]
-                return drift
-
-        validated_images = validate_list_of_dataset2d(images)
+        if isinstance(images, list) and any(
+            isinstance(im, Dataset3d) or (isinstance(im, np.ndarray) and im.ndim == 3)
+            for im in images
+        ):
+            raise TypeError(
+                "DriftCorrection.from_data() only supports lists of 2D arrays or Dataset2d "
+                "instances. Loop over stack frames outside the class for series workflows."
+            )
 
         return cls(
-            images=validated_images,
+            images=validate_list_of_dataset2d(images),
             scan_direction_degrees=scan_direction_degrees,
             _token=cls._token,
         )
-
-    @property
-    def is_series(self) -> bool:
-        return self._frames is not None
-
-    @property
-    def n_frames(self) -> int:
-        return len(self._frames) if self._frames is not None else 0
-
-    def __getitem__(self, idx: int) -> Self:
-        if self._frames is None:
-            raise TypeError("Single-pair DriftCorrection is not indexable.")
-        return self._frames[idx]
-
-    def __iter__(self):
-        if self._frames is None:
-            raise TypeError("Single-pair DriftCorrection is not iterable.")
-        return iter(self._frames)
 
     def _ensure_torch_caches(self) -> None:
         """Rebuild cached tensors on the active device after serialization reloads."""
@@ -279,20 +237,6 @@ class DriftCorrection(AutoSerialize):
             torch.as_tensor(self.scan_fast[i], dtype=dtype, device=target_device)
             for i in range(self.shape[0])
         ]
-
-    def _dispatch_to_frames(self, method_name: str, desc: str, collect: bool = False, **method_kwargs):
-        if self._frames is None:
-            raise TypeError(f"{method_name} is only dispatchable for series instances.")
-        method_kwargs = dict(method_kwargs)
-        for key in ("show_merged", "show_images", "show_image"):
-            if key in method_kwargs:
-                method_kwargs[key] = False
-        results = [] if collect else None
-        for frame in tqdm(self._frames, desc=desc):
-            output = getattr(frame, method_name)(**method_kwargs)
-            if collect:
-                results.append(output)
-        return results if collect else self
 
     def preprocess(
         self,
@@ -352,19 +296,6 @@ class DriftCorrection(AutoSerialize):
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "preprocess",
-                "Preprocessing series",
-                pad_fraction=pad_fraction,
-                pad_value=pad_value,
-                kde_sigma=kde_sigma,
-                number_knots=number_knots,
-                show_merged=show_merged,
-                show_images=show_images,
-                show_knots=show_knots,
-                **kwargs,
-            )
         self.pad_fraction = float(pad_fraction)
         self.pad_value = validate_pad_value(pad_value, self.images)
         self.kde_sigma = float(kde_sigma)
@@ -568,22 +499,6 @@ class DriftCorrection(AutoSerialize):
         ...     images=[im0, im1], scan_direction_degrees=[0, 90])
         >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "align_affine",
-                "Aligning affine",
-                step=step,
-                num_tests=num_tests,
-                refine=refine,
-                upsample_factor=upsample_factor,
-                max_image_shift=max_image_shift,
-                chunk_size=chunk_size,
-                show_merged=show_merged,
-                show_images=show_images,
-                show_knots=show_knots,
-                verbose=verbose,
-                **kwargs,
-            )
         if self.shape[0] < 2:
             raise ValueError(
                 f"align_affine requires at least 2 images (got {self.shape[0]}). "
@@ -1047,33 +962,6 @@ class DriftCorrection(AutoSerialize):
         use ``generate_corrected_image()`` which builds its own warps from
         ``self.knots``.
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "align_nonrigid",
-                "Aligning nonrigid",
-                backend=backend,
-                optimizer_name=optimizer_name,
-                num_iterations=num_iterations,
-                regularization_sigma_px=regularization_sigma_px,
-                regularization_update_step_size=regularization_update_step_size,
-                regularization_poly_order=regularization_poly_order,
-                max_image_shift=max_image_shift,
-                adam_steps=adam_steps,
-                lr=lr,
-                lbfgs_max_iter=lbfgs_max_iter,
-                max_optimize_iterations=max_optimize_iterations,
-                regularization_max_image_shift_px=regularization_max_image_shift_px,
-                loss=loss,
-                loss_pre_smooth=loss_pre_smooth,
-                early_stop_patience=early_stop_patience,
-                early_stop_rtol=early_stop_rtol,
-                min_iterations=min_iterations,
-                solve_individual_rows=solve_individual_rows,
-                show_merged=show_merged,
-                show_images=show_images,
-                show_knots=show_knots,
-                **kwargs,
-            )
         if not hasattr(self, "knots"):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment."
@@ -1583,26 +1471,6 @@ class DriftCorrection(AutoSerialize):
         show_merged: bool = True,
         **kwargs,
     ):
-        if self._frames is not None:
-            results = self._dispatch_to_frames(
-                "generate_corrected",
-                "Generating corrected images",
-                collect=True,
-                upsample_factor=upsample_factor,
-                output_original_shape=output_original_shape,
-                strip_padding=strip_padding,
-                mask_output=mask_output,
-                mask_edge_blend=mask_edge_blend,
-                fourier_filter=fourier_filter,
-                filter_midpoint=filter_midpoint,
-                kde_sigma=kde_sigma,
-                weight_thresh=weight_thresh,
-                show_merged=show_merged,
-                **kwargs,
-            )
-            stack = np.stack([result.array for result in results], axis=0).astype(np.float32, copy=False)
-            return Dataset3d.from_array(stack, name="drift corrected image stack")
-
         if not hasattr(self, "knots"):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before generating the corrected image."
