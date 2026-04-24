@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch.fft import fftfreq
 from numpy.typing import NDArray
-from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm
 
 from quantem.core.config import validate_device
@@ -32,7 +31,7 @@ from quantem.imaging.drift_align import (
 )
 import quantem.imaging.drift_3d_4dstem as _3d_4dstem
 import quantem.imaging.drift_optimize as _optimize
-import quantem.imaging.drift_viz as drift_viz
+import quantem.imaging.drift_visualization as drift_visualization
 
 
 def _as_array(x):
@@ -62,6 +61,88 @@ def _as_array(x):
 from quantem.imaging.drift_3d_4dstem import PairedCorrectionResult  # noqa: E402, F401
 
 
+def _distance_transform_edt_torch(mask: torch.Tensor) -> torch.Tensor:
+    """Torchified euclidean distance transform — GPU drop-in for scipy.
+
+    For each True pixel of ``mask``, returns the euclidean distance to the
+    nearest False pixel; False pixels return 0. Bit-exact match to
+    ``scipy.ndimage.distance_transform_edt`` on single-region masks (the shape
+    that arises in drift-correction edge blending) — verified by parity test
+    in ``test_drift.py``.
+
+    Implementation: Jump Flooding Algorithm. Each pixel tracks the (row, col)
+    of its nearest known False seed. Each pass examines 8 candidate seeds at
+    a halving step distance and adopts the closest one. Runs in
+    O(log max(H, W)) parallel passes — typically ~10 passes for a 1024² mask.
+
+    Parameters
+    ----------
+    mask : torch.BoolTensor of shape (H, W) on GPU
+        True where distance should be measured FROM, False where distance is 0.
+
+    Returns
+    -------
+    distance : torch.FloatTensor of shape (H, W)
+        Euclidean distance per pixel, on the same device as ``mask``.
+    """
+    H, W = mask.shape
+    device = mask.device
+    row_idx, col_idx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij",
+    )
+    # Sentinel = "no seed yet" (any value larger than the canvas works as a
+    # never-wins distance for the comparisons below).
+    NO_SEED = H + W + 1
+    seed_row = torch.where(~mask, row_idx, torch.full_like(row_idx, NO_SEED))
+    seed_col = torch.where(~mask, col_idx, torch.full_like(col_idx, NO_SEED))
+
+    step = max(H, W) // 2
+    while step >= 1:
+        best_seed_row = seed_row.clone()
+        best_seed_col = seed_col.clone()
+        best_dist_sq = (row_idx - best_seed_row) ** 2 + (col_idx - best_seed_col) ** 2
+
+        # 8 neighbors at offsets ±step / 0 (excluding center)
+        for delta_row in (-step, 0, step):
+            for delta_col in (-step, 0, step):
+                if delta_row == 0 and delta_col == 0:
+                    continue
+                cand_seed_row = torch.roll(seed_row, shifts=(delta_row, delta_col), dims=(0, 1))
+                cand_seed_col = torch.roll(seed_col, shifts=(delta_row, delta_col), dims=(0, 1))
+                # Invalidate wrap-around regions so torus-rolled seeds don't
+                # poison real candidates.
+                if delta_row > 0:
+                    cand_seed_row[:delta_row] = NO_SEED
+                    cand_seed_col[:delta_row] = NO_SEED
+                elif delta_row < 0:
+                    cand_seed_row[delta_row:] = NO_SEED
+                    cand_seed_col[delta_row:] = NO_SEED
+                if delta_col > 0:
+                    cand_seed_row[:, :delta_col] = NO_SEED
+                    cand_seed_col[:, :delta_col] = NO_SEED
+                elif delta_col < 0:
+                    cand_seed_row[:, delta_col:] = NO_SEED
+                    cand_seed_col[:, delta_col:] = NO_SEED
+
+                cand_dist_sq = (
+                    (row_idx - cand_seed_row) ** 2 + (col_idx - cand_seed_col) ** 2
+                )
+                closer = cand_dist_sq < best_dist_sq
+                best_dist_sq = torch.where(closer, cand_dist_sq, best_dist_sq)
+                best_seed_row = torch.where(closer, cand_seed_row, best_seed_row)
+                best_seed_col = torch.where(closer, cand_seed_col, best_seed_col)
+
+        seed_row = best_seed_row
+        seed_col = best_seed_col
+        step //= 2
+
+    distance = torch.sqrt(((row_idx - seed_row) ** 2 + (col_idx - seed_col) ** 2).float())
+    distance[~mask] = 0.0
+    return distance
+
+
 class DriftCorrection(AutoSerialize):
     """GPU-accelerated drift correction for paired scan-angle electron microscopy data.
 
@@ -83,10 +164,11 @@ class DriftCorrection(AutoSerialize):
     2-D, 2-D                     same angle          reference (a=ref, b=drifted) → :class:`Dataset2d`
     2-D, 3-D ``(H, W, E)``       any                 reference → :class:`Dataset3d` (corrected EDS/EELS)
     2-D, 4-D ``(H, W, det, det)``any                 reference → :class:`Dataset4d` (corrected 4D-STEM)
-    3-D, 3-D ``(N, H, W)``       different angles    paired tilt/time series → :class:`Dataset3d`
     4-D, 4-D                     orthogonal          paired 4D-STEM merge → :class:`PairedCorrectionResult`
-    2-D, 2-D, 2-D, ...           arbitrary angles    multi-angle alignment → :class:`Dataset2d`
     ============================ =================== ==============================================
+
+    For tilt/time series of paired images, loop in user code:
+    ``for i in range(N): DriftCorrection(stack_a[i], stack_b[i], ...)``.
 
     Inputs may be raw ``ndarray`` or any ``Dataset`` wrapper.  File loading
     is the user's responsibility — call ``Dataset2d.from_file(path)`` /
@@ -104,11 +186,6 @@ class DriftCorrection(AutoSerialize):
     >>> dc.align_affine(step=0.02, num_tests=11)
     >>> dc.align_nonrigid()                       # optional
     >>> result = dc.generate_corrected()          # → Dataset2d
-
-    Paired tilt series:
-
-    >>> dc = DriftCorrection(stack_0deg, stack_90deg, scan_direction_degrees=(0, -90))
-    >>> result = dc.preprocess().align_affine().generate_corrected()  # → Dataset3d
 
     Paired 0°/90° 4D-STEM:
 
@@ -188,7 +265,7 @@ class DriftCorrection(AutoSerialize):
             reference mode.  When ``None``, computed automatically via
             :meth:`compute_vdf`.
 
-        Five supported use cases (the dispatch picks one by input shapes
+        Four supported use cases (the dispatch picks one by input shapes
         and angles)
         --------------------------------------------------------------------
         ===  ===================================  =============================  ============================  ===============================
@@ -196,17 +273,22 @@ class DriftCorrection(AutoSerialize):
                                                                                   ``generate_corrected``
         ===  ===================================  =============================  ============================  ===============================
         1    Paired 2-D HAADF                     2× ``(H, W)``                  :class:`Dataset2d`            ``api/01_from_pair.ipynb``
-        2    Paired 2-D series                    2× ``(N, H, W)``               :class:`Dataset3d`            ``api/02_from_series.ipynb``
-        3    Paired 4-D STEM                      2× ``(H, W, D_h, D_w)``        :class:`PairedCorrectionResult`  ``api/03_from_4dstem.ipynb``
-        4    Reference + drifted 4-D STEM         ``(H, W)`` + ``(H, W, D_h, D_w)``  :class:`Dataset4d`        ``api/04_from_reference_4dstem.ipynb``
-        5    Reference + drifted 3-D EDS / EELS   ``(H, W)`` + ``(H, W, n_E)``   :class:`Dataset3d`            ``api/05_from_reference_eds.ipynb``
+        2    Paired 4-D STEM                      2× ``(H, W, D_h, D_w)``        :class:`PairedCorrectionResult`  ``api/03_from_4dstem.ipynb``
+        3    Reference + drifted 4-D STEM         ``(H, W)`` + ``(H, W, D_h, D_w)``  :class:`Dataset4d`        ``api/04_from_reference_4dstem.ipynb``
+        4    Reference + drifted 3-D EDS / EELS   ``(H, W)`` + ``(H, W, n_E)``   :class:`Dataset3d`            ``api/05_from_reference_eds.ipynb``
         ===  ===================================  =============================  ============================  ===============================
 
-        Cases 1-3 are *paired* (two scans of the same area, typically at
-        orthogonal angles); cases 4-5 are *reference-mode* (one HAADF
+        Cases 1-2 are *paired* (two scans of the same area, typically at
+        orthogonal angles); cases 3-4 are *reference-mode* (one HAADF
         reference + one drifted dataset of the same scan, single-sided).
         Multi-angle HAADF (3+ inputs at different angles) follows the
         case-1 dispatch with ``len(datasets) > 2``.
+
+        For tilt/time series of paired images, loop in user code:
+
+        >>> for i in range(N):
+        ...     dc = DriftCorrection(stack_a[i], stack_b[i], scan_direction_degrees=(0, 90))
+        ...     out[i] = dc.preprocess().align_affine().generate_corrected().array
 
         Examples
         --------
@@ -214,19 +296,15 @@ class DriftCorrection(AutoSerialize):
 
         >>> dc = DriftCorrection(im0, im90, scan_direction_degrees=(0, 90))
 
-        Case 2: paired tilt series (two 3-D ``(N, H, W)`` stacks):
-
-        >>> dc = DriftCorrection(stack_0, stack_90, scan_direction_degrees=(0, -90))
-
-        Case 3: paired 4-D STEM:
+        Case 2: paired 4-D STEM:
 
         >>> dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=(0, -90))
 
-        Case 4: HAADF reference + drifted 4-D STEM (single-sided):
+        Case 3: HAADF reference + drifted 4-D STEM (single-sided):
 
         >>> dc = DriftCorrection(haadf, cube_drifted, scan_direction_degrees=0)
 
-        Case 5: HAADF reference + drifted EDS spectral cube:
+        Case 4: HAADF reference + drifted EDS spectral cube:
 
         >>> dc = DriftCorrection(haadf, eds_cube, scan_direction_degrees=0)
 
@@ -235,7 +313,6 @@ class DriftCorrection(AutoSerialize):
         >>> dc = DriftCorrection(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
         """
         # Core state (always set so all code paths can rely on these).
-        self._frames: list[Self] | None = None
         self._datasets: list[np.ndarray | None] | None = None
         self._datasets_consumed: bool = False
         self._normalized: bool = False
@@ -244,8 +321,6 @@ class DriftCorrection(AutoSerialize):
         self._device = device
         self._dtype = torch.float32
 
-        # Accept the raw arguments and dispatch.  Skip setup when called
-        # via _from_frames() — that path populates attributes directly.
         if not datasets and alignment_image is None:
             return
         self._dispatch_and_setup(datasets, scan_direction_degrees, alignment_image)
@@ -302,19 +377,11 @@ class DriftCorrection(AutoSerialize):
                     f"reference + drifted workflows pass the 2-D reference "
                     f"first: DriftCorrection(reference_2d, drifted_cube, ...)")
 
-            # Paired 3-D at different angles → series (per-frame looped pairs)
+            # Paired 3-D stacks no longer supported — loop in user code.
             if a_ndim == 3 and b_ndim == 3:
-                if sd[0] == sd[1]:
-                    raise ValueError(
-                        "Paired 3-D series expects different scan angles; got "
-                        f"{sd[0]}, {sd[1]}.  For HAADF-ref + EDS spectral cube "
-                        "pass a 2-D reference instead of a 3-D stack.")
-                if a.shape[1:] != b.shape[1:]:
-                    raise ValueError(
-                        f"series scan dims {a.shape[1:]} must match "
-                        f"second stack scan dims {b.shape[1:]}")
-                self._setup_series(arrays, sd)
-                return
+                raise TypeError(
+                    "Paired 3-D series support was removed. Loop in user code: "
+                    "for i in range(N): DriftCorrection(stack_a[i], stack_b[i], ...)")
 
             # Paired ≥4-D: 4D-STEM merge
             if a_ndim >= 4 and b_ndim >= 4:
@@ -365,29 +432,6 @@ class DriftCorrection(AutoSerialize):
         self.scan_direction_degrees = ensure_valid_array(
             scan_direction_degrees, ndim=1)
 
-    def _setup_series(self, stacks, scan_direction_degrees):
-        """Populate state for a paired series: build N per-frame children."""
-        n = stacks[0].shape[0]
-        if n == 0:
-            raise ValueError(f"Series must contain ≥1 frame, got shape {stacks[0].shape}")
-        for i, s in enumerate(stacks):
-            if s.shape[0] != n:
-                raise ValueError(
-                    f"Frame count mismatch: stack 0 has {n} frames "
-                    f"but stack {i} has {s.shape[0]}")
-        # Build one DriftCorrection per frame, passing the paired slices.
-        self._frames = [
-            DriftCorrection(*[s[j] for s in stacks],
-                            scan_direction_degrees=scan_direction_degrees)
-            for j in range(n)
-        ]
-        self.scan_direction_degrees = self._frames[0].scan_direction_degrees
-
-    @property
-    def is_series(self) -> bool:
-        """True if this instance wraps a multi-frame series."""
-        return self._frames is not None
-
     @property
     def is_4dstem(self) -> bool:
         """True if this instance holds ≥3-D dataset(s) for correction.
@@ -404,58 +448,15 @@ class DriftCorrection(AutoSerialize):
         """True only for paired 4D-STEM (two cubes, not reference mode)."""
         return self._datasets is not None and not self._reference_mode
 
-    @property
-    def n_frames(self) -> int:
-        """Number of frames for series instances; ``0`` for single-pair / 4D-STEM /
-        reference instances. (Returning instead of raising keeps the property
-        safe to call from generic introspection code, e.g. serialization.)"""
-        return len(self._frames) if self._frames is not None else 0
-
-    def __getitem__(self, idx: int) -> Self:
-        """Access the *idx*-th frame of a series for per-frame inspection."""
-        if self._frames is None:
-            raise TypeError(
-                "Single-pair DriftCorrection is not indexable. "
-                "Use DriftCorrection(stack_a, stack_b, ...) with 3-D stacks for series mode."
-            )
-        return self._frames[idx]
-
-    def __iter__(self):
-        if self._frames is None:
-            raise TypeError("Single-pair DriftCorrection is not iterable.")
-        return iter(self._frames)
-
-    def _ensure_single(self, name: str) -> None:
-        """Raise TypeError if called on a series instance."""
-        if self._frames is not None:
-            raise TypeError(
-                f"{name} is not supported on series instances. "
-                f"Use drift[i].{name} for individual frames."
-            )
-
-    def _dispatch_to_frames(self, method_name: str, kw: dict, desc: str,
-                             collect: bool = False):
-        """Loop a pipeline method over per-frame children in series mode.
-
-        Strips ``self`` from ``kw``, flattens ``kwargs``, and forces show
-        flags off so per-frame plots don't blow up the output. When
-        ``collect=True`` returns the list of per-frame results; otherwise
-        returns ``self`` for chaining.
-        """
-        kw = {k: v for k, v in kw.items() if k != "self"}
-        kw.update(kw.pop("kwargs", {}))
-        kw["show_merged"] = False
-        kw["show_images"] = False
-        results = [] if collect else None
-        for f in tqdm(self._frames, desc=desc):
-            out = getattr(f, method_name)(**kw)
-            if collect:
-                results.append(out)
-        return results if collect else self
-
     def _show_after_step(self, label: str, show_merged: bool, show_images: bool,
                           show_knots: bool, kwargs: dict):
-        """Render the merged/per-image plots after an alignment step."""
+        """Render the merged/per-image plots after an alignment step.
+
+        ``show_knots`` here is purely the overlay flag forwarded to the
+        merged/warped image plots. For the standalone 2-panel knot
+        trajectory + per-row delta figure, call ``dc.plot_knots()``
+        explicitly after alignment.
+        """
         kwargs.pop("title", None)
         if show_merged:
             self.plot_merged_images(
@@ -495,16 +496,17 @@ class DriftCorrection(AutoSerialize):
                 ".align_nonrigid()) before apply_correction().")
         return self.knots[idx] - self._initial_knots[idx]
 
-    def _drift(self, idx: int) -> torch.Tensor:
-        """Drift in raw-frame coordinates for image ``idx`` (delegates to interpolator).
+    def drift_field(self, idx: int) -> torch.Tensor:
+        """Per-scanline drift in raw-frame pixel coordinates for image ``idx``.
 
-        Returns ``(2, H)`` for K=1 or ``(2, H, W)`` for K>=2.
+        Returns ``(2, H)`` for K=1 (single-knot mode, drift constant across cols)
+        or ``(2, H, W)`` for K>=2. First axis is (row_drift, col_drift).
         """
         if not hasattr(self, "_initial_knots"):
             raise RuntimeError(
-                "apply_correction() requires preprocess() and align_affine() "
-                "first. Run dc.preprocess().align_affine() (and optionally "
-                ".align_nonrigid()) before apply_correction().")
+                "drift_field() requires preprocess() and align_affine() first. "
+                "Run dc.preprocess().align_affine() (and optionally "
+                ".align_nonrigid()) before drift_field().")
         return self._interpolator(idx).drift_raw(self._initial_knots[idx])
 
     def preprocess(
@@ -516,7 +518,8 @@ class DriftCorrection(AutoSerialize):
         normalize: bool = False,
         show_merged: bool = False,
         show_images: bool = False,
-        show_knots: bool = True,
+        overlay_knots: bool = True,
+        show_knot_plot: bool = False,
         **kwargs,
     ):
         """Prepare images for drift correction by building the scanline model.
@@ -556,7 +559,12 @@ class DriftCorrection(AutoSerialize):
             Display the merged (averaged) warped images after preprocessing.
         show_images : bool
             Display each individual warped image after preprocessing.
-        show_knots : bool
+        overlay_knots : bool, default True
+            Overlay knot positions on top of the merged/warped image plots
+            (cheap, useful diagnostic).
+        show_knot_plot : bool, default False
+            Render the standalone 2-panel knot trajectory + per-row delta
+            chart via ``dc.plot_knots()`` after this step.
             Overlay knot positions on displayed images.
         **kwargs
             Additional keyword arguments passed to plotting functions.
@@ -578,10 +586,6 @@ class DriftCorrection(AutoSerialize):
         ...     haadf_ref, vdf, scan_direction_degrees=[0, 0])
         >>> drift.preprocess(normalize=True).align_affine(fixed_indices=[0])
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "preprocess", locals(), "Preprocessing series")
-
         self._normalized = bool(normalize)
         if normalize:
             for img in self.imgs:
@@ -609,9 +613,9 @@ class DriftCorrection(AutoSerialize):
                         f"or use a single scan direction.")
         self.scan_direction = np.deg2rad(self.scan_direction_degrees)
         self.scan_fast = np.stack(
-            [np.sin(-self.scan_direction), np.cos(-self.scan_direction)], axis=1)
+            [np.sin(self.scan_direction), np.cos(self.scan_direction)], axis=1)
         self.scan_slow = np.stack(
-            [np.cos(-self.scan_direction), -np.sin(-self.scan_direction)], axis=1)
+            [np.cos(self.scan_direction), -np.sin(self.scan_direction)], axis=1)
         self.shape = (
             len(self.imgs),
             int(np.round(self.imgs[0].shape[0] * (1 + self.pad_fraction) / 2) * 2),
@@ -662,7 +666,9 @@ class DriftCorrection(AutoSerialize):
             self.imgs_warped.array[img_idx] = warped.cpu().numpy()
         self._initial_knots = [k.clone() for k in self.knots]
         self.calculate_error(0, _warped_t=warped_t)
-        self._show_after_step("initial", show_merged, show_images, show_knots, kwargs)
+        self._show_after_step("initial", show_merged, show_images, overlay_knots, kwargs)
+        if show_knot_plot:
+            self.plot_knots()
         return self
 
     def align_affine(
@@ -676,7 +682,8 @@ class DriftCorrection(AutoSerialize):
         fixed_indices: list[int] | None = None,
         show_merged: bool = True,
         show_images: bool = False,
-        show_knots: bool = True,
+        overlay_knots: bool = True,
+        show_knot_plot: bool = False,
         verbose: bool = False,
         **kwargs,
     ):
@@ -727,7 +734,12 @@ class DriftCorrection(AutoSerialize):
             Display the merged (averaged) image after alignment.
         show_images : bool
             Display each individual warped image after alignment.
-        show_knots : bool
+        overlay_knots : bool, default True
+            Overlay knot positions on top of the merged/warped image plots
+            (cheap, useful diagnostic).
+        show_knot_plot : bool, default False
+            Render the standalone 2-panel knot trajectory + per-row delta
+            chart via ``dc.plot_knots()`` after this step.
             Overlay knot positions on the displayed images.
         verbose : bool
             If True, print the top 5 candidate drift vectors with their
@@ -754,10 +766,6 @@ class DriftCorrection(AutoSerialize):
         ...     haadf_ref, vdf, scan_direction_degrees=[0, 0])
         >>> drift.preprocess().align_affine(fixed_indices=[0])
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "align_affine", locals(), "Aligning affine")
-
         if self.shape[0] < 2:
             raise ValueError(
                 f"align_affine requires at least 2 images (got {self.shape[0]}). "
@@ -863,7 +871,9 @@ class DriftCorrection(AutoSerialize):
             confidence = "high" if margin > 5 else "low" if margin < 2 else "moderate"
             print(f"Confidence: {margin:.1f}% cost margin to runner-up ({confidence})")
 
-        self._show_after_step("affine", show_merged, show_images, show_knots, kwargs)
+        self._show_after_step("affine", show_merged, show_images, overlay_knots, kwargs)
+        if show_knot_plot:
+            self.plot_knots()
         self._knots_after_affine = [k.clone() for k in self.knots]
         return self
 
@@ -1179,7 +1189,8 @@ class DriftCorrection(AutoSerialize):
         min_iterations: int = 4,
         show_merged: bool = True,
         show_images: bool = False,
-        show_knots: bool = True,
+        overlay_knots: bool = True,
+        show_knot_plot: bool = False,
         **kwargs,
     ):
         """Non-rigid drift correction via batched GPU optimization.
@@ -1243,7 +1254,7 @@ class DriftCorrection(AutoSerialize):
             Minimum relative improvement to count as progress.
         min_iterations : int, default 4
             Floor before early stopping can trigger.
-        show_merged, show_images, show_knots : bool
+        show_merged, show_images : bool
             Display knobs forwarded to the plot helpers.
 
         Returns
@@ -1268,10 +1279,6 @@ class DriftCorrection(AutoSerialize):
         ``self._ensure_warped_images()`` first, or use ``generate_corrected()``
         which builds its own warps from ``self.knots``.
         """
-        if self._frames is not None:
-            return self._dispatch_to_frames(
-                "align_nonrigid", locals(), "Aligning nonrigid")
-
         if not hasattr(self, "knots"):
             raise RuntimeError(
                 "No knots found. Call .preprocess() before running alignment.")
@@ -1438,7 +1445,9 @@ class DriftCorrection(AutoSerialize):
                 self.error_track = np.vstack((self.error_track, new_rows))
 
         self._show_after_step(
-            "non-rigid", show_merged, show_images, show_knots, kwargs)
+            "non-rigid", show_merged, show_images, overlay_knots, kwargs)
+        if show_knot_plot:
+            self.plot_knots()
         return self
 
     def generate_corrected(
@@ -1446,9 +1455,9 @@ class DriftCorrection(AutoSerialize):
         upsample_factor: int = 2,
         output_original_shape: bool = True,
         strip_padding: bool = False,
-        mask_output: bool = True,
+        mask_output: bool = False,
         mask_edge_blend: float = 8.0,
-        fourier_filter: bool = True,
+        fourier_filter: bool = False,
         filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
         weight_thresh: float = 0.1,
@@ -1485,10 +1494,10 @@ class DriftCorrection(AutoSerialize):
         etc.) are ignored; dataset parameters (``mode``, ``chunk_size``,
         ``merge``, ``verbose``, ``output_a``, ``output_b``) take effect.
 
-        For pair / series modes the entire pipeline (warping, Fourier
+        For paired-image mode, the entire pipeline (warping, Fourier
         filtering, masking, cropping) runs on GPU via PyTorch, transferring
         to CPU only for the final ``Dataset2d`` output and the
-        ``distance_transform_edt`` mask step.
+        edge-blend mask step (now torch).
 
         Parameters
         ----------
@@ -1501,12 +1510,19 @@ class DriftCorrection(AutoSerialize):
             to the original *scan* dimensions (removing the padding added by
             ``preprocess(pad_fraction=...)``).  This ensures the returned image
             covers exactly the same field-of-view as the raw input scans.
-        mask_output : bool, default True
-            If true, mask the output using the probe position weights
+        mask_output : bool, default False
+            If true, blend the corrected image edge into ``pad_value_mean``
+            with a cosine ramp of width ``mask_edge_blend`` px. Useful for
+            FFT analysis or visualization where a hard data/pad step would
+            cause spectral ringing or look bad. Skip for save-to-npy →
+            downstream-pipeline workflows where the caller crops anyway.
         mask_edge_blend : float, default 8.0
-            Value in pixels to blend from the edge of the mask (where we have data)
-        fourier_filter : bool, default True
-            Whether to apply Fourier-based directional filtering to merge corrected images.
+            Width in pixels of the edge blend ramp (only used when
+            ``mask_output=True``).
+        fourier_filter : bool, default False
+            Whether to apply Fourier-based directional filtering to merge
+            corrected images. Only useful when blending ≥3 scan angles.
+            For paired (0°, 90°) HAADF — the typical case — keep this off.
         filter_midpoint : float, default 0.5
             Midpoint for the sigmoid-based Fourier weighting filter, determining transition smoothness.
             Setting this to a low value close to 0 will include more signal but also more slow scan artifacts.
@@ -1562,13 +1578,6 @@ class DriftCorrection(AutoSerialize):
                 verbose=verbose, output_a=output_a, output_b=output_b,
                 output_dtype=output_dtype, output_device=output_device,
             )
-        if self._frames is not None:
-            results = self._dispatch_to_frames(
-                "generate_corrected", locals(),
-                "Generating corrected images", collect=True)
-            stacked = np.stack([r.array for r in results], axis=0).astype(np.float32)
-            return Dataset3d.from_array(stacked)
-
         device = self._device
         dtype = self._dtype
 
@@ -1620,26 +1629,37 @@ class DriftCorrection(AutoSerialize):
             image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
 
         if mask_output:
-            # distance_transform_edt has no torch equivalent — compute on CPU
-            weight_np = weight_corr.cpu().numpy()
-            mask_edge = np.prod(weight_np >= (weight_thresh / upsample_factor**2), axis=0)
-            mask_edge[:, 0] = False
-            mask_edge[:, -1] = False
-            mask_edge[0, :] = False
-            mask_edge[-1, :] = False
-            mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
-            mask_np = (
-                np.cos(
-                    (np.pi / 2)
-                    * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
-                )
-                ** 2
-            )
-            mask_t = torch.as_tensor(mask_np, dtype=dtype, device=device)
+            # GPU edge-blend mask. Two-stage cosine ramp around the data area:
+            #   1. Build the data mask (where every input image has weight
+            #      above threshold). Force the outer border False so the
+            #      distance transform knows where "outside" is.
+            #   2. distance-transform once to get pixels within `blend` of the
+            #      boundary — this is the "ramp band".
+            #   3. distance-transform that ramp band to get a smooth distance
+            #      from each band pixel to the deep interior.
+            #   4. Apply cos² ramp so mask = 1 deep inside, 0 at the boundary.
+            # Both distance transforms use the torch GPU implementation
+            # (bit-exact to scipy on single-region masks).
+            blend_px = float(mask_edge_blend)
+            data_mask = (weight_corr >= (weight_thresh / upsample_factor**2)).all(dim=0)
+            data_mask[:, 0] = False
+            data_mask[:, -1] = False
+            data_mask[0, :] = False
+            data_mask[-1, :] = False
+
+            distance_to_boundary = _distance_transform_edt_torch(data_mask)
+            ramp_band = distance_to_boundary <= blend_px
+            distance_in_band = _distance_transform_edt_torch(ramp_band)
+            ramp_position = (distance_in_band / blend_px).clamp(0.0, 1.0)
+            edge_blend_mask = (torch.cos((torch.pi / 2) * ramp_position) ** 2).to(dtype)
+
             pad_value_mean = float(np.mean(self.pad_value))
-            image_corr_fft = torch.fft.fft2(
-                torch.fft.ifft2(image_corr_fft).real * mask_t + pad_value_mean * (1 - mask_t)
+            corrected_image = torch.fft.ifft2(image_corr_fft).real
+            blended_image = (
+                corrected_image * edge_blend_mask
+                + pad_value_mean * (1 - edge_blend_mask)
             )
+            image_corr_fft = torch.fft.fft2(blended_image)
 
         if output_original_shape:
             image_corr_fft = _fourier_crop_torch(
@@ -1685,7 +1705,7 @@ class DriftCorrection(AutoSerialize):
         and 4-D STEM datasets. Scan-axis convention depends on the
         construction mode:
 
-        - 2-D paired or series mode: scan axes are the LAST two of input.
+        - 2-D paired mode: scan axes are the LAST two of input.
           Shapes ``(H, W)`` (single image) or ``(N, H, W)`` (batch).
         - 4D-STEM / reference mode (built with a ≥3-D drifted dataset):
           scan axes are the FIRST two of input. Shapes ``(H, W)`` (VDF),
@@ -1727,7 +1747,6 @@ class DriftCorrection(AutoSerialize):
         >>> out = np.memmap('corrected.dat', dtype='float32', mode='w+', shape=cube_b.shape)
         >>> dc.apply_correction(output=out)            # writes to memmap, returns it
         """
-        self._ensure_single("apply_correction")
         if not hasattr(self, "knots") or not hasattr(self, "_initial_knots"):
             raise RuntimeError(
                 "apply_correction() requires preprocess() and align_affine() "
@@ -1791,9 +1810,9 @@ class DriftCorrection(AutoSerialize):
             raise ValueError(
                 f"Input scan-row axis ({img_h}) does not match knot grid "
                 f"height ({knot_h}). For 4D-STEM mode the leading axis is the "
-                f"scan row; for pair/series mode the trailing-2 axes are scan.")
+                f"scan row; for paired-image mode the trailing-2 axes are scan.")
 
-        drift = self._drift(idx)
+        drift = self.drift_field(idx)
         return backward_warp(data_t, drift=drift, mode=mode)
 
     # 4D-STEM dataset path: implementations live in drift_3d_4dstem.py so the
@@ -1848,7 +1867,6 @@ class DriftCorrection(AutoSerialize):
             If provided, compute error from this tensor directly,
             avoiding a GPU-to-CPU round-trip.
         """
-        self._ensure_single("calculate_error")
         if _warped_t is not None:
             images_mean = _warped_t.mean(dim=0)
             sig_diff = torch.mean(
@@ -1883,7 +1901,6 @@ class DriftCorrection(AutoSerialize):
         :meth:`align_affine`. Uses the affine-only knot snapshot when
         available so post-nonrigid wobble doesn't perturb the linear slope.
         """
-        self._ensure_single("drift_rate")
         if not hasattr(self, "_initial_knots"):
             raise RuntimeError("Call preprocess() then align_affine() first.")
         idx = len(self.knots) - 1
@@ -1898,42 +1915,19 @@ class DriftCorrection(AutoSerialize):
         col_rate = float((delta[1, -1, 0] - delta[1, 0, 0]) / max(n - 1, 1))
         return (row_rate, col_rate)
 
-    # -- thin delegators to drift_viz (implementations + docstrings live there) --
-    def print_drift_stats(self, image_index: int = -1) -> None:
-        self._ensure_single("print_drift_stats")
-        return drift_viz.print_drift_stats(self, image_index=image_index)
-
-    def plot_correction_summary(self, **kw):
-        self._ensure_single("plot_correction_summary")
-        return drift_viz.plot_correction_summary(self, **kw)
-
-    def plot_correction_comparison(self, **kw):
-        self._ensure_single("plot_correction_comparison")
-        return drift_viz.plot_correction_comparison(self, **kw)
-
-    def plot_radial_power(self, **kw):
-        self._ensure_single("plot_radial_power")
-        return drift_viz.plot_radial_power(self, **kw)
-
-    def plot_warped_images(self, **kw):
-        self._ensure_single("plot_warped_images")
-        return drift_viz.plot_warped_images(self, **kw)
-
-    def plot_convergence(self, **kw):
-        self._ensure_single("plot_convergence")
-        return drift_viz.plot_convergence(self, **kw)
-
-    def plot_merged_images(self, **kw):
-        self._ensure_single("plot_merged_images")
-        return drift_viz.plot_merged_images(self, **kw)
-
-    def plot_knots(self, **kw):
-        self._ensure_single("plot_knots")
-        return drift_viz.plot_knots(self, **kw)
-
-    def plot_diffraction(self, ds_raw, ds_corrected, **kw):
-        self._ensure_single("plot_diffraction")
-        return drift_viz.plot_dataset_correction(self, ds_raw, ds_corrected, **kw)
+    # -- visualization methods bound directly from drift_visualization so hover
+    #    shows the real signature + docstring (no `**kw` indirection).
+    print_drift_stats = drift_visualization.print_drift_stats
+    plot_correction_summary = drift_visualization.plot_correction_summary
+    plot_correction_comparison = drift_visualization.plot_correction_comparison
+    plot_radial_power = drift_visualization.plot_radial_power
+    plot_warped_images = drift_visualization.plot_warped_images
+    plot_convergence = drift_visualization.plot_convergence
+    plot_merged_images = drift_visualization.plot_merged_images
+    plot_knots = drift_visualization.plot_knots
+    plot_diffraction = drift_visualization.plot_4dstem_correction
+    view_corrected_dp = _3d_4dstem.view_corrected_dp
+    view_corrected_vdfs = _3d_4dstem.view_corrected_vdfs
 
 
 def _bounded_sine_sigmoid_torch(x: torch.Tensor, midpoint: float = 0.5,

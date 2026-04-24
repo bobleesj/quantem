@@ -32,24 +32,46 @@ def _ncc(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _log_fft(img: np.ndarray, mask_radius: int = 5) -> np.ndarray:
-    """Log-magnitude FFT with a zero-frequency mask for display."""
+    """FFT magnitude (Hanning-windowed) of an already-zoomed real-space crop.
+
+    Computed on GPU via ``torch.fft`` when CUDA is available, otherwise CPU.
+    Returns raw ``|FFT|`` (not log-applied) so the show_2d caller can apply
+    ``norm={"stretch_type": "logarithmic"}`` — same convention as
+    drift_original.
+
+    The caller is expected to have already cropped ``img`` to the desired
+    field of view; the FFT is computed on the full input here so that
+    zooming the real-space crop also zooms the FFT field of view.
+    """
     n_h, n_w = img.shape
-    hann = np.outer(np.hanning(n_h), np.hanning(n_w))
-    f = np.fft.fftshift(np.fft.fft2(img * hann))
-    mag = np.log1p(np.abs(f))
-    center_row, center_col = n_h // 2, n_w // 2
-    row_offset, col_offset = np.ogrid[-center_row:n_h - center_row, -center_col:n_w - center_col]
-    mag[row_offset ** 2 + col_offset ** 2 < mask_radius ** 2] = 0
-    return mag
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    img_t = torch.as_tensor(img, dtype=torch.float32, device=device)
+    hann_h = torch.hann_window(n_h, periodic=False, device=device, dtype=torch.float32)
+    hann_w = torch.hann_window(n_w, periodic=False, device=device, dtype=torch.float32)
+    hann = hann_h[:, None] * hann_w[None, :]
+    f = torch.fft.fftshift(torch.fft.fft2(img_t * hann))
+    mag = f.abs()
+    cr, cc = n_h // 2, n_w // 2
+    rr = torch.arange(n_h, device=device) - cr
+    cc_idx = torch.arange(n_w, device=device) - cc
+    r2c2 = rr[:, None] ** 2 + cc_idx[None, :] ** 2
+    mag = torch.where(r2c2 < mask_radius ** 2, torch.zeros_like(mag), mag)
+    return mag.cpu().numpy()
 
 
 def _center_crop_slice(
-    ref_np: np.ndarray, crop: int | None,
+    ref_np: np.ndarray, zoom: float,
 ) -> tuple[tuple[slice, slice], int]:
-    """Return a centre-crop slice and the crop size."""
+    """Return a centre-crop slice for a given zoom factor.
+
+    ``zoom=1.0`` → full image (no crop). ``zoom=2.0`` → 50% centre crop
+    (2× zoomed in). ``zoom=4.0`` → 25% centre crop (4× zoomed in).
+    """
     h, w = ref_np.shape
-    if crop is None:
-        crop = int(min(h, w) * 0.8) // 2 * 2
+    if zoom <= 1.0:
+        return (slice(0, h), slice(0, w)), min(h, w)
+    crop = int(min(h, w) / float(zoom))
+    crop = max(crop, 2)
     r0, c0 = (h - crop) // 2, (w - crop) // 2
     return (slice(r0, r0 + crop), slice(c0, c0 + crop)), crop
 
@@ -61,82 +83,162 @@ def plot_correction_summary(
     corrected: torch.Tensor | np.ndarray | None = None,
     reference_index: int = 0,
     target_index: int = -1,
-    crop: int | None = None,
+    zoom: float = 1.2,
     mode: str = "bicubic",
     show_fft: bool = True,
-    show_diff: bool = True,
+    show_diff: bool = False,
+    show_raw_merge: bool = False,
     fft_mask_radius: int = 5,
+    cmap: str = "gray",
     axsize: tuple[float, float] = (3.5, 3.5),
     **kwargs,
 ) -> tuple[Figure, np.ndarray]:
-    """One-liner before/after comparison of drift correction.
+    """One-shot before/after summary of a drift correction run.
 
-    Shows the reference, raw (drifted) input, and corrected image
-    side by side with RMS and NCC metrics.  Optionally appends rows
-    for FFT magnitudes and difference maps.
-
-    The image and FFT rows are rendered via :func:`show_2d`, so all
-    of its keyword arguments (``cmap``, ``norm``, ``scalebar``,
-    ``cbar``, ``show_ticks``, ...) are forwarded.
+    Renders the reference, the raw (drifted) target, and the corrected
+    target side by side with RMS and NCC quality metrics overlaid in the
+    titles. Optionally appends a row of log-FFT magnitudes and a row of
+    signed difference maps.
 
     Parameters
     ----------
     dc : DriftCorrection
-        Drift correction instance after alignment.
+        Drift correction instance after ``preprocess`` + ``align_affine``
+        (and optionally ``align_nonrigid``).
     corrected : torch.Tensor or np.ndarray, optional
-        Pre-computed corrected image.  If *None*, calls
-        ``dc.apply_correction(mode=mode)`` automatically.
+        Pre-computed corrected target image. When ``None``, calls
+        ``dc.apply_correction(image_index=target_index, mode=mode)``.
     reference_index : int, default 0
         Index of the reference image (typically the fixed HAADF).
     target_index : int, default -1
-        Index of the target image (the one being corrected).
-    crop : int, optional
-        Centre-crop size in pixels.  *None* uses 80% of shorter dimension.
-    mode : str, default "bicubic"
-        Interpolation mode if *corrected* is not provided.
+        Index of the target image (the one being warped to match the ref).
+    zoom : float, default 1.0
+        Microscope-style zoom factor. ``1.0`` shows the full image,
+        ``2.0`` crops to the central 50% (2× zoomed in), ``4.0`` to 25%
+        (4× zoomed in). FFT panels are computed on the same zoomed crop,
+        so zooming in real space also zooms the FFT field of view.
+    mode : str, default ``"bicubic"``
+        Interpolation kernel for ``apply_correction`` when ``corrected``
+        is not supplied.
     show_fft : bool, default True
-        Append a row with log-FFT magnitudes.
-    show_diff : bool, default True
-        Append a row with difference maps (``seismic`` colourmap).
+        Append a row with log-magnitude FFTs.
+    show_diff : bool, default False
+        Append a row with signed (raw − ref, corrected − ref) maps in
+        ``seismic`` colourmap.
+    show_raw_merge : bool, default False
+        Insert an extra column showing ``0.5 * (image 0 raw + image 1 raw
+        rotated)`` — a naive uncorrected merge of the two scans. Visualizes
+        the misalignment that drift correction is fixing.
     fft_mask_radius : int, default 5
-        Pixel radius of the zero-frequency mask in FFT panels.
-    axsize : tuple, default (3.5, 3.5)
-        Size of each subplot panel.
+        Pixel radius of the zero-frequency mask in the FFT panels (so the
+        DC peak does not dominate the colour scale).
+    cmap : str, default ``"gray"``
+        Colourmap for the image and FFT rows. Forwarded to ``show_2d``.
+    axsize : tuple of float, default ``(3.5, 3.5)``
+        Per-panel size in inches.
     **kwargs
-        Extra keyword arguments forwarded to ``show_2d``.
+        Additional keyword arguments forwarded to :func:`show_2d` for the
+        image / FFT rows (``norm``, ``scalebar``, ``cbar``, ``show_ticks``,
+        ...).
 
     Returns
     -------
-    fig : Figure
-    axes : np.ndarray of Axes, shape (nrows, 3)
+    fig : matplotlib.figure.Figure
+    axes : np.ndarray of Axes, shape ``(nrows, 3)``
+
+    Examples
+    --------
+    Default magma view with FFT + diff rows::
+
+        from quantem.imaging import DriftCorrection
+        dc = DriftCorrection(im0, im90, scan_direction_degrees=[0, 90])
+        dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
+        dc.align_affine(step=0.02, num_tests=11)
+        dc.align_nonrigid()
+        fig, axes = dc.plot_correction_summary(axsize=(4, 4))
+
+    Image rows only (no FFT, no diff), gray cmap::
+
+        dc.plot_correction_summary(show_fft=False, show_diff=False, cmap="gray")
+
+    Pass a precomputed corrected image (skip recompute)::
+
+        result = dc.generate_corrected(strip_padding=True)
+        dc.plot_correction_summary(corrected=result.array)
     """
+    kwargs.setdefault("cmap", cmap)
     ref_np = dc.imgs[reference_index].array
     idx = target_index % len(dc.imgs)
     raw_np = dc.imgs[idx].array
     if corrected is None:
-        corrected = dc.apply_correction(image_index=target_index, mode=mode)
+        if dc.is_paired_4dstem:
+            # Full-cube apply OOMs in 4D-STEM mode; warp the VDF directly,
+            # which is what the user wants to visualize anyway.
+            from quantem.imaging.drift_align import backward_warp
+            vdf_t = torch.as_tensor(dc.imgs_t[idx], dtype=torch.float32,
+                                     device=dc._device)
+            corrected = backward_warp(vdf_t, drift=dc.drift_field(idx),
+                                       mode=mode).cpu().numpy()
+        else:
+            corrected = dc.apply_correction(image_index=target_index, mode=mode)
     if isinstance(corrected, torch.Tensor):
         corrected_np = corrected.cpu().numpy()
     else:
         corrected_np = np.asarray(corrected)
-    s, crop = _center_crop_slice(ref_np, crop)
+
+    # Rotate raw/corrected back into reference orientation. Vendor sign
+    # conventions disagree (VELOX vs Dectris), so don't trust the sign of
+    # `scan_direction_degrees`. Instead, try all four 90° rotations and pick
+    # the one whose corrected merge correlates best with the reference.
+    sd = np.asarray(dc.scan_direction_degrees, dtype=float)
+    angle_delta_deg = float(sd[idx] - sd[reference_index])
+    expected_k_steps = int(round(abs(angle_delta_deg) / 90.0)) % 4
+    if expected_k_steps == 0:
+        raw_aligned, corrected_aligned = raw_np, corrected_np
+        rot_k_back = 0
+    else:
+        candidates = [k for k in (1, -1, 2) if k % 4 == expected_k_steps or k % 4 == (-expected_k_steps) % 4]
+        ref_f = ref_np.astype(np.float32)
+        ref_f -= ref_f.mean()
+        best_k, best_score = candidates[0], -np.inf
+        for k in candidates:
+            cand = np.rot90(corrected_np, k=k).astype(np.float32)
+            cand -= cand.mean()
+            score = float((ref_f * cand).sum() / (np.linalg.norm(ref_f) * np.linalg.norm(cand) + 1e-12))
+            if score > best_score:
+                best_score, best_k = score, k
+        rot_k_back = best_k
+        raw_aligned = np.rot90(raw_np, k=rot_k_back)
+        corrected_aligned = np.rot90(corrected_np, k=rot_k_back)
+
     h, w = ref_np.shape
+    s, zoom = _center_crop_slice(ref_np, zoom)
     ref_c = ref_np[s].astype(np.float32)
-    raw_c = raw_np[s].astype(np.float32)
-    cor_c = corrected_np[s].astype(np.float32)
+    raw_c = (raw_aligned[s] if raw_aligned.shape == ref_np.shape
+             else raw_aligned[_center_crop_slice(raw_aligned, zoom)[0]]).astype(np.float32)
+    cor_c = (corrected_aligned[s] if corrected_aligned.shape == ref_np.shape
+             else corrected_aligned[_center_crop_slice(corrected_aligned, zoom)[0]]).astype(np.float32)
     raw_rms = _rms(raw_c, ref_c)
     cor_rms = _rms(cor_c, ref_c)
-    raw_ncc = _ncc(raw_c, ref_c)
-    cor_ncc = _ncc(cor_c, ref_c)
-    nrows = 1 + int(show_fft) + int(show_diff)
-    ncols = 3
+
+    rot_note = (f" (rotated to image {reference_index} orientation)"
+                if rot_k_back else "")
     img_titles = [
-        "Reference",
-        f"Raw (RMS={raw_rms:.3f}, NCC={raw_ncc:.3f})",
-        f"Corrected (RMS={cor_rms:.3f}, NCC={cor_ncc:.3f})",
+        f"image {reference_index} raw",
+        f"image {idx} raw" + rot_note,
+        "corrected",
     ]
+    images_for_row = [ref_c, raw_c, cor_c]
+    if show_raw_merge:
+        merge_c = 0.5 * (ref_c + raw_c)
+        # Insert as 3rd column (between raw and corrected) so flow reads
+        # ref → raw → naive merge (uncorrected) → corrected
+        images_for_row.insert(2, merge_c)
+        img_titles.insert(2, "raw merge (uncorrected)")
+    ncols = len(images_for_row)
+    nrows = 1 + int(show_fft) + int(show_diff)
     if not show_fft and not show_diff:
-        fig, axs = show_2d([ref_c, raw_c, cor_c], title=img_titles, axsize=axsize, **kwargs)
+        fig, axs = show_2d(images_for_row, title=img_titles, axsize=axsize, **kwargs)
         if not isinstance(axs, np.ndarray):
             axs = np.array([[axs]])
         elif axs.ndim == 1:
@@ -146,18 +248,19 @@ def plot_correction_summary(
         fig, axes_grid = plt.subplots(
             nrows, ncols, figsize=(fw * ncols, fh * nrows), squeeze=False,
         )
-        show_2d([ref_c, raw_c, cor_c], title=img_titles,
+        show_2d(images_for_row, title=img_titles,
                 figax=(fig, axes_grid[0]), axsize=axsize, **kwargs)
         row = 1
         if show_fft:
-            fft_kwargs = {k: v for k, v in kwargs.items() if k not in ("cmap",)}
+            fft_kwargs = {k: v for k, v in kwargs.items()
+                          if k not in ("cmap", "norm")}
             show_2d(
-                [_log_fft(ref_c, fft_mask_radius),
-                 _log_fft(raw_c, fft_mask_radius),
-                 _log_fft(cor_c, fft_mask_radius)],
-                title=["FFT: Reference", "FFT: Raw", "FFT: Corrected"],
+                [_log_fft(im, fft_mask_radius) for im in images_for_row],
+                title=[f"FFT: {t}" for t in img_titles],
                 figax=(fig, axes_grid[row]),
                 axsize=axsize,
+                cmap="turbo",
+                norm={"stretch_type": "logarithmic"},
                 **fft_kwargs,
             )
             row += 1
@@ -169,7 +272,7 @@ def plot_correction_summary(
             axes_grid[row][0].axis("off")
             axes_grid[row][0].text(
                 0.5, 0.5,
-                f"Crop: {crop}\u00d7{crop}\nfrom {h}\u00d7{w}",
+                f"Zoom: {zoom}\u00d7{zoom}\nfrom {h}\u00d7{w}",
                 transform=axes_grid[row][0].transAxes,
                 ha="center", va="center", fontsize=10, color="gray",
             )
@@ -186,12 +289,6 @@ def plot_correction_summary(
             )
         fig.tight_layout()
         axs = axes_grid
-    print(f"{'':>12s}   RMS     NCC")
-    print("-" * 35)
-    print(f"{'Raw':>12s}  {raw_rms:.4f}  {raw_ncc:.4f}")
-    print(f"{'Corrected':>12s}  {cor_rms:.4f}  {cor_ncc:.4f}")
-    reduction = (1 - cor_rms / raw_rms) * 100 if raw_rms > 0 else 0
-    print(f"  RMS reduction: {reduction:.1f}%")
     return fig, axs
 
 
@@ -559,25 +656,25 @@ def plot_knots(
         ax_img.imshow(merged, cmap="gray", origin="upper", aspect="equal",
                       vmin=float(merged.min()), vmax=float(merged.max()))
         ax_img.plot(initial[1, :, 0], initial[0, :, 0],
-                    "--", color=color, lw=1.2, alpha=0.7, label="initial")
-        ax_img.plot(current[1, :, 0], current[0, :, 0],
-                    "-", color=color, lw=1.5, label="corrected")
+                    "--", color=color, lw=1.2, alpha=0.7, label="before alignment")
         if hasattr(dc, "_knots_after_affine"):
             affine_np = dc._knots_after_affine[img_idx].cpu().numpy()
             ax_img.plot(affine_np[1, :, 0], affine_np[0, :, 0],
                         ":", color=color, lw=1.0, alpha=0.6, label="after affine")
+        ax_img.plot(current[1, :, 0], current[0, :, 0],
+                    "-", color=color, lw=1.5, label="after nonrigid")
         ax_img.legend(fontsize=8, loc="upper right")
         ax_img.set_title(f"image {img_idx} — knot trajectory", fontsize=10)
         ax_img.axis("off")
         ax_delta = axes[1, img_idx]
-        ax_delta.plot(scanlines, delta[0, :, 0], lw=1.2, label="row \u0394")
-        ax_delta.plot(scanlines, delta[1, :, 0], lw=1.2, label="col \u0394")
         if hasattr(dc, "_knots_after_affine"):
             aff_delta = affine_np - initial
             ax_delta.plot(scanlines, aff_delta[0, :, 0],
-                          ":", lw=1.0, alpha=0.6, label="affine row \u0394")
+                          ":", lw=1.0, alpha=0.6, label="row \u0394 after affine")
             ax_delta.plot(scanlines, aff_delta[1, :, 0],
-                          ":", lw=1.0, alpha=0.6, label="affine col \u0394")
+                          ":", lw=1.0, alpha=0.6, label="col \u0394 after affine")
+        ax_delta.plot(scanlines, delta[0, :, 0], lw=1.2, label="row \u0394 after nonrigid")
+        ax_delta.plot(scanlines, delta[1, :, 0], lw=1.2, label="col \u0394 after nonrigid")
         ax_delta.axhline(0, color="k", lw=0.5, ls="--")
         ax_delta.set_xlabel("scanline")
         ax_delta.set_ylabel("correction (px)")

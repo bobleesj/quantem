@@ -215,7 +215,7 @@ def apply_correction_to_dataset(
             f"{scan_h} scan rows. Ensure reference image and ds_4d "
             f"have matching scan dimensions (check padding / resize).")
 
-    drift = dc._drift(idx).to(device=device, dtype=torch.float32)
+    drift = dc.drift_field(idx).to(device=device, dtype=torch.float32)
     # K=1 → drift is (2, H), broadcast across columns.
     # K>=2 → drift is (2, H, W), varies along fast axis.
     if drift.ndim == 2:
@@ -439,3 +439,224 @@ def generate_corrected_paired_datasets(
         vdf_a=vdf_a,
         vdf_b=vdf_b,
     )
+
+
+def view_corrected_vdfs(
+    dc: "DriftCorrection",
+    *,
+    image_index: int = 1,
+    df_inner_factor: float = 1.5,
+    chunk_rows: int = 32,
+    show: bool = True,
+    cmap: str = "magma",
+    **imshow_kwargs,
+):
+    """Compute drift-corrected BF + DF VDFs from the 4D-STEM cube.
+
+    Fits the probe circle on the mean DP, then re-integrates the cube under
+    a BF disk mask and an annulus DF mask (radius > ``df_inner_factor * R``),
+    and warps each into the corrected scan frame.
+
+    All reductions stay on GPU; only the small mean DP and final 2D VDFs
+    move to host.
+
+    Returns
+    -------
+    bf_corrected, df_corrected : np.ndarray of shape (scan_h, scan_w)
+    """
+    if not dc.is_paired_4dstem:
+        raise RuntimeError(
+            "view_corrected_vdfs requires a paired 4D-STEM DriftCorrection.")
+    if dc._datasets_consumed or dc._datasets[image_index] is None:
+        raise RuntimeError(
+            f"Raw cube for image {image_index} was released. Construct a new "
+            f"DriftCorrection to compute VDFs.")
+
+    from quantem.core.utils.diffractive_imaging_utils import fit_probe_circle
+    from quantem.imaging.drift_align import backward_warp
+
+    cube = dc._datasets[image_index]
+    if not isinstance(cube, torch.Tensor):
+        cube = torch.as_tensor(cube, device=dc._device)
+
+    H, W, det_h, det_w = cube.shape
+    mean_dp = cube.float().mean(dim=(0, 1))
+    yc, xc, radius = fit_probe_circle(mean_dp.cpu().numpy(), show=False)
+
+    yy, xx = torch.meshgrid(
+        torch.arange(det_h, device=cube.device, dtype=torch.float32),
+        torch.arange(det_w, device=cube.device, dtype=torch.float32),
+        indexing='ij',
+    )
+    r_sq = (yy - yc) ** 2 + (xx - xc) ** 2
+    bf_idx = (r_sq < radius ** 2).flatten().nonzero().squeeze(-1)
+    df_idx = (r_sq > (df_inner_factor * radius) ** 2).flatten().nonzero().squeeze(-1)
+
+    cube_flat = cube.view(H, W, det_h * det_w)
+    bf_vdf = torch.zeros(H, W, device=cube.device, dtype=torch.float32)
+    df_vdf = torch.zeros_like(bf_vdf)
+    for r0 in range(0, H, chunk_rows):
+        r1 = min(r0 + chunk_rows, H)
+        chunk = cube_flat[r0:r1].to(torch.int64)
+        bf_vdf[r0:r1] = chunk[..., bf_idx].sum(dim=-1).float()
+        df_vdf[r0:r1] = chunk[..., df_idx].sum(dim=-1).float()
+
+    drift = dc.drift_field(image_index)
+    bf_corrected = backward_warp(bf_vdf, drift=drift, mode='bicubic').cpu().numpy()
+    df_corrected = backward_warp(df_vdf, drift=drift, mode='bicubic').cpu().numpy()
+
+    if show:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(mean_dp.cpu().numpy(), cmap=cmap, **imshow_kwargs)
+        axes[0].add_patch(Circle((xc, yc), radius, fc='none', ec='cyan', lw=2,
+                                  label=f'BF R={radius:.1f}'))
+        axes[0].add_patch(Circle((xc, yc), df_inner_factor * radius, fc='none',
+                                  ec='yellow', lw=2,
+                                  label=f'DF inner {df_inner_factor}R'))
+        axes[0].set_title(f'mean DP — probe R={radius:.1f}px')
+        axes[0].legend(loc='upper right', fontsize=8)
+        axes[1].imshow(bf_corrected, cmap=cmap, **imshow_kwargs)
+        axes[1].set_title('corrected BF')
+        axes[2].imshow(df_corrected, cmap=cmap, **imshow_kwargs)
+        axes[2].set_title(f'corrected DF (r > {df_inner_factor}R)')
+        for ax in axes:
+            ax.set_xticks([]); ax.set_yticks([])
+        plt.tight_layout()
+        plt.show()
+
+    return bf_corrected, df_corrected
+
+
+def _cube_to_np(cube):
+    if isinstance(cube, torch.Tensor):
+        return cube.cpu().numpy() if cube.is_cuda else cube.numpy()
+    return np.asarray(cube)
+
+
+def _sample_dp(cube_np, drift_t, r, c):
+    """Bilinear-sample a DP from cube at the drift-corrected source ``(r-dr, c-dc)``."""
+    dr = float(drift_t[0, r] if drift_t.ndim == 2 else drift_t[0, r, c])
+    dc_off = float(drift_t[1, r] if drift_t.ndim == 2 else drift_t[1, r, c])
+    src_r, src_c = r - dr, c - dc_off
+    H, W = cube_np.shape[:2]
+    r0 = max(0, min(int(np.floor(src_r)), H - 2))
+    c0 = max(0, min(int(np.floor(src_c)), W - 2))
+    fr, fc = src_r - r0, src_c - c0
+    dp = (
+        (1 - fr) * (1 - fc) * cube_np[r0,     c0    ].astype(np.float32)
+        + fr     * (1 - fc) * cube_np[r0 + 1, c0    ].astype(np.float32)
+        + (1 - fr) * fc     * cube_np[r0,     c0 + 1].astype(np.float32)
+        + fr     * fc       * cube_np[r0 + 1, c0 + 1].astype(np.float32)
+    )
+    return dp, (dr, dc_off)
+
+
+def view_corrected_dp(
+    dc: "DriftCorrection",
+    *,
+    scan_positions: list[tuple[int, int]] | tuple[int, int] | None = None,
+    image_index: int = 1,
+    show: bool = True,
+    cmap: str = "magma",
+    log_scale: bool = False,
+    **imshow_kwargs,
+):
+    """Sanity-check drift correction on one or more diffraction patterns.
+
+    For each scan position, pulls the raw DP and bilinear-samples the
+    drift-corrected DP. Confirms the learned drift shifts real DPs (not
+    noise) without paying for the full-cube warp.
+
+    Parameters
+    ----------
+    dc : DriftCorrection
+        Must be a paired-4DSTEM correction (raises otherwise).
+    scan_positions : (row, col), list of (row, col), or None
+        One or more scan-frame indices to probe. Defaults to the brightest
+        VDF pixel of the reference cube.
+    image_index : {0, 1}
+        Which cube to pull from (0 = reference, 1 = target).
+    show : bool
+        If True, plots VDF + raw + corrected + |diff| (one row per position).
+    cmap : str
+        matplotlib colormap (default 'magma').
+    log_scale : bool
+        Use log scale on DP panels (default False).
+    **imshow_kwargs
+        Forwarded to ``ax.imshow`` (e.g. vmin, vmax, interpolation).
+
+    Returns
+    -------
+    list of (dp_raw, dp_corrected, (dr, dc)) tuples, one per position.
+    """
+    if not dc.is_paired_4dstem:
+        raise RuntimeError(
+            "view_corrected_dp requires a paired 4D-STEM DriftCorrection.")
+    if dc._datasets_consumed or dc._datasets[image_index] is None:
+        raise RuntimeError(
+            f"Raw cube for image {image_index} was released. Construct a new "
+            f"DriftCorrection to view DPs.")
+
+    if scan_positions is None:
+        vdf_ref = np.asarray(dc.imgs[0].array)
+        r_pick, c_pick = map(int, np.unravel_index(int(vdf_ref.argmax()), vdf_ref.shape))
+        positions = [(r_pick, c_pick)]
+    elif isinstance(scan_positions, tuple) and len(scan_positions) == 2 and np.isscalar(scan_positions[0]):
+        positions = [(int(scan_positions[0]), int(scan_positions[1]))]
+    else:
+        positions = [(int(r), int(c)) for r, c in scan_positions]
+
+    target_cube = _cube_to_np(dc._datasets[image_index])
+    target_drift = dc.drift_field(image_index)
+    show_ref = image_index != 0 and dc._datasets[0] is not None
+    ref_cube = _cube_to_np(dc._datasets[0]) if show_ref else None
+    ref_drift = dc.drift_field(0) if show_ref else None
+
+    results = []
+    for r, c in positions:
+        dp_target, drift_offset = _sample_dp(target_cube, target_drift, r, c)
+        dp_ref = _sample_dp(ref_cube, ref_drift, r, c)[0] if show_ref else None
+        results.append((dp_ref, dp_target, drift_offset))
+
+    if show:
+        import matplotlib.pyplot as plt
+        import matplotlib.patheffects as path_effects
+        from matplotlib.colors import LogNorm
+        from quantem.imaging.drift_align import backward_warp
+        vdf_t = torch.as_tensor(dc.imgs_t[image_index], dtype=torch.float32,
+                                 device=dc._device)
+        vdf_corrected = backward_warp(vdf_t, drift=target_drift,
+                                       mode='bicubic').cpu().numpy()
+
+        n_rows = len(positions)
+        n_cols = 3 if show_ref else 2
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows),
+                                 squeeze=False)
+        for row_i, ((r_pick, c_pick), (dp_ref, dp_cor, (dr, dc_off))) in enumerate(zip(positions, results)):
+            src_r, src_c = r_pick - dr, c_pick - dc_off
+            dp_norm = LogNorm(vmin=max(dp_cor.min(), 1e-3)) if log_scale else None
+            ax_row = axes[row_i]
+            ax_row[0].imshow(vdf_corrected, cmap=cmap, **imshow_kwargs)
+            for j, (rj, cj) in enumerate(positions):
+                ax_row[0].scatter(cj, rj, s=140, marker='o', facecolors='red',
+                                   edgecolors='white', linewidths=1.5, zorder=5)
+                ax_row[0].annotate(f'P{j}', (cj, rj), color='white',
+                                    fontsize=10, ha='left', va='bottom',
+                                    xytext=(8, 4), textcoords='offset points',
+                                    path_effects=[path_effects.withStroke(
+                                        linewidth=2, foreground='black')])
+            ax_row[0].set_title(f'corrected VDF — P{row_i}=({r_pick},{c_pick})')
+            col = 1
+            if dp_ref is not None:
+                ax_row[col].imshow(dp_ref, cmap=cmap, norm=dp_norm, **imshow_kwargs)
+                ax_row[col].set_title(f'corrected DP image 0 at ({r_pick},{c_pick})')
+                col += 1
+            ax_row[col].imshow(dp_cor, cmap=cmap, norm=dp_norm, **imshow_kwargs)
+            ax_row[col].set_title(f'corrected DP image {image_index} at ({src_r:.1f},{src_c:.1f})')
+            for ax in ax_row:
+                ax.set_xticks([]); ax.set_yticks([])
+        plt.tight_layout()
+        plt.show()
+    return results if len(results) > 1 else results[0]

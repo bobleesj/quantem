@@ -1165,3 +1165,47 @@ def radially_project_fourier_tensor(
         array_1d = array_1d[0]
 
     return q_bins_out, array_1d
+
+
+def auto_zoom_to_peak(
+    image: np.ndarray,
+    size: int = 600,
+    peak_from: str = "profile",
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Crop a square window centered on the brightest feature.
+
+    Parameters
+    ----------
+    image : 2-D ndarray
+        Input image.
+    size : int, default 600
+        Side length of the cropped window in pixels (clamped to image size).
+    peak_from : ``"profile"`` or ``"pixel"``, default ``"profile"``
+        ``"profile"`` finds the brightest row + brightest column via mean
+        projections (robust to single-pixel hot pixels). ``"pixel"`` uses
+        ``argmax`` on the raw image.
+
+    Returns
+    -------
+    cropped : 2-D ndarray
+        ``image[r0:r0+size, c0:c0+size]``.
+    (r0, c0) : tuple of int
+        Top-left corner of the crop in original-image coordinates, useful
+        for cropping a sibling image identically.
+
+    Examples
+    --------
+    >>> raw_zoom, (r0, c0) = auto_zoom_to_peak(raw, size=600)
+    >>> corrected_zoom = corrected[r0:r0+600, c0:c0+600]
+    """
+    h, w = image.shape
+    size = min(size, h, w)
+    if peak_from == "profile":
+        r = int(image.mean(axis=1).argmax())
+        c = int(image.mean(axis=0).argmax())
+    else:
+        r, c = (int(x) for x in np.unravel_index(image.argmax(), image.shape))
+    half = size // 2
+    r0 = max(0, min(h - size, r - half))
+    c0 = max(0, min(w - size, c - half))
+    return image[r0:r0 + size, c0:c0 + size], (r0, c0)
