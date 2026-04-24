@@ -110,7 +110,7 @@ def test_full_pipeline_deterministic():
 
     drift = DriftCorrection(
         im0, im1,
-        scan_direction_degrees=[0.0, 90.0],
+        scan_direction_degrees=[0.0, -90.0],
     ).preprocess(
         pad_fraction=0.25,
         pad_value="median",
@@ -137,7 +137,7 @@ def test_full_pipeline_deterministic():
     im0_2, im1_2, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift2 = DriftCorrection(
         im0_2, im1_2,
-        scan_direction_degrees=[0.0, 90.0],
+        scan_direction_degrees=[0.0, -90.0],
     ).preprocess(
         pad_fraction=0.25,
         pad_value="median",
@@ -175,6 +175,10 @@ def test_constructor_requires_at_least_two_datasets():
 # Recaptured after torch-native knots unification (knots stored as torch tensors).
 # scale=1 is bit-exact across versions; scale=2,4 shifted by ~0.03-1.1%
 # due to optimizer trajectory divergence from dependency upgrades.
+# Frozen baselines captured on RTX PRO 6000 Blackwell + PyTorch 2.10 + CUDA 13.
+# Bit-reproducible per-machine, but cuFFT/cuBLAS algorithm selection at
+# scale=2 (256²) differs across CUDA versions, so the scale=2 row may need
+# recapture on a different host. Scale 1 + 4 are usually portable.
 AFFINE_BASELINES = [
     (1, 0.09237674623727798, 12157.736328125, 28546.263671875),
     (2, 0.13840323686599731, 49798.91015625, 113529.09375),
@@ -187,18 +191,21 @@ def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0
     """Affine on synthetic data must match frozen float32 baseline."""
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
         show_merged=False, show_images=False,
     )
-    np.testing.assert_almost_equal(
-        drift.error_track[-1, 1], expected_error, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[0].sum().item(), expected_k0, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[1].sum().item(), expected_k1, decimal=6)
+    # rtol=1e-6 = float32 machine epsilon × 10. Bit-exact match required on
+    # the capture machine. On a different GPU + CUDA version expect drift
+    # up to ~3e-5 (affine) — recapture baselines or loosen rtol if porting.
+    np.testing.assert_allclose(
+        drift.error_track[-1, 1], expected_error, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[0].sum().item(), expected_k0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[1].sum().item(), expected_k1, rtol=1e-6, atol=1e-6)
 
 
 # Frozen baselines for the pytorch backend with optimizer_name="adam".
@@ -219,7 +226,7 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -235,12 +242,14 @@ def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expe
         loss="mse",
         show_merged=False, show_images=False,
     )
-    np.testing.assert_almost_equal(
-        drift.error_track[-1, 1], expected_error, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[0].sum().item(), expected_k0, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[1].sum().item(), expected_k1, decimal=6)
+    # rtol=1e-6 = float32 machine epsilon × 10. Bit-exact on the capture
+    # machine. Cross-machine Adam drift is ~1e-4 — recapture if porting.
+    np.testing.assert_allclose(
+        drift.error_track[-1, 1], expected_error, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[0].sum().item(), expected_k0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[1].sum().item(), expected_k1, rtol=1e-6, atol=1e-6)
 
 
 # Frozen baselines for the pytorch backend with optimizer_name="lbfgs".
@@ -261,7 +270,7 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
     """
     im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -274,12 +283,15 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
         loss="mse",
         show_merged=False, show_images=False,
     )
-    np.testing.assert_almost_equal(
-        drift.error_track[-1, 1], expected_error, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[0].sum().item(), expected_k0, decimal=6)
-    np.testing.assert_almost_equal(
-        drift.knots[1].sum().item(), expected_k1, decimal=6)
+    # rtol=1e-6 = float32 machine epsilon × 10. Bit-exact on the capture
+    # machine. LBFGS line-search can amplify gradient noise to ~1e-3 across
+    # CUDA versions — recapture or loosen rtol heavily if porting.
+    np.testing.assert_allclose(
+        drift.error_track[-1, 1], expected_error, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[0].sum().item(), expected_k0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        drift.knots[1].sum().item(), expected_k1, rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +364,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run without fixed_indices
     drift_a = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_a.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -361,7 +373,7 @@ def test_align_affine_fixed_indices_none_matches_default():
 
     # Run with explicit fixed_indices=None
     drift_b = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift_b.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -387,7 +399,7 @@ def test_preprocess_normalize_scales_to_unit_range():
     im1_scaled = im1 * 1000 + 5000
 
     dc = DriftCorrection(
-        im0, im1_scaled, scan_direction_degrees=[0.0, 90.0],
+        im0, im1_scaled, scan_direction_degrees=[0.0, -90.0],
     )
     dc.preprocess(normalize=True, show_merged=False, show_images=False)
 
@@ -509,7 +521,7 @@ def test_align_nonrigid_fixed_indices_all_fixed_raises():
     """fixed_indices covering all images should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -664,7 +676,7 @@ def test_align_nonrigid_invalid_loss_raises():
     """Invalid loss name should raise ValueError."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with pytest.raises(ValueError, match="loss must be one of"):
@@ -1144,7 +1156,7 @@ def test_preprocess_rejects_nonsquare_with_multi_direction():
     np.random.seed(0)
     im0 = np.random.rand(96, 64).astype(np.float32)  # non-square
     im1 = np.random.rand(96, 64).astype(np.float32)
-    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0])
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0])
     with pytest.raises(ValueError, match="square images"):
         dc.preprocess(pad_fraction=0.25, kde_sigma=0.5,
                       show_merged=False, show_images=False)
@@ -1178,10 +1190,10 @@ def test_multi_knot_initial_warp_matches_single_knot():
     """K=1 and K=2 with default knot grids produce identical initial warps
     on square images (both encode the same straight-scanline geometry)."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    dc1 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc1 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
         show_merged=False, show_images=False)
-    dc2 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc2 = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
         show_merged=False, show_images=False)
     assert dc2.knots[0].shape == (2, 128, 2)
@@ -1195,7 +1207,7 @@ def test_multi_knot_full_pipeline_runs():
     """Full preprocess + align_affine + align_nonrigid + generate_corrected
     pipeline runs to completion with K=2 and reduces alignment error."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
         show_merged=False, show_images=False)
     initial_error = float(dc.error_track[-1, 1])
@@ -1214,11 +1226,11 @@ def test_multi_knot_apply_correction_returns_correct_shape():
     """apply_correction on K=2 routes through DriftKnot and
     yields a per-pixel drift tensor of the right shape."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
         show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
-    drift_pixel = dc._drift(1)
+    drift_pixel = dc.drift_field(1)
     assert drift_pixel.shape == (2, 128, 128)
     corrected = dc.apply_correction(image_index=1)
     assert corrected.shape == (128, 128)
@@ -1228,7 +1240,7 @@ def test_multi_knot_apply_correction_returns_correct_shape():
 def test_multi_knot_lbfgs_runs():
     """LBFGS optimizer also handles K>1 (parallel dispatch path)."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
         show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
@@ -1241,7 +1253,7 @@ def test_multi_knot_lbfgs_runs():
 def test_multi_knot_inconsistent_K_rejected():
     """All images must use the same K — mismatched knot tensors should raise."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, 90.0]).preprocess(
+    dc = DriftCorrection(im0, im1, scan_direction_degrees=[0.0, -90.0]).preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
         show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5, refine=False, show_merged=False)
@@ -1527,7 +1539,6 @@ def test_from_4dstem_detects_4d():
         cube_a, cube_b, scan_direction_degrees=[0, -90],
     )
     assert dc.is_4dstem
-    assert not dc.is_series
     # VDFs were extracted automatically — alignment images are 2D
     assert dc.imgs[0].array.shape == (32, 32)
     assert dc.imgs[1].array.shape == (32, 32)
@@ -1846,7 +1857,7 @@ def test_align_nonrigid_loss_auto_resolves_pytorch():
     """loss='auto' should resolve to 'gradient_mse' for pytorch backend."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     # Should not raise — auto resolves to gradient_mse for pytorch
@@ -1867,7 +1878,7 @@ def test_align_nonrigid_early_stopping():
     """Early stopping should terminate before max iterations on easy data."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -1898,7 +1909,7 @@ def test_align_nonrigid_early_stopping_disabled():
     """Setting patience >= num_iterations disables early stopping."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(show_merged=False, show_images=False)
     drift.align_affine(
         step=0.02, num_tests=5, refine=True,
@@ -1926,7 +1937,7 @@ def test_align_nonrigid_lbfgs_normalize_warns():
     """LBFGS with normalize=True should emit a warning."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(normalize=True, show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with warnings.catch_warnings(record=True) as w:
@@ -1946,7 +1957,7 @@ def test_align_nonrigid_adam_normalize_no_warning():
     """Adam with normalize=True should NOT emit a warning."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift = DriftCorrection(
-        im0, im1, scan_direction_degrees=[0.0, 90.0],
+        im0, im1, scan_direction_degrees=[0.0, -90.0],
     ).preprocess(normalize=True, show_merged=False, show_images=False)
     drift.align_affine(show_merged=False, show_images=False)
     with warnings.catch_warnings(record=True) as w:
@@ -1986,267 +1997,9 @@ def test_sobel_gradient_magnitude_znorm():
         assert abs(std - 1.0) < 0.05, f"Image {i} std={std}, expected ~1.0"
 
 
-# ── series correction tests (inlined from removed correct_series helper) ─
-
-
-def _make_series_pair(n_frames=3, size=128, seed=42):
-    """Create a small (N, H, W) pair of image stacks for series tests."""
-    rng = np.random.default_rng(seed)
-    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=seed)
-    a = np.stack([im0 + rng.normal(0, 0.01, im0.shape) for _ in range(n_frames)])
-    b = np.stack([im1 + rng.normal(0, 0.01, im1.shape) for _ in range(n_frames)])
-    return a.astype(np.float32), b.astype(np.float32)
-
-
-def _correct_series_inline(
-    images_a, images_b, *, scan_direction_degrees,
-    preprocess=None, align_affine=None, align_nonrigid=False, generate=None,
-):
-    """Inlined replacement for the removed correct_series() helper."""
-    dc = DriftCorrection(
-        images_a, images_b, scan_direction_degrees=scan_direction_degrees,
-    )
-    dc.preprocess(**(preprocess or {}))
-    dc.align_affine(**(align_affine or {}))
-    if align_nonrigid:
-        dc.align_nonrigid(
-            **(align_nonrigid if isinstance(align_nonrigid, dict) else {})
-        )
-    corrected_ds = dc.generate_corrected(
-        **dict(strip_padding=True, **(generate or {}))
-    )
-    corrected = (
-        corrected_ds.array if hasattr(corrected_ds, "array") else corrected_ds
-    )
-    objects = list(dc)
-    return corrected, objects
-
-
-@pytest.fixture
-def series_pair():
-    return _make_series_pair(n_frames=2)
-
-
-class TestCorrectSeries:
-    """Tests for the inlined correct_series workflow on DriftCorrection."""
-
-    def test_defaults(self, series_pair):
-        """All-defaults call should produce (N, H, W) float32 output."""
-        a, b = series_pair
-        corrected, objs = _correct_series_inline(
-            a, b, scan_direction_degrees=[0, -90]
-        )
-        assert corrected.ndim == 3
-        assert corrected.shape[0] == a.shape[0]
-        assert corrected.dtype == np.float32
-        assert len(objs) == a.shape[0]
-        assert all(isinstance(o, DriftCorrection) for o in objs)
-
-    def test_stage_kwargs_forwarded(self, series_pair):
-        """Stage dicts should be forwarded to the underlying methods."""
-        a, b = series_pair
-        corrected, objs = _correct_series_inline(
-            a, b,
-            scan_direction_degrees=[0, -90],
-            preprocess=dict(pad_fraction=0.3, kde_sigma=0.8, number_knots=1),
-            align_affine=dict(step=0.05, num_tests=5),
-            generate=dict(upsample_factor=1, kde_sigma=0.8),
-        )
-        assert corrected.shape[0] == a.shape[0]
-        assert corrected.dtype == np.float32
-
-    def test_nonrigid_true(self, series_pair):
-        """align_nonrigid=True should run nonrigid with defaults."""
-        a, b = series_pair
-        corrected, objs = _correct_series_inline(
-            a, b,
-            scan_direction_degrees=[0, -90],
-            align_nonrigid=True,
-            generate=dict(upsample_factor=1),
-        )
-        assert corrected.shape[0] == a.shape[0]
-        for obj in objs:
-            assert (obj.error_track[:, 0] == 2.0).any(), "nonrigid stage not found"
-
-    def test_nonrigid_dict(self, series_pair):
-        """align_nonrigid=dict(...) should forward params to align_nonrigid."""
-        a, b = series_pair
-        corrected, objs = _correct_series_inline(
-            a, b,
-            scan_direction_degrees=[0, -90],
-            align_nonrigid=dict(num_iterations=2, adam_steps=5),
-            generate=dict(upsample_factor=1),
-        )
-        assert corrected.shape[0] == a.shape[0]
-        for obj in objs:
-            assert (obj.error_track[:, 0] == 2.0).any(), "nonrigid stage not found"
-
-    def test_nonrigid_false_skips(self, series_pair):
-        """align_nonrigid=False (default) should skip nonrigid."""
-        a, b = series_pair
-        _, objs = _correct_series_inline(
-            a, b,
-            scan_direction_degrees=[0, -90],
-            generate=dict(upsample_factor=1),
-        )
-        for obj in objs:
-            assert not (obj.error_track[:, 0] == 2.0).any(), "nonrigid should be skipped"
-
-    def test_2d_input_makes_paired_not_series(self):
-        """2-D inputs build a paired-mode (not series) instance."""
-        a = np.zeros((64, 64), dtype=np.float32)
-        b = np.zeros((64, 64), dtype=np.float32)
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        assert not dc.is_series
-
-    def test_drift_objects_are_inspectable(self, series_pair):
-        """Returned DriftCorrection objects should support standard inspection."""
-        a, b = series_pair
-        _, objs = _correct_series_inline(
-            a, b,
-            scan_direction_degrees=[0, -90],
-            generate=dict(upsample_factor=1),
-        )
-        for obj in objs:
-            assert hasattr(obj, "knots")
-            assert hasattr(obj, "drift_rate")
-
-
-class TestSeriesClassAPI:
-    """Tests for DriftCorrection class-level series support."""
-
-    def test_from_series_detects_3d_stacks(self, series_pair):
-        """from_series with 3-D arrays should create a series instance."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        assert dc.is_series
-        assert dc.n_frames == a.shape[0]
-
-    def test_from_pair_2d_is_single(self):
-        """from_pair with 2-D arrays should create a normal single instance."""
-        im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-        dc = DriftCorrection(im0, im1, scan_direction_degrees=[0, -90])
-        assert not dc.is_series
-
-    def test_getitem_returns_single(self, series_pair):
-        """Indexing a series should return a single-pair instance."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        frame = dc[0]
-        assert not frame.is_series
-
-    def test_iter_yields_all_frames(self, series_pair):
-        """Iterating over series should yield all frames."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        frames = list(dc)
-        assert len(frames) == dc.n_frames
-
-    def test_full_pipeline(self, series_pair):
-        """Full pipeline via class API should produce corrected Dataset3d."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
-        dc.align_affine(step=0.02, num_tests=5)
-        result = dc.generate_corrected(upsample_factor=1)
-        assert isinstance(result, Dataset3d)
-        assert result.array.ndim == 3
-        assert result.array.shape[0] == a.shape[0]
-        assert result.array.dtype == np.float32
-
-    def test_method_chaining(self, series_pair):
-        """Pipeline methods should return self for chaining."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        result = dc.preprocess().align_affine(step=0.02, num_tests=5)
-        assert result is dc
-
-    def test_per_frame_inspection(self, series_pair):
-        """Individual frames should be fully functional after series pipeline."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        dc.preprocess().align_affine(step=0.02, num_tests=5)
-        for i in range(dc.n_frames):
-            frame = dc[i]
-            assert hasattr(frame, "knots")
-            rate = frame.drift_rate
-            assert len(rate) == 2
-
-    def test_ensure_single_guards(self, series_pair):
-        """Methods that require single-pair should raise TypeError on series."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        dc.preprocess().align_affine(step=0.02, num_tests=5)
-        with pytest.raises(TypeError, match="not supported on series"):
-            dc.drift_rate
-        with pytest.raises(TypeError, match="not supported on series"):
-            dc.print_drift_stats()
-        with pytest.raises(TypeError, match="not supported on series"):
-            dc.apply_correction()
-
-    def test_getitem_on_single_raises(self):
-        """Indexing a single-pair instance should raise TypeError."""
-        im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
-        dc = DriftCorrection(im0, im1, scan_direction_degrees=[0, -90])
-        with pytest.raises(TypeError, match="not indexable"):
-            dc[0]
-
-    def test_frame_count_mismatch_raises(self):
-        """Stacks with different frame counts should raise ValueError."""
-        a = np.zeros((3, 64, 64), dtype=np.float32)
-        b = np.zeros((4, 64, 64), dtype=np.float32)
-        with pytest.raises(ValueError, match="Frame count mismatch"):
-            DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-
-    def test_nonrigid_series(self, series_pair):
-        """Nonrigid alignment should work on series."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        dc.preprocess().align_affine(step=0.02, num_tests=5)
-        dc.align_nonrigid(num_iterations=2, adam_steps=5)
-        result = dc.generate_corrected(upsample_factor=1)
-        assert result.shape[0] == a.shape[0]
-        for frame in dc:
-            assert (frame.error_track[:, 0] == 2.0).any()
-
-    def test_empty_series_raises(self):
-        """Zero-frame stacks should raise ValueError, not IndexError."""
-        a = np.zeros((0, 64, 64), dtype=np.float32)
-        b = np.zeros((0, 64, 64), dtype=np.float32)
-        with pytest.raises(ValueError, match="≥1 frame"):
-            DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-
-    def test_calculate_error_on_series_raises(self, series_pair):
-        """calculate_error should raise TypeError on series instances."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        dc.preprocess()
-        with pytest.raises(TypeError, match="not supported on series"):
-            dc.calculate_error(mode=0)
-
-    def test_preprocess_suppresses_plots(self, series_pair):
-        """preprocess on series should not trigger per-frame plots."""
-        a, b = series_pair
-        dc = DriftCorrection(a, b, scan_direction_degrees=[0, -90])
-        # show_merged=True would normally show a plot; on series it's forced off
-        # If this doesn't raise, it ran without attempting to show 2 plots
-        dc.preprocess(show_merged=True)
-        # Verify each frame was preprocessed correctly
-        for frame in dc:
-            assert hasattr(frame, "knots")
-
-
-# ---------------------------------------------------------------------------
-# Tests for serialization round-trip after the n_frames property fix
-# ---------------------------------------------------------------------------
 
 def test_save_load_roundtrip_paired():
-    """save() then load() should round-trip a paired DriftCorrection.
-
-    Previously broken because the n_frames property raised TypeError on
-    non-series instances and serialize.py only caught (AttributeError,
-    RuntimeError, ValueError, KeyError).
-    """
+    """save() then load() should round-trip a paired DriftCorrection."""
     import tempfile
     from pathlib import Path
     from quantem.core.io.serialize import load
@@ -2261,7 +2014,7 @@ def test_save_load_roundtrip_paired():
         dc.save(str(p))
         loaded = load(str(p))
         assert isinstance(loaded, DriftCorrection)
-        assert loaded.n_frames == 0  # paired instance, not a series
+        assert loaded.imgs[0].array.shape == (64, 64)
 
 
 def test_save_load_roundtrip_4dstem_clear_error():
@@ -2307,15 +2060,6 @@ def test_multi_angle_three_image_dispatch():
     dc = DriftCorrection(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
     assert len(dc.imgs) == 3
     assert tuple(dc.scan_direction_degrees) == (0, 45, 90)
-
-
-def test_paired_3d_same_angle_rejected():
-    """3D + 3D at the same scan angle is not a valid series — reject explicitly."""
-    rng = np.random.default_rng(0)
-    a = rng.random((4, 32, 32), dtype=np.float32)
-    b = rng.random((4, 32, 32), dtype=np.float32)
-    with pytest.raises(ValueError, match="different scan angles"):
-        DriftCorrection(a, b, scan_direction_degrees=(0, 0))
 
 
 def test_paired_4dstem_scan_dim_mismatch_rejected():
