@@ -1,22 +1,19 @@
-"""Dataset-path drift correction: ≥3-D inputs with scan axes leading.
+"""4-D STEM drift correction (and 3-D spectral cube path).
 
 The image-pair pipeline lives in :mod:`drift`; this module owns the
-bigger hammer for *any* dataset shape with ``(scan_h, scan_w, …channels)``
-layout:
+bigger hammer for any dataset shape with ``(scan_h, scan_w, …channels)``
+layout — primarily 4-D STEM ``(H, W, det_h, det_w)``, also 3-D spectral
+cubes ``(H, W, n_energy)`` from EDS / EELS. Both go through the same
+shape-agnostic ``apply_correction_to_dataset`` loop (chunked GPU
+``grid_sample`` with pre-allocated memmap output).
 
-* **3-D spectral cubes** (EDS / EELS) — ``(H, W, n_energy)``.
-* **4-D STEM** scans — ``(H, W, det_h, det_w)``.
+The 4-D STEM-specific helpers — ``compute_vdf``, ``view_corrected_dp``,
+``view_corrected_vdfs``, the paired merge ``generate_corrected_paired_datasets``,
+and the :class:`PairedCorrectionResult` container — live here.
 
-Both go through the same shape-agnostic ``apply_correction_to_dataset``
-loop (chunked GPU ``grid_sample`` with pre-allocated memmap output).
-The 4-D STEM-specific helpers — ``compute_vdf``, the paired merge
-``generate_corrected_paired_datasets``, and the
-:class:`PairedCorrectionResult` container — live alongside because they
-share the dataset-shape concern.
-
-Functions here take an already-built :class:`DriftCorrection` as their
-first argument (``dc``) so :class:`drift.DriftCorrection` stays focused
-on the algorithm story.
+Functions take an already-built :class:`DriftCorrection` as their first
+argument (``dc``) so :class:`drift.DriftCorrection` stays focused on the
+algorithm story.
 """
 from __future__ import annotations
 
@@ -446,7 +443,7 @@ def view_corrected_vdfs(
     *,
     image_index: int = 1,
     df_inner_factor: float = 1.5,
-    chunk_rows: int = 32,
+    chunk_rows: int = 16,
     show: bool = True,
     cmap: str = "magma",
     **imshow_kwargs,
@@ -475,32 +472,45 @@ def view_corrected_vdfs(
     from quantem.core.utils.diffractive_imaging_utils import fit_probe_circle
     from quantem.imaging.drift_align import backward_warp
 
-    cube = dc._datasets[image_index]
-    if not isinstance(cube, torch.Tensor):
-        cube = torch.as_tensor(cube, device=dc._device)
+    ds = dc._datasets[image_index]
+    if not isinstance(ds, torch.Tensor):
+        ds = torch.as_tensor(ds, device=dc._device)
 
-    H, W, det_h, det_w = cube.shape
-    mean_dp = cube.float().mean(dim=(0, 1))
-    yc, xc, radius = fit_probe_circle(mean_dp.cpu().numpy(), show=False)
+    H, W, det_h, det_w = ds.shape
+    ds_flat = ds.view(H, W, det_h * det_w)
+
+    # Stream the mean DP and the BF/DF VDFs in one chunked pass over scan rows.
+    # Single int64 promote per chunk avoids the 72 GB transient that
+    # ds.sum(dtype=int64) would allocate up front.
+    mean_dp_acc = torch.zeros(det_h * det_w, dtype=torch.int64, device=ds.device)
+    bf_vdf = torch.zeros(H, W, dtype=torch.float32, device=ds.device)
+    df_vdf = torch.zeros_like(bf_vdf)
 
     yy, xx = torch.meshgrid(
-        torch.arange(det_h, device=cube.device, dtype=torch.float32),
-        torch.arange(det_w, device=cube.device, dtype=torch.float32),
+        torch.arange(det_h, device=ds.device, dtype=torch.float32),
+        torch.arange(det_w, device=ds.device, dtype=torch.float32),
         indexing='ij',
     )
+    # Need probe geometry before per-chunk masking, but probe fit needs the
+    # mean DP, so do mean DP in pass 1 then VDFs in pass 2.
+    for r0 in range(0, H, chunk_rows):
+        r1 = min(r0 + chunk_rows, H)
+        mean_dp_acc += ds_flat[r0:r1].to(torch.int64).sum(dim=(0, 1))
+    mean_dp = (mean_dp_acc.view(det_h, det_w).float() / (H * W))
+    yc, xc, radius = fit_probe_circle(mean_dp.cpu().numpy(), show=False)
+
     r_sq = (yy - yc) ** 2 + (xx - xc) ** 2
     bf_idx = (r_sq < radius ** 2).flatten().nonzero().squeeze(-1)
     df_idx = (r_sq > (df_inner_factor * radius) ** 2).flatten().nonzero().squeeze(-1)
 
-    cube_flat = cube.view(H, W, det_h * det_w)
-    bf_vdf = torch.zeros(H, W, device=cube.device, dtype=torch.float32)
-    df_vdf = torch.zeros_like(bf_vdf)
     for r0 in range(0, H, chunk_rows):
         r1 = min(r0 + chunk_rows, H)
-        chunk = cube_flat[r0:r1].to(torch.int64)
+        chunk = ds_flat[r0:r1].to(torch.int64)
         bf_vdf[r0:r1] = chunk[..., bf_idx].sum(dim=-1).float()
         df_vdf[r0:r1] = chunk[..., df_idx].sum(dim=-1).float()
 
+    bf_raw = bf_vdf.cpu().numpy()
+    df_raw = df_vdf.cpu().numpy()
     drift = dc.drift_field(image_index)
     bf_corrected = backward_warp(bf_vdf, drift=drift, mode='bicubic').cpu().numpy()
     df_corrected = backward_warp(df_vdf, drift=drift, mode='bicubic').cpu().numpy()
@@ -508,7 +518,7 @@ def view_corrected_vdfs(
     if show:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Circle
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
         axes[0].imshow(mean_dp.cpu().numpy(), cmap=cmap, **imshow_kwargs)
         axes[0].add_patch(Circle((xc, yc), radius, fc='none', ec='cyan', lw=2,
                                   label=f'BF R={radius:.1f}'))
@@ -517,10 +527,14 @@ def view_corrected_vdfs(
                                   label=f'DF inner {df_inner_factor}R'))
         axes[0].set_title(f'mean DP — probe R={radius:.1f}px')
         axes[0].legend(loc='upper right', fontsize=8)
-        axes[1].imshow(bf_corrected, cmap=cmap, **imshow_kwargs)
-        axes[1].set_title('corrected BF')
-        axes[2].imshow(df_corrected, cmap=cmap, **imshow_kwargs)
-        axes[2].set_title(f'corrected DF (r > {df_inner_factor}R)')
+        axes[1].imshow(bf_raw, cmap=cmap, **imshow_kwargs)
+        axes[1].set_title(f'BF uncorrected (image {image_index})')
+        axes[2].imshow(bf_corrected, cmap=cmap, **imshow_kwargs)
+        axes[2].set_title(f'BF corrected (image {image_index})')
+        axes[3].imshow(df_raw, cmap=cmap, **imshow_kwargs)
+        axes[3].set_title(f'DF uncorrected (r > {df_inner_factor}R)')
+        axes[4].imshow(df_corrected, cmap=cmap, **imshow_kwargs)
+        axes[4].set_title(f'DF corrected (r > {df_inner_factor}R)')
         for ax in axes:
             ax.set_xticks([]); ax.set_yticks([])
         plt.tight_layout()

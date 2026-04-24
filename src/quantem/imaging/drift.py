@@ -29,7 +29,7 @@ from quantem.imaging.drift_align import (
     cross_corr_batch,
     translate_align,
 )
-import quantem.imaging.drift_3d_4dstem as _3d_4dstem
+import quantem.imaging.drift_4dstem as _4dstem
 import quantem.imaging.drift_optimize as _optimize
 import quantem.imaging.drift_visualization as drift_visualization
 
@@ -55,10 +55,10 @@ def _as_array(x):
         f"Dataset2d.from_file(path) (or Dataset4d.from_file) first.")
 
 
-# PairedCorrectionResult lives in drift_3d_4dstem so the dataset-shaped
+# PairedCorrectionResult lives in drift_4dstem so the dataset-shaped
 # concerns stay together; re-exported for backward compat with users who
 # import it from here.
-from quantem.imaging.drift_3d_4dstem import PairedCorrectionResult  # noqa: E402, F401
+from quantem.imaging.drift_4dstem import PairedCorrectionResult  # noqa: E402, F401
 
 
 def _distance_transform_edt_torch(mask: torch.Tensor) -> torch.Tensor:
@@ -1815,7 +1815,7 @@ class DriftCorrection(AutoSerialize):
         drift = self.drift_field(idx)
         return backward_warp(data_t, drift=drift, mode=mode)
 
-    # 4D-STEM dataset path: implementations live in drift_3d_4dstem.py so the
+    # 4D-STEM dataset path: implementations live in drift_4dstem.py so the
     # orchestrator stays focused on the image pipeline.  These methods are
     # thin delegators that preserve the existing call sites.
 
@@ -1824,16 +1824,16 @@ class DriftCorrection(AutoSerialize):
         ds_4d: np.ndarray,
         chunk_rows: int | None = None,
     ) -> np.ndarray:
-        """Virtual dark-field from a 4D-STEM dataset (delegates to drift_3d_4dstem)."""
-        return _3d_4dstem.compute_vdf(ds_4d, chunk_rows)
+        """Virtual dark-field from a 4D-STEM dataset (delegates to drift_4dstem)."""
+        return _4dstem.compute_vdf(ds_4d, chunk_rows)
 
     def _apply_correction_to_dataset(self, *args, **kwargs):
-        """Delegates the ≥3-D dataset path to :mod:`drift_3d_4dstem`."""
-        return _3d_4dstem.apply_correction_to_dataset(self, *args, **kwargs)
+        """Delegates the ≥3-D dataset path to :mod:`drift_4dstem`."""
+        return _4dstem.apply_correction_to_dataset(self, *args, **kwargs)
 
     def _generate_corrected_paired_datasets(self, **kwargs) -> PairedCorrectionResult:
-        """Delegates the paired 4D-STEM merge to :mod:`drift_3d_4dstem`."""
-        return _3d_4dstem.generate_corrected_paired_datasets(self, **kwargs)
+        """Delegates the paired 4D-STEM merge to :mod:`drift_4dstem`."""
+        return _4dstem.generate_corrected_paired_datasets(self, **kwargs)
 
     # -- serialization -------------------------------------------------------
 
@@ -1926,8 +1926,8 @@ class DriftCorrection(AutoSerialize):
     plot_merged_images = drift_visualization.plot_merged_images
     plot_knots = drift_visualization.plot_knots
     plot_diffraction = drift_visualization.plot_4dstem_correction
-    view_corrected_dp = _3d_4dstem.view_corrected_dp
-    view_corrected_vdfs = _3d_4dstem.view_corrected_vdfs
+    view_corrected_dp = _4dstem.view_corrected_dp
+    view_corrected_vdfs = _4dstem.view_corrected_vdfs
 
 
 def _bounded_sine_sigmoid_torch(x: torch.Tensor, midpoint: float = 0.5,
