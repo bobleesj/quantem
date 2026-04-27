@@ -1,7 +1,7 @@
 """Alignment primitives: cross-correlation translation + backward resampling.
 
 The fused torch operations drift correction relies on AFTER the knot's
-forward warp has put paired images on the same canvas.  Forward warping
+forward warp has put scan images on the same canvas.  Forward warping
 itself lives with the knot in :mod:`drift_knot`; this module is what
 runs once the warped images need to be aligned and the learned drift
 needs to be applied to raw data.

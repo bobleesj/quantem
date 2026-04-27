@@ -12,11 +12,19 @@ import warnings
 import matplotlib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter, map_coordinates
+import quantem.imaging as imaging
+import quantem.imaging.drift as drift_module
+import quantem.imaging.drift_4dstem as drift_4dstem_module
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.imaging.drift import (
     DriftCorrection,
-    PairedCorrectionResult,
+    CorrectionResult,
+)
+from quantem.imaging.drift_visualization import (
+    center_crop,
+    fft_log_magnitude,
+    normalized_cross_correlation,
 )
 
 
@@ -863,6 +871,14 @@ def test_plot_correction_summary_runs():
     )
     assert fig3 is not None
 
+    # Raw-merge column used to leave the diff row with the wrong number of
+    # axes; keep this visual notebook path covered.
+    fig4, axs4 = dc.plot_correction_summary(
+        show_fft=False, show_diff=True, show_raw_merge=True,
+    )
+    assert fig4 is not None
+    assert axs4.shape == (2, 4)
+
     plt.close("all")
 
 
@@ -958,6 +974,33 @@ def test_plot_radial_power_custom_methods():
     assert len(ax.get_lines()) == 2
 
     plt.close("all")
+
+
+def test_drift_visualization_image_helpers():
+    """Notebook helpers should live in drift visualization utilities."""
+    image = np.arange(6 * 8, dtype=np.float32).reshape(6, 8)
+    cropped = center_crop(image, (4, 4))
+    np.testing.assert_array_equal(cropped, image[1:5, 2:6])
+
+    cube = np.zeros((6, 8, 2), dtype=np.float32)
+    cube[..., 0] = image
+    cube_crop = center_crop(cube, (4, 4))
+    assert cube_crop.shape == (4, 4, 2)
+    np.testing.assert_array_equal(cube_crop[..., 0], cropped)
+
+    fft = fft_log_magnitude(cropped)
+    assert fft.shape == cropped.shape
+    assert np.isfinite(fft).all()
+
+    rotated_view = np.rot90(image)
+    assert any(stride < 0 for stride in rotated_view.strides)
+    fft_rotated = fft_log_magnitude(rotated_view)
+    assert fft_rotated.shape == rotated_view.shape
+    assert np.isfinite(fft_rotated).all()
+
+    assert normalized_cross_correlation(image, image, margin=1) > 0.999
+    shifted = image + 10.0
+    assert normalized_cross_correlation(image, shifted, crop_shape=(4, 4)) > 0.999
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1151,7 +1194,7 @@ def test_apply_correction_integer_input():
 
 
 def test_preprocess_rejects_nonsquare_with_multi_direction():
-    """Multi-direction paired scans require square images (the canvas geometry
+    """Multi-direction scan collection require square images (the canvas geometry
     assumes a single scanline length)."""
     np.random.seed(0)
     im0 = np.random.rand(96, 64).astype(np.float32)  # non-square
@@ -1385,8 +1428,8 @@ def test_apply_correction_output_dtype_same():
     assert result.shape == cube_u16.shape
 
 
-def test_apply_correction_matches_apply_correction_paired():
-    """apply_correction and apply_correction agree for paired 0/90° scans."""
+def test_apply_correction_matches_apply_correction_scan_collection():
+    """apply_correction and apply_correction agree for 0/90° scans."""
     im0, im1, _ = make_synthetic_drift_data()
     dc = DriftCorrection(
         im0, im1,
@@ -1512,8 +1555,8 @@ def test_compute_vdf_3d():
 #   4D-STEM class integration tests (from_4dstem with 4D cubes)
 # ═════════════════════════════════════════════════════════════════════════
 
-def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
-    """Create small synthetic paired 4D cubes for testing.
+def _make_4dstem_collection(scan_size=32, det_size=8, seed=42):
+    """Create small synthetic 4D cubes for testing.
 
     Returns (cube_0deg, cube_90deg) each with shape
     ``(scan_size, scan_size, det_size, det_size)`` where the first two
@@ -1532,11 +1575,83 @@ def _make_paired_4d_cubes(scan_size=32, det_size=8, seed=42):
     return cube_a, cube_b
 
 
+def _best_rot90_by_ncc(reference, moving, candidates):
+    """Pick the quarter-turn that best aligns ``moving`` to ``reference``."""
+    ref = reference.astype(np.float32)
+    ref = ref - ref.mean()
+    ref_norm = np.linalg.norm(ref)
+    best_k, best_score = None, -np.inf
+    for k in candidates:
+        cand = np.rot90(moving, k=k).astype(np.float32)
+        cand = cand - cand.mean()
+        score = float((ref * cand).sum() / (ref_norm * np.linalg.norm(cand) + 1e-12))
+        if score > best_score:
+            best_k, best_score = k, score
+    return best_k
+
+
+def _make_detector_template(det_size):
+    """Small structured diffraction pattern used to lift 2-D scans to 4-D."""
+    det_center = det_size / 2
+    rr, cc = np.meshgrid(
+        np.arange(det_size, dtype=np.float32) - det_center,
+        np.arange(det_size, dtype=np.float32) - det_center,
+        indexing="ij",
+    )
+    radius = np.sqrt(rr**2 + cc**2)
+    template = np.where(radius < det_size / 8, 1.0, 0.05).astype(np.float32)
+    for theta in np.linspace(0, 2 * np.pi, 6, endpoint=False):
+        row0 = (det_size / 3) * np.sin(theta)
+        col0 = (det_size / 3) * np.cos(theta)
+        template += 0.4 * np.exp(-((rr - row0) ** 2 + (cc - col0) ** 2) / 4)
+    return template.astype(np.float32)
+
+
+def _lift_to_4dstem(scan_image, detector_template):
+    return (
+        scan_image.astype(np.float32)[:, :, None, None]
+        * detector_template[None, None, :, :]
+    ).astype(np.float32)
+
+
+def _annular_vdf_mask(det_size, inner_fraction=0.25):
+    center = det_size // 2
+    rr, cc = np.meshgrid(
+        np.arange(det_size) - center,
+        np.arange(det_size) - center,
+        indexing="ij",
+    )
+    return rr**2 + cc**2 > (inner_fraction * det_size) ** 2
+
+
+def _masked_vdf(cube, mask):
+    return cube[:, :, mask].sum(axis=-1).astype(np.float32)
+
+
+def _aligned_ncc(reference, candidate, margin=12):
+    """Integer-shift align ``candidate`` to ``reference`` and NCC the interior."""
+    ref_z = reference - reference.mean()
+    cand_z = candidate - candidate.mean()
+    cross_corr = np.fft.fftshift(
+        np.real(np.fft.ifft2(np.fft.fft2(ref_z) * np.conj(np.fft.fft2(cand_z))))
+    )
+    peak_row, peak_col = np.unravel_index(int(np.argmax(cross_corr)), cross_corr.shape)
+    row_shift = peak_row - reference.shape[0] // 2
+    col_shift = peak_col - reference.shape[1] // 2
+    aligned = np.roll(candidate, (row_shift, col_shift), axis=(0, 1))
+    s = slice(margin, -margin)
+    ref_crop = reference[s, s].astype(np.float32)
+    aligned_crop = aligned[s, s].astype(np.float32)
+    ref_crop = (ref_crop - ref_crop.mean()) / (ref_crop.std() + 1e-8)
+    aligned_crop = (aligned_crop - aligned_crop.mean()) / (aligned_crop.std() + 1e-8)
+    return float((ref_crop * aligned_crop).mean())
+
+
 def test_from_4dstem_detects_4d():
     """from_4dstem with 4D arrays creates a 4D-STEM instance."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     assert dc.is_4dstem
     # VDFs were extracted automatically — alignment images are 2D
@@ -1544,23 +1659,24 @@ def test_from_4dstem_detects_4d():
     assert dc.imgs[1].array.shape == (32, 32)
 
 
-def test_from_pair_4dstem_bad_rotation_early():
-    """Non-multiple-of-90° angles are rejected for paired 4-D inputs."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    with pytest.raises(ValueError, match="multiple-of-90"):
-        DriftCorrection(
-            cube_a, cube_b, scan_direction_degrees=[0, -45],
-        )
-
-
-def test_from_pair_4dstem_alignment_image_rejected_in_paired_mode():
-    """alignment_image= is only valid in reference mode, not paired 4D-STEM."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+def test_from_images_4dstem_alignment_image_rejected_in_scan_collection_mode():
+    """alignment_image= is only valid in reference mode, not 4D-STEM collection."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     custom_vdf = cube_a[:, :, 0, 0].copy()
     with pytest.raises(TypeError, match="only meaningful in reference mode"):
         DriftCorrection(
-            cube_a, cube_b, scan_direction_degrees=[0, -90],
+            cube_a, cube_b, scan_direction_degrees=[0, 90],
             alignment_image=custom_vdf,
+        )
+
+
+@pytest.mark.parametrize("scan_direction_degrees", ([0, 0], [0, 180], [13, 103], [0.5, 90.5]))
+def test_from_4dstem_requires_orthogonal_scan_directions(scan_direction_degrees):
+    """4D-STEM collection is specifically for 0/90 scan pairs."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    with pytest.raises(ValueError, match="0/90"):
+        DriftCorrection.from_4dstem(
+            cube_a, cube_b, scan_direction_degrees=scan_direction_degrees,
         )
 
 
@@ -1583,7 +1699,8 @@ def _make_reference_pair(scan_h=64, det_size=4, kind="3d", seed=0):
 def test_from_reference_3d_eds_returns_dataset3d():
     """from_reference + 3-D drifted → generate_corrected returns Dataset3d."""
     ref, eds = _make_reference_pair(scan_h=32, det_size=4, kind="3d")
-    dc = DriftCorrection(ref, eds)
+    dc = DriftCorrection.from_reference(ref, eds)
+    assert dc._reference_mode
     dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
                   show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5,
@@ -1597,7 +1714,8 @@ def test_from_reference_4d_stem_returns_dataset4d():
     """from_reference + 4-D drifted → generate_corrected returns Dataset4d."""
     from quantem.core.datastructures.dataset4d import Dataset4d
     ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
-    dc = DriftCorrection(ref, cube)
+    dc = DriftCorrection.from_reference(ref, cube)
+    assert dc._reference_mode
     dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
                   show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5,
@@ -1612,7 +1730,8 @@ def test_from_reference_2d_returns_dataset2d():
 
     Same scan angle (0, 0) signals reference mode rather than orthogonal pair."""
     ref, drifted = _make_reference_pair(scan_h=32, kind="2d")
-    dc = DriftCorrection(ref, drifted, scan_direction_degrees=0)
+    dc = DriftCorrection.from_reference(ref, drifted)
+    assert dc._reference_mode
     dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
                   show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5,
@@ -1626,13 +1745,17 @@ def test_from_reference_auto_anchors_reference():
     """In reference mode, align_affine and align_nonrigid auto-set
     fixed_indices=[0] so reference knots stay anchored."""
     ref, eds = _make_reference_pair(scan_h=32, det_size=4, kind="3d")
-    dc = DriftCorrection(ref, eds)
+    dc = DriftCorrection.from_reference(ref, eds)
     dc.preprocess(normalize=True, kde_sigma=0.5, number_knots=1,
                   show_merged=False, show_images=False)
     knots_ref_initial = dc._initial_knots[0].clone()
     dc.align_affine(step=0.02, num_tests=5,
                     show_merged=False, show_images=False)
     # Reference image (idx 0) should be unchanged after affine.
+    assert torch.allclose(dc.knots[0], knots_ref_initial, atol=1e-6)
+    dc.align_nonrigid(num_iterations=1, adam_steps=5,
+                      show_merged=False, show_images=False)
+    # Reference image (idx 0) should also stay anchored after nonrigid.
     assert torch.allclose(dc.knots[0], knots_ref_initial, atol=1e-6)
 
 
@@ -1641,22 +1764,31 @@ def test_from_reference_shape_mismatch_raises():
     ref = np.zeros((32, 32), dtype=np.float32)
     drifted = np.zeros((40, 32, 4), dtype=np.float32)
     with pytest.raises(ValueError, match="leading two axes"):
-        DriftCorrection(ref, drifted)
+        DriftCorrection.from_reference(ref, drifted)
 
 
 def test_from_reference_alignment_image_override():
     """alignment_image= bypasses the auto VDF computation."""
     ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
     custom_vdf = np.ones((32, 32), dtype=np.float32) * 0.5
-    dc = DriftCorrection(ref, cube, alignment_image=custom_vdf)
+    dc = DriftCorrection.from_reference(ref, cube, alignment_image=custom_vdf)
     np.testing.assert_array_equal(dc.imgs[1].array, custom_vdf)
 
 
+def test_from_reference_rejects_ambiguous_2d_pair_scan_angles():
+    """The named reference factory must not silently create image collection mode."""
+    ref, drifted = _make_reference_pair(scan_h=32, kind="2d")
+    with pytest.raises(ValueError, match="unambiguously single-sided"):
+        DriftCorrection.from_reference(
+            ref, drifted, scan_direction_degrees=(0.0, 90.0),
+        )
+
+
 def test_generate_corrected_basic():
-    """Full pipeline: from_4dstem → preprocess → align → generate_corrected."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    """Full pipeline: from_4dstem → preprocess → align → explicit scan collection correction."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1666,24 +1798,252 @@ def test_generate_corrected_basic():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    result = dc.generate_corrected()
+    result = dc.generate_corrected_4dstem()
 
-    assert isinstance(result, PairedCorrectionResult)
-    assert result.merged is not None
-    assert result.merged.shape == cube_a.shape
-    assert result.merged.dtype == np.float32
-    assert result.corrected_a.shape == cube_a.shape
-    assert result.corrected_b.shape == cube_a.shape
+    assert isinstance(result, CorrectionResult)
+    assert result.corrected_4dstem is not None
+    assert result.corrected_4dstem.shape == cube_a.shape
+    assert result.corrected_4dstem.dtype == np.float32
+    assert result.corrected_4dstem_0.shape == cube_a.shape
+    assert result.corrected_4dstem_1.shape == cube_a.shape
     assert isinstance(result.drift, DriftCorrection)
-    assert result.vdf_a.shape == (32, 32)
-    assert result.vdf_b.shape == (32, 32)
+    assert result.raw_vdf_0.shape == (32, 32)
+    assert result.raw_vdf_1.shape == (32, 32)
+
+
+def test_from_4dstem_named_api_and_result_fields():
+    """0/90 4D-STEM has an explicit first-class entry point."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
+    assert dc._is_4dstem_collection
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=5, refine=False,
+        show_merged=False, show_images=False,
+    )
+    assert drift_4dstem_module._rot90_to_image0_frame(dc, image_index=1) == 3
+    result = dc.generate_corrected_4dstem()
+
+    assert isinstance(result, CorrectionResult)
+    assert result.corrected_4dstem is not None
+    assert result.corrected_4dstem_0.shape == cube_a.shape
+    assert result.corrected_4dstem_1.shape == cube_a.shape
+    assert result.scalar_corrected_vdf.shape == (32, 32)
+    for old_name in [
+        "merged",
+        "corrected_a",
+        "corrected_b",
+        "component_0",
+        "component_1",
+        "corrected_cube",
+        "cube",
+        "reference_vdf",
+    ]:
+        assert not hasattr(result, old_name)
+
+def test_generate_corrected_4dstem_rejects_reference_mode():
+    """The 4D-STEM collection API should not hide reference-mode semantics."""
+    ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
+    dc = DriftCorrection.from_reference(ref, cube)
+    dc.preprocess(
+        normalize=True, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=5,
+        show_merged=False, show_images=False,
+    )
+    with pytest.raises(RuntimeError, match="4D-STEM collection"):
+        dc.generate_corrected_4dstem()
+
+
+def test_correct_virtual_images_matches_result_scalar_corrected_vdf():
+    """Scan-corrected scalar VDF is exposed as a reusable API."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=5, refine=False,
+        show_merged=False, show_images=False,
+    )
+    assert drift_4dstem_module._rot90_to_image0_frame(dc, image_index=1) == 3
+    result = dc.generate_corrected_4dstem()
+    virtual = dc.correct_virtual_images(result.raw_vdf_0, result.raw_vdf_1)
+
+    np.testing.assert_allclose(virtual["corrected_image"], result.scalar_corrected_vdf, atol=0.0)
+    assert virtual["corrected_image_0"].shape == (32, 32)
+    assert virtual["corrected_image_1"].shape == (32, 32)
+    for old_name in [
+        "merged", "image_0", "image_1", "component_0", "component_1",
+        "weight_0", "weight_1",
+    ]:
+        assert old_name not in virtual
+
+
+def test_4dstem_pair_090_orients_image_1_with_microscope_convention():
+    """A 0/90 4D-STEM pair rotates corrected image 1 into image 0's frame."""
+    cube_0, cube_90 = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_0, cube_90, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=5, refine=False,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected_4dstem()
+    virtual = dc.correct_virtual_images(result.raw_vdf_0, result.raw_vdf_1)
+
+    vdf_1_unoriented = DriftCorrection.integrate_virtual_detector(
+        result.corrected_4dstem_1,
+        reduce="mean",
+    )
+    np.testing.assert_allclose(
+        virtual["corrected_image_1"], vdf_1_unoriented, atol=2e-7,
+    )
+    assert virtual["corrected_image_1"].shape == virtual["corrected_image_0"].shape
+
+
+def test_probe_positions_export_and_plot_for_4dstem_collection():
+    """Updated probe positions stay indexed like the raw 4D-STEM scans."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    nominal_1 = dc.probe_positions(image_index=1, corrected=False, plot=False)
+    dc.align_affine(
+        step=0.02, num_tests=5, refine=False,
+        show_merged=False, show_images=False,
+    )
+    positions_0 = dc.probe_positions(image_index=0, plot=False)
+    positions_1 = dc.probe_positions(image_index=1, plot=False)
+
+    assert positions_0.shape == (32, 32, 2)
+    assert positions_1.shape == (32, 32, 2)
+    assert positions_0.dtype == np.float32
+    assert positions_1.dtype == np.float32
+    assert not np.allclose(positions_1, nominal_1)
+    # Flattening preserves raw diffraction-pattern order for ptychography.
+    assert positions_1.reshape(-1, 2).shape == (32 * 32, 2)
+
+    result = dc.generate_corrected_4dstem(merge=False)
+    result_positions_1 = result.probe_positions(image_index=1, plot=False)
+    np.testing.assert_allclose(result_positions_1, positions_1)
+
+    fig, axes = dc.plot_probe_positions(image_index=1, stride=8)
+    assert len(axes) == 2
+    plt.close(fig)
+
+
+def test_scan_collection_result_virtual_image_and_crop_helpers():
+    """Result helper names make corrected 4D-STEM integrations explicit."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    df_mask = _annular_vdf_mask(det_size=4)
+    bf_mask = ~df_mask
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=5, refine=False,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected_4dstem()
+
+    for mask, reduce in [
+        (None, "mean"),       # all-detector VDF used for alignment
+        (bf_mask, "sum"),     # BF-style disk integration
+        (df_mask, "sum"),     # DF-style annular integration
+    ]:
+        cube_vdf = result.virtual_image(mask, reduce=reduce)
+        manual_vdf = DriftCorrection.integrate_virtual_detector(
+            result.corrected_4dstem, mask, reduce=reduce,
+        )
+        np.testing.assert_allclose(cube_vdf, manual_vdf, atol=1e-6)
+
+
+def test_scan_collection_4dstem_synthetic_corrected_vdf_matches_reference_ncc():
+    """Synthetic 0/90 4D-STEM cubes recover the ground-truth reference VDF.
+
+    This locks the intended diagnostic workflow:
+    1. Start from one drift-free reference 4D-STEM cube.
+    2. Simulate a drifted 0-degree scan and a drifted 90-degree scan.
+    3. Lift both scans to 4D-STEM diffraction-pattern cubes.
+    4. Estimate drift from their auto-extracted VDFs.
+    5. Apply the same drift fields to the full cubes and merge.
+
+    The acceptance criterion is the real target: the VDF computed from the
+    corrected 4D-STEM dataset should have higher NCC against the ground-truth
+    reference VDF than the uncorrected raw merge.
+    """
+    scan_size = 128
+    det_size = 6
+    im0, im90, base = make_synthetic_drift_data(scale=1, seed=42)
+    reference = base[40:40 + scan_size, 30:30 + scan_size].astype(np.float32)
+    detector = _make_detector_template(det_size)
+    vdf_mask = _annular_vdf_mask(det_size)
+    reference_cube = _lift_to_4dstem(reference, detector)
+    cube_0 = _lift_to_4dstem(im0.astype(np.float32), detector)
+    cube_90 = _lift_to_4dstem(im90.astype(np.float32), detector)
+
+    dc = DriftCorrection.from_4dstem(
+        cube_0, cube_90, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=2,
+        normalize=True, show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11, refine=True, max_image_shift=64,
+        show_merged=False, show_images=False,
+    )
+    dc.align_nonrigid(
+        num_iterations=20, regularization_sigma_px=16.0,
+        show_merged=False, show_images=False,
+    )
+    result = dc.generate_corrected_4dstem(
+        mode="bilinear", output_dtype=torch.float32,
+    )
+
+    ground_truth_vdf = _masked_vdf(reference_cube, vdf_mask)
+    raw_vdf_0 = _masked_vdf(cube_0, vdf_mask)
+    raw_vdf_90 = _masked_vdf(cube_90, vdf_mask)
+    raw_rot_k = _best_rot90_by_ncc(ground_truth_vdf, raw_vdf_90, candidates={1, 3})
+    raw_merge = (raw_vdf_0 + np.rot90(raw_vdf_90, k=raw_rot_k)) * 0.5
+
+    vdf_from_corrected_4dstem = _masked_vdf(result.corrected_4dstem, vdf_mask)
+    ncc_raw = _aligned_ncc(ground_truth_vdf, raw_merge)
+    ncc_corrected = _aligned_ncc(ground_truth_vdf, vdf_from_corrected_4dstem)
+    assert ncc_raw < 0.80
+    assert ncc_corrected > 0.97
+    assert ncc_corrected > ncc_raw + 0.19
 
 
 def test_generate_corrected_no_merge():
-    """merge=False returns None for merged."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    """merge=False leaves corrected_4dstem unset but keeps both components."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1693,17 +2053,17 @@ def test_generate_corrected_no_merge():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    result = dc.generate_corrected(merge=False)
-    assert result.merged is None
-    assert result.corrected_a.shape == cube_a.shape
-    assert result.corrected_b.shape == cube_a.shape
+    result = dc.generate_corrected_4dstem(merge=False)
+    assert result.corrected_4dstem is None
+    assert result.corrected_4dstem_0.shape == cube_a.shape
+    assert result.corrected_4dstem_1.shape == cube_a.shape
 
 
 def test_generate_corrected_nonrigid():
     """Nonrigid alignment works in the 4D pipeline."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1714,16 +2074,16 @@ def test_generate_corrected_nonrigid():
         show_merged=False, show_images=False,
     )
     dc.align_nonrigid(show_merged=False, show_images=False)
-    result = dc.generate_corrected()
-    assert result.merged is not None
-    assert result.merged.shape == cube_a.shape
+    result = dc.generate_corrected_4dstem()
+    assert result.corrected_4dstem is not None
+    assert result.corrected_4dstem.shape == cube_a.shape
 
 
 def test_apply_correction_uses_stored_cube():
     """apply_correction with no cube arg uses stored cube."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1741,7 +2101,7 @@ def test_apply_correction_pair_mode_uses_stored_image():
     """apply_correction() with no args on a pair-mode dc warps the stored image."""
     im0, im1, _ = make_synthetic_drift_data(scale=1)
     dc = DriftCorrection(
-        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1760,7 +2120,7 @@ def test_generate_corrected_pair_mode_returns_dataset2d():
     from quantem.core.datastructures.dataset2d import Dataset2d
     im0, im1, _ = make_synthetic_drift_data(scale=1)
     dc = DriftCorrection(
-        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1778,32 +2138,32 @@ def test_is_4dstem_property():
     """is_4dstem reflects whether cubes are stored."""
     im0, im1, _ = make_synthetic_drift_data(scale=1)
     dc_2d = DriftCorrection(
-        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, -90],
+        im0[:32, :32], im1[:32, :32], scan_direction_degrees=[0, 90],
     )
     assert not dc_2d.is_4dstem
-    assert not dc_2d.is_paired_4dstem
+    assert not dc_2d._is_4dstem_collection
 
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc_4d = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     assert dc_4d.is_4dstem
-    assert dc_4d.is_paired_4dstem
+    assert dc_4d._is_4dstem_collection
 
 
-def test_is_paired_4dstem_false_for_reference_mode():
-    """Reference mode sets is_4dstem=True but is_paired_4dstem=False."""
+def test__is_4dstem_collection_false_for_reference_mode():
+    """Reference mode sets is_4dstem=True but _is_4dstem_collection=False."""
     ref, cube = _make_reference_pair(scan_h=32, det_size=4, kind="4d")
-    dc = DriftCorrection(ref, cube)
+    dc = DriftCorrection.from_reference(ref, cube)
     assert dc.is_4dstem
-    assert not dc.is_paired_4dstem
+    assert not dc._is_4dstem_collection
 
 
-def test_generate_corrected_merged_is_distinct_from_corrected_a():
-    """merged must be a separate array from corrected_a (no aliasing)."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
+def test_generate_corrected_4dstem_is_distinct_from_corrected_4dstem_0():
+    """The corrected 4D-STEM dataset must not alias dataset 0."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
     dc = DriftCorrection(
-        cube_a, cube_b, scan_direction_degrees=[0, -90],
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
     )
     dc.preprocess(
         pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
@@ -1813,14 +2173,32 @@ def test_generate_corrected_merged_is_distinct_from_corrected_a():
         step=0.02, num_tests=11,
         show_merged=False, show_images=False,
     )
-    result = dc.generate_corrected()
-    assert result.merged is not result.corrected_a
+    result = dc.generate_corrected_4dstem()
+    assert result.corrected_4dstem is not result.corrected_4dstem_0
+
+
+def test_generate_corrected_rejects_scan_collection_4dstem_generic_api():
+    """4D-STEM collection must use the explicit first-class API."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        pad_fraction=0.25, kde_sigma=0.5, number_knots=1,
+        show_merged=False, show_images=False,
+    )
+    dc.align_affine(
+        step=0.02, num_tests=11,
+        show_merged=False, show_images=False,
+    )
+    with pytest.raises(RuntimeError, match="generate_corrected_4dstem"):
+        dc.generate_corrected()
 
 
 def test_generate_corrected_strip_padding():
     """strip_padding=True returns original scan dimensions, not padded canvas.
 
-    Uses a true paired (0°/90°) alignment so generate_corrected goes through
+    Uses a true scan collection (0°/90°) alignment so generate_corrected goes through
     the merge-on-canvas path where padding is visible (reference mode warps
     on the scan grid directly, so strip_padding has no effect there)."""
     im0, im1, _ = make_synthetic_drift_data(scale=1, seed=0)
@@ -1998,8 +2376,8 @@ def test_sobel_gradient_magnitude_znorm():
 
 
 
-def test_save_load_roundtrip_paired():
-    """save() then load() should round-trip a paired DriftCorrection."""
+def test_save_load_roundtrip_scan_collection():
+    """save() then load() should round-trip a image-collection DriftCorrection."""
     import tempfile
     from pathlib import Path
     from quantem.core.io.serialize import load
@@ -2023,8 +2401,10 @@ def test_save_load_roundtrip_4dstem_clear_error():
     import tempfile
     from pathlib import Path
     from quantem.core.io.serialize import load
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=[0, -90])
+    cube_a, cube_b = _make_4dstem_collection(scan_size=32, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a, cube_b, scan_direction_degrees=[0, 90],
+    )
     dc.preprocess(kde_sigma=0.5, number_knots=1,
                   show_merged=False, show_images=False)
     dc.align_affine(step=0.02, num_tests=5,
@@ -2040,19 +2420,8 @@ def test_save_load_roundtrip_4dstem_clear_error():
             loaded.apply_correction()
 
 
-# ---------------------------------------------------------------------------
-# Tests for tightened dispatch validation
-# ---------------------------------------------------------------------------
-
-def test_4dstem_rotation_05_degrees_rejected():
-    """4D-STEM merge with sub-degree off-axis rotation should not silently merge."""
-    cube_a, cube_b = _make_paired_4d_cubes(scan_size=32, det_size=4)
-    with pytest.raises(ValueError, match="multiple-of-90"):
-        DriftCorrection(cube_a, cube_b, scan_direction_degrees=[0, 0.5])
-
-
 def test_multi_angle_three_image_dispatch():
-    """N=3 paired-2D dispatch (the *more_images branch) builds a single instance."""
+    """N=3 2D image collection dispatch (the *more_images branch) builds a single instance."""
     rng = np.random.default_rng(0)
     im0 = rng.random((48, 48), dtype=np.float32)
     im45 = rng.random((48, 48), dtype=np.float32)
@@ -2062,7 +2431,7 @@ def test_multi_angle_three_image_dispatch():
     assert tuple(dc.scan_direction_degrees) == (0, 45, 90)
 
 
-def test_paired_4dstem_scan_dim_mismatch_rejected():
+def test_scan_collection_4dstem_scan_dim_mismatch_rejected():
     """4D + 4D with mismatched (scan_h, scan_w) should error before alignment."""
     rng = np.random.default_rng(0)
     a = rng.random((32, 32, 4, 4), dtype=np.float32)
@@ -2072,7 +2441,7 @@ def test_paired_4dstem_scan_dim_mismatch_rejected():
 
 
 def test_canvas_to_raw_drift_nonsquare_integration():
-    """End-to-end paired correction on a non-square scan exercises the
+    """End-to-end scan collection correction on a non-square scan exercises the
     alpha = (H-1)/(W-1) Jacobian factor that square tests don't reach."""
     np.random.seed(0)
     H, W = 96, 64  # non-square

@@ -55,10 +55,11 @@ def _as_array(x):
         f"Dataset2d.from_file(path) (or Dataset4d.from_file) first.")
 
 
-# PairedCorrectionResult lives in drift_4dstem so the dataset-shaped
-# concerns stay together; re-exported for backward compat with users who
-# import it from here.
-from quantem.imaging.drift_4dstem import PairedCorrectionResult  # noqa: E402, F401
+# CorrectionResult lives in drift_4dstem so the dataset-shaped
+# concerns stay together.
+from quantem.imaging.drift_4dstem import (  # noqa: E402, F401
+    CorrectionResult,
+)
 
 
 def _distance_transform_edt_torch(mask: torch.Tensor) -> torch.Tensor:
@@ -144,30 +145,30 @@ def _distance_transform_edt_torch(mask: torch.Tensor) -> torch.Tensor:
 
 
 class DriftCorrection(AutoSerialize):
-    """GPU-accelerated drift correction for paired scan-angle electron microscopy data.
+    """GPU-accelerated drift correction for scan-angle electron microscopy data.
 
     Aligns two (or more) images acquired at different scan directions to
     recover per-scanline drift, then produces a corrected output free of
     raster distortion. The same pipeline handles single 2-D image pairs,
-    paired image series (tilt/time), and paired 4D-STEM / EDX datasets.
+    scan image series (tilt/time), and 4D-STEM collection / EDX datasets.
 
     Construction
     ------------
-    Build a ``DriftCorrection`` by passing two (or more) related datasets
-    to the constructor.  No factory methods — the same call handles every
-    mode, picked from the shapes and scan angles you provide:
+    Build a ``DriftCorrection`` from the constructor for scalar image pairs,
+    or use the named constructors for dataset workflows where the intent
+    should be explicit:
 
     ============================ =================== ==============================================
     Inputs                       ``scan_direction``  Mode + output of ``generate_corrected``
     ============================ =================== ==============================================
-    2-D, 2-D                     different angles    paired alignment → :class:`Dataset2d`
+    2-D, 2-D                     different angles    scan collection alignment → :class:`Dataset2d`
     2-D, 2-D                     same angle          reference (a=ref, b=drifted) → :class:`Dataset2d`
     2-D, 3-D ``(H, W, E)``       any                 reference → :class:`Dataset3d` (corrected EDS/EELS)
     2-D, 4-D ``(H, W, det, det)``any                 reference → :class:`Dataset4d` (corrected 4D-STEM)
-    4-D, 4-D                     orthogonal          paired 4D-STEM merge → :class:`PairedCorrectionResult`
+    4-D, 4-D                     orthogonal          4D-STEM collection merge → :class:`CorrectionResult`
     ============================ =================== ==============================================
 
-    For tilt/time series of paired images, loop in user code:
+    For tilt/time series of scan images, loop in user code:
     ``for i in range(N): DriftCorrection(stack_a[i], stack_b[i], ...)``.
 
     Inputs may be raw ``ndarray`` or any ``Dataset`` wrapper.  File loading
@@ -179,7 +180,7 @@ class DriftCorrection(AutoSerialize):
 
     Examples
     --------
-    Paired 0°/90° HAADF:
+    Scan collection 0°/90° HAADF:
 
     >>> dc = DriftCorrection(im0, im90, scan_direction_degrees=(0, 90))
     >>> dc.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
@@ -187,16 +188,17 @@ class DriftCorrection(AutoSerialize):
     >>> dc.align_nonrigid()                       # optional
     >>> result = dc.generate_corrected()          # → Dataset2d
 
-    Paired 0°/90° 4D-STEM:
+    Scan collection 0°/90° 4D-STEM:
 
-    >>> dc = DriftCorrection(cube_0, cube_90, scan_direction_degrees=(0, -90))
-    >>> result = dc.preprocess().align_affine().generate_corrected()
-    >>> result.merged, result.corrected_a, result.corrected_b   # PairedCorrectionResult
+    >>> dc = DriftCorrection.from_4dstem(
+    ...     data_0, data_1, scan_direction_degrees=(0, 90))
+    >>> result = dc.preprocess().align_affine().generate_corrected_4dstem()
+    >>> result.corrected_4dstem, result.corrected_4dstem_0, result.corrected_4dstem_1
 
     HAADF reference + drifted EDS/EELS or 4D-STEM:
 
-    >>> dc = DriftCorrection(haadf, eds_cube, scan_direction_degrees=0)
-    >>> dc.preprocess(normalize=True).align_affine().align_nonrigid()
+    >>> dc = DriftCorrection.from_reference(haadf, eds_data)
+    >>> dc.preprocess(normalize=True).align_affine()
     >>> result = dc.generate_corrected()                  # → Dataset3d (corrected EDS)
 
     Loading from disk:
@@ -258,7 +260,7 @@ class DriftCorrection(AutoSerialize):
         scan_direction_degrees : sequence of floats or single float
             Scan angle per dataset.  A single float broadcasts to all
             inputs (typical for HAADF + EDS reference workflows).  For
-            paired or multi-angle alignment, pass one angle per dataset.
+            image-series alignment, pass one angle per dataset.
         alignment_image : 2-D ndarray, optional
             Pre-computed VDF / summary of the second dataset, used as
             the alignment partner when the second dataset is ≥3-D in
@@ -272,45 +274,45 @@ class DriftCorrection(AutoSerialize):
         #    Use case                             Inputs                         Returns from                  Demo notebook
                                                                                   ``generate_corrected``
         ===  ===================================  =============================  ============================  ===============================
-        1    Paired 2-D HAADF                     2× ``(H, W)``                  :class:`Dataset2d`            ``api/01_from_pair.ipynb``
-        2    Paired 4-D STEM                      2× ``(H, W, D_h, D_w)``        :class:`PairedCorrectionResult`  ``api/03_from_4dstem.ipynb``
+        1    2-D scan images                      2+× ``(H, W)``                :class:`Dataset2d`            ``api/01_from_images.ipynb``
+        2    0/90 4-D STEM collection             2× ``(H, W, D_h, D_w)``        :class:`CorrectionResult`    ``api/03_from_4dstem.ipynb``
         3    Reference + drifted 4-D STEM         ``(H, W)`` + ``(H, W, D_h, D_w)``  :class:`Dataset4d`        ``api/04_from_reference_4dstem.ipynb``
         4    Reference + drifted 3-D EDS / EELS   ``(H, W)`` + ``(H, W, n_E)``   :class:`Dataset3d`            ``api/05_from_reference_eds.ipynb``
         ===  ===================================  =============================  ============================  ===============================
 
-        Cases 1-2 are *paired* (two scans of the same area, typically at
-        orthogonal angles); cases 3-4 are *reference-mode* (one HAADF
+        Cases 1-2 are scan collections (two or more scans of the same area);
+        cases 3-4 are *reference-mode* (one HAADF
         reference + one drifted dataset of the same scan, single-sided).
         Multi-angle HAADF (3+ inputs at different angles) follows the
         case-1 dispatch with ``len(datasets) > 2``.
 
-        For tilt/time series of paired images, loop in user code:
+        For tilt/time series of scan images, loop in user code:
 
         >>> for i in range(N):
-        ...     dc = DriftCorrection(stack_a[i], stack_b[i], scan_direction_degrees=(0, 90))
+        ...     dc = DriftCorrection.from_images(stack_a[i], stack_b[i], scan_direction_degrees=(0, 90))
         ...     out[i] = dc.preprocess().align_affine().generate_corrected().array
 
         Examples
         --------
-        Case 1: paired 2-D HAADF (0° / 90°):
+        Case 1: 2-D HAADF scan images (0° / 90°):
 
-        >>> dc = DriftCorrection(im0, im90, scan_direction_degrees=(0, 90))
+        >>> dc = DriftCorrection.from_images(im0, im90, scan_direction_degrees=(0, 90))
 
-        Case 2: paired 4-D STEM:
+        Case 2: 0/90 4D-STEM collection:
 
-        >>> dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=(0, -90))
+        >>> dc = DriftCorrection.from_4dstem(data_0, data_1, scan_direction_degrees=(0, 90))
 
         Case 3: HAADF reference + drifted 4-D STEM (single-sided):
 
-        >>> dc = DriftCorrection(haadf, cube_drifted, scan_direction_degrees=0)
+        >>> dc = DriftCorrection.from_reference(haadf, data_drifted)
 
-        Case 4: HAADF reference + drifted EDS spectral cube:
+        Case 4: HAADF reference + drifted EDS spectral dataset:
 
-        >>> dc = DriftCorrection(haadf, eds_cube, scan_direction_degrees=0)
+        >>> dc = DriftCorrection.from_reference(haadf, eds_data)
 
         Multi-angle HAADF (e.g. 0° / 45° / 90°, follows case 1):
 
-        >>> dc = DriftCorrection(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
+        >>> dc = DriftCorrection.from_images(im0, im45, im90, scan_direction_degrees=(0, 45, 90))
         """
         # Core state (always set so all code paths can rely on these).
         self._datasets: list[np.ndarray | None] | None = None
@@ -324,6 +326,83 @@ class DriftCorrection(AutoSerialize):
         if not datasets and alignment_image is None:
             return
         self._dispatch_and_setup(datasets, scan_direction_degrees, alignment_image)
+
+    @classmethod
+    def from_images(
+        cls,
+        *images,
+        scan_direction_degrees: list[float] | NDArray | tuple[float, ...] = (0.0, 90.0),
+    ) -> Self:
+        """Create drift correction from two or more 2-D scan images."""
+        return cls(*images, scan_direction_degrees=scan_direction_degrees)
+
+    @classmethod
+    def from_4dstem(
+        cls,
+        *datasets,
+        scan_direction_degrees: list[float] | NDArray | tuple[float, ...] = (0.0, 90.0),
+    ) -> Self:
+        """Create a first-class 0/90 4D-STEM collection drift correction.
+
+        The datasets are treated as independently drifted scans of the same
+        specimen region. Alignment is estimated from their auto-extracted
+        virtual images, then the learned scan-derived drift fields can be
+        applied to the full diffraction-pattern datasets via
+        :meth:`generate_corrected_4dstem`.
+
+        Currently this path supports exactly two orthogonal 4D-STEM datasets.
+        The constructor accepts a dataset collection so future scan-angle
+        sets can use the same public API.
+
+        This is distinct from reference mode:
+        ``DriftCorrection.from_reference(reference_2d, drifted_dataset)``
+        keeps image 0
+        fixed and corrects one dataset toward that external reference.
+        """
+        return cls(
+            *datasets,
+            scan_direction_degrees=scan_direction_degrees,
+        )
+
+    @classmethod
+    def from_reference(
+        cls,
+        reference_image,
+        drifted_dataset,
+        *,
+        alignment_image: NDArray | None = None,
+        scan_direction_degrees: list[float] | NDArray | float = 0.0,
+    ) -> Self:
+        """Create a reference-anchored drift correction.
+
+        ``reference_image`` is a 2-D image that defines the fixed coordinate
+        frame. ``drifted_dataset`` may be a 2-D image, a 3-D spectral dataset
+        such as EDS/EELS, or a 4-D STEM dataset with scan axes leading. Alignment
+        is estimated against either ``alignment_image`` or an automatically
+        extracted virtual image from the drifted dataset, then
+        :meth:`generate_corrected` warps the drifted dataset into the
+        reference frame.
+
+        This is distinct from 0/90 4D-STEM collection correction: reference mode
+        anchors image 0 and corrects one target dataset; it does not merge two
+        independently drifted scans.
+        """
+        result = cls(
+            reference_image,
+            drifted_dataset,
+            scan_direction_degrees=scan_direction_degrees,
+            alignment_image=alignment_image,
+        )
+        if not result._reference_mode:
+            raise ValueError(
+                "from_reference() requires a 2-D reference image and one "
+                "drifted target dataset. For a 2-D target, pass a scalar "
+                "scan_direction_degrees value or matching reference/target "
+                "scan directions so the call is unambiguously single-sided. "
+                "Use DriftCorrection.from_4dstem() for 0/90 4D-STEM "
+                "collection correction."
+            )
+        return result
 
     def _dispatch_and_setup(self, datasets, scan_direction_degrees, alignment_image):
         """Validate inputs and populate mode-specific state."""
@@ -353,7 +432,7 @@ class DriftCorrection(AutoSerialize):
             a, b = arrays
             a_ndim, b_ndim = ndims
 
-            # Reference mode: 2-D ref + ≥3-D drifted, OR 2-D pair at same angle
+            # Reference mode: 2-D ref + ≥3-D drifted, or two 2-D images at the same angle.
             if a_ndim == 2 and (b_ndim >= 3 or sd[0] == sd[1]):
                 if a.shape != b.shape[:2]:
                     raise ValueError(
@@ -365,7 +444,7 @@ class DriftCorrection(AutoSerialize):
                     vdf = b
                 else:
                     vdf = self.compute_vdf(b)
-                self._setup_paired_2d([a, vdf], sd)
+                self._setup_image_collection([a, vdf], sd)
                 self._reference_mode = True
                 self._datasets = [None, b]
                 return
@@ -375,50 +454,59 @@ class DriftCorrection(AutoSerialize):
                 raise TypeError(
                     f"first dataset is {a_ndim}-D but second is 2-D. For "
                     f"reference + drifted workflows pass the 2-D reference "
-                    f"first: DriftCorrection(reference_2d, drifted_cube, ...)")
+                    f"first: DriftCorrection.from_reference(reference_2d, drifted_dataset)")
 
-            # Paired 3-D stacks no longer supported — loop in user code.
+            # 3-D image stacks are not a single correction object; loop in user code.
             if a_ndim == 3 and b_ndim == 3:
                 raise TypeError(
-                    "Paired 3-D series support was removed. Loop in user code: "
+                    "3-D image series support was removed. Loop in user code: "
                     "for i in range(N): DriftCorrection(stack_a[i], stack_b[i], ...)")
 
-            # Paired ≥4-D: 4D-STEM merge
+            # 4D-STEM collection merge
             if a_ndim >= 4 and b_ndim >= 4:
                 if a_ndim != b_ndim:
                     raise TypeError(
-                        f"Paired 4D-STEM expects matching ndim, got "
+                        f"4D-STEM collection expects matching ndim, got "
                         f"{a_ndim} and {b_ndim}.")
                 if a.shape[:2] != b.shape[:2]:
                     raise ValueError(
-                        f"Paired 4D-STEM scan dims {a.shape[:2]} must match "
+                        f"4D-STEM collection scan dims {a.shape[:2]} must match "
                         f"second dataset scan dims {b.shape[:2]}")
-                delta = float((sd[1] - sd[0]) % 360)
-                if abs(delta - round(delta / 90) * 90) > 0.01:
+                normalized = [int(round(angle)) % 360 for angle in sd[:2]]
+                if any(abs(angle - round(angle)) > 1e-6 for angle in sd[:2]):
                     raise ValueError(
-                        f"Paired 4D-STEM scans need a multiple-of-90° angle "
-                        f"difference, got {sd[1] - sd[0]}°.")
+                        f"4D-STEM collection scan directions must be explicit "
+                        f"0/90/-90 degree values, got {sd[:2]}.")
+                if any(angle not in {0, 90, 270} for angle in normalized):
+                    raise ValueError(
+                        f"4D-STEM collection scan directions must be explicit "
+                        f"0/90/-90 degree values, got {sd[:2]}.")
+                delta = (normalized[1] - normalized[0]) % 360
+                if delta not in {90, 270}:
+                    raise ValueError(
+                        f"4D-STEM collection scans need orthogonal 0/90 scan "
+                        f"directions, got angle difference {sd[1] - sd[0]}°.")
                 if alignment_image is not None:
                     raise TypeError(
                         "alignment_image= is only meaningful in reference mode; "
-                        "for paired 4D-STEM the VDFs are auto-extracted.")
+                        "for 4D-STEM collections the VDFs are auto-extracted.")
                 vdf_a = self.compute_vdf(a)
                 vdf_b = self.compute_vdf(b)
-                self._setup_paired_2d([vdf_a, vdf_b], sd)
+                self._setup_image_collection([vdf_a, vdf_b], sd)
                 self._datasets = [a, b]
                 return
 
-            # Paired 2-D HAADF (different angles)
+            # 2-D scan image collection (different angles)
             if a.shape != b.shape:
                 raise ValueError(
-                    f"Paired 2-D scan dims {a.shape} must match second "
+                    f"2-D scan image dims {a.shape} must match second "
                     f"image scan dims {b.shape}")
-            self._setup_paired_2d([a, b], sd)
+            self._setup_image_collection([a, b], sd)
             return
 
         # ── N ≥ 3: multi-angle alignment, all 2-D for now ──
         if all(n == 2 for n in ndims):
-            self._setup_paired_2d(arrays, sd)
+            self._setup_image_collection(arrays, sd)
             return
 
         raise TypeError(
@@ -426,8 +514,8 @@ class DriftCorrection(AutoSerialize):
             f"ndims {ndims}.  Multi-angle alignment (N≥3) currently supports "
             f"2-D inputs only.")
 
-    def _setup_paired_2d(self, arrays, scan_direction_degrees):
-        """Populate state for standard 2-D paired/multi-angle alignment."""
+    def _setup_image_collection(self, arrays, scan_direction_degrees):
+        """Populate state for standard 2-D image collection alignment."""
         self.imgs = validate_list_of_dataset2d(arrays)
         self.scan_direction_degrees = ensure_valid_array(
             scan_direction_degrees, ndim=1)
@@ -436,16 +524,16 @@ class DriftCorrection(AutoSerialize):
     def is_4dstem(self) -> bool:
         """True if this instance holds ≥3-D dataset(s) for correction.
 
-        Covers both paired 4D-STEM mode (two cubes at orthogonal scan
+        Covers both 4D-STEM collection mode (two datasets at orthogonal scan
         angles) *and* reference mode (one reference image + one drifted
-        cube).  Use :attr:`is_paired_4dstem` to distinguish from
+        dataset).  Use :attr:`_is_4dstem_collection` to distinguish from
         reference mode.
         """
         return self._datasets is not None
 
     @property
-    def is_paired_4dstem(self) -> bool:
-        """True only for paired 4D-STEM (two cubes, not reference mode)."""
+    def _is_4dstem_collection(self) -> bool:
+        """True only for 4D-STEM collection (two datasets, not reference mode)."""
         return self._datasets is not None and not self._reference_mode
 
     def _show_after_step(self, label: str, show_merged: bool, show_images: bool,
@@ -508,6 +596,71 @@ class DriftCorrection(AutoSerialize):
                 "Run dc.preprocess().align_affine() (and optionally "
                 ".align_nonrigid()) before drift_field().")
         return self._interpolator(idx).drift_raw(self._initial_knots[idx])
+
+    def probe_positions(
+        self,
+        image_index: int = 0,
+        *,
+        corrected: bool = True,
+        strip_padding: bool = True,
+        plot: bool = True,
+        stride: int = 16,
+    ) -> np.ndarray:
+        """Return nominal or drift-updated probe positions for one scan image.
+
+        The returned array has shape ``(scan_h, scan_w, 2)`` in ``(row, col)``
+        order. ``positions[r, c]`` belongs to the raw diffraction pattern
+        acquired at ``dataset[r, c]`` for the same ``image_index``. For a
+        0/90 4D-STEM collection, call this separately for image 0 and image 1;
+        both outputs are expressed in the same corrected coordinate frame, so
+        they can be used as initial coordinates for iterative ptychography
+        without interpolating the diffraction patterns.
+
+        Parameters
+        ----------
+        image_index : int, default 0
+            Which scan image / 4D-STEM dataset to export positions for.
+        corrected : bool, default True
+            ``True`` returns the fitted drift-updated positions. ``False``
+            returns the nominal positions before alignment.
+        strip_padding : bool, default True
+            Subtract the preprocessing canvas padding so coordinates are in
+            the original image-0 pixel frame. ``False`` returns padded-canvas
+            coordinates.
+        plot : bool, default True
+            Also draw a nominal-vs-corrected position plot for this image.
+        stride : int, default 16
+            Subsampling stride used by the plot only.
+        """
+        if not hasattr(self, "_initial_knots"):
+            raise RuntimeError(
+                "probe_positions() requires preprocess() first. Run "
+                "dc.preprocess() before exporting nominal or corrected "
+                "probe positions."
+            )
+        idx = image_index % len(self.imgs)
+        knots = self.knots[idx] if corrected else self._initial_knots[idx]
+        row_t, col_t = self._interpolator(idx, knots).to_canvas()
+        positions = torch.stack([row_t, col_t], dim=-1)
+        if strip_padding:
+            scan_h, scan_w = self.imgs[0].shape[:2]
+            canvas_h, canvas_w = self.shape[1], self.shape[2]
+            pad_h = (canvas_h - scan_h) / 2.0
+            pad_w = (canvas_w - scan_w) / 2.0
+            offset = torch.tensor(
+                [pad_h, pad_w],
+                device=positions.device,
+                dtype=positions.dtype,
+            )
+            positions = positions - offset
+        positions_np = positions.detach().cpu().numpy().astype(np.float32)
+        if plot:
+            self.plot_probe_positions(
+                image_index=idx,
+                strip_padding=strip_padding,
+                stride=stride,
+            )
+        return positions_np
 
     def preprocess(
         self,
@@ -599,7 +752,7 @@ class DriftCorrection(AutoSerialize):
         if K < 1:
             raise ValueError(f"number_knots must be >= 1 (got {number_knots}).")
         self.number_knots = K
-        # Multi-direction paired scans (e.g. 0° / 90°) require square images.
+        # Multi-direction scan collection (e.g. 0° / 90°) require square images.
         # The canvas geometry assumes a single scanline length, which only
         # holds when H == W; non-square scans yield inconsistent per-image
         # walks that the optimizer can't reconcile.
@@ -608,7 +761,7 @@ class DriftCorrection(AutoSerialize):
             for i, img in enumerate(self.imgs):
                 if img.shape[0] != img.shape[1]:
                     raise ValueError(
-                        f"Multi-direction paired scans require square images, "
+                        f"Multi-direction scan collection require square images, "
                         f"but image {i} is {img.shape}. Either crop to square "
                         f"or use a single scan direction.")
         self.scan_direction = np.deg2rad(self.scan_direction_degrees)
@@ -1196,7 +1349,7 @@ class DriftCorrection(AutoSerialize):
         """Non-rigid drift correction via batched GPU optimization.
 
         Optimizes per-scanline knot positions to minimize misalignment
-        between paired/multi-image scans. Runs entirely on GPU using
+        between image collection scans. Runs entirely on GPU using
         PyTorch (Adam or LBFGS optimizer). Single-knot mode only.
 
         Parameters
@@ -1467,8 +1620,8 @@ class DriftCorrection(AutoSerialize):
         chunk_size: int | None = None,
         merge: bool = True,
         verbose: bool = False,
-        output_a: np.ndarray | None = None,
-        output_b: np.ndarray | None = None,
+        output_0: np.ndarray | None = None,
+        output_1: np.ndarray | None = None,
         output_dtype: torch.dtype | np.dtype | str | None = None,
         output_device: str | torch.device | None = None,
         **kwargs,
@@ -1481,20 +1634,21 @@ class DriftCorrection(AutoSerialize):
         ===================================== ===================================
         Factory + inputs                      Return type
         ===================================== ===================================
-        :meth:`from_pair` (2-D)               :class:`Dataset2d`
-        :meth:`from_pair` (2-D + 3-D)         :class:`Dataset3d` (corrected EDS/EELS)
-        :meth:`from_pair` (2-D + 4-D)         :class:`Dataset4d` (corrected 4D-STEM)
-        Constructor (4-D + 4-D)                  :class:`PairedCorrectionResult`
-        :meth:`from_series`                   :class:`Dataset3d` ``(N, H, W)``
+        Constructor (2-D + 2-D)               :class:`Dataset2d`
+        :meth:`from_reference` (2-D + 3-D)    :class:`Dataset3d` (corrected EDS/EELS)
+        :meth:`from_reference` (2-D + 4-D)    :class:`Dataset4d` (corrected 4D-STEM)
+        :meth:`from_4dstem` (4-D + 4-D)  :class:`CorrectionResult`
         ===================================== ===================================
 
-        For 4D-STEM mode the datasets are warped, the second is rotated
-        into the first scan's coordinate frame, and the two are merged.
+        For 4D-STEM collection mode both datasets are corrected with their own
+        learned knots into a shared scan-derived coordinate system, the
+        corrected 4D-STEM dataset 1 is oriented into dataset 0's display
+        frame, and the two are merged at the diffraction-pattern level.
         Image-mode parameters (``upsample_factor``, ``fourier_filter``,
         etc.) are ignored; dataset parameters (``mode``, ``chunk_size``,
-        ``merge``, ``verbose``, ``output_a``, ``output_b``) take effect.
+        ``merge``, ``verbose``, ``output_0``, ``output_1``) take effect.
 
-        For paired-image mode, the entire pipeline (warping, Fourier
+        For image collection mode, the entire pipeline (warping, Fourier
         filtering, masking, cropping) runs on GPU via PyTorch, transferring
         to CPU only for the final ``Dataset2d`` output and the
         edge-blend mask step (now torch).
@@ -1522,7 +1676,7 @@ class DriftCorrection(AutoSerialize):
         fourier_filter : bool, default False
             Whether to apply Fourier-based directional filtering to merge
             corrected images. Only useful when blending ≥3 scan angles.
-            For paired (0°, 90°) HAADF — the typical case — keep this off.
+            For scan collection (0°, 90°) HAADF — the typical case — keep this off.
         filter_midpoint : float, default 0.5
             Midpoint for the sigmoid-based Fourier weighting filter, determining transition smoothness.
             Setting this to a low value close to 0 will include more signal but also more slow scan artifacts.
@@ -1571,12 +1725,14 @@ class DriftCorrection(AutoSerialize):
                 return Dataset3d.from_array(corrected)
             from quantem.core.datastructures.dataset4d import Dataset4d
             return Dataset4d.from_array(corrected)
-        # 4D-STEM mode: route to paired-dataset path; image-mode params unused.
+        # 4D-STEM collection has its own explicit API because it returns both
+        # corrected inputs and the diffraction-pattern-level merge.
         if self._datasets is not None:
-            return self._generate_corrected_paired_datasets(
-                mode=mode, chunk_size=chunk_size, merge=merge,
-                verbose=verbose, output_a=output_a, output_b=output_b,
-                output_dtype=output_dtype, output_device=output_device,
+            raise RuntimeError(
+                "4D-STEM collection correction uses the explicit "
+                "generate_corrected_4dstem() API. Use "
+                "DriftCorrection.from_4dstem(data_0, data_1, ...)"
+                ".preprocess().align_affine().generate_corrected_4dstem()."
             )
         device = self._device
         dtype = self._dtype
@@ -1705,7 +1861,7 @@ class DriftCorrection(AutoSerialize):
         and 4-D STEM datasets. Scan-axis convention depends on the
         construction mode:
 
-        - 2-D paired mode: scan axes are the LAST two of input.
+        - 2-D image-collection mode: scan axes are the LAST two of input.
           Shapes ``(H, W)`` (single image) or ``(N, H, W)`` (batch).
         - 4D-STEM / reference mode (built with a ≥3-D drifted dataset):
           scan axes are the FIRST two of input. Shapes ``(H, W)`` (VDF),
@@ -1742,9 +1898,9 @@ class DriftCorrection(AutoSerialize):
 
         4D-STEM with pre-allocated memmap output:
 
-        >>> dc = DriftCorrection(cube_a, cube_b, scan_direction_degrees=(0, -90))
+        >>> dc = DriftCorrection(data_0, data_1, scan_direction_degrees=(0, 90))
         >>> dc.preprocess().align_affine()
-        >>> out = np.memmap('corrected.dat', dtype='float32', mode='w+', shape=cube_b.shape)
+        >>> out = np.memmap('corrected.dat', dtype='float32', mode='w+', shape=data_1.shape)
         >>> dc.apply_correction(output=out)            # writes to memmap, returns it
         """
         if not hasattr(self, "knots") or not hasattr(self, "_initial_knots"):
@@ -1810,14 +1966,85 @@ class DriftCorrection(AutoSerialize):
             raise ValueError(
                 f"Input scan-row axis ({img_h}) does not match knot grid "
                 f"height ({knot_h}). For 4D-STEM mode the leading axis is the "
-                f"scan row; for paired-image mode the trailing-2 axes are scan.")
+                f"scan row; for image collection mode the trailing-2 axes are scan.")
 
         drift = self.drift_field(idx)
         return backward_warp(data_t, drift=drift, mode=mode)
 
     # 4D-STEM dataset path: implementations live in drift_4dstem.py so the
-    # orchestrator stays focused on the image pipeline.  These methods are
-    # thin delegators that preserve the existing call sites.
+    # orchestrator stays focused on the image pipeline.
+
+    def generate_corrected_4dstem(
+        self,
+        *,
+        mode: str = "bilinear",
+        chunk_size: int | None = None,
+        merge: bool = True,
+        verbose: bool = False,
+        output_0: np.ndarray | None = None,
+        output_1: np.ndarray | None = None,
+        output_dtype: torch.dtype | np.dtype | str | None = None,
+        output_device: str | torch.device | None = None,
+    ) -> CorrectionResult:
+        """Correct and optionally merge a 0/90 4D-STEM collection dataset pair.
+
+        This is the explicit first-class API for 4D-STEM collection. It requires
+        a ``DriftCorrection`` constructed from two 4D-STEM datasets, for example
+        ``DriftCorrection.from_4dstem(data_0, data_1, ...)``. Both
+        scans are corrected with their own learned knots into the shared
+        scan-derived coordinate system; neither scan is treated as ground
+        truth.
+
+        New code should use this method when the intention is
+        diffraction-pattern-level 0/90 correction.
+        """
+        if not self._is_4dstem_collection:
+            raise RuntimeError(
+                "generate_corrected_4dstem() requires 4D-STEM collection "
+                "construction: DriftCorrection.from_4dstem(data_0, data_1, ...). "
+                "For reference-mode EDS/EELS/4D-STEM, use generate_corrected()."
+            )
+        return self._generate_corrected_4dstem_collection(
+            mode=mode, chunk_size=chunk_size, merge=merge,
+            verbose=verbose, output_0=output_0, output_1=output_1,
+            output_dtype=output_dtype, output_device=output_device,
+        )
+
+    def correct_virtual_images(
+        self,
+        image_0: np.ndarray,
+        image_1: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Correct scalar virtual images like matching 4D-STEM channels.
+
+        Use this for VDF/BF/DF diagnostics from 4D-STEM collection data. Each
+        scalar image is corrected with the same operator used for diffraction
+        pixels; image 1 is oriented into image 0's display frame before the
+        average. ``result["corrected_image"]`` should match the same detector
+        integration from ``generate_corrected_4dstem()`` output, up to output
+        quantization.
+        """
+        return _4dstem.correct_virtual_images(
+            self,
+            image_0,
+            image_1,
+        )
+
+    @staticmethod
+    def integrate_virtual_detector(
+        ds_4d: np.ndarray | torch.Tensor,
+        detector_mask: np.ndarray | torch.Tensor | None = None,
+        *,
+        reduce: str = "mean",
+        chunk_rows: int | None = None,
+    ) -> np.ndarray:
+        """Integrate a VDF/BF/DF-style virtual image from a 4D-STEM dataset."""
+        return _4dstem.integrate_virtual_detector(
+            ds_4d,
+            detector_mask=detector_mask,
+            reduce=reduce,
+            chunk_rows=chunk_rows,
+        )
 
     @staticmethod
     def compute_vdf(
@@ -1831,9 +2058,9 @@ class DriftCorrection(AutoSerialize):
         """Delegates the ≥3-D dataset path to :mod:`drift_4dstem`."""
         return _4dstem.apply_correction_to_dataset(self, *args, **kwargs)
 
-    def _generate_corrected_paired_datasets(self, **kwargs) -> PairedCorrectionResult:
-        """Delegates the paired 4D-STEM merge to :mod:`drift_4dstem`."""
-        return _4dstem.generate_corrected_paired_datasets(self, **kwargs)
+    def _generate_corrected_4dstem_collection(self, **kwargs) -> CorrectionResult:
+        """Delegates the 4D-STEM collection merge to :mod:`drift_4dstem`."""
+        return _4dstem.generate_corrected_4dstem_collection(self, **kwargs)
 
     # -- serialization -------------------------------------------------------
 
@@ -1925,6 +2152,7 @@ class DriftCorrection(AutoSerialize):
     plot_convergence = drift_visualization.plot_convergence
     plot_merged_images = drift_visualization.plot_merged_images
     plot_knots = drift_visualization.plot_knots
+    plot_probe_positions = drift_visualization.plot_probe_positions
     plot_diffraction = drift_visualization.plot_4dstem_correction
     view_corrected_dp = _4dstem.view_corrected_dp
     view_corrected_vdfs = _4dstem.view_corrected_vdfs

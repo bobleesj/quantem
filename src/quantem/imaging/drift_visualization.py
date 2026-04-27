@@ -76,7 +76,170 @@ def _center_crop_slice(
     return (slice(r0, r0 + crop), slice(c0, c0 + crop)), crop
 
 
+def center_crop(
+    image: np.ndarray,
+    crop_shape: int | tuple[int, int] | tuple[slice, slice],
+) -> np.ndarray:
+    """Return a centered real-space crop of an image or scan-axis-leading array.
+
+    ``crop_shape`` may be an integer square size, ``(height, width)``, or an
+    explicit ``(row_slice, col_slice)`` pair. Only the first two axes are
+    cropped, so the helper also works for scan-axis-leading 3-D/4-D datasets.
+    """
+    arr = np.asarray(image)
+    if arr.ndim < 2:
+        raise ValueError(f"center_crop expects at least 2 dimensions, got {arr.ndim}")
+    if (
+        isinstance(crop_shape, tuple)
+        and len(crop_shape) == 2
+        and all(isinstance(v, slice) for v in crop_shape)
+    ):
+        row_slice, col_slice = crop_shape
+    else:
+        if isinstance(crop_shape, int):
+            crop_h = crop_w = int(crop_shape)
+        else:
+            crop_h, crop_w = (int(crop_shape[0]), int(crop_shape[1]))
+        h, w = arr.shape[:2]
+        if crop_h <= 0 or crop_w <= 0:
+            raise ValueError("crop dimensions must be positive")
+        if crop_h > h or crop_w > w:
+            raise ValueError(
+                f"crop shape {(crop_h, crop_w)} exceeds image shape {(h, w)}"
+            )
+        r0 = (h - crop_h) // 2
+        c0 = (w - crop_w) // 2
+        row_slice = slice(r0, r0 + crop_h)
+        col_slice = slice(c0, c0 + crop_w)
+    return arr[row_slice, col_slice, ...]
+
+
+def fft_log_magnitude(
+    image: np.ndarray,
+    *,
+    mask_radius: int = 5,
+) -> np.ndarray:
+    """Return log-scaled, Hanning-windowed FFT magnitude for a 2-D image."""
+    image = np.ascontiguousarray(image)
+    return np.log1p(_log_fft(image, mask_radius=mask_radius)).astype(np.float32)
+
+
+def normalized_cross_correlation(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    margin: int = 0,
+    crop_shape: int | tuple[int, int] | tuple[slice, slice] | None = None,
+) -> float:
+    """Compute z-normalized NCC, optionally on a center crop or inner margin."""
+    ref = np.asarray(reference, dtype=np.float32)
+    cand = np.asarray(candidate, dtype=np.float32)
+    if crop_shape is not None:
+        ref = center_crop(ref, crop_shape)
+        cand = center_crop(cand, crop_shape)
+    elif margin:
+        if margin * 2 >= min(ref.shape[:2]):
+            raise ValueError(
+                f"margin {margin} is too large for image shape {ref.shape[:2]}"
+            )
+        ref = ref[margin:-margin, margin:-margin, ...]
+        cand = cand[margin:-margin, margin:-margin, ...]
+    if ref.shape != cand.shape:
+        raise ValueError(
+            f"reference and candidate shapes must match, got {ref.shape} and {cand.shape}"
+        )
+    return _ncc(ref, cand)
+
+
 # --- public plot functions ---------------------------------------------------
+
+def plot_probe_positions(
+    dc: "DriftCorrection",
+    image_index: int = 0,
+    *,
+    stride: int = 16,
+    strip_padding: bool = True,
+    axsize: tuple[float, float] = (5.0, 4.8),
+    cmap: str = "viridis",
+) -> tuple[Figure, np.ndarray]:
+    """Plot nominal and drift-updated probe positions for one scan image.
+
+    The positions remain indexed like the raw scan: point ``(r, c)`` belongs
+    to the raw diffraction pattern at ``dataset[r, c]``. The corrected
+    positions are plotted in the shared drift-corrected coordinate frame, so
+    image 0 and image 1 position maps can be passed to ptychography without
+    interpolating diffraction patterns.
+    """
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    nominal = dc.probe_positions(
+        image_index=image_index,
+        corrected=False,
+        strip_padding=strip_padding,
+        plot=False,
+    )
+    corrected = dc.probe_positions(
+        image_index=image_index,
+        corrected=True,
+        strip_padding=strip_padding,
+        plot=False,
+    )
+    disp = corrected - nominal
+    mag = np.linalg.norm(disp, axis=-1)
+    s = (slice(None, None, stride), slice(None, None, stride))
+    nominal_s = nominal[s]
+    corrected_s = corrected[s]
+    disp_s = disp[s]
+    mag_s = mag[s]
+
+    fig, axes = plt.subplots(1, 2, figsize=(axsize[0] * 2, axsize[1]))
+    ax0, ax1 = axes
+    ax0.scatter(
+        nominal_s[..., 1].ravel(),
+        nominal_s[..., 0].ravel(),
+        s=8,
+        c="0.75",
+        label="nominal",
+        linewidths=0,
+    )
+    sc0 = ax0.scatter(
+        corrected_s[..., 1].ravel(),
+        corrected_s[..., 0].ravel(),
+        s=10,
+        c=mag_s.ravel(),
+        cmap=cmap,
+        label="drift-updated",
+        linewidths=0,
+    )
+    ax0.set_title(f"image {image_index} probe positions\nnominal vs drift-updated")
+    ax0.set_xlabel("col position (px)")
+    ax0.set_ylabel("row position (px)")
+    ax0.legend(loc="best", frameon=False)
+    fig.colorbar(sc0, ax=ax0, fraction=0.046, pad=0.04, label="displacement (px)")
+
+    q = ax1.quiver(
+        nominal_s[..., 1],
+        nominal_s[..., 0],
+        disp_s[..., 1],
+        disp_s[..., 0],
+        mag_s,
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        cmap=cmap,
+        width=0.003,
+    )
+    ax1.set_title(f"image {image_index} drift displacement\nnominal -> drift-updated")
+    ax1.set_xlabel("col position (px)")
+    ax1.set_ylabel("row position (px)")
+    fig.colorbar(q, ax=ax1, fraction=0.046, pad=0.04, label="displacement (px)")
+    for ax in axes:
+        ax.set_aspect("equal")
+        ax.invert_yaxis()
+        ax.grid(alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    return fig, axes
+
 
 def plot_correction_summary(
     dc: "DriftCorrection",
@@ -171,7 +334,7 @@ def plot_correction_summary(
     idx = target_index % len(dc.imgs)
     raw_np = dc.imgs[idx].array
     if corrected is None:
-        if dc.is_paired_4dstem:
+        if dc._is_4dstem_collection:
             # Full-cube apply OOMs in 4D-STEM mode; warp the VDF directly,
             # which is what the user wants to visualize anyway.
             from quantem.imaging.drift_align import backward_warp
@@ -186,30 +349,14 @@ def plot_correction_summary(
     else:
         corrected_np = np.asarray(corrected)
 
-    # Rotate raw/corrected back into reference orientation. Vendor sign
-    # conventions disagree (VELOX vs Dectris), so don't trust the sign of
-    # `scan_direction_degrees`. Instead, try all four 90° rotations and pick
-    # the one whose corrected merge correlates best with the reference.
     sd = np.asarray(dc.scan_direction_degrees, dtype=float)
     angle_delta_deg = float(sd[idx] - sd[reference_index])
-    expected_k_steps = int(round(abs(angle_delta_deg) / 90.0)) % 4
-    if expected_k_steps == 0:
+    rot_k = (-int(round(angle_delta_deg / 90.0))) % 4
+    if rot_k == 0:
         raw_aligned, corrected_aligned = raw_np, corrected_np
-        rot_k_back = 0
     else:
-        candidates = [k for k in (1, -1, 2) if k % 4 == expected_k_steps or k % 4 == (-expected_k_steps) % 4]
-        ref_f = ref_np.astype(np.float32)
-        ref_f -= ref_f.mean()
-        best_k, best_score = candidates[0], -np.inf
-        for k in candidates:
-            cand = np.rot90(corrected_np, k=k).astype(np.float32)
-            cand -= cand.mean()
-            score = float((ref_f * cand).sum() / (np.linalg.norm(ref_f) * np.linalg.norm(cand) + 1e-12))
-            if score > best_score:
-                best_score, best_k = score, k
-        rot_k_back = best_k
-        raw_aligned = np.rot90(raw_np, k=rot_k_back)
-        corrected_aligned = np.rot90(corrected_np, k=rot_k_back)
+        raw_aligned = np.rot90(raw_np, k=rot_k)
+        corrected_aligned = np.rot90(corrected_np, k=rot_k)
 
     h, w = ref_np.shape
     s, zoom = _center_crop_slice(ref_np, zoom)
@@ -221,8 +368,10 @@ def plot_correction_summary(
     raw_rms = _rms(raw_c, ref_c)
     cor_rms = _rms(cor_c, ref_c)
 
-    rot_note = (f" (rotated to image {reference_index} orientation)"
-                if rot_k_back else "")
+    rot_note = (
+        f" (rot90 k={rot_k} to image {reference_index} orientation)"
+        if rot_k else ""
+    )
     img_titles = [
         f"image {reference_index} raw",
         f"image {idx} raw" + rot_note,
@@ -268,7 +417,15 @@ def plot_correction_summary(
             ref_n = _znorm(ref_c)
             diff_raw = _znorm(raw_c) - ref_n
             diff_cor = _znorm(cor_c) - ref_n
-            vmax = float(max(np.abs(diff_raw).max(), np.abs(diff_cor).max()) * 0.8)
+            diff_images = [diff_raw]
+            diff_titles = [f"Raw \u2212 Ref (RMS={raw_rms:.3f})"]
+            if show_raw_merge:
+                diff_merge = _znorm(merge_c) - ref_n
+                diff_images.append(diff_merge)
+                diff_titles.append("Raw merge \u2212 Ref")
+            diff_images.append(diff_cor)
+            diff_titles.append(f"Corrected \u2212 Ref (RMS={cor_rms:.3f})")
+            vmax = float(max(np.abs(im).max() for im in diff_images) * 0.8)
             axes_grid[row][0].axis("off")
             axes_grid[row][0].text(
                 0.5, 0.5,
@@ -277,16 +434,15 @@ def plot_correction_summary(
                 ha="center", va="center", fontsize=10, color="gray",
             )
             show_2d(
-                [diff_raw, diff_cor],
-                title=[
-                    f"Raw \u2212 Ref (RMS={raw_rms:.3f})",
-                    f"Corrected \u2212 Ref (RMS={cor_rms:.3f})",
-                ],
+                diff_images,
+                title=diff_titles,
                 cmap="seismic",
-                figax=(fig, axes_grid[row, 1:]),
+                figax=(fig, axes_grid[row, 1:1 + len(diff_images)]),
                 axsize=axsize,
                 vmin=-vmax, vmax=vmax,
             )
+            for ax in axes_grid[row, 1 + len(diff_images):]:
+                ax.axis("off")
         fig.tight_layout()
         axs = axes_grid
     return fig, axs
