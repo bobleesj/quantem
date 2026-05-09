@@ -44,6 +44,7 @@ class PtychoLite(Ptychography):
         initial_probe_weights: list[float] | np.ndarray | None = None,
         # preprocessing
         obj_padding_px: tuple[int, int] = (0, 0),
+        probe_positions_px: np.ndarray | None = None,
         # logging/device
         log_dir: os.PathLike | str | None = None,
         log_prefix: str = "",
@@ -76,6 +77,10 @@ class PtychoLite(Ptychography):
             Optional corner-centered vacuum probe intensity for scaling/centering.
         initial_probe_weights : list[float] | np.ndarray | None
             Optional initial component weights (length=num_probes).
+        probe_positions_px : np.ndarray | None
+            Optional absolute probe positions in sample scan pixels, row/column
+            order. Accepts shape ``(scan_row, scan_col, 2)`` or
+            ``(num_positions, 2)``. Float positions are supported.
         log_dir, log_prefix, log_suffix, log_images_every, log_probe_images, device, verbose, rng
             Standard Ptychography configuration.
         """
@@ -83,8 +88,13 @@ class PtychoLite(Ptychography):
         # Ensure dataset model
         if isinstance(dset, PtychographyDatasetRaster):
             dset_model = dset
+            if probe_positions_px is not None:
+                dset_model.probe_positions_px = probe_positions_px
         elif isinstance(dset, Dataset4dstem):
-            dset_model = PtychographyDatasetRaster.from_dataset4dstem(dset)
+            dset_model = PtychographyDatasetRaster.from_dataset4dstem(
+                dset,
+                probe_positions_px=probe_positions_px,
+            )
         else:
             raise TypeError(
                 f"dset must be Dataset4dstem or PtychographyDatasetRaster, got {type(dset)}"
@@ -156,6 +166,7 @@ class PtychoLite(Ptychography):
         )
         ptycho.preprocess(
             obj_padding_px=obj_padding_px,
+            probe_positions_px=probe_positions_px,
         )
         return ptycho
 

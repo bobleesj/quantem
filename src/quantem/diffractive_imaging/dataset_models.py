@@ -631,11 +631,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
+        probe_positions_px: np.ndarray | None = None,
         _token: object | None = None,
     ):
         self.scan_sampling = dset.sampling[:2]
         self.scan_units = dset.units[:2]
         self.gpts = dset.shape[:2]
+        self.probe_positions_px = probe_positions_px
         self.intensities_4d = dset.array.copy()
 
         # convert to dataset3d
@@ -668,6 +670,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
+        probe_positions_px: np.ndarray | None = None,
     ) -> Self:
         """
         Create a new Dataset4dstem from a Dataset4dstem.
@@ -688,6 +691,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
+            probe_positions_px=probe_positions_px,
             _token=cls._token,
         )
 
@@ -700,6 +704,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
+        probe_positions_px: np.ndarray | None = None,
     ) -> Self:
         """
         Create a new Dataset4dstem from a file.
@@ -727,6 +732,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
+            probe_positions_px=probe_positions_px,
             _token=cls._token,
         )
 
@@ -743,6 +749,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
+        probe_positions_px: np.ndarray | None = None,
     ) -> Self:
         """
         Create a new Dataset4dstem from an array.
@@ -781,6 +788,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
+            probe_positions_px=probe_positions_px,
         )
 
     # endregion --- classmethods ---
@@ -861,6 +869,22 @@ class PtychographyDatasetRaster(DatasetConstraints):
         gpts = validate_array(gpts, name="gpts", shape=(2,), dtype=int)
         self._gpts = gpts
 
+    def _probe_positions_px_flat(self) -> np.ndarray | None:
+        """Return explicit sample-coordinate probe positions as ``(N, 2)``."""
+        if self.probe_positions_px is None:
+            return None
+        positions = np.asarray(self.probe_positions_px, dtype=config.get("dtype_real"))
+        expected_flat = (int(np.prod(self.gpts)), 2)
+        expected_grid = (int(self.gpts[0]), int(self.gpts[1]), 2)
+        if positions.shape == expected_grid:
+            return positions.reshape(expected_flat)
+        if positions.shape == expected_flat:
+            return positions
+        raise ValueError(
+            "probe_positions_px must have shape "
+            f"{expected_grid} or {expected_flat}, got {positions.shape}"
+        )
+
     @property
     def fov(self) -> np.ndarray:
         """
@@ -872,6 +896,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
         # max_pos = torch.max(self.initial_scan_positions_px, dim=0)[0]
         # extent_px = max_pos - min_pos
         # return extent_px.cpu().detach().numpy() * self.obj_sampling
+        probe_positions = self._probe_positions_px_flat()
+        if probe_positions is not None:
+            return np.ptp(probe_positions, axis=0) * self.scan_sampling
         return self.scan_sampling * (self.gpts - 1)
 
     @property
@@ -890,33 +917,39 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         Parameters
         ----------
-        positions: (J,2) np.ndarray or None
-            Input probe positions in Å.
-            If None, a raster scan using experimental parameters is constructed.
+        If ``probe_positions_px`` was supplied at construction time, those
+        absolute probe positions are used. Otherwise, a regular raster scan
+        using experimental parameters is constructed.
         positions_mask: np.ndarray, optional
             Boolean real space mask to select positions in datacube to skip for reconstruction
         obj_padding_px: Tuple[int,int], optional
             Pixel dimensions to pad object with
             If None, the padding is set to half the probe ROI dimensions
-        positions_offset_ang, np.ndarray, optional
-            Offset of positions in A
         """
 
         if obj_padding_px is None:
             obj_padding_px = np.array([0, 0])
 
-        nr, nc = self.gpts
         Sr, Sc = self._scan_sampling
-        r = np.arange(nr) * Sr
-        c = np.arange(nc) * Sc
+        probe_positions = self._probe_positions_px_flat()
+        if probe_positions is None:
+            nr, nc = self.gpts
+            r = np.arange(nr) * Sr
+            c = np.arange(nc) * Sc
 
-        r, c = np.meshgrid(r, c, indexing="ij")
+            r, c = np.meshgrid(r, c, indexing="ij")
 
-        if positions_mask is not None:
-            r = r[positions_mask]
-            c = c[positions_mask]
+            if positions_mask is not None:
+                r = r[positions_mask]
+                c = c[positions_mask]
 
-        positions = np.stack((r.ravel(), c.ravel()), axis=-1).astype(config.get("dtype_real"))
+            positions = np.stack((r.ravel(), c.ravel()), axis=-1).astype(config.get("dtype_real"))
+        else:
+            if positions_mask is not None:
+                probe_positions = probe_positions[np.asarray(positions_mask).reshape(-1)]
+            positions = np.empty_like(probe_positions, dtype=config.get("dtype_real"))
+            positions[:, 0] = probe_positions[:, 0] * Sr
+            positions[:, 1] = probe_positions[:, 1] * Sc
 
         if self.com_rotation_rad != 0:
             tf = AffineTransform(angle=self.com_rotation_rad)
@@ -951,6 +984,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         bilinear: bool = False,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
         obj_padding_px: tuple[int, int] | np.ndarray = (0, 0),
+        probe_positions_px: np.ndarray | None = None,
         plot_rotation: bool = True,
         plot_com: str | bool = True,
         vectorized: bool = True,
@@ -964,10 +998,14 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "bilinear": bilinear,
             "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
             "obj_padding_px": obj_padding_px,
+            "probe_positions_px": probe_positions_px,
             "plot_rotation": False,
             "plot_com": False,
             "vectorized": vectorized,
         }
+
+        if probe_positions_px is not None:
+            self.probe_positions_px = probe_positions_px
 
         if probe_energy is not None:
             self.probe_energy = probe_energy

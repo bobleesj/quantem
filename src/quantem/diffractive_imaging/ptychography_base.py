@@ -148,12 +148,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         plot_rotation: bool = True,
         plot_com: str | bool = True,
         plot_probe_overlap: bool = False,
+        probe_positions_px: np.ndarray | None = None,
     ):
         """
         Rather than passing 100 flags here, I'm going to suggest that if users want to run very
         customized pre-processing, they just call the functions themselves directly.
         """
         # self.to(self.device)
+        if probe_positions_px is not None:
+            self.dset.probe_positions_px = probe_positions_px
+
         if not self.dset.preprocessed:
             self.vprint("Dataset was not preprocessed, proceeding with defaults.")
             self.dset.preprocess(
@@ -162,6 +166,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 force_com_transpose=force_com_transpose,
                 padded_diffraction_intensities_shape=padded_diffraction_intensities_shape,
                 obj_padding_px=obj_padding_px,
+                probe_positions_px=probe_positions_px,
                 plot_rotation=plot_rotation,
                 plot_com=plot_com,
                 vectorized=vectorized,
