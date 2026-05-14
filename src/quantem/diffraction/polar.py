@@ -164,6 +164,10 @@ class PairDistributionFunction(AutoSerialize):
         radial_step: float = 1.0,
         two_fold_rotation_symmetry: bool = False,
         device: str = "cpu",
+        origin_batch_size: int = 48,
+        origin_local_margin: int = 25,
+        origin_preload_to_device: bool = False,
+        origin_show_progress: bool = True,
     ) -> Self:
         """Create a PairDistributionFunction from a dataset.
 
@@ -196,6 +200,18 @@ class PairDistributionFunction(AutoSerialize):
             If True, sample only ``[0, pi)`` in the angular axis.
         device : str
             Torch device used for computation.
+        origin_batch_size : int
+            Number of scan positions evaluated per origin-finding batch when
+            ``find_origin=True``.
+        origin_local_margin : int
+            Half-width, in pixels, of the per-scan origin refinement window when
+            ``find_origin=True``.
+        origin_preload_to_device : bool
+            If True, copy the flattened diffraction stack to the torch device
+            once during origin finding. This reduces per-batch transfer overhead
+            at the cost of higher peak device memory use.
+        origin_show_progress : bool
+            If True, show a progress bar during origin finding.
 
         Returns
         -------
@@ -239,6 +255,10 @@ class PairDistributionFunction(AutoSerialize):
                     radial_step=radial_step,
                     two_fold_rotation_symmetry=two_fold_rotation_symmetry,
                     device=device,
+                    batch_size=origin_batch_size,
+                    local_margin=origin_local_margin,
+                    preload_to_device=origin_preload_to_device,
+                    show_progress=origin_show_progress,
                 )
             else:
                 if origin_row is None:

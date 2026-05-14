@@ -12,7 +12,68 @@ from quantem.core.utils.utils import to_numpy
 # grid_sample's grid tensor requires them to be ordered (col, row)
 # but is noted where the call occures
 
+_MEAN_DP_CHUNK_BYTES = 432 * 1024 * 1024
+_ORIGIN_CHUNK_BYTES = 112 * 1024 * 1024
+_FLOAT32_EXACT_INTEGER_LIMIT = 2**24
 
+
+def _mean_dp_torch_chunked(
+    array_4d: NDArray,
+    n_row: int,
+    n_col: int,
+    device: str,
+    *,
+    chunk_bytes: int = _MEAN_DP_CHUNK_BYTES,
+) -> NDArray:
+    """Compute the mean DP in chunks while preserving NumPy integer-mean semantics."""
+    flat_dps = array_4d.reshape(-1, n_row, n_col)
+    n_pos = flat_dps.shape[0]
+    dtype = flat_dps.dtype
+
+    if np.issubdtype(dtype, np.integer):
+        bytes_per_position = np.dtype(np.float32).itemsize * n_row * n_col
+        chunk_positions = max(1, chunk_bytes // bytes_per_position)
+        sum_dp_float = torch.zeros((n_row, n_col), dtype=torch.float32, device=device)
+        max_abs_value = torch.zeros((), dtype=torch.float32, device=device)
+        for start in range(0, n_pos, chunk_positions):
+            end = min(start + chunk_positions, n_pos)
+            chunk_t = torch.asarray(flat_dps[start:end], dtype=torch.float32, device=device)
+            sum_dp_float += chunk_t.sum(dim=0)
+            chunk_abs_max = (
+                chunk_t.abs().max() if np.issubdtype(dtype, np.signedinteger) else chunk_t.max()
+            )
+            max_abs_value = torch.maximum(max_abs_value, chunk_abs_max)
+        if float(max_abs_value.cpu().item()) * n_pos <= _FLOAT32_EXACT_INTEGER_LIMIT:
+            sum_dp_np = sum_dp_float.cpu().numpy()
+            return (sum_dp_np.astype(np.float64) / float(n_pos)).astype(np.float32)
+        del sum_dp_float
+
+        info = np.iinfo(dtype)
+        int64_info = np.iinfo(np.int64)
+        if info.min * n_pos >= int64_info.min and info.max * n_pos <= int64_info.max:
+            bytes_per_position = np.dtype(np.int64).itemsize * n_row * n_col
+            chunk_positions = max(1, chunk_bytes // bytes_per_position)
+            sum_dp = torch.zeros((n_row, n_col), dtype=torch.int64, device=device)
+            for start in range(0, n_pos, chunk_positions):
+                end = min(start + chunk_positions, n_pos)
+                chunk_t = torch.asarray(flat_dps[start:end], dtype=torch.int64, device=device)
+                sum_dp += chunk_t.sum(dim=0)
+            sum_dp_np = sum_dp.cpu().numpy()
+            return (sum_dp_np.astype(np.float64) / float(n_pos)).astype(np.float32)
+
+    return array_4d.mean(axis=(0, 1)).astype(np.float32)
+
+
+def _array_chunk_to_device_float32(chunk: NDArray, device: str) -> torch.Tensor:
+    """Move an array chunk to the torch device as float32."""
+    try:
+        return torch.asarray(chunk, dtype=torch.float32, device=device)
+    except (TypeError, RuntimeError):
+        chunk_np = np.ascontiguousarray(chunk, dtype=np.float32)
+        return torch.from_numpy(chunk_np).to(device)
+
+
+@torch.inference_mode()
 def auto_origin_id(
     data: Dataset4dstem,
     *,
@@ -23,8 +84,10 @@ def auto_origin_id(
     radial_step: float = 2.0,
     two_fold_rotation_symmetry: bool = False,
     device: str = "cpu",
-    batch_size: int = 16,
+    batch_size: int = 48,
     local_margin: int = 25,
+    preload_to_device: bool = False,
+    show_progress: bool = True,
 ) -> NDArray:
     """
     Automatic diffraction center finding by minimizing angular intensity
@@ -64,6 +127,12 @@ def auto_origin_id(
         ``(2*local_margin+1)`` square window centered on the global
         origin. Set this large enough to cover the worst-case descan
         drift across the scan.
+    preload_to_device : bool
+        If True, copy the flattened diffraction stack to the torch device once
+        before per-scan refinement. This can reduce host/device transfer
+        overhead on MPS/CUDA at the cost of higher peak device memory use.
+    show_progress : bool
+        If True, show a tqdm progress bar during per-scan origin refinement.
 
     Returns
     -------
@@ -82,10 +151,10 @@ def auto_origin_id(
             "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
         )
 
-    origin_array = np.zeros((scan_row, scan_col, 2), dtype=float)
+    origin_shape = (scan_row, scan_col, 2)
     # first get COM of mean DP because it gives a robust rough center
     array_4d = data.array if data.array.ndim == 4 else data.array[None, None, :, :]
-    mean_dp_np = array_4d.mean(axis=(0, 1)).astype(np.float32)
+    mean_dp_np = _mean_dp_torch_chunked(array_4d, n_row, n_col, device)
     total_intensity = mean_dp_np.sum()
     row_grid, col_grid = np.mgrid[0:n_row, 0:n_col]
     com_row = int(round(float((row_grid * mean_dp_np).sum() / total_intensity)))
@@ -126,12 +195,17 @@ def auto_origin_id(
     n_r = radial_bins.numel()
     min_r_idx = int(np.floor(0.1 * n_r))
     max_r_idx = int(np.ceil(0.9 * n_r))
-    # Normalize offsets to [-1, 1] because grid_sample expects normalized coordinates
+    score_offset_row = offset_row[:, min_r_idx:max_r_idx]
+    score_offset_col = offset_col[:, min_r_idx:max_r_idx]
+    score_n_r = score_offset_col.shape[1]
+    # Normalize only the radial band used for scoring. This keeps the objective
+    # identical while avoiding grid_sample work for radial bins that are discarded.
     col_norm_scale = 2.0 / (n_col - 1)
     row_norm_scale = 2.0 / (n_row - 1)
-    base_col_norm = offset_col * col_norm_scale
-    base_row_norm = offset_row * row_norm_scale
-
+    base_col_norm = score_offset_col * col_norm_scale
+    base_row_norm = score_offset_row * row_norm_scale
+    col_origin_norm = torch.arange(n_col, dtype=torch.float32, device=device) * col_norm_scale - 1.0
+    row_origin_norm = torch.arange(n_row, dtype=torch.float32, device=device) * row_norm_scale - 1.0
     # Mean-DP global center search: coarse → fine, masking candidates
     # whose polar grid would extend OOB at each step.
     mean_dp_batch = torch.from_numpy(mean_dp_np).to(device)[None, None]
@@ -148,12 +222,15 @@ def auto_origin_id(
         row_norm_scale,
         device,
         step=4,
+        col_origin_norm=col_origin_norm,
+        row_origin_norm=row_origin_norm,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, 0, score_n_r)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
-    best = scores.masked_fill(~valid, float("inf")).argmin().item()
+    scores.masked_fill_(~valid, float("inf"))
+    best = scores.argmin().item()
     coarse_row, coarse_col = int(rows[best].item()), int(cols[best].item())
     # Fine: step=1 over ±6 around the coarse winner
     rows, cols, grids = _build_candidate_grids(
@@ -168,12 +245,15 @@ def auto_origin_id(
         row_norm_scale,
         device,
         step=1,
+        col_origin_norm=col_origin_norm,
+        row_origin_norm=row_origin_norm,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, 0, score_n_r)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
-    best = scores.masked_fill(~valid, float("inf")).argmin().item()
+    scores.masked_fill_(~valid, float("inf"))
+    best = scores.argmin().item()
     global_row, global_col = int(rows[best].item()), int(cols[best].item())
 
     # Per-scan-position refinement (coarse → medium → fine) for descan
@@ -190,6 +270,8 @@ def auto_origin_id(
         row_norm_scale,
         device,
         step=local_coarse_step,
+        col_origin_norm=col_origin_norm,
+        row_origin_norm=row_origin_norm,
     )
     coarse_valid = (
         (coarse_rows >= safe_low)
@@ -197,6 +279,10 @@ def auto_origin_id(
         & (coarse_cols >= safe_low)
         & (coarse_cols <= safe_high_col)
     )
+    if not bool(coarse_valid.all().item()):
+        coarse_rows = coarse_rows[coarse_valid]
+        coarse_cols = coarse_cols[coarse_valid]
+        coarse_grids = coarse_grids[coarse_valid]
     n_coarse = coarse_grids.shape[0]
     # Per-DP relative offsets used by the medium and fine stages
     med_rel = torch.arange(
@@ -208,28 +294,57 @@ def auto_origin_id(
         m.reshape(-1) for m in torch.meshgrid(fine_rel, fine_rel, indexing="ij")
     )
     flat_dps = array_4d.reshape(-1, n_row, n_col)
-    origin_flat = origin_array.reshape(-1, 2)
+    flat_dps_t = None
+    if preload_to_device:
+        flat_dps_t = _array_chunk_to_device_float32(flat_dps, device)
     n_pos = flat_dps.shape[0]
+    origin_flat_t = torch.empty((n_pos, 2), dtype=torch.int32, device=device)
+    med_grid_buffer = torch.empty(
+        (
+            min(batch_size, n_pos),
+            med_drow.numel(),
+            base_col_norm.shape[0],
+            base_col_norm.shape[1],
+            2,
+        ),
+        dtype=base_col_norm.dtype,
+        device=device,
+    )
+    fine_grid_buffer = torch.empty(
+        (
+            min(batch_size, n_pos),
+            fine_drow.numel(),
+            base_col_norm.shape[0],
+            base_col_norm.shape[1],
+            2,
+        ),
+        dtype=base_col_norm.dtype,
+        device=device,
+    )
 
-    def refine(dp_batch, current_row, current_col, drow, dcol):
+    def refine(dp_batch, current_row, current_col, drow, dcol, grid_buffer):
         """scores candidates per DP and return the best(row, col) per DP. Invalid (out of bounds) candidates are masked."""
         n_cands = drow.numel()
         cand_rows = (current_row[:, None] + drow[None, :]).clamp(0, n_row - 1)
         cand_cols = (current_col[:, None] + dcol[None, :]).clamp(0, n_col - 1)
-        g_col = (
-            base_col_norm + (cand_cols.reshape(-1).float() * col_norm_scale - 1.0)[:, None, None]
+        grids = grid_buffer[: dp_batch.shape[0], :n_cands]
+        grids[..., 0] = base_col_norm[None, None, :, :] + col_origin_norm[cand_cols][
+            :, :, None, None
+        ]
+        grids[..., 1] = base_row_norm[None, None, :, :] + row_origin_norm[cand_rows][
+            :, :, None, None
+        ]
+        grids = grids.reshape(
+            dp_batch.shape[0], n_cands, base_col_norm.shape[0] * base_col_norm.shape[1], 2
         )
-        g_row = (
-            base_row_norm + (cand_rows.reshape(-1).float() * row_norm_scale - 1.0)[:, None, None]
-        )
-        grids = torch.stack([g_col, g_row], dim=-1)
-        dps = dp_batch.repeat_interleave(n_cands, dim=0)
         polars = F.grid_sample(
-            dps, grids, mode="bilinear", padding_mode="zeros", align_corners=True
+            dp_batch, grids, mode="bilinear", padding_mode="zeros", align_corners=True
         )
         scores = (
-            polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[..., min_r_idx:max_r_idx]
-            .std(dim=2)
+            polars.squeeze(1)
+            .view(dp_batch.shape[0], n_cands, *base_col_norm.shape)
+            .var(dim=2, correction=1)
+            .sqrt()
             .sum(dim=2)
         )
         valid = (
@@ -238,44 +353,74 @@ def auto_origin_id(
             & (cand_cols >= safe_low)
             & (cand_cols <= safe_high_col)
         )
-        best = scores.masked_fill(~valid, float("inf")).argmin(dim=1)
+        scores.masked_fill_(~valid, float("inf"))
+        best = scores.argmin(dim=1)
         return (
             cand_rows.gather(1, best[:, None]).squeeze(1),
             cand_cols.gather(1, best[:, None]).squeeze(1),
         )
 
-    pbar = tqdm(total=n_pos, desc="Finding origin for each scan position")
-    for start in range(0, n_pos, batch_size):
-        end = min(start + batch_size, n_pos)
-        bsz = end - start
-        dp_b = (
-            torch.from_numpy(np.ascontiguousarray(flat_dps[start:end], dtype=np.float32))
-            .to(device)
-            .unsqueeze(1)
-        )  # (B, 1, H, W)
-        # Coarse (shared grids): broadcast B DPs across n_coarse candidate
-        # grids in one grid_sample call by stacking DPs in the channel dim
-        # and stride-0 expanding along the candidate dim
-        polars_coarse = F.grid_sample(
-            dp_b.transpose(0, 1).expand(n_coarse, bsz, n_row, n_col),
-            coarse_grids,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
+    pbar = (
+        tqdm(
+            total=n_pos,
+            desc="Finding origin for each scan position",
+            mininterval=0.5,
         )
-        scores_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx].std(dim=2).sum(dim=2)
-        scores_coarse = scores_coarse.masked_fill(~coarse_valid[:, None], float("inf"))
-        best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
-        current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
-        # Medium: per-DP search around the coarse winner
-        current_row, current_col = refine(dp_b, current_row, current_col, med_drow, med_dcol)
-        # Fine: per-DP ±1 around the medium winner
-        current_row, current_col = refine(dp_b, current_row, current_col, fine_drow, fine_dcol)
-        origin_flat[start:end, 0] = current_row.cpu().numpy()
-        origin_flat[start:end, 1] = current_col.cpu().numpy()
-        pbar.update(bsz)
-    pbar.close()
-    return origin_array
+        if show_progress
+        else None
+    )
+    max_transfer_chunk_bytes = _ORIGIN_CHUNK_BYTES
+    max_transfer_chunk_positions = max(
+        batch_size,
+        max_transfer_chunk_bytes // (np.dtype(np.float32).itemsize * n_row * n_col),
+    )
+    transfer_chunk_size = min(
+        n_pos,
+        max(batch_size, (max_transfer_chunk_positions // batch_size) * batch_size),
+    )
+    if flat_dps_t is not None:
+        transfer_chunk_size = n_pos
+
+    for chunk_start in range(0, n_pos, transfer_chunk_size):
+        chunk_end = min(chunk_start + transfer_chunk_size, n_pos)
+        if flat_dps_t is None:
+            chunk_t = _array_chunk_to_device_float32(flat_dps[chunk_start:chunk_end], device)
+        else:
+            chunk_t = flat_dps_t[chunk_start:chunk_end]
+
+        for start in range(chunk_start, chunk_end, batch_size):
+            end = min(start + batch_size, chunk_end)
+            bsz = end - start
+            chunk_offset = start - chunk_start
+            dp_b = chunk_t[chunk_offset : chunk_offset + bsz].unsqueeze(1)
+            # Coarse (shared grids): broadcast B DPs across n_coarse candidate
+            # grids in one grid_sample call by stacking DPs in the channel dim
+            # and stride-0 expanding along the candidate dim
+            polars_coarse = F.grid_sample(
+                dp_b.transpose(0, 1).expand(n_coarse, bsz, n_row, n_col),
+                coarse_grids,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            scores_coarse = polars_coarse.var(dim=2, correction=1).sqrt().sum(dim=2)
+            best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
+            current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
+            # Medium: per-DP search around the coarse winner
+            current_row, current_col = refine(
+                dp_b, current_row, current_col, med_drow, med_dcol, med_grid_buffer
+            )
+            # Fine: per-DP ±1 around the medium winner
+            current_row, current_col = refine(
+                dp_b, current_row, current_col, fine_drow, fine_dcol, fine_grid_buffer
+            )
+            origin_flat_t[start:end, 0] = current_row
+            origin_flat_t[start:end, 1] = current_col
+            if pbar is not None:
+                pbar.update(bsz)
+    if pbar is not None:
+        pbar.close()
+    return origin_flat_t.cpu().numpy().astype(float, copy=False).reshape(origin_shape)
 
 
 def polar_transform(
@@ -541,6 +686,8 @@ def _build_candidate_grids(
     row_norm_scale: float,
     device: str = "cpu",
     step: int = 1,
+    col_origin_norm: torch.Tensor | None = None,
+    row_origin_norm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a batch of normalized sampling grids, one per candidate origin
     pixel in a search window around (center_row, center_col). Candidates are
@@ -588,14 +735,22 @@ def _build_candidate_grids(
     row_flat, col_flat = row_grid.reshape(-1), col_grid.reshape(-1)
     # Shift the pre-computed polar offsets to each candidate origin,
     # converting to grid_sample's [-1, 1] normalized coordinates
-    grid_col = (
-        base_col_norm.unsqueeze(0) + (col_flat.float() * col_norm_scale - 1.0)[:, None, None]
+    grids = torch.empty(
+        (row_flat.numel(), base_col_norm.shape[0], base_col_norm.shape[1], 2),
+        dtype=base_col_norm.dtype,
+        device=device,
     )
-    grid_row = (
-        base_row_norm.unsqueeze(0) + (row_flat.float() * row_norm_scale - 1.0)[:, None, None]
-    )
+    if col_origin_norm is None:
+        col_shift = col_flat.float() * col_norm_scale - 1.0
+    else:
+        col_shift = col_origin_norm[col_flat]
+    if row_origin_norm is None:
+        row_shift = row_flat.float() * row_norm_scale - 1.0
+    else:
+        row_shift = row_origin_norm[row_flat]
+    grids[..., 0] = base_col_norm.unsqueeze(0) + col_shift[:, None, None]
+    grids[..., 1] = base_row_norm.unsqueeze(0) + row_shift[:, None, None]
     # grid_sample requires (col, row) ordering in the last dim
-    grids = torch.stack([grid_col, grid_row], dim=-1)  # (N, n_phi, n_r, 2)
     return row_flat, col_flat, grids
 
 
@@ -619,4 +774,4 @@ def _angular_std_scores(
     # A correctly centered pattern has uniform intensity along each ring,
     # so the angular std is minimized at the true center
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    return region.std(dim=1).sum(dim=1)
+    return region.var(dim=1, correction=1).sqrt().sum(dim=1)

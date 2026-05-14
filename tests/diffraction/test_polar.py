@@ -1,11 +1,20 @@
 import numpy as np
 import pytest
+import torch
+import torch.nn.functional as F
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.diffraction.polar import PairDistributionFunction
-from quantem.diffraction.polar_transform import auto_origin_id, polar_transform
+from quantem.diffraction.polar_transform import (
+    _array_chunk_to_device_float32,
+    _build_candidate_grids,
+    _build_polar_sampling_offsets,
+    _mean_dp_torch_chunked,
+    auto_origin_id,
+    polar_transform,
+)
 
 # ============================================================================
 # Fixtures
@@ -71,6 +80,250 @@ def synthetic_dataset2d(synthetic_diffraction_pattern):
     )
 
 
+def _origin_parity_dataset() -> Dataset4dstem:
+    """Small deterministic stack for brittle origin-finder parity checks."""
+    ny = nx = 160
+    y, x = np.ogrid[:ny, :nx]
+    base_center = (ny - 1) / 2.0
+    centers = np.array(
+        [
+            [
+                [base_center, base_center],
+                [base_center + 1, base_center - 2],
+                [base_center - 2, base_center + 2],
+            ],
+            [
+                [base_center + 2, base_center + 1],
+                [base_center - 1, base_center - 1],
+                [base_center - 3, base_center],
+            ],
+        ],
+        dtype=float,
+    )
+
+    array_4d = np.empty((*centers.shape[:2], ny, nx), dtype=np.float32)
+    for iy in range(centers.shape[0]):
+        for ix in range(centers.shape[1]):
+            cy, cx = centers[iy, ix]
+            radius = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+            pattern = np.zeros((ny, nx), dtype=np.float32)
+            for ring_radius, amplitude, sigma in (
+                (10, 80, 1.8),
+                (22, 120, 2.2),
+                (38, 60, 2.8),
+            ):
+                pattern += amplitude * np.exp(-((radius - ring_radius) ** 2) / (2 * sigma**2))
+            pattern += 1000 * np.exp(-(radius**2) / (2 * 2.5**2))
+            pattern += 2.0
+            array_4d[iy, ix] = pattern
+
+    return Dataset4dstem.from_array(array_4d, name="origin_parity")
+
+
+ORIGIN_PARITY_EXPECTED = np.array(
+    [
+        [[80.0, 80.0], [81.0, 78.0], [78.0, 82.0]],
+        [[82.0, 81.0], [79.0, 79.0], [77.0, 80.0]],
+    ],
+    dtype=float,
+)
+
+
+def _reference_shared_scores(
+    dp_batch: torch.Tensor,
+    cand_rows: torch.Tensor,
+    cand_cols: torch.Tensor,
+    offset_row: torch.Tensor,
+    offset_col: torch.Tensor,
+    min_r_idx: int,
+    max_r_idx: int,
+    n_row: int,
+    n_col: int,
+) -> torch.Tensor:
+    col_norm_scale = 2.0 / (n_col - 1)
+    row_norm_scale = 2.0 / (n_row - 1)
+    base_col_norm = offset_col * col_norm_scale
+    base_row_norm = offset_row * row_norm_scale
+    grid_col = (
+        base_col_norm.unsqueeze(0)
+        + (cand_cols.float() * col_norm_scale - 1.0)[:, None, None]
+    )
+    grid_row = (
+        base_row_norm.unsqueeze(0)
+        + (cand_rows.float() * row_norm_scale - 1.0)[:, None, None]
+    )
+    grids = torch.stack([grid_col, grid_row], dim=-1)
+    polars = F.grid_sample(
+        dp_batch.transpose(0, 1).expand(cand_rows.numel(), dp_batch.shape[0], n_row, n_col),
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return polars[:, :, :, min_r_idx:max_r_idx].std(dim=2).sum(dim=2).T
+
+
+def _reference_paired_scores(
+    dp_batch: torch.Tensor,
+    cand_rows: torch.Tensor,
+    cand_cols: torch.Tensor,
+    offset_row: torch.Tensor,
+    offset_col: torch.Tensor,
+    min_r_idx: int,
+    max_r_idx: int,
+    n_row: int,
+    n_col: int,
+) -> torch.Tensor:
+    col_norm_scale = 2.0 / (n_col - 1)
+    row_norm_scale = 2.0 / (n_row - 1)
+    base_col_norm = offset_col * col_norm_scale
+    base_row_norm = offset_row * row_norm_scale
+    n_cands = cand_rows.shape[1]
+    grid_col = (
+        base_col_norm
+        + (cand_cols.reshape(-1).float() * col_norm_scale - 1.0)[:, None, None]
+    )
+    grid_row = (
+        base_row_norm
+        + (cand_rows.reshape(-1).float() * row_norm_scale - 1.0)[:, None, None]
+    )
+    grids = torch.stack([grid_col, grid_row], dim=-1)
+    polars = F.grid_sample(
+        dp_batch.repeat_interleave(n_cands, dim=0),
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    n_phi, n_r = base_col_norm.shape
+    return (
+        polars.view(dp_batch.shape[0], n_cands, n_phi, n_r)[..., min_r_idx:max_r_idx]
+        .std(dim=2)
+        .sum(dim=2)
+    )
+
+
+def _optimized_shared_scores(
+    dp_batch: torch.Tensor,
+    center_row: int,
+    center_col: int,
+    margin: int,
+    step: int,
+    offset_row: torch.Tensor,
+    offset_col: torch.Tensor,
+    min_r_idx: int,
+    max_r_idx: int,
+    n_row: int,
+    n_col: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    col_norm_scale = 2.0 / (n_col - 1)
+    row_norm_scale = 2.0 / (n_row - 1)
+    base_col_norm = offset_col[:, min_r_idx:max_r_idx] * col_norm_scale
+    base_row_norm = offset_row[:, min_r_idx:max_r_idx] * row_norm_scale
+    col_origin_norm = (
+        torch.arange(n_col, dtype=torch.float32, device=dp_batch.device) * col_norm_scale - 1.0
+    )
+    row_origin_norm = (
+        torch.arange(n_row, dtype=torch.float32, device=dp_batch.device) * row_norm_scale - 1.0
+    )
+    cand_rows, cand_cols, grids = _build_candidate_grids(
+        base_col_norm,
+        base_row_norm,
+        center_row,
+        center_col,
+        margin,
+        n_row,
+        n_col,
+        col_norm_scale,
+        row_norm_scale,
+        "mps",
+        step=step,
+        col_origin_norm=col_origin_norm,
+        row_origin_norm=row_origin_norm,
+    )
+    polars = F.grid_sample(
+        dp_batch.transpose(0, 1).expand(cand_rows.numel(), dp_batch.shape[0], n_row, n_col),
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    scores = polars.var(dim=2, correction=1).sqrt().sum(dim=2).T
+    return cand_rows, cand_cols, scores
+
+
+def _optimized_paired_scores(
+    dp_batch: torch.Tensor,
+    cand_rows: torch.Tensor,
+    cand_cols: torch.Tensor,
+    offset_row: torch.Tensor,
+    offset_col: torch.Tensor,
+    min_r_idx: int,
+    max_r_idx: int,
+    n_row: int,
+    n_col: int,
+) -> torch.Tensor:
+    col_norm_scale = 2.0 / (n_col - 1)
+    row_norm_scale = 2.0 / (n_row - 1)
+    base_col_norm = offset_col[:, min_r_idx:max_r_idx] * col_norm_scale
+    base_row_norm = offset_row[:, min_r_idx:max_r_idx] * row_norm_scale
+    col_origin_norm = (
+        torch.arange(n_col, dtype=torch.float32, device=dp_batch.device) * col_norm_scale - 1.0
+    )
+    row_origin_norm = (
+        torch.arange(n_row, dtype=torch.float32, device=dp_batch.device) * row_norm_scale - 1.0
+    )
+    n_cands = cand_rows.shape[1]
+    grids = torch.empty(
+        (
+            dp_batch.shape[0],
+            n_cands,
+            base_col_norm.shape[0],
+            base_col_norm.shape[1],
+            2,
+        ),
+        dtype=base_col_norm.dtype,
+        device=base_col_norm.device,
+    )
+    grids[..., 0] = base_col_norm[None, None, :, :] + col_origin_norm[cand_cols][
+        :, :, None, None
+    ]
+    grids[..., 1] = base_row_norm[None, None, :, :] + row_origin_norm[cand_rows][
+        :, :, None, None
+    ]
+    grids = grids.reshape(
+        dp_batch.shape[0], n_cands, base_col_norm.shape[0] * base_col_norm.shape[1], 2
+    )
+    polars = F.grid_sample(dp_batch, grids, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return (
+        polars.squeeze(1)
+        .view(dp_batch.shape[0], n_cands, *base_col_norm.shape)
+        .var(dim=2, correction=1)
+        .sqrt()
+        .sum(dim=2)
+    )
+
+
+def _mps_origin_score_case():
+    device = "mps"
+    n_row = n_col = 160
+    dp_batch = torch.from_numpy(
+        np.ascontiguousarray(_origin_parity_dataset().array.reshape(-1, n_row, n_col)[:4])
+    ).to(device)[:, None]
+    offset_row, offset_col, _, radial_bins = _build_polar_sampling_offsets(
+        None,
+        18,
+        0.0,
+        56.0,
+        1.0,
+        False,
+        device,
+    )
+    min_r_idx = int(np.floor(0.1 * radial_bins.numel()))
+    max_r_idx = int(np.ceil(0.9 * radial_bins.numel()))
+    return dp_batch, offset_row, offset_col, min_r_idx, max_r_idx, n_row, n_col
+
+
 # ============================================================================
 # Test PairDistributionFunction Construction
 # ============================================================================
@@ -109,6 +362,150 @@ class TestPairDistributionFunctionConstruction:
                 row, col = origin_array[iy, ix]
                 assert abs(row - expected_center) < 1
                 assert abs(col - expected_center) < 1
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+    def test_find_origin_mps_brittle_origin_parity(self):
+        """MPS optimized origin finder must keep the exact locked origins."""
+        origin_array = auto_origin_id(
+            _origin_parity_dataset(),
+            device="mps",
+            batch_size=3,
+            local_margin=25,
+            radial_step=1.0,
+            show_progress=False,
+        )
+        np.testing.assert_array_equal(origin_array, ORIGIN_PARITY_EXPECTED)
+        origin_array_preloaded = auto_origin_id(
+            _origin_parity_dataset(),
+            device="mps",
+            batch_size=3,
+            local_margin=25,
+            radial_step=1.0,
+            preload_to_device=True,
+            show_progress=False,
+        )
+        np.testing.assert_array_equal(origin_array_preloaded, ORIGIN_PARITY_EXPECTED)
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+    def test_find_origin_mps_torch_integer_mean_matches_numpy_exactly(self):
+        """Chunked MPS integer mean must match the original NumPy mean bit-for-bit."""
+        rng = np.random.default_rng(42)
+        array_4d = rng.integers(
+            0,
+            2**31 - 1,
+            size=(3, 5, 24, 26),
+            dtype=np.uint32,
+        )
+        expected = array_4d.mean(axis=(0, 1)).astype(np.float32)
+        actual = _mean_dp_torch_chunked(
+            array_4d,
+            24,
+            26,
+            "mps",
+            chunk_bytes=3 * np.dtype(np.int64).itemsize * 24 * 26,
+        )
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+    def test_find_origin_mps_low_count_float32_mean_matches_numpy_exactly(self):
+        """Low-count integer mean can use float32 accumulation without losing exactness."""
+        rng = np.random.default_rng(43)
+        array_4d = rng.integers(0, 64, size=(16, 16, 24, 26), dtype=np.uint32)
+        expected = array_4d.mean(axis=(0, 1)).astype(np.float32)
+        actual = _mean_dp_torch_chunked(
+            array_4d,
+            24,
+            26,
+            "mps",
+            chunk_bytes=17 * np.dtype(np.float32).itemsize * 24 * 26,
+        )
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+    def test_find_origin_mps_direct_chunk_transfer_matches_cpu_conversion(self):
+        """Direct uint32-to-MPS chunk transfer must preserve the old float32 values."""
+        rng = np.random.default_rng(43)
+        chunk = rng.integers(0, 2**31 - 1, size=(4, 19, 23), dtype=np.uint32)
+        expected = torch.from_numpy(np.ascontiguousarray(chunk, dtype=np.float32)).to("mps")
+        actual = _array_chunk_to_device_float32(chunk, "mps")
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+    def test_find_origin_mps_brittle_score_parity(self):
+        """Mid-band MPS scorer must match the old full-grid scorer exactly."""
+        dp_batch, offset_row, offset_col, min_r_idx, max_r_idx, n_row, n_col = (
+            _mps_origin_score_case()
+        )
+
+        cand_rows, cand_cols, shared_fast = _optimized_shared_scores(
+            dp_batch,
+            80,
+            80,
+            8,
+            4,
+            offset_row,
+            offset_col,
+            min_r_idx,
+            max_r_idx,
+            n_row,
+            n_col,
+        )
+        shared_reference = _reference_shared_scores(
+            dp_batch,
+            cand_rows,
+            cand_cols,
+            offset_row,
+            offset_col,
+            min_r_idx,
+            max_r_idx,
+            n_row,
+            n_col,
+        )
+        torch.testing.assert_close(shared_fast, shared_reference, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            shared_fast.argmin(dim=1),
+            shared_reference.argmin(dim=1),
+            rtol=0,
+            atol=0,
+        )
+
+        current_row = torch.tensor([80, 81, 78, 82], dtype=torch.long, device="mps")
+        current_col = torch.tensor([80, 78, 82, 81], dtype=torch.long, device="mps")
+        rel = torch.arange(-4, 5, 2, dtype=torch.long, device="mps")
+        drow, dcol = (m.reshape(-1) for m in torch.meshgrid(rel, rel, indexing="ij"))
+        paired_rows = (current_row[:, None] + drow[None, :]).clamp(0, n_row - 1)
+        paired_cols = (current_col[:, None] + dcol[None, :]).clamp(0, n_col - 1)
+        paired_reference = _reference_paired_scores(
+            dp_batch,
+            paired_rows,
+            paired_cols,
+            offset_row,
+            offset_col,
+            min_r_idx,
+            max_r_idx,
+            n_row,
+            n_col,
+        )
+        paired_fast = _optimized_paired_scores(
+            dp_batch,
+            paired_rows,
+            paired_cols,
+            offset_row,
+            offset_col,
+            min_r_idx,
+            max_r_idx,
+            n_row,
+            n_col,
+        )
+        torch.testing.assert_close(paired_fast, paired_reference, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            paired_fast.argmin(dim=1),
+            paired_reference.argmin(dim=1),
+            rtol=0,
+            atol=0,
+        )
 
 
 # ============================================================================
