@@ -237,6 +237,11 @@ fn intersectSlicePlane(origin: vec3<f32>, dir: vec3<f32>, axis: i32, pos: f32,
   return t;
 }
 
+fn applyWindow(value: f32) -> f32 {
+  let denom = max(u.vmax - u.vmin, 1e-6);
+  return clamp((value - u.vmin) / denom, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   // Reconstruct ray from clip space — OpenGL convention z in [-1, 1]
@@ -289,7 +294,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       let slicePos = rayOrigin + tSliceXY * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValXY = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
-      sliceValXY = clamp((sliceValXY - u.vmin) / (u.vmax - u.vmin), 0.0, 1.0);
+      sliceValXY = applyWindow(sliceValXY);
       var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValXY * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
       sliceCol = mix(sliceCol, vec3<f32>(0.3, 0.5, 1.0), 0.25);
       let sliceAlpha = u.slicePlaneOpacity * (1.0 - accum.a);
@@ -301,7 +306,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       let slicePos = rayOrigin + tSliceXZ * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValXZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
-      sliceValXZ = clamp((sliceValXZ - u.vmin) / (u.vmax - u.vmin), 0.0, 1.0);
+      sliceValXZ = applyWindow(sliceValXZ);
       var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValXZ * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
       sliceCol = mix(sliceCol, vec3<f32>(0.3, 1.0, 0.4), 0.25);
       let sliceAlpha = u.slicePlaneOpacity * (1.0 - accum.a);
@@ -313,7 +318,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       let slicePos = rayOrigin + tSliceYZ * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValYZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
-      sliceValYZ = clamp((sliceValYZ - u.vmin) / (u.vmax - u.vmin), 0.0, 1.0);
+      sliceValYZ = applyWindow(sliceValYZ);
       var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValYZ * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
       sliceCol = mix(sliceCol, vec3<f32>(1.0, 0.3, 0.3), 0.25);
       let sliceAlpha = u.slicePlaneOpacity * (1.0 - accum.a);
@@ -323,7 +328,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // Sample volume — remap from [vmin, vmax] to [0, 1]
     var intensity = textureSampleLevel(volume, volumeSampler, texCoord, 0.0).r;
-    intensity = clamp((intensity - u.vmin) / (u.vmax - u.vmin), 0.0, 1.0);
+    intensity = applyWindow(intensity);
     intensity = clamp(intensity * u.brightness, 0.0, 1.0);
 
     // Colormap lookup
@@ -388,6 +393,7 @@ export class VolumeRenderer {
   private bindGroup: GPUBindGroup | null = null;
   private aspectRatio: [number, number, number] = [1, 1, 1];
   private canvas: HTMLCanvasElement;
+  private deviceLost: boolean = false;
 
   static isSupported(): boolean {
     return typeof navigator !== "undefined" && !!navigator.gpu;
@@ -402,6 +408,13 @@ export class VolumeRenderer {
   private constructor(device: GPUDevice, canvas: HTMLCanvasElement) {
     this.device = device;
     this.canvas = canvas;
+
+    // Mark renderer dead on device loss so render() early-returns instead of
+    // crashing on a dead handle. Matches the pattern used in fft.ts.
+    device.lost.then((info) => {
+      this.deviceLost = true;
+      console.warn("VolumeRenderer: WebGPU device lost", info?.reason, info?.message);
+    });
 
     // Configure canvas context
     const context = canvas.getContext("webgpu");
@@ -491,17 +504,24 @@ export class VolumeRenderer {
   }
 
   uploadVolume(data: Float32Array, nx: number, ny: number, nz: number): void {
+    if (this.deviceLost) return;
     // Normalize to [0,255] uint8 — R8 always supports LINEAR filtering
     let min = Infinity, max = -Infinity;
     for (let i = 0; i < data.length; i++) {
-      if (data[i] < min) min = data[i];
-      if (data[i] > max) max = data[i];
+      const value = data[i];
+      if (!Number.isFinite(value)) continue;
+      if (value < min) min = value;
+      if (value > max) max = value;
     }
-    const range = max - min || 1;
-    const invRange = 255 / range;
     const normalized = new Uint8Array(data.length);
-    for (let i = 0; i < data.length; i++) {
-      normalized[i] = ((data[i] - min) * invRange + 0.5) | 0;
+    if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+      normalized.fill(128);
+    } else {
+      const invRange = 255 / (max - min);
+      for (let i = 0; i < data.length; i++) {
+        const value = Number.isFinite(data[i]) ? data[i] : min;
+        normalized[i] = Math.max(0, Math.min(255, Math.round((value - min) * invRange)));
+      }
     }
 
     // Compute aspect ratio (longest axis = 1.0)
@@ -538,6 +558,7 @@ export class VolumeRenderer {
   }
 
   uploadColormap(lut: Uint8Array): void {
+    if (this.deviceLost) return;
     // Convert RGB (3 bytes per entry) to RGBA (4 bytes per entry) — WebGPU doesn't support RGB8
     const rgba = new Uint8Array(256 * 4);
     for (let i = 0; i < 256; i++) {
@@ -564,7 +585,8 @@ export class VolumeRenderer {
     this.rebuildBindGroup();
   }
 
-  render(params: VolumeRenderParams, camera: CameraState, bgColor: [number, number, number], dprOverride?: number, numStepsOverride?: number): void {
+  render(params: VolumeRenderParams, camera: CameraState, bgColor: [number, number, number], dprOverride?: number, numStepsOverride?: number, zStretch: number = 1): void {
+    if (this.deviceLost) return;
     const canvas = this.canvas;
 
     // Handle high-DPI displays (dprOverride allows reduced resolution during drag)
@@ -612,7 +634,7 @@ export class VolumeRenderer {
     f32[16] = eyeX; f32[17] = eyeY; f32[18] = eyeZ;
     // _pad0 at 19
     // aspectRatio: vec3 at offset 80/4=20
-    f32[20] = this.aspectRatio[0]; f32[21] = this.aspectRatio[1]; f32[22] = this.aspectRatio[2];
+    f32[20] = this.aspectRatio[0]; f32[21] = this.aspectRatio[1]; f32[22] = this.aspectRatio[2] * Math.max(1, zStretch);
     // _pad1 at 23
     // bgColor: vec4 at offset 96/4=24
     f32[24] = bgColor[0]; f32[25] = bgColor[1]; f32[26] = bgColor[2]; f32[27] = 1.0;
@@ -659,6 +681,7 @@ export class VolumeRenderer {
   }
 
   dispose(): void {
+    if (this.deviceLost) return;
     this.volumeTexture.destroy();
     this.colormapTexture.destroy();
     this.uniformBuffer.destroy();

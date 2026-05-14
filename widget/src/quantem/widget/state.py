@@ -7,10 +7,12 @@ JSON_METADATA_VERSION = "1.0"
 
 
 def resolve_widget_version() -> str:
-    try:
-        return importlib.metadata.version("quantem-widget")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
+    for dist_name in ("quantem.widget", "quantem-widget"):
+        try:
+            return importlib.metadata.version(dist_name)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return "0.0.0+local"
 
 
 def build_json_header(widget_name: str) -> dict[str, Any]:

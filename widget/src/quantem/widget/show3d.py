@@ -5,8 +5,10 @@ For viewing a stack of 2D images (e.g., defocus sweep, time series, z-stack, mov
 Includes playback controls, statistics, ROI selection, FFT, and more.
 """
 
+import gc
 import json
 import pathlib
+import sys
 from enum import Enum
 from typing import Self
 
@@ -31,6 +33,16 @@ except ImportError:
     torch = None  # type: ignore[assignment]
     _HAS_TORCH = False
 
+
+def _all_finite(arr: np.ndarray, *, chunk_size: int = 1_000_000) -> bool:
+    """Chunked full finite scan without allocating one giant boolean array."""
+    flat = np.ravel(arr)
+    for start in range(0, flat.size, chunk_size):
+        if not np.isfinite(flat[start : start + chunk_size]).all():
+            return False
+    return True
+
+
 class Colormap(str, Enum):
     """Available colormaps for image display."""
 
@@ -40,6 +52,8 @@ class Colormap(str, Enum):
     MAGMA = "magma"
     HOT = "hot"
     GRAY = "gray"
+    HSV = "hsv"
+    TURBO = "turbo"
     CIVIDIS = "cividis"
     RDBU = "RdBu"
     RDBU_R = "RdBu_r"
@@ -54,7 +68,7 @@ class Colormap(str, Enum):
 # Names that the JS bundle's GPUColormapEngine knows about. Keep in sync with
 # js/colormaps.ts COLORMAPS table.
 _VALID_CMAPS = frozenset({
-    "inferno", "viridis", "plasma", "magma", "hot", "gray",
+    "inferno", "viridis", "plasma", "magma", "hot", "gray", "hsv", "turbo",
     "cividis", "RdBu", "RdBu_r", "seismic", "twilight", "twilight_shifted",
 })
 
@@ -152,6 +166,12 @@ class Show3D(anywidget.AnyWidget):
     height = traitlets.Int(1).tag(sync=True)
     width = traitlets.Int(1).tag(sync=True)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
+    # Monotonic counter incremented each time frame_bytes is written. Defensive
+    # against the case where traitlets.Bytes identity-compares to suppress the
+    # trait change event when JS sees the same DataView wrapper — JS subscribes
+    # to this counter as a guaranteed-changing dep so render effects always
+    # re-fire on slice scrubs / playback ticks.
+    frame_seq = traitlets.Int(0).tag(sync=True)
     _display_bin_factor = traitlets.Int(1).tag(sync=True)
     # Flipped True by JS after the first colormap pass has painted to canvas.
     # Drives the truthful timing print (end-to-end, not __init__-only).
@@ -295,20 +315,28 @@ class Show3D(anywidget.AnyWidget):
 
     @traitlets.validate("vmax")
     def _validate_vmax_ge_vmin(self, proposal):
+        import math
         new_vmax = proposal["value"]
-        if new_vmax is not None and self.vmin is not None and new_vmax < self.vmin:
-            raise traitlets.TraitError(
-                f"vmax ({new_vmax}) must be >= vmin ({self.vmin})"
-            )
+        if new_vmax is not None:
+            if not math.isfinite(new_vmax):
+                raise traitlets.TraitError(f"vmax must be finite, got {new_vmax}")
+            if self.vmin is not None and new_vmax < self.vmin:
+                raise traitlets.TraitError(
+                    f"vmax ({new_vmax}) must be >= vmin ({self.vmin})"
+                )
         return new_vmax
 
     @traitlets.validate("vmin")
     def _validate_vmin_le_vmax(self, proposal):
+        import math
         new_vmin = proposal["value"]
-        if new_vmin is not None and self.vmax is not None and new_vmin > self.vmax:
-            raise traitlets.TraitError(
-                f"vmin ({new_vmin}) must be <= vmax ({self.vmax})"
-            )
+        if new_vmin is not None:
+            if not math.isfinite(new_vmin):
+                raise traitlets.TraitError(f"vmin must be finite, got {new_vmin}")
+            if self.vmax is not None and new_vmin > self.vmax:
+                raise traitlets.TraitError(
+                    f"vmin ({new_vmin}) must be <= vmax ({self.vmax})"
+                )
         return new_vmin
 
     @traitlets.validate("cmap")
@@ -395,7 +423,10 @@ class Show3D(anywidget.AnyWidget):
 
     @traitlets.validate("fps")
     def _validate_fps(self, proposal):
+        import math
         val = float(proposal["value"])
+        if not math.isfinite(val):
+            raise traitlets.TraitError(f"fps must be finite, got {val}")
         if val <= 0:
             raise traitlets.TraitError(f"fps must be > 0, got {val}")
         return val
@@ -607,14 +638,14 @@ class Show3D(anywidget.AnyWidget):
             data = data[None, ...]
         if data.ndim != 3:
             raise ValueError(f"Expected 3D array, got {data.ndim}D")
-        if data.shape[0] == 0:
-            raise ValueError(f"Empty stack: shape {data.shape}. Need at least 1 frame.")
+        if 0 in data.shape:
+            raise ValueError(f"Empty stack: shape {data.shape}. All dims must be >= 1.")
         if np.iscomplexobj(data):
             raise TypeError(
                 "Show3D does not accept complex data. Convert first: "
                 "np.abs(arr) for magnitude or np.angle(arr) for phase."
             )
-        if not np.isfinite(data).all():
+        if not _all_finite(data):
             raise ValueError(
                 "Data contains NaN or inf. Clean first: "
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
@@ -622,7 +653,27 @@ class Show3D(anywidget.AnyWidget):
 
         # Multi-panel: convert remaining args, validate shapes, concatenate
         if len(data_args) > 1:
-            panels = [data.astype(np.float32)]
+            def _sample_is_finite(arr: np.ndarray) -> bool:
+                return _all_finite(arr)
+
+            def _as_valid_panel(arr: np.ndarray, panel_name: str) -> np.ndarray:
+                if not _sample_is_finite(arr):
+                    raise ValueError(
+                        f"{panel_name} contains NaN or inf. Clean first: "
+                        "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
+                    )
+                with np.errstate(over="ignore", invalid="ignore"):
+                    arr32 = arr.astype(np.float32, copy=False)
+                if not _sample_is_finite(arr32):
+                    raise ValueError(
+                        f"{panel_name} exceeds float32 range (|value| > 3.4e38) "
+                        "after cast; rescale first."
+                    )
+                return arr32
+
+            # copy=False avoids a redundant 120 MB+ allocation per panel when
+            # the user already passed float32 (the common case for ptycho recons).
+            panels = [_as_valid_panel(data, "Panel 0")]
             for i, extra in enumerate(data_args[1:], 1):
                 if hasattr(extra, "array"):
                     extra = extra.array
@@ -631,6 +682,8 @@ class Show3D(anywidget.AnyWidget):
                     arr = arr[None, ...]
                 if arr.ndim != 3:
                     raise ValueError(f"Panel {i}: expected 3D array, got {arr.ndim}D")
+                if 0 in arr.shape:
+                    raise ValueError(f"Panel {i}: empty stack shape {arr.shape}. All dims must be >= 1.")
                 if np.iscomplexobj(arr):
                     raise TypeError(
                         f"Panel {i}: complex data not accepted. Convert first: "
@@ -641,7 +694,11 @@ class Show3D(anywidget.AnyWidget):
                         f"Panel {i} has {arr.shape[0]} frames, but panel 0 has "
                         f"{panels[0].shape[0]} frames. All panels must match."
                     )
-                panels.append(arr.astype(np.float32))
+                if arr.shape[1:] != panels[0].shape[1:]:
+                    raise ValueError(
+                        f"Panel {i} image shape {arr.shape[1:]} must match panel 0 image shape {panels[0].shape[1:]}."
+                    )
+                panels.append(_as_valid_panel(arr, f"Panel {i}"))
             self.n_panels = len(panels)
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
@@ -678,7 +735,15 @@ class Show3D(anywidget.AnyWidget):
                         .reshape(n_f, oh // panel_bin, panel_bin, ow // panel_bin, panel_bin)
                         .mean(axis=(2, 4)).astype(np.float32)
                     )
-                # Normalize the SMALL binned data
+                # Normalize the SMALL binned data. We center each panel on its
+                # 2/98 percentile band so panels with different intensity scales
+                # become visually comparable, but we do NOT clip — clipping piled
+                # all outliers at 0 and 1 and killed the visible histogram
+                # distribution. Without clipping, JS-side Auto-contrast + slider
+                # both reflect the real distribution shape.
+                # Multiply by precomputed float32 reciprocal instead of dividing
+                # by float64 — keeps the whole op in float32 (no upcast to
+                # float64 intermediate), 3x faster on 120 MB panels.
                 normalized = []
                 for bp in binned_panels:
                     if bp.size > 10_000_000:
@@ -686,10 +751,10 @@ class Show3D(anywidget.AnyWidget):
                         p2, p98 = np.percentile(sample, [2, 98])
                     else:
                         p2, p98 = np.percentile(bp, [2, 98])
-                    rng = max(p98 - p2, 1e-10)
-                    normalized.append(np.clip((bp - p2) / rng, 0, 1).astype(np.float32))
+                    rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
+                    normalized.append((bp - np.float32(p2)) * rng_inv)
             else:
-                # No binning needed — normalize at full res
+                # No binning needed — normalize at full res (no clip; see note above)
                 normalized = []
                 for p in panels:
                     if p.size > 10_000_000:
@@ -697,8 +762,8 @@ class Show3D(anywidget.AnyWidget):
                         p2, p98 = np.percentile(sample, [2, 98])
                     else:
                         p2, p98 = np.percentile(p, [2, 98])
-                    rng = max(p98 - p2, 1e-10)
-                    normalized.append(np.clip((p - p2) / rng, 0, 1).astype(np.float32))
+                    rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
+                    normalized.append((p - np.float32(p2)) * rng_inv)
 
             # Concatenate horizontally with 2px black separator
             sep_w = 2
@@ -729,8 +794,18 @@ class Show3D(anywidget.AnyWidget):
                 "Show3D does not accept complex data. Convert first: "
                 "np.abs(arr) for magnitude or np.angle(arr) for phase."
             )
-        # Store data as float32 numpy array
-        self._data = data.astype(np.float32)
+        # Store data as float32 numpy array. The pre-cast NaN/inf check runs on
+        # the original dtype; values that fit in float64 but exceed float32 range
+        # (~3.4e38) silently overflow to inf and contaminate stats / display.
+        # Sample-check the cast output and reject early if so.
+        with np.errstate(over="ignore", invalid="ignore"):
+            self._data = data.astype(np.float32, copy=False)
+        if not _all_finite(self._data):
+            raise ValueError(
+                "Data exceeds float32 range (|value| > 3.4e38) after cast; "
+                "values silently overflowed to inf. Rescale first: "
+                "arr = arr / np.max(np.abs(arr)) or use np.log1p(np.abs(arr))."
+            )
 
         # Create GPU copy if torch acceleration enabled
         if self._use_torch:
@@ -853,6 +928,7 @@ class Show3D(anywidget.AnyWidget):
 
         # Initial position at middle
         self.slice_idx = int(self.n_slices // 2)
+        self._roi_plot_timer = None
 
         # Observers
         self.observe(self._on_slice_change, names=["slice_idx"])
@@ -916,11 +992,13 @@ class Show3D(anywidget.AnyWidget):
         if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
             data = data.array
         data = to_numpy(data)
+        if data.ndim == 2:
+            data = data[None, ...]
         if data.ndim != 3:
             raise ValueError(f"Expected 3D array, got {data.ndim}D")
-        if data.shape[0] == 0:
-            raise ValueError(f"Empty stack: shape {data.shape}. Need at least 1 frame.")
-        if not np.isfinite(data).all():
+        if 0 in data.shape:
+            raise ValueError(f"Empty stack: shape {data.shape}. All dims must be >= 1.")
+        if not _all_finite(data):
             raise ValueError(
                 "Data contains NaN or inf. Clean first: "
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
@@ -943,9 +1021,22 @@ class Show3D(anywidget.AnyWidget):
                 "Show3D does not accept complex data. Convert first: "
                 "np.abs(arr) for magnitude or np.angle(arr) for phase."
             )
-        self._data = data.astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            self._data = data.astype(np.float32, copy=False)
+        # Pre-cast check ran on the source dtype; if float64 values exceed float32
+        # range they silently become inf on cast and contaminate stats.
+        if not _all_finite(self._data):
+            raise ValueError(
+                "Data exceeds float32 range (|value| > 3.4e38) after cast; "
+                "values silently overflowed to inf. Rescale first: "
+                "arr = arr / np.max(np.abs(arr)) or use np.log1p(np.abs(arr))."
+            )
         if self._use_torch:
             self._data_torch = torch.from_numpy(self._data).to(self._device)
+        self.n_panels = 1
+        self.panel_titles = []
+        self._multi_panel_bin = 0
+        self._panel_width = int(data.shape[2])
         self.n_slices = int(data.shape[0])
 
         # Auto-bin display data
@@ -993,7 +1084,7 @@ class Show3D(anywidget.AnyWidget):
             self.roi_list = []
             self.roi_selected_idx = -1
             self.profile_line = []
-            self.profile_active = False
+            # profile_active is the JS-side toggle (no Python trait); skipping
         # Re-run bookmark validator with new n_slices (out-of-range markers
         # silently survived the swap otherwise).
         self.bookmarked_frames = list(self.bookmarked_frames)
@@ -1066,22 +1157,128 @@ class Show3D(anywidget.AnyWidget):
             "panel_titles": list(self.panel_titles),
             "timestamps": list(self.timestamps),
             "timestamp_unit": self.timestamp_unit,
-            "display_bin": self._display_bin,
         }
 
     def save(self, path: str):
         save_state_file(path, "Show3D", self.state_dict())
 
     def load_state_dict(self, state):
+        import warnings as _w
+        state = dict(state)
+        allowed = {
+            "title", "cmap", "log_scale", "auto_contrast",
+            "percentile_high", "percentile_low", "vmin", "vmax",
+            "show_stats", "show_controls", "show_fft", "fft_window",
+            "show_playback", "pixel_size", "pixel_unit", "smooth",
+            "image_rotation", "scale_bar_visible", "size", "fps",
+            "loop", "reverse", "boomerang", "loop_end", "loop_start",
+            "bookmarked_frames", "playback_path", "slice_idx",
+            "roi_active", "roi_list", "roi_selected_idx", "profile_line",
+            "profile_width", "diff_mode", "dim_label", "labels",
+            "panel_titles", "timestamps", "timestamp_unit",
+        }
+        unknown = []
+        if "canvas_size" in state:
+            state["size"] = state.pop("canvas_size")
+        # `display_bin` is constructor/data dependent. Loading only the private
+        # integer leaves display_data/height/width stale, so ignore saved values.
+        state.pop("display_bin", None)
+        for key in list(state):
+            if key not in allowed:
+                unknown.append(key)
+                state.pop(key)
+
+        pct_low_marker = object()
+        pct_high_marker = object()
+        pct_low = state.pop("percentile_low", pct_low_marker)
+        pct_high = state.pop("percentile_high", pct_high_marker)
+        if pct_low is not pct_low_marker or pct_high is not pct_high_marker:
+            low = float(self.percentile_low if pct_low is pct_low_marker else pct_low)
+            high = float(self.percentile_high if pct_high is pct_high_marker else pct_high)
+            if not (0 <= low <= 100 and 0 <= high <= 100 and low < high):
+                raise traitlets.TraitError(
+                    f"percentile_low ({low}) must be < percentile_high ({high}) and both in [0, 100]"
+                )
+            if high <= float(self.percentile_low):
+                self.percentile_low = low
+                self.percentile_high = high
+            else:
+                self.percentile_high = high
+                self.percentile_low = low
+
+        vmin_marker = object()
+        vmax_marker = object()
+        vmin = state.pop("vmin", vmin_marker)
+        vmax = state.pop("vmax", vmax_marker)
+        if vmin is not vmin_marker or vmax is not vmax_marker:
+            new_vmin = self.vmin if vmin is vmin_marker else vmin
+            new_vmax = self.vmax if vmax is vmax_marker else vmax
+            if new_vmin is not None and new_vmax is not None and float(new_vmin) > float(new_vmax):
+                raise traitlets.TraitError(f"vmin ({new_vmin}) must be <= vmax ({new_vmax})")
+            self.vmin = None
+            self.vmax = None
+            if new_vmin is not None:
+                self.vmin = float(new_vmin)
+            if new_vmax is not None:
+                self.vmax = float(new_vmax)
+
+        loop_start_marker = object()
+        loop_end_marker = object()
+        loop_start = state.pop("loop_start", loop_start_marker)
+        loop_end = state.pop("loop_end", loop_end_marker)
+        if loop_start is not loop_start_marker or loop_end is not loop_end_marker:
+            n = max(1, int(self.n_slices))
+            start = int(self.loop_start if loop_start is loop_start_marker else loop_start)
+            end = int(self.loop_end if loop_end is loop_end_marker else loop_end)
+            start = max(0, min(start, n - 1))
+            if end >= 0:
+                end = min(end, n - 1)
+                if start > end:
+                    raise traitlets.TraitError(f"loop_start ({start}) must be <= loop_end ({end})")
+            else:
+                end = -1
+            self.loop_start = 0
+            self.loop_end = end
+            self.loop_start = start
+
         for key, val in state.items():
-            # Silent migration for renamed keys in older saved state files.
-            if key == "canvas_size":
-                key = "size"
-            if key == "display_bin":
-                self._display_bin = val
-                continue
-            if hasattr(self, key):
-                setattr(self, key, val)
+            setattr(self, key, val)
+        self._vmin_user = self.vmin
+        self._vmax_user = self.vmax
+        self._vmin = self.vmin if self.vmin is not None else self.data_min
+        self._vmax = self.vmax if self.vmax is not None else self.data_max
+        if unknown:
+            _w.warn(
+                f"load_state_dict ignored unknown keys: {unknown}. "
+                "These may be from a newer widget version or a different widget type.",
+                stacklevel=2,
+            )
+
+    def free(self):
+        """Release VRAM and RAM held by this widget. `del widget` won't
+        free memory because traitlets observers pin the refcount."""
+        if self._data is None:
+            return
+        # Cancel pending ROI debounce so its callback can't fire post-free.
+        if self._roi_plot_timer is not None:
+            self._roi_plot_timer.cancel()
+            self._roi_plot_timer = None
+        device = str(self._device) if self._device is not None else ""
+        self._data = None
+        self._data_torch = None
+        self._display_data = None
+        for trait in ("frame_bytes", "roi_plot_data", "_gif_data", "_zip_data", "_bundle_data", "_buffer_bytes"):
+            setattr(self, trait, b"")
+        gc.collect()
+        # Flush cupy pool: _data may have been a torch view into cupy memory.
+        if "cupy" in sys.modules:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+            _cp.fft.config.get_plan_cache().clear()
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     def summary(self):
         lines = [self.title or "Show3D", "═" * 32]
@@ -1134,9 +1331,9 @@ class Show3D(anywidget.AnyWidget):
 
     def _get_color_range(self, frame: np.ndarray) -> tuple[float, float]:
         """Get vmin/vmax based on current settings."""
-        if self.vmin is not None and self.vmax is not None:
-            vmin = float(self.vmin)
-            vmax = float(self.vmax)
+        if self.vmin is not None or self.vmax is not None:
+            vmin = float(self.vmin if self.vmin is not None else self._vmin)
+            vmax = float(self.vmax if self.vmax is not None else self._vmax)
             if self.log_scale:
                 # Signed log so negative vmin (e.g. diff_mode) doesn't collapse to 0.
                 vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
@@ -1151,13 +1348,11 @@ class Show3D(anywidget.AnyWidget):
 
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         """Normalize frame to uint8 with current display settings."""
-        # Apply log scale if enabled. For diff_mode (which produces negatives),
-        # use signed log so negative differences don't collapse to zero.
+        # Signed log so negatives don't collapse to zero. Matches JS `slog` so
+        # GIF/PNG exports look identical to live render for signed data
+        # (diff_mode, phase, residuals, anything that can go negative).
         if self.log_scale:
-            if self.diff_mode != "off":
-                frame = np.sign(frame) * np.log1p(np.abs(frame))
-            else:
-                frame = np.log1p(np.maximum(frame, 0))
+            frame = np.sign(frame) * np.log1p(np.abs(frame))
 
         vmin, vmax = self._get_color_range(frame)
 
@@ -1190,13 +1385,21 @@ class Show3D(anywidget.AnyWidget):
             # Vectorized diff: data[1:] - data[:-1]
             # Symmetric clamp around 0 so the all-zero baseline frame at idx=0
             # stays inside the displayed range whether diffs are positive or negative.
-            diffs = data[1:] - data[:-1]
-            self.data_min = min(0.0, float(diffs.min()))
-            self.data_max = max(0.0, float(diffs.max()))
+            if self.n_slices < 2:
+                self.data_min = 0.0
+                self.data_max = 0.0
+            else:
+                diffs = data[1:] - data[:-1]
+                self.data_min = min(0.0, float(diffs.min()))
+                self.data_max = max(0.0, float(diffs.max()))
         elif self.diff_mode == "first":
-            diffs = data[1:] - data[0:1]
-            self.data_min = min(0.0, float(diffs.min()))
-            self.data_max = max(0.0, float(diffs.max()))
+            if self.n_slices < 2:
+                self.data_min = 0.0
+                self.data_max = 0.0
+            else:
+                diffs = data[1:] - data[0:1]
+                self.data_min = min(0.0, float(diffs.min()))
+                self.data_max = max(0.0, float(diffs.max()))
         else:
             self.data_min = float(data.min())
             self.data_max = float(data.max())
@@ -1219,6 +1422,7 @@ class Show3D(anywidget.AnyWidget):
             else:
                 self.roi_stats = {}
             self.frame_bytes = display_frame.tobytes()
+            self.frame_seq = self.frame_seq + 1
 
     def _roi_mask(self, roi: dict):
         r, c = np.ogrid[0 : self.height, 0 : self.width]
@@ -1310,7 +1514,7 @@ class Show3D(anywidget.AnyWidget):
         if self.roi_active:
             self._update_roi_stats(self._get_display_frame())
             # Debounce the expensive all-frame ROI plot
-            if hasattr(self, '_roi_plot_timer') and self._roi_plot_timer is not None:
+            if self._roi_plot_timer is not None:
                 self._roi_plot_timer.cancel()
             import threading
             self._roi_plot_timer = threading.Timer(0.5, self._compute_roi_plot)
@@ -1603,23 +1807,40 @@ class Show3D(anywidget.AnyWidget):
         if not self._gif_export_requested:
             return
         self._gif_export_requested = False
-        self._generate_gif()
+        try:
+            self._generate_gif()
+        except Exception as e:
+            # On error: clear _gif_data + bump frame_seq so JS observer fires
+            # and resets exporting=False. Without this the UI shows "..." forever.
+            import warnings
+            warnings.warn(f"GIF export failed: {type(e).__name__}: {e}")
+            self._gif_data = b""
 
     def _normalize_frames_torch(self, start: int, end: int) -> np.ndarray:
         """Batch-normalize frames [start, end] on GPU. Returns (N, H, W) uint8 numpy."""
         frames = self._data_torch[start : end + 1].clone()
+        # Signed log so negatives don't collapse to 0 (matches _normalize_frame
+        # + JS slog). Without this, GIF export of phase/diff data looks wrong.
         if self.log_scale:
-            frames = torch.log1p(torch.clamp(frames, min=0))
+            frames = torch.sign(frames) * torch.log1p(torch.abs(frames))
         if self.auto_contrast:
             flat = frames.reshape(-1).float()
-            vmin = float(torch.quantile(flat, self.percentile_low / 100.0).item())
-            vmax = float(torch.quantile(flat, self.percentile_high / 100.0).item())
+            # torch.quantile fails with "input tensor is too large" above 2^24 ≈ 16.7M
+            # elements (e.g. 16 × 1370² = 30M). Subsample for percentile estimation —
+            # 1M samples is more than enough for the 2/98 percentile to within ~0.01%.
+            if flat.numel() > 16_000_000:
+                stride = flat.numel() // 1_000_000
+                flat_sub = flat[::stride]
+            else:
+                flat_sub = flat
+            vmin = float(torch.quantile(flat_sub, self.percentile_low / 100.0).item())
+            vmax = float(torch.quantile(flat_sub, self.percentile_high / 100.0).item())
         else:
             vmin = self._vmin
             vmax = self._vmax
             if self.log_scale:
-                vmin = float(np.log1p(max(vmin, 0)))
-                vmax = float(np.log1p(max(vmax, 0)))
+                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
+                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
         if vmax > vmin:
             normalized = torch.clamp((frames - vmin) / (vmax - vmin) * 255.0, 0, 255).to(torch.uint8)
         else:
@@ -1688,15 +1909,24 @@ class Show3D(anywidget.AnyWidget):
                 "percentile_high": float(self.percentile_high),
             },
         }
+        gif_bytes = buf.getvalue()
+        with self.hold_sync():
+            self._gif_metadata_json = ""
+            self._gif_data = b""
         with self.hold_sync():
             self._gif_metadata_json = json.dumps(metadata, indent=2)
-            self._gif_data = buf.getvalue()
+            self._gif_data = gif_bytes
 
     def _on_zip_export(self, change=None):
         if not self._zip_export_requested:
             return
         self._zip_export_requested = False
-        self._generate_zip()
+        try:
+            self._generate_zip()
+        except Exception as e:
+            import warnings
+            warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
+            self._zip_data = b""
 
     def _generate_zip(self):
         import io
@@ -1744,7 +1974,9 @@ class Show3D(anywidget.AnyWidget):
                     img.save(img_buf, format="PNG")
                     label = self.labels[i] if self.labels else str(i).zfill(4)
                     zf.writestr(f"frame_{label}.png", img_buf.getvalue())
-        self._zip_data = buf.getvalue()
+        zip_bytes = buf.getvalue()
+        self._zip_data = b""
+        self._zip_data = zip_bytes
 
     def _on_bundle_export(self, change=None):
         if not self._bundle_export_requested:
@@ -1828,7 +2060,9 @@ class Show3D(anywidget.AnyWidget):
             zf.writestr(f"frame_{safe_label}.png", img_buf.getvalue())
             zf.writestr("roi_timeseries.csv", csv_text)
             zf.writestr("state.json", json.dumps(state_payload, indent=2))
-        self._bundle_data = buf.getvalue()
+        bundle_bytes = buf.getvalue()
+        self._bundle_data = b""
+        self._bundle_data = bundle_bytes
 
 
     def save_image(self, path: str | pathlib.Path, *, frame_idx: int | None = None,
@@ -1880,4 +2114,3 @@ class Show3D(anywidget.AnyWidget):
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(path), dpi=(dpi, dpi))
         return path
-

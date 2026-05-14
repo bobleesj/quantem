@@ -49,61 +49,21 @@ const typography = {
   title: { fontWeight: "bold" as const },
 };
 
-const SPACING = {
-  XS: 4,    // Extra small gap
-  SM: 8,    // Small gap (default between elements)
-  MD: 12,   // Medium gap (between control groups)
-  LG: 16,   // Large gap (between major sections)
-};
+import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-controls";
 
 const controlPanel = {
   select: { minWidth: 90, fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
 };
 
-const switchStyles = {
-  small: { '& .MuiSwitch-thumb': { width: 12, height: 12 }, '& .MuiSwitch-switchBase': { padding: '4px' } },
-};
-
-const sliderStyles = {
-  small: {
-    "& .MuiSlider-thumb": { width: 12, height: 12 },
-    "& .MuiSlider-rail": { height: 3 },
-    "& .MuiSlider-track": { height: 3 },
-  },
-};
-
-// Container styles matching Show4DSTEM
 const container = {
   root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "monospace", overflow: "visible" },
   imageBox: { bgcolor: "#000", border: "1px solid #444", overflow: "hidden", position: "relative" as const },
-};
-
-// Control row style - bordered container for each row (matching Show4DSTEM)
-const controlRow = {
-  display: "flex",
-  alignItems: "center",
-  gap: "6px",
-  px: 1,
-  py: 0.5,
-  width: "fit-content",
 };
 
 const upwardMenuProps = {
   anchorOrigin: { vertical: "top" as const, horizontal: "left" as const },
   transformOrigin: { vertical: "bottom" as const, horizontal: "left" as const },
   sx: { zIndex: 9999 },
-};
-
-// Compact button style for Reset (matching Show4DSTEM)
-const compactButton = {
-  fontSize: 10,
-  py: 0.25,
-  px: 1,
-  minWidth: 0,
-  "&.Mui-disabled": {
-    color: "#666",
-    borderColor: "#444",
-  },
 };
 
 import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse, getGPUColormapEngine, GPUColormapEngine } from "../colormaps";
@@ -322,6 +282,8 @@ function Histogram({
       <canvas
         ref={canvasRef}
         style={{ width, height, border: `1px solid ${colors.border}` }}
+        role="img"
+        aria-label="Histogram of intensity values with min and max clip handles"
       />
       <Slider
         value={[vminPct, vmaxPct]}
@@ -333,6 +295,7 @@ function Histogram({
         max={100}
         size="small"
         valueLabelDisplay="auto"
+        aria-label="Histogram intensity clip range"
         valueLabelFormat={(pct) => {
           const val = dataMin + (pct / 100) * (dataMax - dataMin);
           return val >= 1000 ? val.toExponential(1) : val.toFixed(1);
@@ -714,6 +677,10 @@ function Show3D() {
   const [width] = useModelState<number>("width");
   const [height] = useModelState<number>("height");
   const [frameBytes] = useModelState<DataView>("frame_bytes");
+  // Defensive: traitlets.Bytes can identity-suppress trait events when content
+  // and length are similar. frame_seq is incremented Python-side on every write
+  // so JS effects always see a change. Use it in dep arrays alongside frameBytes.
+  const [frameSeq] = useModelState<number>("frame_seq");
 
   // Truthful first-render signal: flipped ONCE after the first frame_bytes
   // arrives and the browser has had time to composite two frames.  Python side
@@ -1007,7 +974,7 @@ function Show3D() {
   // Line profile state
   const [profileActive, setProfileActive] = React.useState(false);
   const [profileLine, setProfileLine] = useModelState<{row: number; col: number}[]>("profile_line");
-  const [profileWidth] = useModelState<number>("profile_width");
+  const [profileWidth, setProfileWidth] = useModelState<number>("profile_width");
   const [profileData, setProfileData] = React.useState<Float32Array | null>(null);
   const profileCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const profilePoints = profileLine || [];
@@ -1039,16 +1006,25 @@ function Show3D() {
     }
   }, [hideDisplay, showLens]);
 
-  // Sync sizes from Python and set initial minimum
+  // Sync sizes from Python and set initial minimum. In multi-panel mode the user
+  // is comparing N images side-by-side; default ~300 px per panel so each is
+  // readable instead of crushed when the widget concatenates them into one wide
+  // canvas (e.g. 4 panels at 500 px total → 125 px per panel = too small).
   React.useEffect(() => {
     if (canvasSizeTrait > 0) {
       setMainCanvasSize(canvasSizeTrait);
-      // Only set initial size on first load (when ref is still default)
       if (initialCanvasSizeRef.current === CANVAS_TARGET_SIZE) {
         initialCanvasSizeRef.current = canvasSizeTrait;
       }
+    } else if ((nPanels || 1) > 1) {
+      const perPanel = 300;
+      const target = (nPanels || 1) * perPanel;
+      setMainCanvasSize(target);
+      if (initialCanvasSizeRef.current === CANVAS_TARGET_SIZE) {
+        initialCanvasSizeRef.current = target;
+      }
     }
-  }, [canvasSizeTrait]);
+  }, [canvasSizeTrait, nPanels]);
 
   // Calculate display scale
   const displayScale = mainCanvasSize / Math.max(width, height);
@@ -1120,7 +1096,7 @@ function Show3D() {
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
-    traitVmin, traitVmax,
+    traitVmin, traitVmax, smooth, imageRotation,
   });
   React.useEffect(() => {
     playRef.current = {
@@ -1130,7 +1106,7 @@ function Show3D() {
       dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
       zoom, panX, panY, playbackPath,
       profileActive, profilePoints, profileWidth,
-      traitVmin, traitVmax,
+      traitVmin, traitVmax, smooth, imageRotation,
     };
   }, [fps, reverse, boomerang, loop, loopStart, effectiveLoopEnd,
     nSlices, width, height, displayScale, canvasW, canvasH,
@@ -1138,7 +1114,7 @@ function Show3D() {
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
-    traitVmin, traitVmax]);
+    traitVmin, traitVmax, smooth, imageRotation]);
 
   // Playback logic — rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
@@ -1283,17 +1259,28 @@ function Show3D() {
           mainOffscreenRef.current.getContext("2d")!.putImageData(mainImgDataRef.current, 0, 0);
         }
 
-        // Draw to display canvas
+        // Draw to display canvas. Apply image_rotation so playback matches the
+        // static render path (lines 1444-1453); otherwise rotated stacks
+        // silently lose their rotation when the user hits Play.
         const canvas = canvasRef.current;
         if (canvas) {
           const ctx = canvas.getContext("2d");
           if (ctx) {
-            ctx.imageSmoothingEnabled = smooth;
+            ctx.imageSmoothingEnabled = c.smooth;
             ctx.clearRect(0, 0, c.canvasW, c.canvasH);
             ctx.save();
             ctx.translate(c.panX, c.panY);
             ctx.scale(c.zoom, c.zoom);
-            ctx.drawImage(mainOffscreenRef.current, 0, 0, c.width * c.displayScale, c.height * c.displayScale);
+            const dw = c.width * c.displayScale, dh = c.height * c.displayScale;
+            if (c.imageRotation % 4 !== 0) {
+              const cx = c.canvasW / 2 / c.zoom, cy = c.canvasH / 2 / c.zoom;
+              ctx.translate(cx, cy);
+              ctx.rotate((c.imageRotation * Math.PI) / 2);
+              ctx.translate(-dw / 2, -dh / 2);
+              ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+            } else {
+              ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+            }
             ctx.restore();
           }
         }
@@ -1307,6 +1294,15 @@ function Show3D() {
         if (c.profileActive && c.profilePoints.length === 2) {
           const p0 = c.profilePoints[0], p1 = c.profilePoints[1];
           setProfileData(sampleLineProfile(frame, c.width, c.height, p0.row, p0.col, p1.row, p1.col, c.profileWidth));
+        }
+        // Histogram refresh during playback. The non-playback effect path is keyed on
+        // frameBytes/frameSeq which DON'T change during rAF playback (frames come from
+        // the prefetch buffer, not via Comm), so we drive histogram updates directly
+        // here at the same 10 Hz cadence. Skip every 2nd tick → ~5 Hz refresh.
+        playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
+        if (playbackHistogramCounterRef.current === 0) {
+          const histInput = c.logScale ? applyLogScale(frame) : frame;
+          setImageHistogramData(histInput);
         }
       }
 
@@ -1342,16 +1338,52 @@ function Show3D() {
     const parsed = extractFloat32(frameBytes);
     if (!parsed || parsed.length === 0) return;
     rawFrameDataRef.current = parsed;
-  }, [frameBytes]);
+  }, [frameBytes, frameSeq]);
 
-  // Update histogram data (reflects log scale state, debounced during playback)
+  // Update histogram data (reflects log scale state). During playback we throttle so
+  // a full O(N) bin pass on multi-MB frames doesn't blow the frame budget. We rely on
+  // `displaySliceIdx` ticking at ~10 Hz (the playback rAF's React-state throttle) and
+  // only update histogram every 2nd tick → ~5 Hz refresh, ~10 % CPU budget.
+  const playbackHistogramCounterRef = React.useRef(0);
   React.useEffect(() => {
     const raw = rawFrameDataRef.current;
-    if (!raw || raw.length === 0 || playing) return;
+    if (!raw || raw.length === 0) return;
+    if (playing) {
+      playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
+      if (playbackHistogramCounterRef.current !== 0) return;
+    } else {
+      playbackHistogramCounterRef.current = 0;
+    }
     const data = logScale ? applyLogScale(raw) : raw;
     setImageHistogramData(data);
     setImageDataRange(findDataRange(data));
-  }, [frameBytes, playing, logScale]);
+  }, [frameBytes, frameSeq, playing, logScale, displaySliceIdx]);
+
+  // Auto-snap thumbs to percentile-clip values while Auto is on. Fires once at mount
+  // (so the slider visually reflects the percentile-clipped contrast that Python applies
+  // when auto_contrast=True), and re-fires when logScale flips (linear vs log percentile
+  // give different clip values, so the thumbs must follow). The lastLogScaleRef tracks
+  // the previous logScale value so we only re-snap on transitions, not on every render.
+  const initialAutoSnappedRef = React.useRef(false);
+  const lastLogScaleRef = React.useRef(logScale);
+  React.useEffect(() => {
+    const logScaleChanged = lastLogScaleRef.current !== logScale;
+    lastLogScaleRef.current = logScale;
+    if (!autoContrast || !imageHistogramData || imageHistogramData.length === 0) return;
+    // Skip initial snap if user already moved thumbs (e.g. loaded from saved state).
+    if (!initialAutoSnappedRef.current && (imageVminPct !== 0 || imageVmaxPct !== 100)) {
+      initialAutoSnappedRef.current = true;
+      return;
+    }
+    // After first snap, only re-snap on logScale transitions.
+    if (initialAutoSnappedRef.current && !logScaleChanged) return;
+    const span = dataMax - dataMin;
+    if (span <= 0) return;
+    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh);
+    setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
+    setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
+    initialAutoSnappedRef.current = true;
+  }, [autoContrast, imageHistogramData, dataMin, dataMax, percentileLow, percentileHigh, logScale, imageVminPct, imageVmaxPct]);
 
   React.useEffect(() => {
     if (!roiActive || roiItems.length === 0 || !showRoiResizeHint) return;
@@ -1401,6 +1433,9 @@ function Show3D() {
         if (bitmaps && bitmaps[0]) {
           const ctx = mainOffscreenRef.current.getContext("2d");
           if (ctx) ctx.drawImage(bitmaps[0], 0, 0);
+          // ImageBitmap holds external GPU/CPU memory not reclaimed by GC. Must close()
+          // explicitly or repeated render calls (cmap/contrast/scrub) leak ~MB per call.
+          bitmaps[0].close();
         } else {
           // Fallback: mapAsync path
           if (mainImgDataRef.current) {
@@ -1454,7 +1489,7 @@ function Show3D() {
       ctx.drawImage(mainOffscreenRef.current, 0, 0, width * displayScale, height * displayScale);
       ctx.restore();
     }
-  }, [frameBytes, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, smooth]);
+  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, smooth, imageRotation]);
 
   // Draw effect: only zoom/pan changes — cheap, just drawImage from cached offscreen
   // useLayoutEffect prevents black flash when canvas dimensions change (resize)
@@ -1679,8 +1714,15 @@ function Show3D() {
 
     ctx.save();
     ctx.scale(DPR, DPR);
-    const lx = lensAnchor ? lensAnchor.x : margin;
-    const ly = lensAnchor ? lensAnchor.y : canvasH - lensSize - margin - 20;
+    // Clamp anchor + default position to canvas bounds. Without clamp a small canvas
+    // (e.g. multi-panel 100 px tall) puts the inset off-screen (-60 px) because
+    // default ly = canvasH - lensSize - margin - 20 goes negative.
+    const cssH = canvasH;
+    const cssW = canvasW;
+    const rawLx = lensAnchor ? lensAnchor.x : margin;
+    const rawLy = lensAnchor ? lensAnchor.y : cssH - lensSize - margin - 20;
+    const lx = Math.max(0, Math.min(cssW - lensSize, rawLx));
+    const ly = Math.max(0, Math.min(cssH - lensSize, rawLy));
     ctx.imageSmoothingEnabled = smooth;
     ctx.drawImage(regionCanvas, lx, ly, lensSize, lensSize);
     ctx.strokeStyle = themeColors.accent;
@@ -2000,7 +2042,15 @@ function Show3D() {
     }
     if (!hideDisplay && showColorbar) {
       const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
-      const { vmin, vmax } = sliderRange(imageDataRange.min, imageDataRange.max, imageVminPct, imageVmaxPct);
+      // Colorbar must match what's painted on the image, not the raw data range.
+      // When autoContrast is on, the image uses percentileClip(low, high) of the
+      // current frame — show that range. Otherwise use slider range over data.
+      let vmin: number, vmax: number;
+      if (autoContrast && imageHistogramData && imageHistogramData.length > 0) {
+        ({ vmin, vmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh));
+      } else {
+        ({ vmin, vmax } = sliderRange(imageDataRange.min, imageDataRange.max, imageVminPct, imageVmaxPct));
+      }
       const cssW = uiRef.current.width / DPR;
       const cssH = uiRef.current.height / DPR;
       ctx.save();
@@ -2008,7 +2058,7 @@ function Show3D() {
       drawColorbar(ctx, cssW, cssH, lut, vmin, vmax, logScale);
       ctx.restore();
     }
-  }, [pixelSize, scaleBarVisible, width, canvasW, canvasH, displayScale, zoom, showColorbar, hideDisplay, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale]);
+  }, [pixelSize, scaleBarVisible, width, canvasW, canvasH, displayScale, zoom, showColorbar, hideDisplay, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, percentileLow, percentileHigh]);
 
   // Compute FFT magnitude (expensive, async — only re-run on data/GPU changes)
   // Supports ROI-scoped FFT: when ROI is active with a selected ROI, compute
@@ -2499,6 +2549,7 @@ function Show3D() {
       vmax,
       logScale,
       pixelSize: pixelSize > 0 ? pixelSize : undefined,
+      pixelUnit: pixelSize > 0 ? (pixelUnit || "Å") : "px",
       showColorbar: withColorbar,
       showScaleBar: pixelSize > 0,
       drawAnnotations: (ctx) => {
@@ -3009,7 +3060,10 @@ function Show3D() {
 
   const handleCanvasMouseLeave = () => {
     setCursorInfo(null);
-    if (showLens) setLensPos(null);
+    // Lens persists at last position when cursor exits main canvas. Wiping on every
+    // leave kills the inset whenever the user touches a slider, FFT panel, or any
+    // sibling control — surprising "lens vanished" footgun. User explicitly turns
+    // lens off via the Lens switch.
     pendingRoiAddRef.current = null;
     setIsDraggingROI(false);
     setIsDraggingResize(false);
@@ -3379,7 +3433,7 @@ function Show3D() {
               {!hideDisplay && (
                 <>
                   <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
-                  <Switch checked={showFft} onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                  <Switch checked={showFft} onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panel" }} />
                 </>
               )}
               {!hideProfile && (
@@ -3392,9 +3446,18 @@ function Show3D() {
                     if (on) {
                       if (!lockRoi) { setRoiActive(false); setRoiSelectedIdx(-1); }
                     } else {
-                      setProfileLine([]); setProfileData(null); setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false);
+                      // Toggle OFF hides overlay (gated by `profileActive` in render) but keeps
+                      // the line + sampled data so re-enable restores instantly. Use the Clear
+                      // button below to actively wipe.
+                      setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false);
                     }
-                  }} disabled={lockProfile} size="small" sx={switchStyles.small} />
+                  }} disabled={lockProfile} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle line intensity profile tool" }} />
+                  {profileActive && (
+                    <>
+                      <Typography sx={{ ...typography.label, fontSize: 10, ml: "4px" }}>W:</Typography>
+                      <Slider value={profileWidth} min={1} max={15} step={1} onChange={(_, v) => { if (!lockProfile) setProfileWidth(v as number); }} disabled={lockProfile} size="small" valueLabelDisplay="auto" sx={{ width: 60, ml: "2px" }} aria-label={`Profile width ${profileWidth} px`} />
+                    </>
+                  )}
                 </>
               )}
               {!hideDisplay && (
@@ -3410,6 +3473,7 @@ function Show3D() {
                     disabled={lockDisplay}
                     size="small"
                     sx={switchStyles.small}
+                    inputProps={{ "aria-label": "Toggle magnifier lens" }}
                   />
                 </>
               )}
@@ -3425,14 +3489,14 @@ function Show3D() {
                     } else {
                       setRoiActive(false); setRoiSelectedIdx(-1); pendingRoiAddRef.current = null;
                     }
-                  }} disabled={lockRoi} size="small" sx={switchStyles.small} />
+                  }} disabled={lockRoi} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle ROI selection tool" }} />
                 </>
               )}
               <Box sx={{ flex: 1 }} />
               <Box sx={{ display: "flex", alignItems: "center", gap: "6px" }}>
                 {!hideExport && (
                   <>
-                    <Button size="small" sx={{ ...compactButton, color: themeColors.accent }} onClick={(e) => { if (!lockExport) setExportAnchor(e.currentTarget); }} disabled={lockExport || exporting}>{exporting ? "..." : "Export"}</Button>
+                    <Button size="small" sx={{ ...compactButton, color: themeColors.accent }} onClick={(e) => { if (!lockExport) setExportAnchor(e.currentTarget); }} disabled={lockExport || exporting} aria-label="Open export menu (PDF, PNG, GIF, bundle)">{exporting ? "..." : "Export"}</Button>
                     <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} sx={{ zIndex: 9999 }}>
                       <MenuItem disabled={lockExport} onClick={() => handleExportFigure(true)} sx={{ fontSize: 12 }}>PDF + colorbar</MenuItem>
                       <MenuItem disabled={lockExport} onClick={() => handleExportFigure(false)} sx={{ fontSize: 12 }}>PDF</MenuItem>
@@ -3441,11 +3505,11 @@ function Show3D() {
                       <MenuItem disabled={lockExport} onClick={handleExportPngAll} sx={{ fontSize: 12 }}>PNG (all frames .zip)</MenuItem>
                       <MenuItem disabled={lockExport} onClick={handleExportGif} sx={{ fontSize: 12 }}>GIF (fps: {fps})</MenuItem>
                     </Menu>
-                    <Button size="small" sx={compactButton} disabled={lockExport} onClick={handleCopy}>Copy</Button>
+                    <Button size="small" sx={compactButton} disabled={lockExport} onClick={handleCopy} aria-label="Copy current frame to clipboard as PNG">Copy</Button>
                   </>
                 )}
                 {!hideView && (
-                  <Button size="small" sx={compactButton} disabled={lockView || !needsReset} onClick={handleDoubleClick}>Reset</Button>
+                  <Button size="small" sx={compactButton} disabled={lockView || !needsReset} onClick={handleDoubleClick} aria-label="Reset zoom and pan">Reset</Button>
                 )}
               </Box>
             </Box>
@@ -3475,10 +3539,10 @@ function Show3D() {
             onWheel={handleWheel}
             onDoubleClick={handleDoubleClick}
           >
-            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: "pixelated" }} />
-            <canvas ref={overlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} />
-            <canvas ref={uiRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} />
-            <canvas ref={lensCanvasRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} />
+            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={`Slice image ${(playing ? displaySliceIdx : sliceIdx) + 1} of ${nSlices}${title ? `: ${title}` : ""} (${width} by ${height} pixels). Use arrow keys to scrub frames.`} />
+            <canvas ref={overlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
+            <canvas ref={uiRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
+            <canvas ref={lensCanvasRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             {/* Cursor readout overlay */}
             {cursorInfo && (
               <Box sx={{ position: "absolute", top: 3, right: 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", minWidth: 100, textAlign: "right" }}>
@@ -3540,6 +3604,8 @@ function Show3D() {
                 onMouseMove={handleProfileMouseMove}
                 onMouseLeave={handleProfileMouseLeave}
                 style={{ width: canvasW, height: profileHeight, display: "block", border: `1px solid ${themeColors.border}`, borderBottom: "none", cursor: "crosshair" }}
+                role="img"
+                aria-label="Line intensity profile along the drawn line"
               />
               <div
                 onMouseDown={(e) => { if (lockProfile) return; e.preventDefault(); setIsResizingProfile(true); setProfileResizeStart({ y: e.clientY, height: profileHeight }); }}
@@ -3553,6 +3619,8 @@ function Show3D() {
               <canvas
                 ref={roiPlotCanvasRef}
                 style={{ width: canvasW, height: 76, display: "block", border: `1px solid ${themeColors.border}` }}
+                role="img"
+                aria-label="ROI mean intensity over frames"
               />
             </Box>
           )}
@@ -3564,25 +3632,42 @@ function Show3D() {
                   {/* Row 1: Scale + Auto + Color */}
                   <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Scale:</Typography>
-                    <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
+                    <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Intensity scale (linear or logarithmic)" }}>
                       <MenuItem value="linear">Lin</MenuItem>
                       <MenuItem value="log">Log</MenuItem>
                     </Select>
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
-                    <Switch checked={autoContrast} onChange={(e) => { if (!lockDisplay) setAutoContrast(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                    <Switch checked={autoContrast} onChange={(e) => {
+                      if (lockDisplay) return;
+                      const on = e.target.checked;
+                      setAutoContrast(on);
+                      if (on && imageHistogramData) {
+                        // ON → snap slider thumbs to actual percentile clip so slider shows what's rendered.
+                        const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh);
+                        const span = dataMax - dataMin;
+                        if (span > 0) {
+                          setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
+                          setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
+                        }
+                      } else {
+                        // OFF → reset slider to full range so user sees raw data.
+                        setImageVminPct(0);
+                        setImageVmaxPct(100);
+                      }
+                    }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
-                    <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                    <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
                   </Box>
                   {/* Row 2: Color + Smooth + Diff + zoom indicator */}
                   <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Color:</Typography>
-                    <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }}>
+                    <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} inputProps={{ "aria-label": "Image colormap" }}>
                       {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                     </Select>
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Smooth:</Typography>
-                    <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                    <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Diff:</Typography>
-                    <Select disabled={lockDisplay} value={diffMode} onChange={(e) => setDiffMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
+                    <Select disabled={lockDisplay} value={diffMode} onChange={(e) => setDiffMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Difference mode (off, previous frame, first frame)" }}>
                       <MenuItem value="off">Off</MenuItem>
                       <MenuItem value="previous">Prev</MenuItem>
                       <MenuItem value="first">First</MenuItem>
@@ -3605,7 +3690,13 @@ function Show3D() {
 
                     vminPct={imageVminPct}
                     vmaxPct={imageVmaxPct}
-                    onRangeChange={(min, max) => { if (!lockHistogram) { setImageVminPct(min); setImageVmaxPct(max); } }}
+                    onRangeChange={(min, max) => {
+                      if (lockHistogram) return;
+                      setImageVminPct(min);
+                      setImageVmaxPct(max);
+                      // User-driven drag overrides Auto: turn it off so slider drives rendering.
+                      if (autoContrast) setAutoContrast(false);
+                    }}
                     width={110}
                     height={58}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
@@ -3622,9 +3713,9 @@ function Show3D() {
             <Box sx={{ mt: `${SPACING.XS}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, width: "fit-content" }}>
               <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: lockDisplay ? 0.5 : 1, pointerEvents: lockDisplay ? "none" : "auto" }}>
                 <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Lens {lensMag}×</Typography>
-                <Slider disabled={lockDisplay} value={lensMag} min={2} max={8} step={1} onChange={(_, v) => setLensMag(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} />
+                <Slider disabled={lockDisplay} value={lensMag} min={2} max={8} step={1} onChange={(_, v) => setLensMag(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens magnification" valueLabelDisplay="auto" />
                 <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>{lensDisplaySize}px</Typography>
-                <Slider disabled={lockDisplay} value={lensDisplaySize} min={64} max={256} step={16} onChange={(_, v) => setLensDisplaySize(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} />
+                <Slider disabled={lockDisplay} value={lensDisplaySize} min={64} max={256} step={16} onChange={(_, v) => setLensDisplaySize(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens display size in pixels" valueLabelDisplay="auto" />
               </Box>
             </Box>
           )}
@@ -3633,16 +3724,16 @@ function Show3D() {
           {showControls && !hidePlayback && (() => { const activeIdx = playing ? displaySliceIdx : sliceIdx; return (<>
           <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, width: canvasW, boxSizing: "border-box", opacity: lockPlayback ? 0.5 : 1, pointerEvents: lockPlayback ? "none" : "auto" }}>
             <Stack direction="row" spacing={0} sx={{ flexShrink: 0, mr: 0.5 }}>
-              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }}>
+              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
                 <FastRewindIcon sx={{ fontSize: 18 }} />
               </IconButton>
-              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: themeColors.accent, p: 0.25 }}>
+              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: themeColors.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
                 {playing ? <PauseIcon sx={{ fontSize: 18 }} /> : <PlayArrowIcon sx={{ fontSize: 18 }} />}
               </IconButton>
-              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }}>
+              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
                 <FastForwardIcon sx={{ fontSize: 18 }} />
               </IconButton>
-              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setPlaying(false); setSliceIdx(loop ? Math.max(0, loopStart) : 0); } }} sx={{ color: themeColors.textMuted, p: 0.25 }}>
+              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setPlaying(false); setSliceIdx(loop ? Math.max(0, loopStart) : 0); } }} sx={{ color: themeColors.textMuted, p: 0.25 }} aria-label="Stop and rewind to start" title="Stop">
                 <StopIcon sx={{ fontSize: 16 }} />
               </IconButton>
             </Stack>
@@ -3665,6 +3756,7 @@ function Show3D() {
                 valueLabelDisplay="auto"
                 valueLabelFormat={(v) => `${v + 1}`}
                 marks={bookmarkedFrames.map(f => ({ value: f }))}
+                aria-label={`Loop range and current ${dimLabel.toLowerCase()} (frame ${activeIdx + 1} of ${nSlices}, loop ${loopStart + 1} to ${effectiveLoopEnd + 1})`}
                 sx={{
                   ...sliderStyles.small,
                   flex: 1,
@@ -3687,6 +3779,7 @@ function Show3D() {
                 valueLabelDisplay="auto"
                 valueLabelFormat={(v) => `${v + 1}`}
                 marks={bookmarkedFrames.map(f => ({ value: f }))}
+                aria-label={`Current ${dimLabel.toLowerCase()} (${activeIdx + 1} of ${nSlices})`}
                 sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" } }}
               />
             )}
@@ -3699,24 +3792,24 @@ function Show3D() {
           {/* Row 2: FPS, Loop, Bounce, Bookmark */}
           <Box sx={{ ...controlRow, mt: `${SPACING.XS}px`, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, width: canvasW, boxSizing: "border-box", opacity: lockPlayback ? 0.5 : 1, pointerEvents: lockPlayback ? "none" : "auto" }}>
             <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>fps</Typography>
-            <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => { if (!lockPlayback) setFps(v as number); }} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} />
+            <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => { if (!lockPlayback) setFps(v as number); }} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
             <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
             <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Loop</Typography>
-            <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} />
+            <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
             <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Bounce</Typography>
-            <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} />
+            <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce (ping-pong) playback" }} />
             <Tooltip title="Bookmark current frame" arrow>
               <IconButton size="small" disabled={lockPlayback} onClick={() => {
                 if (lockPlayback) return;
                 const set = new Set(bookmarkedFrames);
                 if (set.has(activeIdx)) { set.delete(activeIdx); } else { set.add(activeIdx); }
                 setBookmarkedFrames(Array.from(set).sort((a, b) => a - b));
-              }} sx={{ color: bookmarkedFrames.includes(activeIdx) ? themeColors.accent : themeColors.textMuted, p: 0.25, flexShrink: 0 }}>
+              }} sx={{ color: bookmarkedFrames.includes(activeIdx) ? themeColors.accent : themeColors.textMuted, p: 0.25, flexShrink: 0 }} aria-label={bookmarkedFrames.includes(activeIdx) ? "Remove bookmark" : "Bookmark current frame"}>
                 <Typography sx={{ fontSize: 14, lineHeight: 1 }}>{bookmarkedFrames.includes(activeIdx) ? "\u2605" : "\u2606"}</Typography>
               </IconButton>
             </Tooltip>
             {loop && (loopStart > 0 || (loopEnd >= 0 && loopEnd < nSlices - 1)) && (
-              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setLoopStart(0); setLoopEnd(-1); } }} sx={{ color: themeColors.textMuted, p: 0.25, flexShrink: 0 }} title="Reset loop range">
+              <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setLoopStart(0); setLoopEnd(-1); } }} sx={{ color: themeColors.textMuted, p: 0.25, flexShrink: 0 }} title="Reset loop range" aria-label="Reset loop range">
                 <Typography sx={{ fontSize: 10, lineHeight: 1 }}>Reset</Typography>
               </IconButton>
             )}
@@ -3736,15 +3829,16 @@ function Show3D() {
                     onChange={(e) => setNewRoiShape(e.target.value as "circle" | "square" | "rectangle" | "annular")}
                     MenuProps={themedMenuProps}
                     sx={{ ...themedSelect, minWidth: 85, fontSize: 10 }}
+                    inputProps={{ "aria-label": "New ROI shape" }}
                   >
                     {(["square", "rectangle", "circle", "annular"] as const).map((shape) => (<MenuItem key={shape} value={shape}>{shape.charAt(0).toUpperCase() + shape.slice(1)}</MenuItem>))}
                   </Select>
-                  <Button size="small" sx={compactButton} onClick={() => addROIAt(height / 2, width / 2)}>ADD</Button>
-                  <Button size="small" sx={compactButton} disabled={!selectedRoi} onClick={duplicateSelectedROI}>DUP</Button>
+                  <Button size="small" sx={compactButton} onClick={() => addROIAt(height / 2, width / 2)} aria-label="Add ROI at image center">ADD</Button>
+                  <Button size="small" sx={compactButton} disabled={!selectedRoi} onClick={duplicateSelectedROI} aria-label="Duplicate selected ROI">DUP</Button>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Plot:</Typography>
-                  <Switch checked={showRoiPlot} onChange={(e) => setShowRoiPlot(e.target.checked)} size="small" sx={switchStyles.small} />
+                  <Switch checked={showRoiPlot} onChange={(e) => setShowRoiPlot(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle ROI intensity plot" }} />
                   <Box sx={{ flex: 1 }} />
-                  <Button size="small" sx={{ ...compactButton, fontSize: 9, minWidth: 24, color: "#ef5350" }} disabled={!roiItems.length} onClick={() => { setRoiList([]); setRoiSelectedIdx(-1); }}>CLEAR</Button>
+                  <Button size="small" sx={{ ...compactButton, fontSize: 9, minWidth: 24, color: "#ef5350" }} disabled={!roiItems.length} onClick={() => { setRoiList([]); setRoiSelectedIdx(-1); }} aria-label="Clear all ROIs">CLEAR</Button>
                 </Box>
 
                 {/* Selected ROI details */}
@@ -3757,29 +3851,30 @@ function Show3D() {
                       onChange={(e) => updateSelectedRoi({ shape: String(e.target.value) })}
                       MenuProps={themedMenuProps}
                       sx={{ ...themedSelect, minWidth: 85, fontSize: 10 }}
+                      inputProps={{ "aria-label": "Selected ROI shape" }}
                     >
                       {(["square", "rectangle", "circle", "annular"] as const).map((shape) => (<MenuItem key={shape} value={shape}>{shape.charAt(0).toUpperCase() + shape.slice(1)}</MenuItem>))}
                     </Select>
                     {selectedRoi.shape === "rectangle" && (
                       <>
                         <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>W</Typography>
-                        <Slider value={selectedRoi.width} min={5} max={width} onChange={(_, v) => updateSelectedRoi({ width: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} />
+                        <Slider value={selectedRoi.width} min={5} max={width} onChange={(_, v) => updateSelectedRoi({ width: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} aria-label="ROI width" valueLabelDisplay="auto" />
                         <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>H</Typography>
-                        <Slider value={selectedRoi.height} min={5} max={height} onChange={(_, v) => updateSelectedRoi({ height: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} />
+                        <Slider value={selectedRoi.height} min={5} max={height} onChange={(_, v) => updateSelectedRoi({ height: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} aria-label="ROI height" valueLabelDisplay="auto" />
                       </>
                     )}
                     {selectedRoi.shape === "annular" && (
                       <>
                         <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Inner</Typography>
-                        <Slider value={selectedRoi.radius_inner} min={1} max={Math.max(2, selectedRoi.radius - 1)} onChange={(_, v) => updateSelectedRoi({ radius_inner: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} />
+                        <Slider value={selectedRoi.radius_inner} min={1} max={Math.max(2, selectedRoi.radius - 1)} onChange={(_, v) => updateSelectedRoi({ radius_inner: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} aria-label="Annular ROI inner radius" valueLabelDisplay="auto" />
                         <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Outer</Typography>
-                        <Slider value={selectedRoi.radius} min={selectedRoi.radius_inner + 1} max={Math.max(width, height)} onChange={(_, v) => updateSelectedRoi({ radius: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} />
+                        <Slider value={selectedRoi.radius} min={selectedRoi.radius_inner + 1} max={Math.max(width, height)} onChange={(_, v) => updateSelectedRoi({ radius: v as number })} size="small" sx={{ ...sliderStyles.small, width: 40 }} aria-label="Annular ROI outer radius" valueLabelDisplay="auto" />
                       </>
                     )}
                     {selectedRoi.shape !== "rectangle" && selectedRoi.shape !== "annular" && (
                       <>
                         <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Size</Typography>
-                        <Slider value={selectedRoi.radius} min={5} max={Math.max(width, height)} onChange={(_, v) => updateSelectedRoi({ radius: v as number })} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+                        <Slider value={selectedRoi.radius} min={5} max={Math.max(width, height)} onChange={(_, v) => updateSelectedRoi({ radius: v as number })} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="ROI radius" valueLabelDisplay="auto" />
                       </>
                     )}
                     <Box sx={{ display: "flex", gap: "2px" }}>
@@ -3788,8 +3883,8 @@ function Show3D() {
                       ))}
                     </Box>
                     <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Border</Typography>
-                    <Slider value={selectedRoi.line_width} min={1} max={6} step={1} onChange={(_, v) => updateSelectedRoi({ line_width: v as number })} size="small" sx={{ ...sliderStyles.small, width: 30 }} />
-                    <Button size="small" sx={{ ...compactButton, fontSize: 9, minWidth: 20, color: "#ef5350" }} onClick={deleteSelectedROI}>&times;</Button>
+                    <Slider value={selectedRoi.line_width} min={1} max={6} step={1} onChange={(_, v) => updateSelectedRoi({ line_width: v as number })} size="small" sx={{ ...sliderStyles.small, width: 30 }} aria-label="ROI border line width" valueLabelDisplay="auto" />
+                    <Button size="small" sx={{ ...compactButton, fontSize: 9, minWidth: 20, color: "#ef5350" }} onClick={deleteSelectedROI} aria-label="Delete selected ROI">&times;</Button>
                   </Box>
                 )}
 
@@ -3838,7 +3933,7 @@ function Show3D() {
                 Preview{previewCropDims ? ` (${previewCropDims.w}\u00d7${previewCropDims.h})` : ""}
               </Typography>
               {!hideView && (
-                <Button size="small" sx={compactButton} disabled={lockView || (previewZoom.zoom === 1 && previewZoom.panX === 0 && previewZoom.panY === 0)} onClick={handlePreviewDoubleClick}>Reset</Button>
+                <Button size="small" sx={compactButton} disabled={lockView || (previewZoom.zoom === 1 && previewZoom.panX === 0 && previewZoom.panY === 0)} onClick={handlePreviewDoubleClick} aria-label="Reset preview zoom and pan">Reset</Button>
               )}
             </Stack>
             <Box
@@ -3851,8 +3946,8 @@ function Show3D() {
               onMouseUp={handlePreviewMouseUp}
               onMouseLeave={handlePreviewMouseUp}
             >
-              <canvas ref={previewCanvasRef} width={previewCanvasDims.w} height={previewCanvasDims.h} style={{ width: previewCanvasDims.w, height: previewCanvasDims.h, imageRendering: "pixelated" }} />
-              <canvas ref={previewOverlayRef} width={Math.round(previewCanvasDims.w * DPR)} height={Math.round(previewCanvasDims.h * DPR)} style={{ position: "absolute", top: 0, left: 0, width: previewCanvasDims.w, height: previewCanvasDims.h, pointerEvents: "none" }} />
+              <canvas ref={previewCanvasRef} width={previewCanvasDims.w} height={previewCanvasDims.h} style={{ width: previewCanvasDims.w, height: previewCanvasDims.h, imageRendering: "pixelated" }} role="img" aria-label={`ROI preview crop${previewCropDims ? ` (${previewCropDims.w} by ${previewCropDims.h} pixels)` : ""}`} />
+              <canvas ref={previewOverlayRef} width={Math.round(previewCanvasDims.w * DPR)} height={Math.round(previewCanvasDims.h * DPR)} style={{ position: "absolute", top: 0, left: 0, width: previewCanvasDims.w, height: previewCanvasDims.h, pointerEvents: "none" }} aria-hidden="true" />
               {!hideView && (
                 <Box onMouseDown={handleMainResizeStart} sx={{ position: "absolute", bottom: 0, right: 0, width: 16, height: 16, cursor: lockView ? "default" : "nwse-resize", opacity: lockView ? 0.3 : 0.6, pointerEvents: lockView ? "none" : "auto", background: `linear-gradient(135deg, transparent 50%, ${themeColors.accent} 50%)`, "&:hover": { opacity: lockView ? 0.3 : 1 } }} />
               )}
@@ -3892,7 +3987,7 @@ function Show3D() {
                 </Typography>
               ) : <Box />}
               {!hideView && (
-                <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsReset} onClick={handleFftReset}>Reset</Button>
+                <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsReset} onClick={handleFftReset} aria-label="Reset FFT zoom and pan">Reset</Button>
               )}
             </Stack>
             {/* FFT Canvas - same size as main image */}
@@ -3906,8 +4001,8 @@ function Show3D() {
               onWheel={lockView ? undefined : handleFftWheel}
               onDoubleClick={lockView ? undefined : handleFftReset}
             >
-              <canvas ref={fftCanvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: "pixelated" }} />
-              <canvas ref={fftOverlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} />
+              <canvas ref={fftCanvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={roiFftActive && fftCropDims ? `FFT power spectrum of ROI crop (${fftCropDims.cropWidth} by ${fftCropDims.cropHeight} pixels)` : "FFT power spectrum of current frame"} />
+              <canvas ref={fftOverlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             </Box>
             {/* FFT Statistics bar */}
             {showStats && !hideStats && (
@@ -3937,27 +4032,27 @@ function Show3D() {
                 {/* Row 1: Scale + Auto */}
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Scale:</Typography>
-                  <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
+                  <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
                     <MenuItem value="linear">Lin</MenuItem>
                     <MenuItem value="log">Log</MenuItem>
                   </Select>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
-                  <Switch checked={fftAuto} onChange={(e) => { if (!lockDisplay) setFftAuto(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                  <Switch checked={fftAuto} onChange={(e) => { if (!lockDisplay) setFftAuto(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
                   {roiFftActive && fftCropDims && (
                     <>
                       <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Win:</Typography>
-                      <Switch checked={fftWindow} onChange={(e) => { if (!lockDisplay) setFftWindow(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                      <Switch checked={fftWindow} onChange={(e) => { if (!lockDisplay) setFftWindow(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle Hann windowing before FFT" }} />
                     </>
                   )}
                 </Box>
                 {/* Row 2: Color + Colorbar */}
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Color:</Typography>
-                  <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps}>
+                  <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
                     {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                   </Select>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
-                  <Switch checked={fftShowColorbar} onChange={(e) => { if (!lockDisplay) setFftShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                  <Switch checked={fftShowColorbar} onChange={(e) => { if (!lockDisplay) setFftShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT colorbar overlay" }} />
                 </Box>
               </Box>
               {/* Right: Histogram spanning both rows */}
@@ -3985,4 +4080,6 @@ function Show3D() {
   );
 }
 
-export const render = createRender(Show3D);
+// anywidget v0.9+ deprecates `export render` in favor of `export default { render }`.
+const render = createRender(Show3D);
+export default { render };

@@ -175,6 +175,13 @@ def test_show3d_multi_panel_mismatch():
         Show3D(a, b)
 
 
+def test_show3d_multi_panel_shape_mismatch():
+    a = np.random.rand(5, 16, 16).astype(np.float32)
+    b = np.random.rand(5, 12, 16).astype(np.float32)
+    with pytest.raises(ValueError, match="shape"):
+        Show3D(a, b)
+
+
 def test_show3d_state_dict_keys():
     data = np.random.rand(5, 8, 8).astype(np.float32)
     w = Show3D(data)
@@ -239,6 +246,26 @@ def test_show3d_set_image():
     assert w.cmap == "viridis"
 
 
+def test_show3d_set_image_accepts_2d():
+    data = np.random.rand(10, 16, 16).astype(np.float32)
+    w = Show3D(data)
+    img = np.random.rand(24, 32).astype(np.float32)
+    w.set_image(img)
+    assert w.n_slices == 1
+    assert w.height == 24
+    assert w.width == 32
+
+
+def test_show3d_set_image_resets_multi_panel_state():
+    a = np.random.rand(5, 8, 8).astype(np.float32)
+    b = np.random.rand(5, 8, 8).astype(np.float32)
+    w = Show3D(a, b, panel_titles=["A", "B"])
+    w.set_image(np.random.rand(3, 6, 7).astype(np.float32))
+    assert w.n_panels == 1
+    assert list(w.panel_titles) == []
+    assert w.width == 7
+
+
 def test_show3d_dim_label():
     data = np.random.rand(5, 8, 8).astype(np.float32)
     w = Show3D(data, dim_label="Defocus")
@@ -264,6 +291,21 @@ def test_show3d_rejects_complex_in_panel():
         Show3D(a, b)
 
 
+def test_show3d_rejects_nan_in_panel():
+    a = np.random.rand(5, 8, 8).astype(np.float32)
+    b = np.random.rand(5, 8, 8).astype(np.float32)
+    b[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="Panel 1 contains NaN or inf"):
+        Show3D(a, b)
+
+
+def test_show3d_rejects_float32_overflow_in_panel():
+    a = np.random.rand(5, 8, 8).astype(np.float32)
+    b = np.full((5, 8, 8), np.float64(np.finfo(np.float32).max) * 2.0, dtype=np.float64)
+    with pytest.raises(ValueError, match="Panel 1 exceeds float32 range"):
+        Show3D(a, b)
+
+
 def test_show3d_set_image_rejects_complex():
     data = np.random.rand(5, 8, 8).astype(np.float32)
     w = Show3D(data)
@@ -283,6 +325,21 @@ def test_show3d_state_includes_slice_idx():
 def test_show3d_rejects_empty_stack():
     with pytest.raises(ValueError, match="Empty stack"):
         Show3D(np.zeros((0, 100, 100), dtype=np.float32))
+    with pytest.raises(ValueError, match="Empty stack"):
+        Show3D(np.zeros((2, 0, 100), dtype=np.float32))
+    w = Show3D(np.zeros((2, 4, 4), dtype=np.float32))
+    with pytest.raises(ValueError, match="Empty stack"):
+        w.set_image(np.zeros((2, 0, 4), dtype=np.float32))
+
+
+def test_show3d_single_frame_diff_modes_do_not_crash():
+    w = Show3D(np.ones((1, 4, 4), dtype=np.float32))
+    w.diff_mode = "previous"
+    assert w.data_min == 0.0
+    assert w.data_max == 0.0
+    w.diff_mode = "first"
+    assert w.data_min == 0.0
+    assert w.data_max == 0.0
 
 
 def test_show3d_slice_idx_clamps_on_oob():
@@ -379,12 +436,34 @@ def test_show3d_rejects_inf():
         Show3D(data)
 
 
+def test_show3d_large_array_full_finite_scan():
+    data = np.zeros((2, 1001, 500), dtype=np.float32)
+    data.ravel()[123457] = np.nan
+    with pytest.raises(ValueError, match="NaN or inf"):
+        Show3D(data)
+
+
 def test_show3dvolume_rejects_nan():
     from quantem.widget import Show3DVolume
     data = np.random.rand(3, 8, 8).astype(np.float32)
     data[0, 0, 0] = np.nan
     with pytest.raises(ValueError, match="NaN or inf"):
         Show3DVolume(data)
+
+
+def test_show3dvolume_rejects_float32_overflow():
+    from quantem.widget import Show3DVolume
+    data = np.full((3, 8, 8), np.float64(np.finfo(np.float32).max) * 2.0, dtype=np.float64)
+    with pytest.raises(ValueError, match="float32 range"):
+        Show3DVolume(data)
+
+
+def test_show3dvolume_dual_rejects_float32_overflow_b():
+    from quantem.widget import Show3DVolume
+    a = np.random.rand(3, 8, 8).astype(np.float32)
+    b = np.full((3, 8, 8), np.float64(np.finfo(np.float32).max) * 2.0, dtype=np.float64)
+    with pytest.raises(ValueError, match="data_b exceeds float32 range"):
+        Show3DVolume(a, b)
 
 
 def test_show3d_state_timestamps_roundtrip():
@@ -395,3 +474,37 @@ def test_show3d_state_timestamps_roundtrip():
     w2 = Show3D(data, state=sd)
     assert list(w2.timestamps) == [0, 1.5, 3.0, 4.5]
     assert w2.timestamp_unit == "ms"
+
+
+def test_show3d_percentile_state_roundtrip_below_default_low():
+    data = np.random.rand(4, 8, 8).astype(np.float32)
+    w = Show3D(data, percentile_low=0.5, percentile_high=0.8)
+    w2 = Show3D(data, state=w.state_dict())
+    assert w2.percentile_low == pytest.approx(0.5)
+    assert w2.percentile_high == pytest.approx(0.8)
+
+
+def test_show3d_partial_vmin_state_roundtrip_affects_export_range():
+    data = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+    w = Show3D(data, vmin=5.0)
+    w2 = Show3D(data, state=w.state_dict())
+    assert w2._get_color_range(data[0])[0] == pytest.approx(5.0)
+
+
+def test_show3d_state_with_active_roi_loads_before_timer_exists():
+    data = np.ones((2, 4, 4), dtype=np.float32)
+    w = Show3D(data, state={"roi_active": True})
+    try:
+        assert w.roi_active is True
+    finally:
+        w.free()
+
+
+def test_show3d_load_state_ignores_data_derived_traits():
+    data = np.ones((2, 4, 4), dtype=np.float32)
+    w = Show3D(data)
+    with pytest.warns(UserWarning, match="n_slices"):
+        w.load_state_dict({"n_slices": 999, "height": 999, "width": 999})
+    assert w.n_slices == 2
+    assert w.height == 4
+    assert w.width == 4

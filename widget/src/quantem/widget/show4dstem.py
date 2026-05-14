@@ -11,9 +11,11 @@ To reduce data size, bin k-space at the dataset level before viewing:
     widget = Show4DSTEM(dataset)
 """
 
+import gc
 import json
 import math
 import pathlib
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Self
 
@@ -683,32 +685,27 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.pos_col = int(max(0, min(col, self.shape_cols - 1)))
 
     def free(self):
-        """Free GPU memory held by this widget.
-
-        Deletes the internal data tensor, runs garbage collection, and
-        flushes the MPS allocator cache. Call this before loading a new
-        dataset to avoid running out of GPU memory.
-
-        Examples
-        --------
-        >>> w.free()          # release ~9 GB of MPS memory
-        >>> del result        # free the source numpy array
-        """
-        import gc
-
-        device = str(self._device) if hasattr(self, "_device") else ""
-        nbytes = self._data.nbytes if hasattr(self._data, "nbytes") else 0
+        """Release VRAM and RAM held by this widget. `del widget` won't
+        free memory because traitlets observers pin the refcount."""
+        if self._data is None:
+            return
+        device = str(self._device)
         self._data = None
+        for attr in ("_det_row_coords", "_det_col_coords",
+                     "_scan_row_coords", "_scan_col_coords", "_data_pre"):
+            setattr(self, attr, None)
+        for trait in ("frame_bytes", "virtual_image_bytes", "vi_roi_dp_bytes", "_gif_data"):
+            setattr(self, trait, b"")
         gc.collect()
+        # Flush cupy pool: _data may have been a torch view into cupy memory.
+        if "cupy" in sys.modules:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+            _cp.fft.config.get_plan_cache().clear()
         if device == "mps":
-            try:
-                torch.mps.empty_cache()
-            except AttributeError:
-                pass
+            torch.mps.empty_cache()
         elif device.startswith("cuda"):
             torch.cuda.empty_cache()
-        if nbytes > 0:
-            print(f"freed {_format_memory(nbytes)} ({device})")
 
     def summary(self):
         name = self.title if self.title else "Show4DSTEM"

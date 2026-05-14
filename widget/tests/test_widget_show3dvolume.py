@@ -48,6 +48,26 @@ def test_show3dvolume_pixel_size():
     vol = np.random.rand(8, 8, 8).astype(np.float32)
     w = Show3DVolume(vol, pixel_size=2.5)
     assert w.pixel_size == pytest.approx(2.5)
+    assert w.pixel_size_axes == pytest.approx([2.5, 2.5, 2.5])
+
+
+def test_show3dvolume_pixel_size_anisotropic():
+    # Tuple input: full triple stored, scalar trait is lateral mean.
+    vol = np.random.rand(8, 8, 8).astype(np.float32)
+    w = Show3DVolume(vol, pixel_size=(2.0, 0.5, 0.5))
+    assert w.pixel_size_axes == pytest.approx([2.0, 0.5, 0.5])
+    assert w.pixel_size == pytest.approx(0.5)  # (0.5 + 0.5) / 2
+    # List, ndarray, and 3-tuple all accepted.
+    Show3DVolume(vol, pixel_size=[1.0, 2.0, 3.0])
+    Show3DVolume(vol, pixel_size=np.array([1.0, 2.0, 3.0]))
+    # Wrong length rejected.
+    with pytest.raises(ValueError, match="3 elements"):
+        Show3DVolume(vol, pixel_size=(1.0, 2.0))
+    # NaN/neg rejected.
+    with pytest.raises(ValueError, match="finite"):
+        Show3DVolume(vol, pixel_size=(float("nan"), 1.0, 1.0))
+    with pytest.raises(ValueError, match=">= 0"):
+        Show3DVolume(vol, pixel_size=(-1.0, 1.0, 1.0))
 
 
 def test_show3dvolume_log_scale_auto_contrast():
@@ -82,12 +102,50 @@ def test_show3dvolume_cmap_validator():
         w.cmap = ""
 
 
+def test_show3dvolume_cmap_matches_js_dropdown():
+    """Every name in js/colormaps.ts COLORMAP_POINTS must be accepted by the
+    Python validator. The JS dropdown shows all of them, so a user picking
+    one from the dropdown must not crash the Python trait sync round-trip.
+    """
+    import pathlib
+    import re
+
+    js_path = (
+        pathlib.Path(__file__).parent.parent
+        / "js"
+        / "colormaps.ts"
+    )
+    text = js_path.read_text()
+    # COLORMAP_POINTS keys are everything between the const declaration and
+    # the matching closing brace. Pull them via a simple regex over top-level
+    # identifiers followed by `: [`.
+    block_start = text.index("const COLORMAP_POINTS")
+    block = text[block_start:]
+    block = block[: block.index("};") + 1]
+    js_names = set(re.findall(r"\n  (\w+):\s*\[", block))
+    assert js_names, "failed to parse JS COLORMAP_POINTS keys"
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    for name in js_names:
+        # Round-trip: any name shown in the dropdown must be a valid trait
+        # value. If this raises, the dropdown is offering a cmap the
+        # validator rejects (silent user-pain bug).
+        w = Show3DVolume(vol, cmap=name)
+        assert w.cmap == name
+
+
 def test_show3dvolume_pixel_size_validator():
     vol = np.random.rand(4, 4, 4).astype(np.float32)
     with pytest.raises(traitlets.TraitError):
         Show3DVolume(vol, pixel_size=float("nan"))
     with pytest.raises(traitlets.TraitError):
         Show3DVolume(vol, pixel_size=-1.0)
+    w = Show3DVolume(vol)
+    with pytest.raises(traitlets.TraitError, match="length 3"):
+        w.pixel_size_axes = [1.0, 2.0]
+    with pytest.raises(traitlets.TraitError, match="finite"):
+        w.pixel_size_axes = [1.0, float("nan"), 1.0]
+    with pytest.raises(traitlets.TraitError, match=">= 0"):
+        w.pixel_size_axes = [1.0, -1.0, 1.0]
 
 
 def test_show3dvolume_dim_labels_validator():
@@ -212,7 +270,7 @@ def test_show3dvolume_unknown_kwarg_rejected():
 def test_show3dvolume_dim_labels_default():
     vol = np.random.rand(4, 4, 4).astype(np.float32)
     w = Show3DVolume(vol)
-    assert list(w.dim_labels) == ["X", "Y", "Z"]
+    assert list(w.dim_labels) == ["Z", "Y", "X"]
 
 
 def test_show3dvolume_dim_labels_custom():
@@ -238,3 +296,185 @@ def test_show3dvolume_dual_rejects_complex_b():
     b = (np.random.rand(4, 4, 4) + 1j * np.random.rand(4, 4, 4)).astype(np.complex64)
     with pytest.raises(TypeError, match="complex"):
         Show3DVolume(a, b)
+
+
+def test_show3dvolume_z_stretch_default():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    assert w.z_stretch == pytest.approx(1.0)
+
+
+def test_show3dvolume_z_stretch_kwarg():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, z_stretch=8.0)
+    assert w.z_stretch == pytest.approx(8.0)
+
+
+def test_show3dvolume_z_stretch_clamp_min():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.z_stretch = 0.5
+    assert w.z_stretch == pytest.approx(1.0)
+
+
+def test_show3dvolume_z_stretch_clamp_max():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.z_stretch = 100
+    assert w.z_stretch == pytest.approx(16.0)
+
+
+def test_show3dvolume_z_stretch_rejects_nan():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    with pytest.raises(traitlets.TraitError):
+        w.z_stretch = float("nan")
+
+
+def test_show3dvolume_z_stretch_rejects_inf():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    with pytest.raises(traitlets.TraitError):
+        w.z_stretch = float("inf")
+
+
+def test_show3dvolume_z_stretch_in_state_dict():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, z_stretch=4.0)
+    sd = w.state_dict()
+    assert "z_stretch" in sd
+    assert sd["z_stretch"] == pytest.approx(4.0)
+
+
+def test_show3dvolume_z_stretch_roundtrip():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.load_state_dict({"z_stretch": 7.5})
+    assert w.z_stretch == pytest.approx(7.5)
+
+
+def test_show3dvolume_smooth_default():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    assert w.smooth is False
+
+
+def test_show3dvolume_smooth_kwarg():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, smooth=True)
+    assert w.smooth is True
+
+
+def test_show3dvolume_smooth_toggle():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.smooth = True
+    assert w.smooth is True
+    w.smooth = False
+    assert w.smooth is False
+
+
+def test_show3dvolume_smooth_in_state_dict():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, smooth=True)
+    sd = w.state_dict()
+    assert "smooth" in sd
+    assert sd["smooth"] is True
+
+
+def test_show3dvolume_smooth_roundtrip():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.load_state_dict({"smooth": True})
+    assert w.smooth is True
+
+
+def test_show3dvolume_load_state_warns_unknown_keys():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    import warnings as _warnings
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        w.load_state_dict({"slise_z": 5, "smooth": True})
+    assert any("slise_z" in str(c.message) for c in caught)
+    assert w.smooth is True  # known key still applied
+
+
+def test_show3dvolume_load_state_rejects_dual_without_data_b():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)  # single-volume
+    with pytest.raises(ValueError, match="dual_mode"):
+        w.load_state_dict({"dual_mode": True})
+
+
+def test_show3dvolume_linked_contrast_default():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    assert w.linked_contrast is True
+
+
+def test_show3dvolume_linked_contrast_roundtrip():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    w.load_state_dict({"linked_contrast": False})
+    assert w.linked_contrast is False
+
+
+def test_show3dvolume_vmin_rejects_nan():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    with pytest.raises(traitlets.TraitError, match="finite"):
+        w.vmin = float("nan")
+
+
+def test_show3dvolume_vmax_rejects_inf():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol)
+    with pytest.raises(traitlets.TraitError, match="finite"):
+        w.vmax = float("inf")
+
+
+def test_show3dvolume_linked_contrast_kwarg():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, linked_contrast=False)
+    assert w.linked_contrast is False
+
+
+def test_show3dvolume_reverse_kwarg():
+    vol = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(vol, reverse=True)
+    assert w.reverse is True
+
+
+def test_show3dvolume_auto_z_stretch_thin_z():
+    # nz=14, nxy=730 ptycho — ratio 52, should auto-pick z_stretch>1 and compact=True
+    vol = np.random.rand(14, 730, 730).astype(np.float32)
+    w = Show3DVolume(vol)
+    assert w.z_stretch > 1.0
+    assert w.z_stretch <= 16.0
+    assert w.compact is True
+
+
+def test_show3dvolume_no_auto_for_cubic():
+    # nz=ny=nx — ratio 1, should stay at defaults
+    vol = np.random.rand(64, 64, 64).astype(np.float32)
+    w = Show3DVolume(vol)
+    assert w.z_stretch == 1.0
+    assert w.compact is False
+
+
+def test_show3dvolume_user_z_stretch_wins():
+    vol = np.random.rand(14, 730, 730).astype(np.float32)
+    w = Show3DVolume(vol, z_stretch=2.0, compact=False)
+    assert w.z_stretch == 2.0
+    assert w.compact is False
+
+
+def test_show3dvolume_export_diff_in_dual_mode():
+    a = np.random.rand(4, 4, 4).astype(np.float32)
+    b = np.random.rand(4, 4, 4).astype(np.float32)
+    w = Show3DVolume(a, b, show_diff=True)
+    slices = w._get_export_slices()
+    # In dual+show_diff, exported volume should be |A - B|, not A
+    expected = np.abs(a - b)
+    np.testing.assert_array_almost_equal(slices[0], expected[0, :, :])

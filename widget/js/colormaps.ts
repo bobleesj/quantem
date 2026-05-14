@@ -530,6 +530,7 @@ export class GPUColormapEngine {
     const encoder = this.device.createCommandEncoder();
     const params = new ArrayBuffer(24);
     let rendered = 0;
+    const tempBuffers: GPUBuffer[] = [];
 
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
@@ -587,13 +588,13 @@ export class GPUColormapEngine {
       renderPass.end();
       rendered++;
 
-      // Note: blitParamsBuffer is a temporary — ideally per-slot persistent
-      // For now, acceptable overhead (8 bytes per image)
+      // The 8-byte uniform is finished referencing once the encoder is closed;
+      // we destroy after submit to avoid a per-frame leak (was previously accumulating).
+      tempBuffers.push(blitParamsBuffer);
     }
 
     this.device.queue.submit([encoder.finish()]);
-    if (rendered > 0) {
-    }
+    for (const b of tempBuffers) b.destroy();
     return rendered;
   }
 
@@ -616,6 +617,7 @@ export class GPUColormapEngine {
     const encoder = this.device.createCommandEncoder();
     const params = new ArrayBuffer(24);
     const canvases: OffscreenCanvas[] = [];
+    const tempBuffers: GPUBuffer[] = [];
 
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
@@ -651,6 +653,7 @@ export class GPUColormapEngine {
         size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([slot.width, slot.height]));
+      tempBuffers.push(blitParamsBuffer);
 
       const blitGroup = this.device.createBindGroup({
         layout: this.blitPipeline!.getBindGroupLayout(0),
@@ -677,6 +680,7 @@ export class GPUColormapEngine {
     }
 
     this.device.queue.submit([encoder.finish()]);
+    for (const b of tempBuffers) b.destroy();
 
     // transferToImageBitmap after GPU finishes (synchronous, no mapAsync)
     const bitmaps: ImageBitmap[] = [];
@@ -885,47 +889,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
       layout: "auto",
       compute: { module, entryPoint: "clear_bins" },
     });
-  }
-
-  /**
-   * Compute a 256-bin histogram for slot `idx` on GPU.
-   * Returns normalized bins (0–1) matching `computeHistogramFromBytes`.
-   */
-  async computeHistogram(idx: number, _logScale: boolean = false): Promise<number[]> {
-    this.ensureHistPipeline();
-    const slot = this.slots[idx];
-    if (!slot || !this.histPipeline || !this.histClearPipeline) return new Array(256).fill(0);
-
-    // Find data range (we need min/max for binning)
-    // For GPU efficiency, do a quick CPU scan — findDataRange is fast (<5ms for 16M)
-    // A full GPU min/max reduction would add complexity for minimal gain here.
-    // Note: when logScale is true, we need the log-transformed range.
-
-    const binsBuffer = this.device.createBuffer({
-      size: 256 * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-    const readBuffer = this.device.createBuffer({
-      size: 256 * 4,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const paramsBuf = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    // We need min/max from the (possibly log-transformed) data for proper binning.
-    // Pass raw min/max = 0; the shader will use the actual data range.
-    // Actually, we need to know the range to bin correctly. Read it back from
-    // the data we already uploaded. For now, accept min/max as parameters.
-    // The caller (Show2D data effect) already computes findDataRange.
-    // So let's accept dmin/dmax as params.
-
-    // This method needs dmin/dmax — return a version that takes them:
-    binsBuffer.destroy();
-    readBuffer.destroy();
-    paramsBuf.destroy();
-    return new Array(256).fill(0);
   }
 
   /**

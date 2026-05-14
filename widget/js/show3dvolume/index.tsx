@@ -25,13 +25,12 @@ import PauseIcon from "@mui/icons-material/Pause";
 import FastForwardIcon from "@mui/icons-material/FastForward";
 import FastRewindIcon from "@mui/icons-material/FastRewind";
 import StopIcon from "@mui/icons-material/Stop";
-import "./show3dvolume.css";
 import { useTheme } from "../theme";
 import { VolumeRenderer, CameraState, DEFAULT_CAMERA } from "../webgpu-volume";
 import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, exportFigure, canvasToPDF } from "../figure";
 import { extractFloat32, formatNumber, downloadBlob, downloadDataView } from "../format";
 import { computeHistogramFromBytes } from "../stats";
-import { findDataRange, computeStats, applyLogScale, percentileClip, sliderRange } from "../stats";
+import { findDataRange, applyLogScale, percentileClip, sliderRange } from "../stats";
 // control-customizer + tool-parity dropped in new monorepo (matches Show3D).
 
 // ============================================================================
@@ -44,22 +43,10 @@ const typography = {
   title: { fontWeight: "bold" as const },
 };
 
-const SPACING = { XS: 4, SM: 8, MD: 12, LG: 16 };
+import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-controls";
 
 const controlPanel = {
   select: { minWidth: 90, fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
-};
-
-const switchStyles = {
-  small: { "& .MuiSwitch-thumb": { width: 12, height: 12 }, "& .MuiSwitch-switchBase": { padding: "4px" } },
-};
-
-const sliderStyles = {
-  small: {
-    "& .MuiSlider-thumb": { width: 12, height: 12 },
-    "& .MuiSlider-rail": { height: 3 },
-    "& .MuiSlider-track": { height: 3 },
-  },
 };
 
 const container = {
@@ -67,27 +54,10 @@ const container = {
   imageBox: { bgcolor: "#000", border: "1px solid #444", overflow: "hidden", position: "relative" as const },
 };
 
-const controlRow = {
-  display: "flex",
-  alignItems: "center",
-  gap: `${SPACING.SM}px`,
-  px: 1,
-  py: 0.5,
-  width: "fit-content",
-};
-
 const upwardMenuProps = {
   anchorOrigin: { vertical: "top" as const, horizontal: "left" as const },
   transformOrigin: { vertical: "bottom" as const, horizontal: "left" as const },
   sx: { zIndex: 9999 },
-};
-
-const compactButton = {
-  fontSize: 10,
-  py: 0.25,
-  px: 1,
-  minWidth: 0,
-  "&.Mui-disabled": { color: "#666", borderColor: "#444" },
 };
 
 import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse } from "../colormaps";
@@ -133,9 +103,35 @@ function extractYZ(vol: Float32Array, nx: number, ny: number, nz: number, x: num
 // ============================================================================
 type ZoomState = { zoom: number; panX: number; panY: number };
 const DEFAULT_ZOOM: ZoomState = { zoom: 1, panX: 0, panY: 0 };
-const CANVAS_TARGET = 400;
+const CANVAS_TARGET = 430;
 const AXES = ["xy", "xz", "yz"] as const;
 const DPR = window.devicePixelRatio || 1;
+// Signed log1p: matches Python `np.sign(x) * np.log1p(np.abs(x))` so live render
+// matches GIF/PNG export when log_scale=true on data with negative values.
+const signedLog1p = (x: number): number => x >= 0 ? Math.log1p(x) : -Math.log1p(-x);
+
+// Reverse a 256-entry RGB LUT (768 bytes) so a flip toggle inverts the
+// colormap direction without re-uploading the volume. Per-entry reverse, not
+// per-byte: the i-th output triplet is the (255-i)-th input triplet.
+const reverseLut = (lut: Uint8Array): Uint8Array => {
+  const out = new Uint8Array(lut.length);
+  const n = lut.length / 3;
+  for (let i = 0; i < n; i++) {
+    const src = (n - 1 - i) * 3;
+    const dst = i * 3;
+    out[dst + 0] = lut[src + 0];
+    out[dst + 1] = lut[src + 1];
+    out[dst + 2] = lut[src + 2];
+  }
+  return out;
+};
+// Negate values when flip=true. Returns same array when flip=false (no alloc).
+const maybeFlip = (data: Float32Array, flip: boolean): Float32Array => {
+  if (!flip) return data;
+  const out = new Float32Array(data.length);
+  for (let i = 0; i < data.length; i++) out[i] = -data[i];
+  return out;
+};
 
 // ============================================================================
 // InfoTooltip
@@ -308,34 +304,31 @@ function Show3DVolume() {
   const [traitVmin] = useModelState<number | null>("vmin");
   const [traitVmax] = useModelState<number | null>("vmax");
   const [showControls] = useModelState<boolean>("show_controls");
-  const [showStats] = useModelState<boolean>("show_stats");
   const [showCrosshair, setShowCrosshair] = useModelState<boolean>("show_crosshair");
   const [showFft, setShowFft] = useModelState<boolean>("show_fft");
+  const [smooth, setSmooth] = useModelState<boolean>("smooth");
+  const [flip, setFlip] = useModelState<boolean>("flip");
   // No disabled_tools / hidden_tools traits in new monorepo Show3DVolume.
   const [dimLabels] = useModelState<string[]>("dim_labels");
-  const [statsMean] = useModelState<number[]>("stats_mean");
-  const [statsMin] = useModelState<number[]>("stats_min");
-  const [statsMax] = useModelState<number[]>("stats_max");
-  const [statsStd] = useModelState<number[]>("stats_std");
   const [pixelSize] = useModelState<number>("pixel_size");
+  // Per-axis sampling [pz, py, px] for anisotropic data; falls back to [pixelSize]*3.
+  const [pixelSizeAxes] = useModelState<number[]>("pixel_size_axes");
   const [scaleBarVisible] = useModelState<boolean>("scale_bar_visible");
+  const [zStretch, setZStretch] = useModelState<number>("z_stretch");
 
   // No tool-parity in new monorepo. Everything visible + unlocked.
   const hideDisplay = false;
   const hideHistogram = false;
-  const hideStats = false;
   const hidePlayback = false;
   const hideView = false;
   const hideExport = false;
   const hideVolume = false;
   const lockDisplay = false;
   const lockHistogram = false;
-  const lockStats = false;
   const lockPlayback = false;
   const lockView = false;
   const lockExport = false;
   const lockVolume = false;
-  const effectiveShowFft = showFft && !hideDisplay;
 
   // Initialize WebGPU FFT
   React.useEffect(() => {
@@ -358,14 +351,17 @@ function Show3DVolume() {
   const [fftDragStart, setFftDragStart] = React.useState<{ x: number; y: number; pX: number; pY: number } | null>(null);
 
   // FFT d-spacing measurement
-  const [fftClickInfo, setFftClickInfo] = React.useState<{
+  type FftClickInfo = {
     axis: number; row: number; col: number; distPx: number;
     spatialFreq: number | null; dSpacing: number | null;
-  } | null>(null);
-  const fftClickStartRef = React.useRef<{ x: number; y: number; axis: number } | null>(null);
+  };
+  const [fftClickInfo, setFftClickInfo] = React.useState<FftClickInfo | null>(null);
+  const [fftClickInfoB, setFftClickInfoB] = React.useState<FftClickInfo | null>(null);
+  const fftClickStartRef = React.useRef<{ x: number; y: number; axis: number; which: "A" | "B" } | null>(null);
   const fftCanvasRefs = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
   const fftOverlayRefs = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
   const fftOffscreenRefs = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
+  const fftImgDataRefs = React.useRef<(ImageData | null)[]>([null, null, null]);
   const fftMagCacheRefs = React.useRef<(Float32Array | null)[]>([null, null, null]);
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
   const [gpuReady, setGpuReady] = React.useState(false);
@@ -376,12 +372,14 @@ function Show3DVolume() {
   const [zooms, setZooms] = React.useState<ZoomState[]>([DEFAULT_ZOOM, DEFAULT_ZOOM, DEFAULT_ZOOM]);
   const [dragAxis, setDragAxis] = React.useState<number | null>(null);
   const [dragStart, setDragStart] = React.useState<{ x: number; y: number; pX: number; pY: number } | null>(null);
-  // rAF bypass: keep live zoom in ref during drag, sync to React state on mouseup
+  // rAF bypass: keep live zoom in ref during drag, sync to React state on mouseup.
+  // Only sync ref from state when NOT dragging - otherwise an unrelated re-render
+  // (playback tick, cursor update) would clobber in-flight pan values.
   const liveZoomsRef = React.useRef<ZoomState[]>([DEFAULT_ZOOM, DEFAULT_ZOOM, DEFAULT_ZOOM]);
-  liveZoomsRef.current = zooms;
+  if (dragAxis === null) liveZoomsRef.current = zooms;
   const zoomRafRef = React.useRef<number>(0);
   const liveFftZoomsRef = React.useRef<ZoomState[]>([DEFAULT_ZOOM, DEFAULT_ZOOM, DEFAULT_ZOOM]);
-  liveFftZoomsRef.current = fftZooms;
+  if (fftDragAxis === null) liveFftZoomsRef.current = fftZooms;
   const fftZoomRafRef = React.useRef<number>(0);
 
   // Canvas resize (matching Show2D pattern)
@@ -428,7 +426,7 @@ function Show3DVolume() {
   const [slicePlaneOpacity, setSlicePlaneOpacity] = React.useState(0.35);
 
   // Linked contrast toggle (dual mode)
-  const [linkedContrast, setLinkedContrast] = React.useState(true);
+  const [linkedContrast, setLinkedContrast] = useModelState<boolean>("linked_contrast");
   // Volume B independent contrast state
   const [imageVminPctB, setImageVminPctB] = React.useState(0);
   const [imageVmaxPctB, setImageVmaxPctB] = React.useState(100);
@@ -452,7 +450,9 @@ function Show3DVolume() {
   const [showColorbar, setShowColorbar] = React.useState(false);
 
   // Compact mode: hide axis headers, stats, FFT — just canvases
-  const [compact, setCompact] = React.useState(false);
+  const [compact, setCompact] = useModelState<boolean>("compact");
+  // Compact mode hides FFT panels (line 2513); also skip the GPU compute to avoid wasted work.
+  const effectiveShowFft = showFft && !hideDisplay && !compact;
 
   // Cursor readout state
   const [cursorInfo, setCursorInfo] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
@@ -474,10 +474,6 @@ function Show3DVolume() {
   const [volumeBytesB] = useModelState<DataView>("volume_bytes_b");
   const [dualMode] = useModelState<boolean>("dual_mode");
   const [titleB] = useModelState<string>("title_b");
-  const [statsMeanB] = useModelState<number[]>("stats_mean_b");
-  const [statsMinB] = useModelState<number[]>("stats_min_b");
-  const [statsMaxB] = useModelState<number[]>("stats_max_b");
-  const [statsStdB] = useModelState<number[]>("stats_std_b");
 
   const [showDiff, setShowDiff] = useModelState<boolean>("show_diff");
 
@@ -505,6 +501,7 @@ function Show3DVolume() {
   const fftCanvasRefsB = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
   const fftOverlayRefsB = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
   const fftOffscreenRefsB = React.useRef<(HTMLCanvasElement | null)[]>([null, null, null]);
+  const fftImgDataRefsB = React.useRef<(ImageData | null)[]>([null, null, null]);
   const fftMagCacheRefsB = React.useRef<(Float32Array | null)[]>([null, null, null]);
 
   // Volume B 3D renderer
@@ -521,23 +518,27 @@ function Show3DVolume() {
   const [cursorInfoB, setCursorInfoB] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
   // Diff cursor readout
   const [cursorInfoDiff, setCursorInfoDiff] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
-  // Diff stats (JS-computed, not Python traits)
-  const [diffStats, setDiffStats] = React.useState<{ mean: number; min: number; max: number; std: number }[]>([]);
-  // JS-computed local stats during playback (Python stats are skipped while playing)
-  type LocalStats = { mean: number[]; min: number[]; max: number[]; std: number[] } | null;
-  const [localStats, setLocalStats] = React.useState<LocalStats>(null);
-  const [localStatsB, setLocalStatsB] = React.useState<LocalStats>(null);
 
   // Slice dimensions: [xy: ny x nx], [xz: nz x nx], [yz: nz x ny]
   const sliceDims: [number, number][] = React.useMemo(() => [[ny, nx], [nz, nx], [nz, ny]], [nx, ny, nz]);
 
-  // Canvas sizes
+  // Canvas sizes. For depth panels (XZ=1, YZ=2) when nz << nxy, multiply
+  // display height by z_stretch so the depth axis is readable. The internal
+  // canvas pixel resolution (w x h_native) stays at scan-aligned dims; CSS
+  // height stretches the rendered pixels with zero extra memory.
+  // smooth=true → CSS bilinear (auto); smooth=false → nearest-neighbor (pixelated).
+  // Overlay canvases (crosshair, scale bar, colorbar, FFT scale bar) use displayH
+  // for their pixel buffer to avoid distortion under CSS stretch.
   const canvasSizes = React.useMemo(() => {
-    return sliceDims.map(([h, w]) => {
+    return sliceDims.map(([h, w], a) => {
       const scale = canvasTarget / Math.max(w, h);
-      return { w: Math.round(w * scale), h: Math.round(h * scale), scale };
+      const baseW = Math.round(w * scale);
+      const baseH = Math.round(h * scale);
+      const isDepth = a > 0;
+      const displayH = isDepth ? Math.min(canvasTarget, Math.round(baseH * Math.max(1, zStretch))) : baseH;
+      return { w: baseW, h: baseH, displayH, scale };
     });
-  }, [sliceDims, canvasTarget]);
+  }, [sliceDims, canvasTarget, zStretch]);
 
   // Pre-allocate reusable offscreen canvases + ImageData per axis (avoids GC churn)
   React.useEffect(() => {
@@ -609,6 +610,48 @@ function Show3DVolume() {
     setImageDataRange(findDataRange(processed));
   }, [allFloats, logScale]);
 
+  // Initial-mount Auto snap: when autoContrast is true from Python and histogram data
+  // just loaded with default 0/100 slider, snap thumbs to 2/98 percentile so user sees
+  // the actual range being rendered.
+  React.useEffect(() => {
+    if (!autoContrast || !imageHistogramData) return;
+    if (imageVminPct !== 0 || imageVmaxPct !== 100) return;  // user already moved
+    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, 2, 98);
+    const span = imageDataRange.max - imageDataRange.min;
+    if (span > 0) {
+      setImageVminPct(Math.max(0, Math.min(100, ((pmin - imageDataRange.min) / span) * 100)));
+      setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - imageDataRange.min) / span) * 100)));
+    }
+  }, [autoContrast, imageHistogramData, imageDataRange]);
+
+  // Volume B equivalent of the initial-mount Auto snap (only when unlinked).
+  React.useEffect(() => {
+    if (!autoContrast || !imageHistogramDataB) return;
+    if (linkedContrast) return;
+    if (imageVminPctB !== 0 || imageVmaxPctB !== 100) return;  // user already moved
+    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramDataB, 2, 98);
+    const span = imageDataRangeB.max - imageDataRangeB.min;
+    if (span > 0) {
+      setImageVminPctB(Math.max(0, Math.min(100, ((pmin - imageDataRangeB.min) / span) * 100)));
+      setImageVmaxPctB(Math.max(0, Math.min(100, ((pmax - imageDataRangeB.min) / span) * 100)));
+    }
+  }, [autoContrast, imageHistogramDataB, imageDataRangeB, linkedContrast]);
+
+  // Diff equivalent of the initial-mount Auto snap. Fires when user toggles
+  // showDiff ON while autoContrast was already ON: without this, slice render
+  // uses 2/98 (line ~1073) but the slider stays at 0/100, so the thumb position
+  // doesn't match what's rendered.
+  React.useEffect(() => {
+    if (!autoContrast || !diffHistogramData) return;
+    if (diffVminPct !== 0 || diffVmaxPct !== 100) return;  // user already moved
+    const { vmin: pmin, vmax: pmax } = percentileClip(diffHistogramData, 2, 98);
+    const span = diffDataRange.max - diffDataRange.min;
+    if (span > 0) {
+      setDiffVminPct(Math.max(0, Math.min(100, ((pmin - diffDataRange.min) / span) * 100)));
+      setDiffVmaxPct(Math.max(0, Math.min(100, ((pmax - diffDataRange.min) / span) * 100)));
+    }
+  }, [autoContrast, diffHistogramData, diffDataRange]);
+
   // Compute Volume B histogram from full volume
   React.useEffect(() => {
     if (!allFloatsB || allFloatsB.length === 0) return;
@@ -617,14 +660,22 @@ function Show3DVolume() {
     setImageDataRangeB(findDataRange(processed));
   }, [allFloatsB, logScale]);
 
-  // Compute diff histogram from XY diff slice
+  // Compute diff histogram from FULL diff volume — keeps stats stable as slices move.
+  // Clear diff caches when diff turns off so memory drops.
   React.useEffect(() => {
-    if (!allFloatsDiff) return;
-    const xySlice = extractXY(allFloatsDiff, nx, ny, nz, sliceZ);
-    const processed = logScale ? applyLogScale(xySlice) : xySlice;
+    if (!allFloatsDiff) {
+      setDiffHistogramData(null);
+      setDiffDataRange({ min: 0, max: 1 });
+      for (let a = 0; a < 3; a++) {
+        sliceOffscreenRefsDiff.current[a] = null;
+        sliceImgDataRefsDiff.current[a] = null;
+      }
+      return;
+    }
+    const processed = logScale ? applyLogScale(allFloatsDiff) : allFloatsDiff;
     setDiffHistogramData(processed);
     setDiffDataRange(findDataRange(processed));
-  }, [allFloatsDiff, sliceZ, nx, ny, nz, logScale]);
+  }, [allFloatsDiff, logScale]);
 
   // Download GIF when data arrives from Python
   React.useEffect(() => {
@@ -665,44 +716,109 @@ function Show3DVolume() {
     return () => { disposed = true; volumeRendererRef.current?.dispose(); volumeRendererRef.current = null; };
   }, []);
 
+  const volumeFloats = React.useMemo(() => {
+    if (!allFloats) return null;
+    return logScale ? applyLogScale(allFloats) : allFloats;
+  }, [allFloats, logScale]);
+  const volumeFloatsB = React.useMemo(() => {
+    if (!allFloatsB) return null;
+    return logScale ? applyLogScale(allFloatsB) : allFloatsB;
+  }, [allFloatsB, logScale]);
+
   // Upload volume data
   React.useEffect(() => {
     const renderer = volumeRendererRef.current;
-    if (!renderer || !allFloats || allFloats.length === 0) return;
-    renderer.uploadVolume(allFloats, nx, ny, nz);
-  }, [allFloats, nx, ny, nz, rendererReady]);
+    if (!renderer || !volumeFloats || volumeFloats.length === 0) return;
+    renderer.uploadVolume(volumeFloats, nx, ny, nz);
+  }, [volumeFloats, nx, ny, nz, rendererReady]);
 
-  // Upload colormap
+  // Upload colormap. When flip, reverse the LUT entry order so the 3D volume
+  // inverts contrast the same way slice panels do (slices negate the data and
+  // swap vmin/vmax, equivalent to reversing the colormap lookup). LUT is
+  // 256 RGB triplets (768 bytes); reverse per-entry, not per-byte.
   React.useEffect(() => {
     const renderer = volumeRendererRef.current;
     if (!renderer) return;
-    renderer.uploadColormap(COLORMAPS[cmap] || COLORMAPS.inferno);
-  }, [cmap, rendererReady]);
+    const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
+    renderer.uploadColormap(flip ? reverseLut(lut) : lut);
+  }, [cmap, rendererReady, flip]);
 
   // Render 3D volume
+  // Map slider %s + optional traitVmin/Vmax to the texture's [0,1] normalized space.
+  // The 3D texture is normalized per-volume to [0, 255] across (dataMin, dataMax),
+  // so absolute traitVmin/Vmax must be converted to that normalized space before
+  // being passed to the WGSL remap. Without this, slice panels honor traitVmin/Vmax
+  // but the ray-cast view ignores it — giving inconsistent contrast.
+  const volTexRange = React.useMemo(() => {
+    const span = imageDataRange.max - imageDataRange.min;
+    const hasTrait = traitVmin != null && traitVmax != null && span > 0;
+    let baseMin: number, baseMax: number;
+    if (hasTrait) {
+      const tMin = logScale ? signedLog1p(traitVmin!) : traitVmin!;
+      const tMax = logScale ? signedLog1p(traitVmax!) : traitVmax!;
+      baseMin = (tMin - imageDataRange.min) / span;
+      baseMax = (tMax - imageDataRange.min) / span;
+    } else {
+      baseMin = 0;
+      baseMax = 1;
+    }
+    const subMin = baseMin + (baseMax - baseMin) * (imageVminPct / 100);
+    const subMax = baseMin + (baseMax - baseMin) * (imageVmaxPct / 100);
+    return { vmin: subMin, vmax: subMax };
+  }, [traitVmin, traitVmax, imageDataRange, imageVminPct, imageVmaxPct, logScale]);
+  const volTexRangeB = React.useMemo(() => {
+    const span = imageDataRangeB.max - imageDataRangeB.min;
+    if (linkedContrast) {
+      const spanA = imageDataRange.max - imageDataRange.min;
+      if (spanA <= 0 || span <= 0) return { vmin: 0, vmax: 1 };
+      const absMin = imageDataRange.min + volTexRange.vmin * spanA;
+      const absMax = imageDataRange.min + volTexRange.vmax * spanA;
+      return {
+        vmin: (absMin - imageDataRangeB.min) / span,
+        vmax: (absMax - imageDataRangeB.min) / span,
+      };
+    }
+    const hasTrait = traitVmin != null && traitVmax != null && span > 0;
+    let baseMin: number, baseMax: number;
+    if (hasTrait) {
+      const tMin = logScale ? signedLog1p(traitVmin!) : traitVmin!;
+      const tMax = logScale ? signedLog1p(traitVmax!) : traitVmax!;
+      baseMin = (tMin - imageDataRangeB.min) / span;
+      baseMax = (tMax - imageDataRangeB.min) / span;
+    } else {
+      baseMin = 0;
+      baseMax = 1;
+    }
+    const subMin = baseMin + (baseMax - baseMin) * (imageVminPctB / 100);
+    const subMax = baseMin + (baseMax - baseMin) * (imageVmaxPctB / 100);
+    return { vmin: subMin, vmax: subMax };
+  }, [linkedContrast, volTexRange, imageDataRange, traitVmin, traitVmax, imageDataRangeB, imageVminPctB, imageVmaxPctB, logScale]);
   // Keep render params in ref for direct rAF rendering (bypasses React during drag)
   const volumeRenderParamsRef = React.useRef({
     sliceX, sliceY, sliceZ, nx, ny, nz,
     opacity: opacityA, brightness: 1.0, showSlicePlanes, slicePlaneOpacity,
-    vmin: imageVminPct / 100, vmax: imageVmaxPct / 100,
+    vmin: volTexRange.vmin, vmax: volTexRange.vmax,
   });
   volumeRenderParamsRef.current = {
     sliceX, sliceY, sliceZ, nx, ny, nz,
     opacity: opacityA, brightness: 1.0, showSlicePlanes, slicePlaneOpacity,
-    vmin: imageVminPct / 100, vmax: imageVmaxPct / 100,
+    vmin: volTexRange.vmin, vmax: volTexRange.vmax,
   };
-  // Volume B render params: use independent contrast + opacity
+  // Volume B render params: independent contrast + opacity. nx/ny/nz come from A
+  // (the Python validator rejects dual data with a different shape — same-shape
+  // assumption is load-bearing here; do not propagate B's dims without also widening
+  // the validator and uploadVolume bookkeeping).
   const volumeRenderParamsBRef = React.useRef({
     ...volumeRenderParamsRef.current,
     opacity: opacityB,
-    vmin: (linkedContrast ? imageVminPct : imageVminPctB) / 100,
-    vmax: (linkedContrast ? imageVmaxPct : imageVmaxPctB) / 100,
+    vmin: volTexRangeB.vmin,
+    vmax: volTexRangeB.vmax,
   });
   volumeRenderParamsBRef.current = {
     ...volumeRenderParamsRef.current,
     opacity: opacityB,
-    vmin: (linkedContrast ? imageVminPct : imageVminPctB) / 100,
-    vmax: (linkedContrast ? imageVmaxPct : imageVmaxPctB) / 100,
+    vmin: volTexRangeB.vmin,
+    vmax: volTexRangeB.vmax,
   };
   const bgColorRef = React.useRef<[number, number, number]>([0, 0, 0]);
   React.useEffect(() => {
@@ -716,9 +832,9 @@ function Show3DVolume() {
   React.useEffect(() => {
     if (volumeDrag) return; // Skip during drag — rAF handles it directly
     const renderer = volumeRendererRef.current;
-    if (!renderer || !allFloats || allFloats.length === 0) return;
-    renderer.render(volumeRenderParamsRef.current, camera, bgColorRef.current);
-  }, [allFloats, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, imageVminPct, imageVmaxPct, opacityA]);
+    if (!renderer || !volumeFloats || volumeFloats.length === 0) return;
+    renderer.render(volumeRenderParamsRef.current, camera, bgColorRef.current, undefined, undefined, zStretch);
+  }, [volumeFloats, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, volTexRange, opacityA, zStretch]);
 
   // Prevent scroll on volume canvas
   React.useEffect(() => {
@@ -742,28 +858,35 @@ function Show3DVolume() {
       if (disposed) { renderer.dispose(); return; }
       volumeRendererRefB.current = renderer;
       setRendererReady(n => n + 1);
-    }).catch(() => { /* fallback handled by webgpuSupported */ });
+    }).catch((e) => {
+      // Volume A may have succeeded; this means B-specific failure (exhausted texture quota etc).
+      console.warn("Show3DVolume: Volume B WebGPU init failed:", e);
+    });
     return () => { disposed = true; volumeRendererRefB.current?.dispose(); volumeRendererRefB.current = null; };
   }, [isDual, webgpuSupported]);
 
   React.useEffect(() => {
     const renderer = volumeRendererRefB.current;
-    if (!renderer || !allFloatsB || allFloatsB.length === 0) return;
-    renderer.uploadVolume(allFloatsB, nx, ny, nz);
-  }, [allFloatsB, nx, ny, nz, rendererReady]);
+    if (!renderer || !volumeFloatsB || volumeFloatsB.length === 0) return;
+    renderer.uploadVolume(volumeFloatsB, nx, ny, nz);
+  }, [volumeFloatsB, nx, ny, nz, rendererReady]);
 
   React.useEffect(() => {
     const renderer = volumeRendererRefB.current;
     if (!renderer) return;
-    renderer.uploadColormap(COLORMAPS[cmap] || COLORMAPS.inferno);
-  }, [cmap, isDual, rendererReady]);
+    const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
+    renderer.uploadColormap(flip ? reverseLut(lut) : lut);
+  }, [cmap, isDual, rendererReady, flip]);
 
+  // Volume B effective contrast — when unlinked, A's contrast must not trigger B re-render.
+  const vminBEff = linkedContrast ? imageVminPct : imageVminPctB;
+  const vmaxBEff = linkedContrast ? imageVmaxPct : imageVmaxPctB;
   React.useEffect(() => {
     if (volumeDrag) return; // Skip during drag — rAF handles it directly
     const renderer = volumeRendererRefB.current;
-    if (!renderer || !allFloatsB || allFloatsB.length === 0) return;
-    renderer.render(volumeRenderParamsBRef.current, camera, bgColorRef.current);
-  }, [allFloatsB, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, opacityB]);
+    if (!renderer || !volumeFloatsB || volumeFloatsB.length === 0) return;
+    renderer.render(volumeRenderParamsBRef.current, camera, bgColorRef.current, undefined, undefined, zStretch);
+  }, [volumeFloatsB, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, vminBEff, vmaxBEff, volTexRangeB, opacityB, zStretch]);
 
   React.useEffect(() => {
     const canvas = volumeCanvasRefB.current;
@@ -778,6 +901,9 @@ function Show3DVolume() {
   // -------------------------------------------------------------------------
   const volumeRafRef = React.useRef<number>(0);
   const liveCameraRef = React.useRef<CameraState>(camera);
+  // Live z_stretch ref for rAF drag path — keeps latest value without re-binding closure.
+  const zStretchRef = React.useRef(zStretch);
+  zStretchRef.current = zStretch;
   liveCameraRef.current = camera;
   const volumeDragDataRef = React.useRef<{ button: number; x: number; y: number; yaw: number; pitch: number; panX: number; panY: number } | null>(null);
 
@@ -821,9 +947,9 @@ function Show3DVolume() {
           const params = volumeRenderParamsRef.current;
           const bg = bgColorRef.current;
           const rendererA = volumeRendererRef.current;
-          if (rendererA) rendererA.render(params, cam, bg);
+          if (rendererA) rendererA.render(params, cam, bg, undefined, undefined, zStretchRef.current);
           const rendererB = volumeRendererRefB.current;
-          if (rendererB) rendererB.render(volumeRenderParamsBRef.current, cam, bg);
+          if (rendererB) rendererB.render(volumeRenderParamsBRef.current, cam, bg, undefined, undefined, zStretchRef.current);
         });
       }
     };
@@ -884,11 +1010,24 @@ function Show3DVolume() {
 
   const cameraChanged = camera.yaw !== DEFAULT_CAMERA.yaw || camera.pitch !== DEFAULT_CAMERA.pitch || camera.distance !== DEFAULT_CAMERA.distance || camera.panX !== DEFAULT_CAMERA.panX || camera.panY !== DEFAULT_CAMERA.panY;
 
-  // Any zoom active?
+  // Slice-panel dirty: slice zoom only. FFT zoom is owned by the FFT panel's
+  // own Reset and shouldn't be reset by the slice header (and vice versa).
   const needsResetAxis = (a: number) => {
-    const z = zooms[a]; const fz = fftZooms[a];
-    return z.zoom !== 1 || z.panX !== 0 || z.panY !== 0 || fz.zoom !== 1 || fz.panX !== 0 || fz.panY !== 0;
+    const z = zooms[a];
+    return z.zoom !== 1 || z.panX !== 0 || z.panY !== 0;
   };
+
+  // Top toolbar Reset is the same scope as the 'r' shortcut: camera, all slice
+  // and FFT zooms, loop bounds, and the percentile sliders for A / B / |A-B|.
+  // Mirror handleResetAll's surface so the button is only enabled when at least
+  // one of those things is off-default.
+  const anyZoomDirty = zooms.some(z => z.zoom !== 1 || z.panX !== 0 || z.panY !== 0)
+    || fftZooms.some(z => z.zoom !== 1 || z.panX !== 0 || z.panY !== 0);
+  const loopDirty = loopStarts.some(v => v !== 0) || loopEnds.some(v => v !== -1);
+  const contrastDirty = imageVminPct !== 0 || imageVmaxPct !== 100
+    || imageVminPctB !== 0 || imageVmaxPctB !== 100
+    || diffVminPct !== 0 || diffVmaxPct !== 100;
+  const anythingDirty = cameraChanged || anyZoomDirty || loopDirty || contrastDirty;
 
   // -------------------------------------------------------------------------
   // Build colormapped offscreen canvases (expensive: log scale, percentile, colormap LUT)
@@ -908,7 +1047,8 @@ function Show3DVolume() {
     allFloatsDiff: Float32Array | null;
     nx: number; ny: number; nz: number;
     traitVmin: number | null; traitVmax: number | null;
-  }>({ sliceX: -1, sliceY: -1, sliceZ: -1, cmap: "", logScale: false, autoContrast: false, imageVminPct: -1, imageVmaxPct: -1, imageVminPctB: -1, imageVmaxPctB: -1, linkedContrast: true, diffVminPct: -1, diffVmaxPct: -1, allFloats: null, allFloatsB: null, allFloatsDiff: null, nx: 0, ny: 0, nz: 0, traitVmin: null, traitVmax: null });
+    flip: boolean;
+  }>({ sliceX: -1, sliceY: -1, sliceZ: -1, cmap: "", logScale: false, autoContrast: false, imageVminPct: -1, imageVmaxPct: -1, imageVminPctB: -1, imageVmaxPctB: -1, linkedContrast: true, diffVminPct: -1, diffVmaxPct: -1, allFloats: null, allFloatsB: null, allFloatsDiff: null, nx: 0, ny: 0, nz: 0, traitVmin: null, traitVmax: null, flip: false });
 
   React.useLayoutEffect(() => {
     if (!allFloats || allFloats.length === 0) return;
@@ -918,6 +1058,7 @@ function Show3DVolume() {
       logScale !== prev.logScale || autoContrast !== prev.autoContrast ||
       imageVminPct !== prev.imageVminPct || imageVmaxPct !== prev.imageVmaxPct ||
       traitVmin !== prev.traitVmin || traitVmax !== prev.traitVmax ||
+      flip !== prev.flip ||
       nx !== prev.nx || ny !== prev.ny || nz !== prev.nz;
     const axisChanged = [
       globalChanged || sliceZ !== prev.sliceZ,  // axis 0 (XY) depends on sliceZ
@@ -934,11 +1075,14 @@ function Show3DVolume() {
     for (let a = 0; a < 3; a++) {
       if (!axisChanged[a]) continue;
       const [sliceH, sliceW] = sliceDims[a];
-      const processed = logScale ? applyLogScale(extractors[a]()) : extractors[a]();
+      const processed = maybeFlip(logScale ? applyLogScale(extractors[a]()) : extractors[a](), flip);
       let vmin: number, vmax: number;
       const hasAbsRange = traitVmin != null && traitVmax != null;
-      const rMin = hasAbsRange ? (logScale ? Math.log1p(Math.max(traitVmin!, 0)) : traitVmin!) : imageDataRange.min;
-      const rMax = hasAbsRange ? (logScale ? Math.log1p(Math.max(traitVmax!, 0)) : traitVmax!) : imageDataRange.max;
+      // Flip negates data, so the range must also flip (min<->max with sign).
+      const rawMin = hasAbsRange ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : imageDataRange.min;
+      const rawMax = hasAbsRange ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : imageDataRange.max;
+      const rMin = flip ? -rawMax : rawMin;
+      const rMax = flip ? -rawMin : rawMax;
       if (!hasAbsRange && autoContrast) {
         ({ vmin, vmax } = percentileClip(processed, 2, 98));
       } else if (imageVminPct > 0 || imageVmaxPct < 100) {
@@ -959,6 +1103,7 @@ function Show3DVolume() {
     if (isDual && allFloatsB) {
       const dataBChanged = allFloatsB !== prev.allFloatsB;
       const bContrastChanged = !linkedContrast && (imageVminPctB !== prev.imageVminPctB || imageVmaxPctB !== prev.imageVmaxPctB);
+      const aContrastChanged = linkedContrast && (imageVminPct !== prev.imageVminPct || imageVmaxPct !== prev.imageVmaxPct);
       const linkChanged = linkedContrast !== prev.linkedContrast;
       const extractorsB = [
         () => extractXY(allFloatsB, nx, ny, nz, sliceZ),
@@ -970,17 +1115,22 @@ function Show3DVolume() {
       const bVmaxPct = linkedContrast ? imageVmaxPct : imageVmaxPctB;
       const bRange = linkedContrast ? imageDataRange : imageDataRangeB;
       for (let a = 0; a < 3; a++) {
-        if (!axisChanged[a] && !dataBChanged && !bContrastChanged && !linkChanged) continue;
+        if (!axisChanged[a] && !dataBChanged && !bContrastChanged && !aContrastChanged && !linkChanged) continue;
         const [sliceH, sliceW] = sliceDims[a];
-        const processed = logScale ? applyLogScale(extractorsB[a]()) : extractorsB[a]();
+        const processed = maybeFlip(logScale ? applyLogScale(extractorsB[a]()) : extractorsB[a](), flip);
         let vmin: number, vmax: number;
-        if (autoContrast) {
+        const hasAbsRange = traitVmin != null && traitVmax != null;
+        const rawMin = hasAbsRange ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : bRange.min;
+        const rawMax = hasAbsRange ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : bRange.max;
+        const rMin = flip ? -rawMax : rawMin;
+        const rMax = flip ? -rawMin : rawMax;
+        if (!hasAbsRange && autoContrast) {
           ({ vmin, vmax } = percentileClip(processed, 2, 98));
         } else if (bVminPct > 0 || bVmaxPct < 100) {
-          ({ vmin, vmax } = sliderRange(bRange.min, bRange.max, bVminPct, bVmaxPct));
+          ({ vmin, vmax } = sliderRange(rMin, rMax, bVminPct, bVmaxPct));
         } else {
-          vmin = bRange.min;
-          vmax = bRange.max;
+          vmin = rMin;
+          vmax = rMax;
         }
         const offscreenB = sliceOffscreenRefsB.current[a];
         const imgDataB = sliceImgDataRefsB.current[a];
@@ -1001,23 +1151,20 @@ function Show3DVolume() {
         () => extractXZ(allFloatsDiff, nx, ny, nz, sliceY),
         () => extractYZ(allFloatsDiff, nx, ny, nz, sliceX),
       ];
-      const newDiffStats: { mean: number; min: number; max: number; std: number }[] = [...diffStats];
-      let anyDiffChanged = false;
       for (let a = 0; a < 3; a++) {
         if (!axisChanged[a] && !diffChanged) continue;
-        anyDiffChanged = true;
         const [sliceH, sliceW] = sliceDims[a];
         const processed = logScale ? applyLogScale(extractorsDiff[a]()) : extractorsDiff[a]();
+        // Use full diff range (matches histogram) so slider %s map consistently across all three panels.
         let vmin: number, vmax: number;
-        if (diffVminPct > 0 || diffVmaxPct < 100) {
-          const { min: dMin, max: dMax } = findDataRange(processed);
-          ({ vmin, vmax } = sliderRange(dMin, dMax, diffVminPct, diffVmaxPct));
+        if (autoContrast) {
+          ({ vmin, vmax } = percentileClip(processed, 2, 98));
+        } else if (diffVminPct > 0 || diffVmaxPct < 100) {
+          ({ vmin, vmax } = sliderRange(diffDataRange.min, diffDataRange.max, diffVminPct, diffVmaxPct));
         } else {
-          const r = findDataRange(processed);
-          vmin = r.min;
-          vmax = r.max;
+          vmin = diffDataRange.min;
+          vmax = diffDataRange.max;
         }
-        newDiffStats[a] = computeStats(processed);
         const offscreenD = sliceOffscreenRefsDiff.current[a];
         const imgDataD = sliceImgDataRefsDiff.current[a];
         if (offscreenD && imgDataD && offscreenD.width === sliceW && offscreenD.height === sliceH) {
@@ -1026,11 +1173,10 @@ function Show3DVolume() {
           sliceOffscreenRefsDiff.current[a] = renderToOffscreen(processed, sliceW, sliceH, diffLut, vmin, vmax);
         }
       }
-      if (anyDiffChanged) setDiffStats(newDiffStats);
     }
 
-    prevCacheRef.current = { sliceX, sliceY, sliceZ, cmap, logScale, autoContrast, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, diffVminPct, diffVmaxPct, allFloats, allFloatsB, allFloatsDiff, nx, ny, nz, traitVmin, traitVmax };
-  }, [allFloats, allFloatsB, allFloatsDiff, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, logScale, autoContrast, sliceDims, imageVminPct, imageVmaxPct, imageDataRange, imageVminPctB, imageVmaxPctB, imageDataRangeB, linkedContrast, diffVminPct, diffVmaxPct, traitVmin, traitVmax]);
+    prevCacheRef.current = { sliceX, sliceY, sliceZ, cmap, logScale, autoContrast, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, diffVminPct, diffVmaxPct, allFloats, allFloatsB, allFloatsDiff, nx, ny, nz, traitVmin, traitVmax, flip };
+  }, [allFloats, allFloatsB, allFloatsDiff, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, logScale, autoContrast, sliceDims, imageVminPct, imageVmaxPct, imageDataRange, imageVminPctB, imageVmaxPctB, imageDataRangeB, linkedContrast, diffVminPct, diffVmaxPct, diffDataRange, traitVmin, traitVmax, flip]);
 
   // -------------------------------------------------------------------------
   // Redraw slices with zoom/pan (cheap: just drawImage from cached offscreen)
@@ -1045,7 +1191,7 @@ function Show3DVolume() {
       if (!ctx) continue;
       const [sliceH, sliceW] = sliceDims[a];
       const { w: cw, h: ch } = canvasSizes[a];
-      ctx.imageSmoothingEnabled = false;
+      ctx.imageSmoothingEnabled = smooth;
       ctx.clearRect(0, 0, cw, ch);
       const zs = zooms[a];
       if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
@@ -1070,7 +1216,7 @@ function Show3DVolume() {
         if (!ctx) continue;
         const [sliceH, sliceW] = sliceDims[a];
         const { w: cw, h: ch } = canvasSizes[a];
-        ctx.imageSmoothingEnabled = false;
+        ctx.imageSmoothingEnabled = smooth;
         ctx.clearRect(0, 0, cw, ch);
         const zs = zooms[a];
         if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
@@ -1096,7 +1242,7 @@ function Show3DVolume() {
         if (!ctx) continue;
         const [sliceH, sliceW] = sliceDims[a];
         const { w: cw, h: ch } = canvasSizes[a];
-        ctx.imageSmoothingEnabled = false;
+        ctx.imageSmoothingEnabled = smooth;
         ctx.clearRect(0, 0, cw, ch);
         const zs = zooms[a];
         if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
@@ -1112,7 +1258,7 @@ function Show3DVolume() {
         }
       }
     }
-  }, [allFloats, allFloatsB, allFloatsDiff, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, logScale, autoContrast, zooms, sliceDims, canvasSizes, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, diffVminPct, diffVmaxPct]);
+  }, [allFloats, allFloatsB, allFloatsDiff, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, logScale, autoContrast, zooms, sliceDims, canvasSizes, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, diffVminPct, diffVmaxPct, smooth, flip]);
 
   // -------------------------------------------------------------------------
   // Render overlays (crosshair lines)
@@ -1133,22 +1279,23 @@ function Show3DVolume() {
         if (!overlay) continue;
         const ctx = overlay.getContext("2d");
         if (!ctx) continue;
-        const { w: cw, h: ch, scale } = canvasSizes[a];
-        ctx.clearRect(0, 0, cw, ch);
+        const { w: cw, h: ch, displayH: dh, scale } = canvasSizes[a];
+        const stretchY = dh / ch;
+        ctx.clearRect(0, 0, cw, dh);
         if (showCrosshair) {
           const zs = zooms[a];
           const [dataX, dataY] = crossPositions[a];
-          const cx = cw / 2, cy = ch / 2;
+          const cx = cw / 2, cy = dh / 2;
           let canvasX = dataX * scale;
-          let canvasY = dataY * scale;
+          let canvasY = dataY * scale * stretchY;
           if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
             canvasX = (canvasX - cx) * zs.zoom + cx + zs.panX;
-            canvasY = (canvasY - cy) * zs.zoom + cy + zs.panY;
+            canvasY = (canvasY - cy) * zs.zoom + cy + zs.panY * stretchY;
           }
           ctx.strokeStyle = tc.accentYellow + "80";
           ctx.lineWidth = 1;
           ctx.setLineDash([4, 4]);
-          ctx.beginPath(); ctx.moveTo(canvasX, 0); ctx.lineTo(canvasX, ch); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(canvasX, 0); ctx.lineTo(canvasX, dh); ctx.stroke();
           ctx.beginPath(); ctx.moveTo(0, canvasY); ctx.lineTo(cw, canvasY); ctx.stroke();
           ctx.setLineDash([]);
         }
@@ -1160,21 +1307,36 @@ function Show3DVolume() {
   // Scale bar (HiDPI UI overlay)
   // -------------------------------------------------------------------------
   React.useEffect(() => {
-    const uiRefSets = [uiRefs];
-    if (isDual) uiRefSets.push(uiRefsB);
-    if (allFloatsDiff) uiRefSets.push(uiRefsDiff);
-    for (const refs of uiRefSets) {
+    const uiRefSets: { refs: React.MutableRefObject<(HTMLCanvasElement | null)[]>; role: "A" | "B" | "diff" }[] = [{ refs: uiRefs, role: "A" }];
+    if (isDual) uiRefSets.push({ refs: uiRefsB, role: "B" });
+    if (allFloatsDiff) uiRefSets.push({ refs: uiRefsDiff, role: "diff" });
+    for (const { refs, role } of uiRefSets) {
+      // Pick the right contrast source for this row's colorbar.
+      let cbMinPct: number, cbMaxPct: number, cbRange: { min: number; max: number };
+      if (role === "A") {
+        cbMinPct = imageVminPct; cbMaxPct = imageVmaxPct; cbRange = imageDataRange;
+      } else if (role === "B") {
+        cbMinPct = linkedContrast ? imageVminPct : imageVminPctB;
+        cbMaxPct = linkedContrast ? imageVmaxPct : imageVmaxPctB;
+        cbRange = linkedContrast ? imageDataRange : imageDataRangeB;
+      } else {
+        cbMinPct = diffVminPct; cbMaxPct = diffVmaxPct; cbRange = diffDataRange;
+      }
       for (let a = 0; a < 3; a++) {
         const uiCanvas = refs.current[a];
         if (!uiCanvas) continue;
-        const { w: cw, h: ch } = canvasSizes[a];
+        const { w: cw, displayH: dh } = canvasSizes[a];
         uiCanvas.width = Math.round(cw * DPR);
-        uiCanvas.height = Math.round(ch * DPR);
+        uiCanvas.height = Math.round(dh * DPR);
         const uiCtx = uiCanvas.getContext("2d");
         if (!uiCtx) continue;
         uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
         if (scaleBarVisible) {
-          const pxSize = pixelSize || 0;
+          // Width-direction sampling per panel: XY → px (axes[2]), XZ → px (axes[2]),
+          // YZ → py (axes[1]). Falls back to scalar pixelSize if axes triple absent.
+          const widthAxis = [2, 2, 1][a];
+          const axes = pixelSizeAxes && pixelSizeAxes.length === 3 ? pixelSizeAxes : null;
+          const pxSize = axes ? axes[widthAxis] : (pixelSize || 0);
           const sliceW = sliceDims[a][1];
           const unit = pxSize > 0 ? "Å" : "px";
           const size = pxSize > 0 ? pxSize : 1;
@@ -1183,9 +1345,10 @@ function Show3DVolume() {
 
         if (showColorbar) {
           const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
-          const cbMin = traitVmin != null && traitVmax != null ? (logScale ? Math.log1p(Math.max(traitVmin, 0)) : traitVmin) : imageDataRange.min;
-          const cbMax = traitVmin != null && traitVmax != null ? (logScale ? Math.log1p(Math.max(traitVmax, 0)) : traitVmax) : imageDataRange.max;
-          const { vmin, vmax } = sliderRange(cbMin, cbMax, imageVminPct, imageVmaxPct);
+          const useTraitRange = role === "A" && traitVmin != null && traitVmax != null;
+          const baseMin = useTraitRange ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : cbRange.min;
+          const baseMax = useTraitRange ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : cbRange.max;
+          const { vmin, vmax } = sliderRange(baseMin, baseMax, cbMinPct, cbMaxPct);
           const cssW = uiCanvas.width / DPR;
           const cssH = uiCanvas.height / DPR;
           uiCtx.save();
@@ -1195,7 +1358,7 @@ function Show3DVolume() {
         }
       }
     }
-  }, [pixelSize, scaleBarVisible, zooms, canvasSizes, sliceDims, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, themeInfo.theme, isDual, allFloatsDiff]);
+  }, [pixelSize, pixelSizeAxes, scaleBarVisible, zooms, canvasSizes, sliceDims, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, imageDataRangeB, linkedContrast, diffVminPct, diffVmaxPct, diffDataRange, traitVmin, traitVmax, logScale, themeInfo.theme, isDual, allFloatsDiff]);
 
   // -------------------------------------------------------------------------
   // FFT computation and caching (per-axis: only recompute changed axes)
@@ -1208,7 +1371,21 @@ function Show3DVolume() {
   }>({ sliceX: -1, sliceY: -1, sliceZ: -1, allFloats: null, allFloatsB: null, fftColormap: "", fftLogScale: false, fftAuto: false, gpuReady: false, effectiveShowFft: false });
 
   React.useEffect(() => {
-    if (!effectiveShowFft || !allFloats || allFloats.length === 0) return;
+    if (!effectiveShowFft || !allFloats || allFloats.length === 0) {
+      // Release FFT caches when toggling off (each is up to 64 MB per axis).
+      if (prevFFTCacheRef.current.effectiveShowFft && !effectiveShowFft) {
+        for (let a = 0; a < 3; a++) {
+          fftMagCacheRefs.current[a] = null;
+          fftOffscreenRefs.current[a] = null;
+          fftImgDataRefs.current[a] = null;
+          fftMagCacheRefsB.current[a] = null;
+          fftOffscreenRefsB.current[a] = null;
+          fftImgDataRefsB.current[a] = null;
+        }
+        prevFFTCacheRef.current.effectiveShowFft = false;
+      }
+      return;
+    }
 
     const prevFFT = prevFFTCacheRef.current;
     const globalFFTChanged = allFloats !== prevFFT.allFloats || fftColormap !== prevFFT.fftColormap ||
@@ -1226,6 +1403,7 @@ function Show3DVolume() {
       floats: Float32Array,
       magCache: React.MutableRefObject<(Float32Array | null)[]>,
       offscreenCache: React.MutableRefObject<(HTMLCanvasElement | null)[]>,
+      imgDataCache: React.MutableRefObject<(ImageData | null)[]>,
       _canvasRefSet: React.MutableRefObject<(HTMLCanvasElement | null)[]>,
       forceAll: boolean,
     ) => {
@@ -1275,24 +1453,41 @@ function Show3DVolume() {
         const displayData = fftLogScale ? applyLogScale(mag) : mag;
         if (fftLogScale) { displayMin = Math.log1p(displayMin); displayMax = Math.log1p(displayMax); }
 
-        const offscreen = renderToOffscreen(displayData, pw, ph, lut, displayMin, displayMax);
-        if (!offscreen) continue;
-        offscreenCache.current[a] = offscreen;
+        // Reuse cached offscreen if dims match — saves ~4 MB ImageData alloc per axis.
+        const existingOff = offscreenCache.current[a];
+        const existingImg = imgDataCache.current[a];
+        if (existingOff && existingImg && existingOff.width === pw && existingOff.height === ph) {
+          renderToOffscreenReuse(displayData, lut, displayMin, displayMax, existingOff, existingImg);
+        } else {
+          const offscreen = renderToOffscreen(displayData, pw, ph, lut, displayMin, displayMax);
+          if (!offscreen) continue;
+          offscreenCache.current[a] = offscreen;
+          const ctx = offscreen.getContext("2d");
+          imgDataCache.current[a] = ctx ? ctx.getImageData(0, 0, pw, ph) : null;
+        }
 
         // Drawing is handled by the separate cheap redraw effect below
       }
     };
 
     const computeAllFFTs = async () => {
-      await computeFFTsForVolume(allFloats, fftMagCacheRefs, fftOffscreenRefs, fftCanvasRefs, false);
+      await computeFFTsForVolume(allFloats, fftMagCacheRefs, fftOffscreenRefs, fftImgDataRefs, fftCanvasRefs, false);
       if (isDual && allFloatsB) {
         const dataBChanged = allFloatsB !== prevFFT.allFloatsB;
-        await computeFFTsForVolume(allFloatsB, fftMagCacheRefsB, fftOffscreenRefsB, fftCanvasRefsB, dataBChanged);
+        await computeFFTsForVolume(allFloatsB, fftMagCacheRefsB, fftOffscreenRefsB, fftImgDataRefsB, fftCanvasRefsB, dataBChanged);
       }
     };
 
-    computeAllFFTs().then(() => setFftVersion(v => v + 1));
-    prevFFTCacheRef.current = { sliceX, sliceY, sliceZ, allFloats, allFloatsB, fftColormap, fftLogScale, fftAuto, gpuReady, effectiveShowFft };
+    // Debounce FFT compute during slider scrubbing: defer 80 ms so a 60 Hz drag
+    // collapses to ~12 Hz, freeing the main thread for image redraws.
+    let cancelled = false;
+    const debounceMs = 80;
+    const timeoutId = setTimeout(() => {
+      if (cancelled) return;
+      computeAllFFTs().then(() => { if (!cancelled) setFftVersion(v => v + 1); });
+      prevFFTCacheRef.current = { sliceX, sliceY, sliceZ, allFloats, allFloatsB, fftColormap, fftLogScale, fftAuto, gpuReady, effectiveShowFft };
+    }, debounceMs);
+    return () => { cancelled = true; clearTimeout(timeoutId); };
   }, [effectiveShowFft, allFloats, allFloatsB, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, fftColormap, fftLogScale, fftAuto, gpuReady]);
 
   // Redraw cached FFT with zoom/pan (cheap -- no recomputation)
@@ -1311,7 +1506,7 @@ function Show3DVolume() {
         if (!ctx) continue;
         const { w: cw, h: ch } = canvasSizes[a];
         const ow = offscreen.width, oh = offscreen.height;
-        ctx.imageSmoothingEnabled = false;
+        ctx.imageSmoothingEnabled = smooth;
         ctx.clearRect(0, 0, cw, ch);
         const zs = fftZooms[a];
         if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
@@ -1325,7 +1520,7 @@ function Show3DVolume() {
         }
       }
     }
-  }, [effectiveShowFft, isDual, fftZooms, canvasSizes, fftVersion]);
+  }, [effectiveShowFft, isDual, fftZooms, canvasSizes, fftVersion, smooth]);
 
   // Render FFT overlays (reciprocal-space scale bars + d-spacing crosshair per axis)
   React.useEffect(() => {
@@ -1337,23 +1532,30 @@ function Show3DVolume() {
       for (let a = 0; a < 3; a++) {
         const overlay = refs.current[a];
         if (!overlay) continue;
-        const { w: cw, h: ch } = canvasSizes[a];
+        const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
+        const stretchY = dh / ch;
         overlay.width = Math.round(cw * DPR);
-        overlay.height = Math.round(ch * DPR);
+        overlay.height = Math.round(dh * DPR);
         const ctx = overlay.getContext("2d");
         if (!ctx) continue;
         ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-        // FFT scale bar (only when calibrated)
-        if (pixelSize > 0) {
+        // FFT scale bar (only when calibrated). Use width-direction sampling per
+        // panel so anisotropic data shows correct |g| units. XY/XZ width → px; YZ width → py.
+        const widthAxis = [2, 2, 1][a];
+        const axes = pixelSizeAxes && pixelSizeAxes.length === 3 ? pixelSizeAxes : null;
+        const realPx = axes ? axes[widthAxis] : pixelSize;
+        if (realPx > 0) {
           const [, sliceW] = dims[a];
           const pw = nextPow2(sliceW);
-          const fftPixelSize = 1 / (pw * pixelSize);
+          const fftPixelSize = 1 / (pw * realPx);
           drawFFTScaleBarHiDPI(overlay, DPR, fftZooms[a].zoom, fftPixelSize, pw, "Å⁻¹");
         }
 
-        // D-spacing crosshair on clicked FFT panel (Volume A only)
-        if (refs === fftOverlayRefs && fftClickInfo && fftClickInfo.axis === a) {
+        // D-spacing crosshair on clicked FFT panel, per-volume.
+        const clickInfo = refs === fftOverlayRefs ? fftClickInfo : fftClickInfoB;
+        if (clickInfo && clickInfo.axis === a) {
+          const fftClickInfo = clickInfo;
           const [sliceH, sliceW] = dims[a];
           const fftW = nextPow2(sliceW);
           const fftH = nextPow2(sliceH);
@@ -1361,11 +1563,11 @@ function Show3DVolume() {
           ctx.save();
           ctx.scale(DPR, DPR);
           const zs = fftZooms[a];
-          const cx = cw / 2, cy = ch / 2;
+          const cx = cw / 2, cy = dh / 2;
           const rawX = fftClickInfo.col / fftW * cw;
-          const rawY = fftClickInfo.row / fftH * ch;
+          const rawY = fftClickInfo.row / fftH * dh;
           const screenX = (rawX - cx) * zs.zoom + cx + zs.panX;
-          const screenY = (rawY - cy) * zs.zoom + cy + zs.panY;
+          const screenY = (rawY - cy) * zs.zoom + cy + zs.panY * stretchY;
 
           ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
           ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
@@ -1395,7 +1597,7 @@ function Show3DVolume() {
         }
       }
     }
-  }, [effectiveShowFft, isDual, fftZooms, canvasSizes, pixelSize, nx, ny, nz, fftClickInfo]);
+  }, [effectiveShowFft, isDual, fftZooms, canvasSizes, pixelSize, pixelSizeAxes, nx, ny, nz, fftClickInfo, fftClickInfoB]);
 
   // -------------------------------------------------------------------------
   // Playback logic (matching Show3D pattern)
@@ -1413,108 +1615,101 @@ function Show3DVolume() {
     if (!playing) return;
     const intervalMs = 1000 / fps;
 
-    if (playAxis === 3) {
-      // "All" mode: advance all 3 axes simultaneously
-      playIntervalRef.current = window.setInterval(() => {
-        const dir = boomerang ? bounceDirRef.current : (reverse ? -1 : 1);
-        // Check if any axis would go out of range
-        let shouldBounce = false;
-        for (let a = 0; a < 3; a++) {
-          const next = sliceValuesRef.current[a] + dir;
-          if (next > effectiveLoopEnds[a] || next < loopStarts[a]) { shouldBounce = true; break; }
-        }
-        if (boomerang && shouldBounce) {
-          bounceDirRef.current = (-bounceDirRef.current) as 1 | -1;
-        }
-        const finalDir = boomerang ? bounceDirRef.current : dir;
-        for (let a = 0; a < 3; a++) {
-          const start = loopStarts[a];
-          const end = effectiveLoopEnds[a];
-          let next = sliceValuesRef.current[a] + finalDir;
-          if (next > end) next = loop || boomerang ? start : end;
-          else if (next < start) next = loop || boomerang ? end : start;
-          sliceSettersRef.current[a](next);
-          sliceValuesRef.current[a] = next;
-        }
-        if (!loop && !boomerang && shouldBounce) setPlaying(false);
-      }, intervalMs);
-    } else {
-      // Single axis mode
-      const axis = playAxis;
-      const start = loopStarts[axis];
-      const end = effectiveLoopEnds[axis];
-      const setter = sliceSettersRef.current[axis];
-      playIntervalRef.current = window.setInterval(() => {
-        const prev = sliceValuesRef.current[axis];
-        let next = prev;
-        if (boomerang) {
-          const candidate = prev + bounceDirRef.current;
-          if (candidate > end) {
-            bounceDirRef.current = -1;
-            next = prev - 1 >= start ? prev - 1 : prev;
-          } else if (candidate < start) {
-            bounceDirRef.current = 1;
-            next = prev + 1 <= end ? prev + 1 : prev;
-          } else {
-            next = candidate;
+    // Factor the interval creation so visibilitychange can restart it without
+    // re-running the whole effect (which would lose ref state).
+    const startInterval = () => {
+      if (playIntervalRef.current) return;
+      if (playAxis === 3) {
+        // "All" mode: advance all 3 axes simultaneously
+        playIntervalRef.current = window.setInterval(() => {
+          const dir = boomerang ? bounceDirRef.current : (reverse ? -1 : 1);
+          // Check if any axis would go out of range
+          let shouldBounce = false;
+          for (let a = 0; a < 3; a++) {
+            const next = sliceValuesRef.current[a] + dir;
+            if (next > effectiveLoopEnds[a] || next < loopStarts[a]) { shouldBounce = true; break; }
           }
-        } else {
-          next = prev + (reverse ? -1 : 1);
-          if (reverse) {
-            if (next < start) {
-              if (!loop) setPlaying(false);
-              next = loop ? end : start;
+          if (boomerang && shouldBounce) {
+            bounceDirRef.current = (-bounceDirRef.current) as 1 | -1;
+          }
+          const finalDir = boomerang ? bounceDirRef.current : dir;
+          for (let a = 0; a < 3; a++) {
+            const start = loopStarts[a];
+            const end = effectiveLoopEnds[a];
+            let next = sliceValuesRef.current[a] + finalDir;
+            if (next > end) next = loop || boomerang ? start : end;
+            else if (next < start) next = loop || boomerang ? end : start;
+            sliceSettersRef.current[a](next);
+            sliceValuesRef.current[a] = next;
+          }
+          if (!loop && !boomerang && shouldBounce) setPlaying(false);
+        }, intervalMs);
+      } else {
+        // Single axis mode
+        const axis = playAxis;
+        const start = loopStarts[axis];
+        const end = effectiveLoopEnds[axis];
+        const setter = sliceSettersRef.current[axis];
+        playIntervalRef.current = window.setInterval(() => {
+          const prev = sliceValuesRef.current[axis];
+          let next = prev;
+          if (boomerang) {
+            const candidate = prev + bounceDirRef.current;
+            if (candidate > end) {
+              bounceDirRef.current = -1;
+              next = prev - 1 >= start ? prev - 1 : prev;
+            } else if (candidate < start) {
+              bounceDirRef.current = 1;
+              next = prev + 1 <= end ? prev + 1 : prev;
+            } else {
+              next = candidate;
             }
-          } else if (next > end) {
-            if (!loop) setPlaying(false);
-            next = loop ? start : end;
+          } else {
+            next = prev + (reverse ? -1 : 1);
+            if (reverse) {
+              if (next < start) {
+                if (!loop) setPlaying(false);
+                next = loop ? end : start;
+              }
+            } else if (next > end) {
+              if (!loop) setPlaying(false);
+              next = loop ? start : end;
+            }
           }
+          setter(next);
+          sliceValuesRef.current[axis] = next;
+        }, intervalMs);
+      }
+    };
+
+    startInterval();
+
+    // Pause when the tab/window is hidden, auto-resume on show.
+    // setInterval keeps firing on hidden tabs in Chrome (rate-limited, not zero)
+    // and wastes Comm traffic, so we clear it. Track whether playback was active
+    // at hide time so we restart only if the user hadn't paused in between.
+    let wasPlayingBeforeHide = false;
+    const onVis = () => {
+      if (document.hidden) {
+        if (playIntervalRef.current) {
+          wasPlayingBeforeHide = true;
+          clearInterval(playIntervalRef.current);
+          playIntervalRef.current = null;
         }
-        setter(next);
-        sliceValuesRef.current[axis] = next;
-      }, intervalMs);
-    }
+      } else if (wasPlayingBeforeHide) {
+        wasPlayingBeforeHide = false;
+        startInterval();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
+      document.removeEventListener("visibilitychange", onVis);
       if (playIntervalRef.current) {
         clearInterval(playIntervalRef.current);
         playIntervalRef.current = null;
       }
     };
   }, [playing, fps, reverse, boomerang, loop, playAxis, loopStarts, effectiveLoopEnds]);
-
-  // JS-side stats during playback (Python skips stats while playing)
-  React.useEffect(() => {
-    if (!playing) {
-      setLocalStats(null);
-      setLocalStatsB(null);
-      return;
-    }
-    if (!allFloats || allFloats.length === 0) return;
-    const extractors = [
-      () => extractXY(allFloats, nx, ny, nz, sliceZ),
-      () => extractXZ(allFloats, nx, ny, nz, sliceY),
-      () => extractYZ(allFloats, nx, ny, nz, sliceX),
-    ];
-    const means: number[] = [], mins: number[] = [], maxs: number[] = [], stds: number[] = [];
-    for (let a = 0; a < 3; a++) {
-      const s = computeStats(extractors[a]());
-      means.push(s.mean); mins.push(s.min); maxs.push(s.max); stds.push(s.std);
-    }
-    setLocalStats({ mean: means, min: mins, max: maxs, std: stds });
-    if (isDual && allFloatsB) {
-      const extractorsB = [
-        () => extractXY(allFloatsB, nx, ny, nz, sliceZ),
-        () => extractXZ(allFloatsB, nx, ny, nz, sliceY),
-        () => extractYZ(allFloatsB, nx, ny, nz, sliceX),
-      ];
-      const meansB: number[] = [], minsB: number[] = [], maxsB: number[] = [], stdsB: number[] = [];
-      for (let a = 0; a < 3; a++) {
-        const s = computeStats(extractorsB[a]());
-        meansB.push(s.mean); minsB.push(s.min); maxsB.push(s.max); stdsB.push(s.std);
-      }
-      setLocalStatsB({ mean: meansB, min: minsB, max: maxsB, std: stdsB });
-    }
-  }, [playing, allFloats, allFloatsB, isDual, sliceX, sliceY, sliceZ, nx, ny, nz]);
 
   // -------------------------------------------------------------------------
   // Direct canvas draw (bypasses React state for 60fps pan during drag)
@@ -1536,7 +1731,7 @@ function Show3DVolume() {
       if (!canvas || !offscreen) continue;
       const ctx = canvas.getContext("2d");
       if (!ctx) continue;
-      ctx.imageSmoothingEnabled = false;
+      ctx.imageSmoothingEnabled = smooth;
       ctx.clearRect(0, 0, cw, ch);
       if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
         ctx.save();
@@ -1567,7 +1762,7 @@ function Show3DVolume() {
       const ctx = canvas.getContext("2d");
       if (!ctx) continue;
       const ow = offscreen.width, oh = offscreen.height;
-      ctx.imageSmoothingEnabled = false;
+      ctx.imageSmoothingEnabled = smooth;
       ctx.clearRect(0, 0, cw, ch);
       if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
         ctx.save();
@@ -1585,7 +1780,10 @@ function Show3DVolume() {
   // Zoom/Pan handlers (matching Show3D)
   // -------------------------------------------------------------------------
   const handleWheel = (e: React.WheelEvent, axis: number) => {
-    const canvas = canvasRefs.current[axis];
+    // In dual + show_diff the A panel is unmounted (its canvasRefs are null), so
+    // pick whichever slice canvas is actually mounted for this axis.
+    const canvas =
+      canvasRefs.current[axis] ?? canvasRefsDiff.current[axis] ?? canvasRefsB.current[axis];
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const zs = zooms[axis];
@@ -1611,10 +1809,15 @@ function Show3DVolume() {
     setDragStart({ x: e.clientX, y: e.clientY, pX: zs.panX, pY: zs.panY });
   };
 
-  const handleMouseMove = (e: React.MouseEvent, axis: number) => {
-    // Fast-path: rAF direct draw during pan drag (no React re-render)
+  // Single mousemove helper for A / B / Diff panels. Same drag-pan fast path,
+  // same readout math; only the canvas array, data array, and setter differ.
+  const makeMouseMoveHandler = (
+    refs: React.RefObject<(HTMLCanvasElement | null)[]>,
+    data: Float32Array | null,
+    setInfo: (v: { row: number; col: number; value: number; view: string } | null) => void,
+  ) => (e: React.MouseEvent, axis: number) => {
     if (dragAxis === axis && dragStart) {
-      const canvas = canvasRefs.current[axis];
+      const canvas = refs.current?.[axis];
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const dx = (e.clientX - dragStart.x) * (canvas.width / rect.width);
@@ -1630,167 +1833,69 @@ function Show3DVolume() {
       }
       return;
     }
-
-    // Cursor readout (only when not dragging)
-    const cursorCanvas = canvasRefs.current[axis];
-    if (cursorCanvas && allFloats && allFloats.length > 0) {
-      const rect = cursorCanvas.getBoundingClientRect();
-      const canvasX = (e.clientX - rect.left) * (cursorCanvas.width / rect.width);
-      const canvasY = (e.clientY - rect.top) * (cursorCanvas.height / rect.height);
-      const { w: cw, h: ch, scale } = canvasSizes[axis];
-      const zs = liveZoomsRef.current[axis];
-      const cx = cw / 2, cy = ch / 2;
-      // Reverse zoom/pan transform to get image pixel coordinates
-      let imgX: number, imgY: number;
-      if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
-        imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
-        imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
-      } else {
-        imgX = canvasX / scale;
-        imgY = canvasY / scale;
-      }
-      const px = Math.floor(imgX);
-      const py = Math.floor(imgY);
-      const [sliceH, sliceW] = sliceDims[axis];
-      if (px >= 0 && px < sliceW && py >= 0 && py < sliceH) {
-        // Look up voxel value from volume data at the appropriate 3D coordinate
-        let value: number;
-        if (axis === 0) {
-          // XY view: x maps to x, y maps to y, slice along Z
-          value = allFloats[sliceZ * ny * nx + py * nx + px];
-        } else if (axis === 1) {
-          // XZ view: x maps to x, y maps to z, slice along Y
-          value = allFloats[py * ny * nx + sliceY * nx + px];
-        } else {
-          // YZ view: x maps to y, y maps to z, slice along X
-          value = allFloats[py * ny * nx + px * nx + sliceX];
-        }
-        setCursorInfo({ row: py, col: px, value, view: ["XY", "XZ", "YZ"][axis] });
-      } else {
-        setCursorInfo(null);
-      }
+    const cursorCanvas = refs.current?.[axis];
+    if (!cursorCanvas || !data || data.length === 0) return;
+    const rect = cursorCanvas.getBoundingClientRect();
+    const canvasX = (e.clientX - rect.left) * (cursorCanvas.width / rect.width);
+    const canvasY = (e.clientY - rect.top) * (cursorCanvas.height / rect.height);
+    const { w: cw, h: ch, scale } = canvasSizes[axis];
+    const zs = liveZoomsRef.current[axis];
+    const cx = cw / 2, cy = ch / 2;
+    let imgX: number, imgY: number;
+    if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
+      imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
+      imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
+    } else {
+      imgX = canvasX / scale;
+      imgY = canvasY / scale;
     }
+    const px = Math.floor(imgX);
+    const py = Math.floor(imgY);
+    const [sliceH, sliceW] = sliceDims[axis];
+    if (px < 0 || px >= sliceW || py < 0 || py >= sliceH) {
+      setInfo(null);
+      return;
+    }
+    // 3D voxel lookup. XY: slice along Z. XZ: slice along Y. YZ: slice along X.
+    let value: number;
+    if (axis === 0)       value = data[sliceZ * ny * nx + py * nx + px];
+    else if (axis === 1)  value = data[py * ny * nx + sliceY * nx + px];
+    else                  value = data[py * ny * nx + px * nx + sliceX];
+    setInfo({ row: py, col: px, value, view: ["XY", "XZ", "YZ"][axis] });
   };
+  const handleMouseMove = makeMouseMoveHandler(canvasRefs, allFloats, setCursorInfo);
+  const handleMouseMoveB = makeMouseMoveHandler(canvasRefsB, allFloatsB, setCursorInfoB);
+  const handleMouseMoveDiff = makeMouseMoveHandler(canvasRefsDiff, allFloatsDiff, setCursorInfoDiff);
 
   const handleMouseUp = () => {
     if (zoomRafRef.current) { cancelAnimationFrame(zoomRafRef.current); zoomRafRef.current = 0; }
     setZooms(liveZoomsRef.current);
     setDragAxis(null); setDragStart(null);
   };
+  // Don't kill the drag when the cursor briefly leaves the panel - users routinely
+  // drag past the edge while panning. Only clear the cursor readout overlay.
+  const handleMouseLeave = () => { setCursorInfo(null); };
+  const handleMouseLeaveB = () => { setCursorInfoB(null); };
+  const handleMouseLeaveDiff = () => { setCursorInfoDiff(null); };
 
-  const handleMouseLeave = () => { setDragAxis(null); setDragStart(null); setCursorInfo(null); };
-
-  // Volume B cursor readout (uses same zoom/pan state)
-  const handleMouseMoveB = (e: React.MouseEvent, axis: number) => {
-    if (dragAxis === axis && dragStart) {
-      const canvas = canvasRefsB.current[axis];
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const dx = (e.clientX - dragStart.x) * (canvas.width / rect.width);
-      const dy = (e.clientY - dragStart.y) * (canvas.height / rect.height);
-      const newZoom = { ...liveZoomsRef.current[axis], panX: dragStart.pX + dx, panY: dragStart.pY + dy };
-      const next = [...liveZoomsRef.current]; next[axis] = newZoom;
-      liveZoomsRef.current = next;
-      if (!zoomRafRef.current) {
-        zoomRafRef.current = requestAnimationFrame(() => {
-          zoomRafRef.current = 0;
-          drawSliceDirect(axis);
-        });
-      }
-      return;
-    }
-    const cursorCanvas = canvasRefsB.current[axis];
-    if (cursorCanvas && allFloatsB && allFloatsB.length > 0) {
-      const rect = cursorCanvas.getBoundingClientRect();
-      const canvasX = (e.clientX - rect.left) * (cursorCanvas.width / rect.width);
-      const canvasY = (e.clientY - rect.top) * (cursorCanvas.height / rect.height);
-      const { w: cw, h: ch, scale } = canvasSizes[axis];
-      const zs = liveZoomsRef.current[axis];
-      const cx = cw / 2, cy = ch / 2;
-      let imgX: number, imgY: number;
-      if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
-        imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
-        imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
-      } else {
-        imgX = canvasX / scale;
-        imgY = canvasY / scale;
-      }
-      const px = Math.floor(imgX);
-      const py = Math.floor(imgY);
-      const [sliceH, sliceW] = sliceDims[axis];
-      if (px >= 0 && px < sliceW && py >= 0 && py < sliceH) {
-        let value: number;
-        if (axis === 0) {
-          value = allFloatsB[sliceZ * ny * nx + py * nx + px];
-        } else if (axis === 1) {
-          value = allFloatsB[py * ny * nx + sliceY * nx + px];
-        } else {
-          value = allFloatsB[py * ny * nx + px * nx + sliceX];
-        }
-        setCursorInfoB({ row: py, col: px, value, view: ["XY", "XZ", "YZ"][axis] });
-      } else {
-        setCursorInfoB(null);
-      }
-    }
-  };
-
-  const handleMouseLeaveB = () => { setDragAxis(null); setDragStart(null); setCursorInfoB(null); };
-
-  // Diff cursor readout
-  const handleMouseMoveDiff = (e: React.MouseEvent, axis: number) => {
-    if (dragAxis === axis && dragStart) {
-      const canvas = canvasRefsDiff.current[axis];
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const dx = (e.clientX - dragStart.x) * (canvas.width / rect.width);
-      const dy = (e.clientY - dragStart.y) * (canvas.height / rect.height);
-      const newZoom = { ...liveZoomsRef.current[axis], panX: dragStart.pX + dx, panY: dragStart.pY + dy };
-      const next = [...liveZoomsRef.current]; next[axis] = newZoom;
-      liveZoomsRef.current = next;
-      if (!zoomRafRef.current) {
-        zoomRafRef.current = requestAnimationFrame(() => {
-          zoomRafRef.current = 0;
-          drawSliceDirect(axis);
-        });
-      }
-      return;
-    }
-    const cursorCanvas = canvasRefsDiff.current[axis];
-    if (cursorCanvas && allFloatsDiff && allFloatsDiff.length > 0) {
-      const rect = cursorCanvas.getBoundingClientRect();
-      const canvasX = (e.clientX - rect.left) * (cursorCanvas.width / rect.width);
-      const canvasY = (e.clientY - rect.top) * (cursorCanvas.height / rect.height);
-      const { w: cw, h: ch, scale } = canvasSizes[axis];
-      const zs = liveZoomsRef.current[axis];
-      const cx = cw / 2, cy = ch / 2;
-      let imgX: number, imgY: number;
-      if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
-        imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
-        imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
-      } else {
-        imgX = canvasX / scale;
-        imgY = canvasY / scale;
-      }
-      const px = Math.floor(imgX);
-      const py = Math.floor(imgY);
-      const [sliceH, sliceW] = sliceDims[axis];
-      if (px >= 0 && px < sliceW && py >= 0 && py < sliceH) {
-        let value: number;
-        if (axis === 0) {
-          value = allFloatsDiff[sliceZ * ny * nx + py * nx + px];
-        } else if (axis === 1) {
-          value = allFloatsDiff[py * ny * nx + sliceY * nx + px];
-        } else {
-          value = allFloatsDiff[py * ny * nx + px * nx + sliceX];
-        }
-        setCursorInfoDiff({ row: py, col: px, value, view: ["XY", "XZ", "YZ"][axis] });
-      } else {
-        setCursorInfoDiff(null);
-      }
-    }
-  };
-
-  const handleMouseLeaveDiff = () => { setDragAxis(null); setDragStart(null); setCursorInfoDiff(null); };
+  // Global mouseup ensures drag ends even if the user releases the mouse outside
+  // any slice or FFT canvas (e.g. they drag onto the volume panel and let go).
+  // Without this the dragAxis state stays pinned and the next mouseMove on ANY
+  // panel pans it - very confusing.
+  React.useEffect(() => {
+    if (dragAxis === null && fftDragAxis === null) return;
+    const onUp = () => {
+      if (zoomRafRef.current) { cancelAnimationFrame(zoomRafRef.current); zoomRafRef.current = 0; }
+      if (fftZoomRafRef.current) { cancelAnimationFrame(fftZoomRafRef.current); fftZoomRafRef.current = 0; }
+      setZooms(liveZoomsRef.current);
+      setFftZooms(liveFftZoomsRef.current);
+      setDragAxis(null); setDragStart(null);
+      setFftDragAxis(null); setFftDragStart(null);
+      fftClickStartRef.current = null;
+    };
+    document.addEventListener("mouseup", onUp);
+    return () => document.removeEventListener("mouseup", onUp);
+  }, [dragAxis, fftDragAxis]);
 
   const handleResetAll = () => {
     if (!lockView) {
@@ -1808,23 +1913,44 @@ function Show3DVolume() {
     if (!lockDisplay) {
       setImageVminPct(0);
       setImageVmaxPct(100);
+      // Reset dual + diff sliders too so "Reset all" / R key is symmetric across A/B/|A-B|.
+      setImageVminPctB(0);
+      setImageVmaxPctB(100);
+      setDiffVminPct(0);
+      setDiffVmaxPct(100);
     }
   };
 
   const handleResetAxis = (a: number) => {
     if (lockView) return;
     setZooms(prev => { const next = [...prev]; next[a] = DEFAULT_ZOOM; return next; });
-    setFftZooms(prev => { const next = [...prev]; next[a] = DEFAULT_ZOOM; return next; });
   };
 
   // -------------------------------------------------------------------------
   // Keyboard shortcuts
   // -------------------------------------------------------------------------
+  // Arrow Left/Right  : prev/next Z slice
+  // Arrow Up/Down     : prev/next Y slice  (Up = decrease, Down = increase)
+  // Shift + Arrow L/R : prev/next X slice
+  // Home / End        : first / last on active axis (playAxis)
+  // Space             : play/pause
+  // r / R             : reset all (zooms, camera, contrast, loop bounds)
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Ignore key events that originate inside an editable field (text input, textarea).
+    // Lets users type into the title input without triggering shortcuts.
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement | null)?.isContentEditable) {
+      return;
+    }
     const axisSetters = [setSliceZ, setSliceY, setSliceX];
     const axisValues = [sliceZ, sliceY, sliceX];
     const axisMaxes = [nz - 1, ny - 1, nx - 1];
     const activeAxis = playAxis < 3 ? playAxis : 0;
+    const advance = (axis: number, delta: number) => {
+      if (lockPlayback) return;
+      e.preventDefault();
+      axisSetters[axis](Math.max(0, Math.min(axisMaxes[axis], axisValues[axis] + delta)));
+    };
     switch (e.key) {
       case " ":
         if (!lockPlayback) {
@@ -1833,16 +1959,18 @@ function Show3DVolume() {
         }
         break;
       case "ArrowLeft":
-        if (!lockPlayback) {
-          e.preventDefault();
-          axisSetters[activeAxis](Math.max(0, axisValues[activeAxis] - 1));
-        }
+        // Shift+ArrowLeft -> X axis -1; plain ArrowLeft -> Z axis -1
+        advance(e.shiftKey ? 2 : 0, -1);
         break;
       case "ArrowRight":
-        if (!lockPlayback) {
-          e.preventDefault();
-          axisSetters[activeAxis](Math.min(axisMaxes[activeAxis], axisValues[activeAxis] + 1));
-        }
+        advance(e.shiftKey ? 2 : 0, 1);
+        break;
+      case "ArrowUp":
+        // Up = Y axis -1 (image-coords convention: up means smaller Y)
+        advance(1, -1);
+        break;
+      case "ArrowDown":
+        advance(1, 1);
         break;
       case "Home":
         if (!lockPlayback) {
@@ -1858,7 +1986,11 @@ function Show3DVolume() {
         break;
       case "r":
       case "R":
-        handleResetAll();
+        // Only handle 'r' when no modifier so we don't shadow Ctrl+R / Cmd+R reload.
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          handleResetAll();
+        }
         break;
     }
   };
@@ -1869,14 +2001,27 @@ function Show3DVolume() {
   const handleExportPng = () => {
     if (lockExport) return;
     setExportAnchor(null);
-    // Export all 3 slice canvases as individual PNGs
-    for (let a = 0; a < 3; a++) {
-      const canvas = canvasRefs.current[a];
-      if (!canvas) continue;
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-        downloadBlob(blob, `show3dvolume_${AXES[a]}.png`);
-      }, "image/png");
+    // Export all visible slice canvases as individual PNGs.
+    // - single mode: A only
+    // - dual + !show_diff: A and B
+    // - dual + show_diff: |A − B| only (matches what's on screen)
+    const groups: { refs: React.MutableRefObject<(HTMLCanvasElement | null)[]>; suffix: string }[] = [];
+    if (isDual && showDiff) {
+      groups.push({ refs: canvasRefsDiff, suffix: "diff" });
+    } else {
+      groups.push({ refs: canvasRefs, suffix: isDual ? "A" : "" });
+      if (isDual) groups.push({ refs: canvasRefsB, suffix: "B" });
+    }
+    for (const { refs, suffix } of groups) {
+      for (let a = 0; a < 3; a++) {
+        const canvas = refs.current[a];
+        if (!canvas) continue;
+        const name = suffix ? `show3dvolume_${AXES[a]}_${suffix}.png` : `show3dvolume_${AXES[a]}.png`;
+        canvas.toBlob((blob) => {
+          if (!blob) return;
+          downloadBlob(blob, name);
+        }, "image/png");
+      }
     }
   };
 
@@ -1908,11 +2053,14 @@ function Show3DVolume() {
     ];
     for (let a = 0; a < 3; a++) {
       const [sliceH, sliceW] = sliceDims[a];
-      const processed = logScale ? applyLogScale(sliceData[a]) : sliceData[a];
+      // Match on-screen pipeline: log then flip (negate), same as offscreen render path.
+      const processed = maybeFlip(logScale ? applyLogScale(sliceData[a]) : sliceData[a], flip);
       let vmin: number, vmax: number;
       const hasAbsR = traitVmin != null && traitVmax != null;
-      const eMin = hasAbsR ? (logScale ? Math.log1p(Math.max(traitVmin!, 0)) : traitVmin!) : imageDataRange.min;
-      const eMax = hasAbsR ? (logScale ? Math.log1p(Math.max(traitVmax!, 0)) : traitVmax!) : imageDataRange.max;
+      const rawMin = hasAbsR ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : imageDataRange.min;
+      const rawMax = hasAbsR ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : imageDataRange.max;
+      const eMin = flip ? -rawMax : rawMin;
+      const eMax = flip ? -rawMin : rawMax;
       if (!hasAbsR && autoContrast) {
         ({ vmin, vmax } = percentileClip(processed, 2, 98));
       } else if (imageVminPct > 0 || imageVmaxPct < 100) {
@@ -1927,12 +2075,13 @@ function Show3DVolume() {
       const sliceIndices = [sliceZ, sliceY, sliceX];
       const figCanvas = exportFigure({
         imageCanvas: offscreen,
-        title: `${title || "Volume"} — ${axisLabel} slice ${sliceIndices[a]}`,
+        title: `${title || "Volume"}: ${axisLabel} slice ${sliceIndices[a]}`,
         lut,
         vmin,
         vmax,
         logScale,
         pixelSize: pixelSize > 0 ? pixelSize : undefined,
+        pixelUnit: pixelSize > 0 ? "Å" : "pixels",
         showColorbar: withColorbar,
         showScaleBar: pixelSize > 0,
       });
@@ -1943,8 +2092,8 @@ function Show3DVolume() {
   // -------------------------------------------------------------------------
   // FFT Zoom/Pan handlers
   // -------------------------------------------------------------------------
-  const handleFftWheel = (e: React.WheelEvent, axis: number) => {
-    const canvas = fftCanvasRefs.current[axis];
+  const handleFftWheel = (e: React.WheelEvent, axis: number, which: "A" | "B" = "A") => {
+    const canvas = (which === "B" ? fftCanvasRefsB : fftCanvasRefs).current[axis];
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const zs = fftZooms[axis];
@@ -1964,16 +2113,16 @@ function Show3DVolume() {
     setFftZooms(prev => { const next = [...prev]; next[axis] = DEFAULT_ZOOM; return next; });
   };
 
-  const handleFftMouseDown = (e: React.MouseEvent, axis: number) => {
-    fftClickStartRef.current = { x: e.clientX, y: e.clientY, axis };
+  const handleFftMouseDown = (e: React.MouseEvent, axis: number, which: "A" | "B" = "A") => {
+    fftClickStartRef.current = { x: e.clientX, y: e.clientY, axis, which };
     const zs = fftZooms[axis];
     setFftDragAxis(axis);
     setFftDragStart({ x: e.clientX, y: e.clientY, pX: zs.panX, pY: zs.panY });
   };
 
-  const handleFftMouseMove = (e: React.MouseEvent, axis: number) => {
+  const handleFftMouseMove = (e: React.MouseEvent, axis: number, which: "A" | "B" = "A") => {
     if (fftDragAxis !== axis || !fftDragStart) return;
-    const canvas = fftCanvasRefs.current[axis];
+    const canvas = (which === "B" ? fftCanvasRefsB : fftCanvasRefs).current[axis];
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const dx = (e.clientX - fftDragStart.x) * (canvas.width / rect.width);
@@ -1989,13 +2138,17 @@ function Show3DVolume() {
     }
   };
 
-  const handleFftMouseUp = (e: React.MouseEvent, axis: number) => {
+  const handleFftMouseUp = (e: React.MouseEvent, axis: number, _which: "A" | "B" = "A") => {
     // Click detection for d-spacing measurement
     if (fftClickStartRef.current && fftClickStartRef.current.axis === axis) {
       const dx = e.clientX - fftClickStartRef.current.x;
       const dy = e.clientY - fftClickStartRef.current.y;
       if (Math.sqrt(dx * dx + dy * dy) < 3) {
-        const canvas = fftCanvasRefs.current[axis];
+        // Use the panel that received mouseDOWN, not mouseUP, so a drag from A
+        // onto B's panel still measures against A. This matters because the
+        // magnitude cache and click-info setter must match the originating panel.
+        const which = fftClickStartRef.current.which;
+        const canvas = (which === "B" ? fftCanvasRefsB : fftCanvasRefs).current[axis];
         if (canvas) {
           const rect = canvas.getBoundingClientRect();
           const { w: cw, h: ch } = canvasSizes[axis];
@@ -2015,8 +2168,8 @@ function Show3DVolume() {
           let imgCol = imgX / cw * fftW;
           let imgRow = imgY / ch * fftH;
 
-          // Snap to nearest Bragg spot
-          const cachedMag = fftMagCacheRefs.current[axis];
+          // Snap to nearest Bragg spot using the correct volume's magnitude cache.
+          const cachedMag = (which === "B" ? fftMagCacheRefsB : fftMagCacheRefs).current[axis];
           if (cachedMag && imgCol >= 0 && imgCol < fftW && imgRow >= 0 && imgRow < fftH) {
             const snapped = findFFTPeak(cachedMag, fftW, fftH, imgCol, imgRow, FFT_SNAP_RADIUS);
             imgCol = snapped.col;
@@ -2027,21 +2180,24 @@ function Show3DVolume() {
             const dcCol = imgCol - fftW / 2;
             const dcRow = imgRow - fftH / 2;
             const distPx = Math.sqrt(dcCol * dcCol + dcRow * dcRow);
-
+            const setter = which === "B" ? setFftClickInfoB : setFftClickInfo;
             if (distPx < 1) {
-              setFftClickInfo(null);
+              setter(null);
             } else {
               let spatialFreq: number | null = null;
               let dSpacing: number | null = null;
-              if (pixelSize > 0) {
+              const axes = pixelSizeAxes && pixelSizeAxes.length === 3 ? pixelSizeAxes : null;
+              const rowSpacing = axes ? axes[[1, 0, 0][axis]] : pixelSize;
+              const colSpacing = axes ? axes[[2, 2, 1][axis]] : pixelSize;
+              if (rowSpacing > 0 && colSpacing > 0) {
                 const paddedW = fftW;
                 const paddedH = fftH;
-                const freqC = dcCol / paddedW / pixelSize;
-                const freqR = dcRow / paddedH / pixelSize;
+                const freqC = dcCol / paddedW / colSpacing;
+                const freqR = dcRow / paddedH / rowSpacing;
                 spatialFreq = Math.sqrt(freqC * freqC + freqR * freqR);
                 dSpacing = spatialFreq > 0 ? 1 / spatialFreq : null;
               }
-              setFftClickInfo({ axis, row: imgRow, col: imgCol, distPx, spatialFreq, dSpacing });
+              setter({ axis, row: imgRow, col: imgCol, distPx, spatialFreq, dSpacing });
             }
           }
         }
@@ -2057,6 +2213,7 @@ function Show3DVolume() {
   const handleFftResetAxis = (a: number) => {
     setFftZooms(prev => { const next = [...prev]; next[a] = DEFAULT_ZOOM; return next; });
     if (fftClickInfo && fftClickInfo.axis === a) setFftClickInfo(null);
+    if (fftClickInfoB && fftClickInfoB.axis === a) setFftClickInfoB(null);
   };
 
   const fftNeedsResetAxis = (a: number) => { const z = fftZooms[a]; return z.zoom !== 1 || z.panX !== 0 || z.panY !== 0; };
@@ -2111,6 +2268,12 @@ function Show3DVolume() {
     `${dl[0]}${dl[1]} (${dl[2]}=${sliceX})`,
   ];
   const sliceValues = [sliceZ, sliceY, sliceX];
+  // Mirror of slice values for playback intervals to read between renders.
+  // The interval's `sliceValuesRef.current[a] = next` writes are load-bearing
+  // at high fps (>~20): React batches setSliceZ/Y/X so two ticks can fire
+  // before the next render reassigns this ref to the new [sliceZ,sliceY,sliceX].
+  // Without the mutation the second tick reads the stale value and computes the
+  // same `next`, freezing playback.
   const sliceValuesRef = React.useRef(sliceValues);
   sliceValuesRef.current = sliceValues;
   const sliceMaxes = [nz - 1, ny - 1, nx - 1];
@@ -2119,6 +2282,14 @@ function Show3DVolume() {
     (_: Event, v: number | number[]) => setSliceY(v as number),
     (_: Event, v: number | number[]) => setSliceX(v as number),
   ];
+  // Thin-Z layout: depth axis much smaller than lateral. Stack YZ/XZ panels vertically beside XY.
+  const thinZ = nz < Math.min(nx, ny) / 4;
+  const thinZGridTemplate = thinZ
+    ? `"a0 a1" "a0 a2" / ${canvasSizes[0].w}px ${Math.max(canvasSizes[1].w, canvasSizes[2].w)}px`
+    : `"a0 a1 a2" / ${canvasSizes[0].w}px ${canvasSizes[1].w}px ${canvasSizes[2].w}px`;
+  const panelTotalW = (canvasSizes[0]?.w ?? CANVAS_TARGET) + (thinZ
+    ? Math.max(canvasSizes[1]?.w ?? 0, canvasSizes[2]?.w ?? 0)
+    : ((canvasSizes[1]?.w ?? 0) + (canvasSizes[2]?.w ?? 0) + SPACING.SM)) + SPACING.SM;
 
   // -------------------------------------------------------------------------
   // Render
@@ -2145,61 +2316,33 @@ function Show3DVolume() {
           {/* ControlCustomizer dropped in new monorepo */}
         </Typography>
         {/* Controls row: Export/Copy/Reset + FFT on right */}
-        <Box sx={{ display: "flex", alignItems: "center", gap: "4px", mb: `${SPACING.XS}px`, height: 28 }}>
-          <Box sx={{ flex: 1 }} />
-          {!hideExport && (
-            <>
-              <Button size="small" sx={{ ...compactButton, color: tc.accent }} onClick={(e) => { if (!lockExport) setExportAnchor(e.currentTarget); }} disabled={lockExport || exporting}>{exporting ? "Exporting..." : "Export"}</Button>
-              <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} sx={{ zIndex: 9999 }}>
-                <MenuItem disabled={lockExport} onClick={() => handleExportFigure(true)} sx={{ fontSize: 12 }}>PDF + colorbar</MenuItem>
-                <MenuItem disabled={lockExport} onClick={() => handleExportFigure(false)} sx={{ fontSize: 12 }}>PDF</MenuItem>
-                <MenuItem disabled={lockExport} onClick={handleExportPng} sx={{ fontSize: 12 }}>PNG (current slices)</MenuItem>
-                <MenuItem disabled={lockExport} onClick={handleExportGif} sx={{ fontSize: 12 }}>GIF (animation)</MenuItem>
-                <MenuItem disabled={lockExport} onClick={handleExportZip} sx={{ fontSize: 12 }}>ZIP (all slices)</MenuItem>
-              </Menu>
-              <Button size="small" sx={compactButton} disabled={lockExport} onClick={async () => {
-                const canvas = canvasRefs.current[0];
-                if (!canvas) return;
-                try {
-                  const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/png"));
-                  if (!blob) return;
-                  await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-                } catch {
-                  canvas.toBlob((b) => { if (b) downloadBlob(b, "show3dvolume_xy.png"); }, "image/png");
-                }
-              }}>Copy</Button>
-            </>
-          )}
-          {!hideView && (
-            <Button size="small" sx={compactButton} disabled={lockView || lockVolume || !cameraChanged} onClick={() => { if (!lockView && !lockVolume) handleVolumeDoubleClick(); }}>Reset</Button>
-          )}
-          {!hideDisplay && (
-            <>
-              <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
-              <Switch
-                checked={showFft}
-                onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }}
-                disabled={lockDisplay}
-                size="small"
-                sx={switchStyles.small}
-              />
-            </>
-          )}
-        </Box>
+        {/* Export menu (anchor lives in playback row) */}
+        {!hideExport && (
+          <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "right" }} sx={{ zIndex: 9999 }}>
+            <MenuItem disabled={lockExport} onClick={() => handleExportFigure(true)} sx={{ fontSize: 12 }}>PDF + colorbar</MenuItem>
+            <MenuItem disabled={lockExport} onClick={() => handleExportFigure(false)} sx={{ fontSize: 12 }}>PDF</MenuItem>
+            <MenuItem disabled={lockExport} onClick={handleExportPng} sx={{ fontSize: 12 }}>PNG (current slices)</MenuItem>
+            <MenuItem disabled={lockExport} onClick={handleExportGif} sx={{ fontSize: 12 }}>GIF (animation)</MenuItem>
+            <MenuItem disabled={lockExport} onClick={handleExportZip} sx={{ fontSize: 12 }}>ZIP (all slices)</MenuItem>
+          </Menu>
+        )}
         {/* 3D volume controls row — above canvases */}
         {webgpuSupported && !hideVolume && (
           <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mb: `${SPACING.XS}px` }}>
-            <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Planes:</Typography>
+            <Typography sx={{ ...typography.label, fontSize: 10 }}>Planes:</Typography>
             <Switch checked={showSlicePlanes} onChange={(e) => setShowSlicePlanes(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} />
             {showSlicePlanes && (
-              <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+              <>
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Opacity:</Typography>
+                <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+              </>
             )}
-            <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>{isDual ? "Vol A:" : "Vol Strength:"}</Typography>
-            <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+            <Typography sx={{ ...typography.label, fontSize: 10 }}>{isDual ? "Vol A:" : "Vol Strength:"}</Typography>
+            <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
             {isDual && (
               <>
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Vol B:</Typography>
-                <Slider value={opacityB} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityB(v as number)} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Vol B:</Typography>
+                <Slider value={opacityB} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityB(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
               </>
             )}
           </Box>
@@ -2281,27 +2424,66 @@ function Show3DVolume() {
         )}
       </Box>
       )}
-      {/* Slice canvases row — Volume A */}
-      {isDual && !compact && (
+      {/* Slice canvases row — Volume A.
+          In dual + show_diff mode we hide A and B and render the |A − B| panel alone. */}
+      {isDual && !compact && !showDiff && (
         <Typography variant="caption" sx={{ ...typography.label, ...typography.title, mb: `${SPACING.XS}px`, mt: `${SPACING.SM}px`, display: "block" }}>
           {title || "Volume A"}
         </Typography>
       )}
-      <Stack direction="row" spacing={`${SPACING.LG}px`}>
+      {/* Top toolbar inline above panels — no border. Width pegged to panel grid total so flex-end aligns with right edge of slice panels. */}
+      <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mb: `${SPACING.XS}px`, justifyContent: "flex-end", width: panelTotalW }}>
+        {!hideDisplay && (
+          <>
+            <Typography sx={{ ...typography.label, fontSize: 10 }}>Compact:</Typography>
+            <Switch checked={compact} onChange={(e) => { if (!lockDisplay) setCompact(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+            <Typography sx={{ ...typography.label, fontSize: 10, opacity: compact ? 0.4 : 1 }} title={compact ? "Disable Compact to see FFT panels" : ""}>FFT:</Typography>
+            <Switch checked={showFft} onChange={(e) => { if (!lockDisplay && !compact) setShowFft(e.target.checked); }} disabled={lockDisplay || compact} size="small" sx={switchStyles.small} />
+          </>
+        )}
+        {!hideExport && (
+          <>
+            <Button size="small" sx={{ ...compactButton, color: tc.accent }} onClick={(e) => { if (!lockExport) setExportAnchor(e.currentTarget); }} disabled={lockExport || exporting} aria-label="Open export menu (PDF, PNG, GIF, ZIP)">{exporting ? "Exporting..." : "Export"}</Button>
+            <Button size="small" sx={compactButton} disabled={lockExport} aria-label="Copy XY slice to clipboard as PNG" onClick={async () => {
+              // Copy the XY canvas of whichever panel is currently shown:
+              // dual + show_diff → |A − B| ; else → A.
+              const canvas = (isDual && showDiff ? canvasRefsDiff : canvasRefs).current[0];
+              if (!canvas) return;
+              try {
+                const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/png"));
+                if (!blob) return;
+                await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+              } catch (err) {
+                console.warn("Copy failed, falling back to download:", err);
+                canvas.toBlob((b) => { if (b) downloadBlob(b, "show3dvolume_xy.png"); else console.error("Copy fallback toBlob returned null"); }, "image/png");
+              }
+            }}>Copy</Button>
+          </>
+        )}
+        {!hideView && (
+          <Button size="small" sx={compactButton} disabled={lockView || !anythingDirty} onClick={() => { if (!lockView) handleResetAll(); }} title="Reset camera, slice/FFT zooms, loop bounds, and contrast sliders (shortcut: r)">Reset</Button>
+        )}
+      </Box>
+      {!(isDual && showDiff) && (
+      <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start" }}>
         {AXES.map((_, a) => {
-          const { w: cw, h: ch } = canvasSizes[a];
+          const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
+          // In thin-Z stacked layout, hide headers for axes 1+2 (Y, X depth panels) so
+          // they butt up against each other with zero whitespace. Colored borders + slider
+          // labels still identify axes.
+          const hideHeader = compact || (thinZ && a > 0);
           return (
-            <Box key={a} sx={{ minWidth: cw }}>
+            <Box key={a} sx={{ minWidth: cw, gridArea: `a${a}` }}>
               {/* Header row matching Show3D */}
-              {!compact && (
+              {!hideHeader && (
                 <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
                   <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
                   <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
                 </Stack>
               )}
-              {/* Canvas with plane-colored border */}
+              {/* Canvas with plane-colored border. dh = displayH (stretched for depth panels). */}
               <Box
-                sx={{ ...container.imageBox, width: cw, height: ch, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
+                sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
                 onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                 onMouseMove={(e) => handleMouseMove(e, a)}
                 onMouseUp={handleMouseUp}
@@ -2313,19 +2495,19 @@ function Show3DVolume() {
                   ref={(el) => { canvasRefs.current[a] = el; }}
                   width={cw}
                   height={ch}
-                  style={{ width: cw, height: ch, imageRendering: "pixelated" }}
+                  style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
                 />
                 <canvas
                   ref={(el) => { overlayRefs.current[a] = el; }}
                   width={cw}
-                  height={ch}
-                  style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
+                  height={dh}
+                  style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                 />
                 <canvas
                   ref={(el) => { uiRefs.current[a] = el; }}
                   width={Math.round(cw * DPR)}
-                  height={Math.round(ch * DPR)}
-                  style={{ position: "absolute", top: 0, left: 0, width: cw, height: ch, pointerEvents: "none" }}
+                  height={Math.round(dh * DPR)}
+                  style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                 />
                 {/* Cursor readout overlay */}
                 {cursorInfo && cursorInfo.view === ["XY", "XZ", "YZ"][a] && (
@@ -2346,33 +2528,18 @@ function Show3DVolume() {
                   }}
                 />
               </Box>
-              {/* Stats bar */}
-              {showStats && !hideStats && !compact && (
-                <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: tc.bgAlt, display: "flex", gap: 2, alignItems: "center", overflow: "hidden", whiteSpace: "nowrap", width: cw, boxSizing: "border-box", opacity: lockStats ? 0.6 : 1 }}>
-                  {[
-                    { label: "Mean", value: (localStats?.mean ?? statsMean)?.[a] },
-                    { label: "Min", value: (localStats?.min ?? statsMin)?.[a] },
-                    { label: "Max", value: (localStats?.max ?? statsMax)?.[a] },
-                    { label: "Std", value: (localStats?.std ?? statsStd)?.[a] },
-                  ].map(({ label, value }) => (
-                    <Typography key={label} sx={{ fontSize: 11, color: tc.textMuted, whiteSpace: "nowrap" }}>
-                      {label} <Box component="span" sx={{ color: tc.accent, fontFamily: "monospace", fontSize: 10 }}>{value !== undefined ? formatNumber(value) : "-"}</Box>
-                    </Typography>
-                  ))}
-                </Box>
-              )}
               {/* FFT canvas (inline, below stats) */}
               {effectiveShowFft && !compact && (
                 <Box sx={{ mt: `${SPACING.SM}px` }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 20 }}>
                     <Stack direction="row" alignItems="center" sx={{ overflow: "hidden" }}>
                       <Typography variant="caption" sx={{ ...typography.label, fontSize: 10, flexShrink: 0 }}>
-                        {`FFT ${[`${dl[1]}${dl[2]}`, `${dl[0]}${dl[2]}`, `${dl[0]}${dl[1]}`][a]} ${gpuReady ? "(GPU)" : "(CPU)"}`}
+                        {`FFT ${[`${dl[1]}${dl[2]}`, `${dl[0]}${dl[2]}`, `${dl[0]}${dl[1]}`][a]} ${gpuReady ? "" : " (CPU fallback)"}`}
                       </Typography>
                       {fftClickInfo && fftClickInfo.axis === a && (
                         <Typography sx={{ fontSize: 10, fontFamily: "monospace", color: tc.textMuted, ml: 1, whiteSpace: "nowrap" }}>
                           {fftClickInfo.dSpacing != null ? (
-                            <>d=<Box component="span" sx={{ color: tc.accent, fontWeight: "bold" }}>{fftClickInfo.dSpacing >= 10 ? `${(fftClickInfo.dSpacing / 10).toFixed(2)} nm` : `${fftClickInfo.dSpacing.toFixed(2)} \u00C5`}</Box>{" |g|="}<Box component="span" sx={{ color: tc.accent }}>{fftClickInfo.spatialFreq!.toFixed(4)} \u00C5\u207B\u00B9</Box></>
+                            <>d=<Box component="span" sx={{ color: tc.accent, fontWeight: "bold" }}>{fftClickInfo.dSpacing >= 10 ? `${(fftClickInfo.dSpacing / 10).toFixed(2)} nm` : `${fftClickInfo.dSpacing.toFixed(2)} \u00C5`}</Box>{" |g|="}<Box component="span" sx={{ color: tc.accent }}>{`${fftClickInfo.spatialFreq!.toFixed(4)} \u00C5\u207B\u00B9`}</Box></>
                           ) : (
                             <>dist=<Box component="span" sx={{ color: tc.accent }}>{fftClickInfo.distPx.toFixed(1)} px</Box></>
                           )}
@@ -2382,7 +2549,7 @@ function Show3DVolume() {
                     <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsResetAxis(a)} onClick={() => handleFftResetAxis(a)}>Reset</Button>
                   </Stack>
                   <Box
-                    sx={{ ...container.imageBox, width: cw, height: ch, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
+                    sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
                     onMouseDown={(e) => { if (!lockView) handleFftMouseDown(e, a); }}
                     onMouseMove={(e) => { if (!lockView) handleFftMouseMove(e, a); }}
                     onMouseUp={(e) => { if (!lockView) handleFftMouseUp(e, a); }}
@@ -2394,13 +2561,13 @@ function Show3DVolume() {
                       ref={(el) => { fftCanvasRefs.current[a] = el; }}
                       width={cw}
                       height={ch}
-                      style={{ width: cw, height: ch, imageRendering: "pixelated" }}
+                      style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
                     />
                     <canvas
                       ref={(el) => { fftOverlayRefs.current[a] = el; }}
                       width={Math.round(cw * DPR)}
-                      height={Math.round(ch * DPR)}
-                      style={{ position: "absolute", top: 0, left: 0, width: cw, height: ch, pointerEvents: "none" }}
+                      height={Math.round(dh * DPR)}
+                      style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                     />
                   </Box>
                   {fftZooms[a].zoom !== 1 && (
@@ -2462,28 +2629,34 @@ function Show3DVolume() {
             </Box>
           );
         })}
-      </Stack>
-      {/* Slice canvases row — Volume B (dual mode only) */}
+      </Box>
+      )}
+      {/* Slice canvases row — Volume B (dual mode only).
+          When show_diff is ON we hide the B image grid and FFT block, then render only the
+          standalone diff panel (rendered as a sibling below). The shared slider row stays
+          shared between A/B/diff. */}
       {isDual && (
         <>
-          {!compact && (
+          {!compact && !showDiff && (
             <Typography variant="caption" sx={{ ...typography.label, ...typography.title, mb: `${SPACING.XS}px`, mt: `${SPACING.LG}px`, display: "block" }}>
               {titleB || "Volume B"}
             </Typography>
           )}
-          <Stack direction="row" spacing={`${SPACING.LG}px`} sx={compact ? { mt: `${SPACING.XS}px` } : undefined}>
+          {!showDiff && (
+          <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", ...(compact ? { mt: `${SPACING.XS}px` } : {}) }}>
             {AXES.map((_, a) => {
-              const { w: cw, h: ch } = canvasSizes[a];
+              const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
+              const hideHeaderB = compact || (thinZ && a > 0);
               return (
-                <Box key={`b${a}`} sx={{ minWidth: cw }}>
-                  {!compact && (
+                <Box key={`b${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
+                  {!hideHeaderB && (
                     <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
                       <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
                       <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
                     </Stack>
                   )}
                   <Box
-                    sx={{ ...container.imageBox, width: cw, height: ch, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
+                    sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
                     onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                     onMouseMove={(e) => handleMouseMoveB(e, a)}
                     onMouseUp={handleMouseUp}
@@ -2495,19 +2668,19 @@ function Show3DVolume() {
                       ref={(el) => { canvasRefsB.current[a] = el; }}
                       width={cw}
                       height={ch}
-                      style={{ width: cw, height: ch, imageRendering: "pixelated" }}
+                      style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
                     />
                     <canvas
                       ref={(el) => { overlayRefsB.current[a] = el; }}
                       width={cw}
-                      height={ch}
-                      style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
+                      height={dh}
+                      style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                     />
                     <canvas
                       ref={(el) => { uiRefsB.current[a] = el; }}
                       width={Math.round(cw * DPR)}
-                      height={Math.round(ch * DPR)}
-                      style={{ position: "absolute", top: 0, left: 0, width: cw, height: ch, pointerEvents: "none" }}
+                      height={Math.round(dh * DPR)}
+                      style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                     />
                     {cursorInfoB && cursorInfoB.view === ["XY", "XZ", "YZ"][a] && (
                       <Box sx={{ position: "absolute", top: 3, right: 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", minWidth: 100, textAlign: "right" }}>
@@ -2517,47 +2690,33 @@ function Show3DVolume() {
                       </Box>
                     )}
                   </Box>
-                  {showStats && !hideStats && !compact && (
-                    <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: tc.bgAlt, display: "flex", gap: 2, alignItems: "center", overflow: "hidden", whiteSpace: "nowrap", width: cw, boxSizing: "border-box", opacity: lockStats ? 0.6 : 1 }}>
-                      {[
-                        { label: "Mean", value: (localStatsB?.mean ?? statsMeanB)?.[a] },
-                        { label: "Min", value: (localStatsB?.min ?? statsMinB)?.[a] },
-                        { label: "Max", value: (localStatsB?.max ?? statsMaxB)?.[a] },
-                        { label: "Std", value: (localStatsB?.std ?? statsStdB)?.[a] },
-                      ].map(({ label, value }) => (
-                        <Typography key={label} sx={{ fontSize: 11, color: tc.textMuted, whiteSpace: "nowrap" }}>
-                          {label} <Box component="span" sx={{ color: tc.accent, fontFamily: "monospace", fontSize: 10 }}>{value !== undefined ? formatNumber(value) : "-"}</Box>
-                        </Typography>
-                      ))}
-                    </Box>
-                  )}
                   {effectiveShowFft && !compact && (
                     <Box sx={{ mt: `${SPACING.SM}px` }}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 20 }}>
                         <Typography variant="caption" sx={{ ...typography.label, fontSize: 10 }}>
-                          {`FFT ${[`${dl[1]}${dl[2]}`, `${dl[0]}${dl[2]}`, `${dl[0]}${dl[1]}`][a]} ${gpuReady ? "(GPU)" : "(CPU)"}`}
+                          {`FFT ${[`${dl[1]}${dl[2]}`, `${dl[0]}${dl[2]}`, `${dl[0]}${dl[1]}`][a]} ${gpuReady ? "" : " (CPU fallback)"}`}
                         </Typography>
                       </Stack>
                       <Box
-                        sx={{ ...container.imageBox, width: cw, height: ch, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
-                        onMouseDown={(e) => { if (!lockView) handleFftMouseDown(e, a); }}
-                        onMouseMove={(e) => { if (!lockView) handleFftMouseMove(e, a); }}
-                        onMouseUp={(e) => { if (!lockView) handleFftMouseUp(e, a); }}
-                        onMouseLeave={() => { if (!lockView) { setFftDragAxis(null); setFftDragStart(null); } }}
-                        onWheel={(e) => { if (!lockView) handleFftWheel(e, a); }}
+                        sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
+                        onMouseDown={(e) => { if (!lockView) handleFftMouseDown(e, a, "B"); }}
+                        onMouseMove={(e) => { if (!lockView) handleFftMouseMove(e, a, "B"); }}
+                        onMouseUp={(e) => { if (!lockView) handleFftMouseUp(e, a, "B"); }}
+                        onMouseLeave={() => { if (!lockView) { fftClickStartRef.current = null; setFftDragAxis(null); setFftDragStart(null); } }}
+                        onWheel={(e) => { if (!lockView) handleFftWheel(e, a, "B"); }}
                         onDoubleClick={() => { if (!lockView) handleFftDoubleClick(a); }}
                       >
                         <canvas
                           ref={(el) => { fftCanvasRefsB.current[a] = el; }}
                           width={cw}
                           height={ch}
-                          style={{ width: cw, height: ch, imageRendering: "pixelated" }}
+                          style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
                         />
                         <canvas
                           ref={(el) => { fftOverlayRefsB.current[a] = el; }}
                           width={Math.round(cw * DPR)}
-                          height={Math.round(ch * DPR)}
-                          style={{ position: "absolute", top: 0, left: 0, width: cw, height: ch, pointerEvents: "none" }}
+                          height={Math.round(dh * DPR)}
+                          style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                         />
                       </Box>
                       {fftZooms[a].zoom !== 1 && (
@@ -2570,8 +2729,10 @@ function Show3DVolume() {
                 </Box>
               );
             })}
-          </Stack>
-          {/* Diff row — |A - B| (dual mode + show_diff only) */}
+          </Box>
+          )}
+          {/* Diff row — |A − B| (dual mode + show_diff only).
+              When show_diff is ON this is the only image grid shown (A and B hidden above). */}
           {showDiff && allFloatsDiff && (
             <>
               {!compact && (
@@ -2579,19 +2740,20 @@ function Show3DVolume() {
                   |A − B|
                 </Typography>
               )}
-              <Stack direction="row" spacing={`${SPACING.LG}px`} sx={compact ? { mt: `${SPACING.XS}px` } : undefined}>
+              <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", ...(compact ? { mt: `${SPACING.XS}px` } : {}) }}>
                 {AXES.map((_, a) => {
-                  const { w: cw, h: ch } = canvasSizes[a];
+                  const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
+                  const hideHeaderDiff = compact || (thinZ && a > 0);
                   return (
-                    <Box key={`diff${a}`} sx={{ minWidth: cw }}>
-                      {!compact && (
+                    <Box key={`diff${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
+                      {!hideHeaderDiff && (
                         <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
                           <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
                           <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
                         </Stack>
                       )}
                       <Box
-                        sx={{ ...container.imageBox, width: cw, height: ch, cursor: "grab", borderColor: "#ff8c00" }}
+                        sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: "#ff8c00" }}
                         onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                         onMouseMove={(e) => handleMouseMoveDiff(e, a)}
                         onMouseUp={handleMouseUp}
@@ -2603,19 +2765,19 @@ function Show3DVolume() {
                           ref={(el) => { canvasRefsDiff.current[a] = el; }}
                           width={cw}
                           height={ch}
-                          style={{ width: cw, height: ch, imageRendering: "pixelated" }}
+                          style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
                         />
                         <canvas
                           ref={(el) => { overlayRefsDiff.current[a] = el; }}
                           width={cw}
-                          height={ch}
-                          style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
+                          height={dh}
+                          style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                         />
                         <canvas
                           ref={(el) => { uiRefsDiff.current[a] = el; }}
                           width={Math.round(cw * DPR)}
-                          height={Math.round(ch * DPR)}
-                          style={{ position: "absolute", top: 0, left: 0, width: cw, height: ch, pointerEvents: "none" }}
+                          height={Math.round(dh * DPR)}
+                          style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
                         />
                         {cursorInfoDiff && cursorInfoDiff.view === ["XY", "XZ", "YZ"][a] && (
                           <Box sx={{ position: "absolute", top: 3, right: 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", minWidth: 100, textAlign: "right" }}>
@@ -2625,33 +2787,23 @@ function Show3DVolume() {
                           </Box>
                         )}
                       </Box>
-                      {showStats && !hideStats && !compact && diffStats[a] && (
-                        <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: tc.bgAlt, display: "flex", gap: 2, alignItems: "center", overflow: "hidden", whiteSpace: "nowrap", width: cw, boxSizing: "border-box", opacity: lockStats ? 0.6 : 1 }}>
-                          {[
-                            { label: "Mean", value: diffStats[a].mean },
-                            { label: "Min", value: diffStats[a].min },
-                            { label: "Max", value: diffStats[a].max },
-                            { label: "Std", value: diffStats[a].std },
-                          ].map(({ label, value }) => (
-                            <Typography key={label} sx={{ fontSize: 11, color: tc.textMuted, whiteSpace: "nowrap" }}>
-                              {label} <Box component="span" sx={{ color: tc.accent, fontFamily: "monospace", fontSize: 10 }}>{formatNumber(value)}</Box>
-                            </Typography>
-                          ))}
-                        </Box>
-                      )}
                     </Box>
                   );
                 })}
-              </Stack>
+              </Box>
             </>
           )}
-          {/* Shared slider row — below Volume B in dual mode */}
+          {/* Shared slider row — below Volume B in dual mode.
+              Use the same grid template as the panels so each slider sits
+              directly under its axis (in thinZ stacked mode, Y/X sliders stack
+              like the depth panels instead of trying to flex to a 3rd column
+              that wraps off-screen). */}
           {!hidePlayback && (
-            <Stack direction="row" spacing={`${SPACING.LG}px`} sx={{ mt: `${SPACING.SM}px` }}>
+            <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: `${SPACING.XS}px`, columnGap: `${SPACING.SM}px`, justifyContent: "start", mt: `${SPACING.SM}px` }}>
               {AXES.map((_, a) => {
                 const { w: cw } = canvasSizes[a];
                 return (
-                  <Box key={`slider${a}`} sx={{ minWidth: cw }}>
+                  <Box key={`slider${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
                     <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: cw, maxWidth: cw, boxSizing: "border-box" }}>
                       <Typography sx={{ ...typography.labelSmall, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
                       {loop ? (
@@ -2701,59 +2853,109 @@ function Show3DVolume() {
                   </Box>
                 );
               })}
-            </Stack>
+            </Box>
           )}
         </>
       )}
       {/* FFT controls row */}
       {effectiveShowFft && (
         <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg }}>
-          <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>FFT Scale:</Typography>
+          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Scale:</Typography>
           <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
             <MenuItem value="linear">Lin</MenuItem>
             <MenuItem value="log">Log</MenuItem>
           </Select>
-          <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Color:</Typography>
+          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Color:</Typography>
           <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps}>
             {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
           </Select>
-          <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Auto:</Typography>
+          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Auto:</Typography>
           <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} />
         </Box>
       )}
-      {/* Controls row with histogram on right */}
-      {showControls && (!hideDisplay || !hideHistogram) && (
+      {/* Controls row with histogram on right.
+          Inner controls Box width pinned to total panel width (sum of canvasSizes.w + gaps)
+          so all three controlRows + Z-slider align flush with the slice panels above. */}
+      {showControls && (!hideDisplay || !hideHistogram) && (() => {
+        return (
         <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, alignItems: "stretch" }}>
           {!hideDisplay && (
-            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "center" }}>
-              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg }}>
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Scale:</Typography>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "center", width: panelTotalW }}>
+              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: "100%", boxSizing: "border-box" }}>
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
                 <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
                   <MenuItem value="linear">Lin</MenuItem>
                   <MenuItem value="log">Log</MenuItem>
                 </Select>
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Color:</Typography>
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
                 <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }}>
                   {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                 </Select>
-              </Box>
-              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg }}>
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Auto:</Typography>
-                <Switch checked={autoContrast} onChange={(e) => { if (!lockDisplay) setAutoContrast(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Cross:</Typography>
-                <Switch checked={showCrosshair} onChange={(e) => { if (!lockDisplay) setShowCrosshair(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Colorbar:</Typography>
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Colorbar:</Typography>
                 <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Compact:</Typography>
-                <Switch checked={compact} onChange={(e) => { if (!lockDisplay) setCompact(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                <Typography sx={{ ...typography.label, fontSize: 10 }} title="CSS bilinear interpolation on image canvas. Off = pixelated.">Smooth:</Typography>
+                <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+              </Box>
+              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: "100%", boxSizing: "border-box" }}>
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Cross:</Typography>
+                <Switch checked={showCrosshair} onChange={(e) => { if (!lockDisplay) setShowCrosshair(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                <Typography sx={{ ...typography.label, fontSize: 10 }} title="Depth-axis display height multiplier (1-16x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch:</Typography>
+                <Slider value={zStretch} min={1} max={16} step={0.5} onChange={(_, v) => { if (!lockDisplay) setZStretch(v as number); }} disabled={lockDisplay} size="small" valueLabelDisplay="auto" sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
+                <Typography sx={{ ...typography.label, fontSize: 10 }} title="Negate displayed values. Useful when phase sign is inverted.">Flip:</Typography>
+                <Switch checked={flip} onChange={(e) => { if (!lockDisplay) setFlip(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
                 {isDual && (
                   <>
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Diff:</Typography>
+                    <Typography sx={{ ...typography.label, fontSize: 10 }}>Diff:</Typography>
                     <Switch checked={showDiff} onChange={(e) => setShowDiff(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: tc.textMuted }}>Link Contrast:</Typography>
+                    <Typography sx={{ ...typography.label, fontSize: 10 }}>Link Contrast:</Typography>
                     <Switch checked={linkedContrast} onChange={(e) => { if (!lockDisplay) setLinkedContrast(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
                   </>
                 )}
+                <Typography sx={{ ...typography.label, fontSize: 10 }}>Auto:</Typography>
+                <Switch checked={autoContrast} onChange={(e) => {
+                  if (lockDisplay) return;
+                  const on = e.target.checked;
+                  setAutoContrast(on);
+                  if (on && imageHistogramData) {
+                    // ON → snap to 2/98 percentile.
+                    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, 2, 98);
+                    const span = imageDataRange.max - imageDataRange.min;
+                    if (span > 0) {
+                      setImageVminPct(Math.max(0, Math.min(100, ((pmin - imageDataRange.min) / span) * 100)));
+                      setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - imageDataRange.min) / span) * 100)));
+                    }
+                    // Volume B: snap independent slider too when unlinked.
+                    if (isDual && !linkedContrast && imageHistogramDataB) {
+                      const { vmin: pminB, vmax: pmaxB } = percentileClip(imageHistogramDataB, 2, 98);
+                      const spanB = imageDataRangeB.max - imageDataRangeB.min;
+                      if (spanB > 0) {
+                        setImageVminPctB(Math.max(0, Math.min(100, ((pminB - imageDataRangeB.min) / spanB) * 100)));
+                        setImageVmaxPctB(Math.max(0, Math.min(100, ((pmaxB - imageDataRangeB.min) / spanB) * 100)));
+                      }
+                    }
+                    // Diff panel: snap its independent slider too.
+                    if (showDiff && diffHistogramData) {
+                      const { vmin: pminD, vmax: pmaxD } = percentileClip(diffHistogramData, 2, 98);
+                      const spanD = diffDataRange.max - diffDataRange.min;
+                      if (spanD > 0) {
+                        setDiffVminPct(Math.max(0, Math.min(100, ((pminD - diffDataRange.min) / spanD) * 100)));
+                        setDiffVmaxPct(Math.max(0, Math.min(100, ((pmaxD - diffDataRange.min) / spanD) * 100)));
+                      }
+                    }
+                  } else {
+                    // OFF → reset slider(s) to full range 0/100 so user gets default contrast back.
+                    setImageVminPct(0);
+                    setImageVmaxPct(100);
+                    if (isDual && !linkedContrast) {
+                      setImageVminPctB(0);
+                      setImageVmaxPctB(100);
+                    }
+                    if (showDiff) {
+                      setDiffVminPct(0);
+                      setDiffVmaxPct(100);
+                    }
+                  }
+                }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
               </Box>
             </Box>
           )}
@@ -2767,15 +2969,17 @@ function Show3DVolume() {
                   vmaxPct={imageVmaxPct}
                   onRangeChange={(min, max) => {
                     if (!lockHistogram) {
+                      // User drag overrides Auto — Auto would otherwise win and ignore slider.
+                      if (autoContrast) setAutoContrast(false);
                       setImageVminPct(min);
                       setImageVmaxPct(max);
                     }
                   }}
                   width={110}
-                  height={58}
+                  height={46}
                   theme={themeInfo.theme === "dark" ? "dark" : "light"}
-                  dataMin={imageDataRange.min}
-                  dataMax={imageDataRange.max}
+                  dataMin={flip ? -imageDataRange.max : imageDataRange.min}
+                  dataMax={flip ? -imageDataRange.min : imageDataRange.max}
                 />
               </Box>
               {isDual && !linkedContrast && imageHistogramDataB && (
@@ -2787,33 +2991,35 @@ function Show3DVolume() {
                     vmaxPct={imageVmaxPctB}
                     onRangeChange={(min, max) => {
                       if (!lockHistogram) {
+                        if (autoContrast) setAutoContrast(false);
                         setImageVminPctB(min);
                         setImageVmaxPctB(max);
                       }
                     }}
                     width={110}
-                    height={58}
+                    height={46}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
-                    dataMin={imageDataRangeB.min}
-                    dataMax={imageDataRangeB.max}
+                    dataMin={flip ? -imageDataRangeB.max : imageDataRangeB.min}
+                    dataMax={flip ? -imageDataRangeB.min : imageDataRangeB.max}
                   />
                 </Box>
               )}
               {showDiff && allFloatsDiff && diffHistogramData && (
                 <Box sx={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto" }}>
-                  <Typography sx={{ ...typography.label, fontSize: 9, color: tc.textMuted, textAlign: "center", mb: 0.25 }}>{titleB || "B"} diff</Typography>
+                  <Typography sx={{ ...typography.label, fontSize: 9, color: tc.textMuted, textAlign: "center", mb: 0.25 }}>|A - B|</Typography>
                   <Histogram
                     data={diffHistogramData}
                     vminPct={diffVminPct}
                     vmaxPct={diffVmaxPct}
                     onRangeChange={(min, max) => {
                       if (!lockHistogram) {
+                        if (autoContrast) setAutoContrast(false);
                         setDiffVminPct(min);
                         setDiffVmaxPct(max);
                       }
                     }}
                     width={110}
-                    height={58}
+                    height={46}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
                     dataMin={diffDataRange.min}
                     dataMax={diffDataRange.max}
@@ -2823,13 +3029,15 @@ function Show3DVolume() {
             </Box>
           )}
         </Box>
-      )}
+        );
+      })()}
       {/* Playback: transport + axis selector + fps + loop + bounce */}
-      {!hidePlayback && (
-      <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg }}>
+      {!hidePlayback && (() => {
+        return (
+      <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: panelTotalW, boxSizing: "border-box" }}>
         <Select
           value={playAxis}
-          onChange={(e) => { if (!lockPlayback) { setPlaying(false); setPlayAxis(e.target.value as number); } }}
+          onChange={(e) => { if (!lockPlayback) { setPlaying(false); setPlayAxis(Number(e.target.value)); } }}
           disabled={lockPlayback}
           size="small"
           sx={{ ...themedSelect, minWidth: 40, fontSize: 10 }}
@@ -2871,9 +3079,12 @@ function Show3DVolume() {
         <Typography sx={{ ...typography.label, color: tc.textMuted, flexShrink: 0 }}>Bounce</Typography>
         <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} />
       </Box>
-      )}
+        );
+      })()}
     </Box>
   );
 }
 
-export const render = createRender(Show3DVolume);
+// anywidget v0.9+ deprecates `export render` in favor of `export default { render }`.
+const render = createRender(Show3DVolume);
+export default { render };

@@ -1,5 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
+from quantem.widget.profile import profile
 from quantem.widget.show2d import Show2D
 from quantem.widget.show3d import Show3D
 from quantem.widget.show3dvolume import Show3DVolume
@@ -11,4 +12,4 @@ except PackageNotFoundError:
     # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
     __version__ = "0.0.0+local"
 
-__all__ = ["Show2D", "Show3D", "Show3DVolume", "Show4DSTEM"]
+__all__ = ["Show2D", "Show3D", "Show3DVolume", "Show4DSTEM", "profile"]

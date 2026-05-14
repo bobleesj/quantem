@@ -316,31 +316,7 @@ const typography = {
   labelSmall: { fontSize: 10 },
   value: { fontSize: 10, fontFamily: "monospace" },
 };
-const SPACING = { XS: 4, SM: 8, MD: 12, LG: 16 };
-const controlRow = {
-  display: "flex",
-  alignItems: "center",
-  gap: `${SPACING.SM}px`,
-  px: 1,
-  py: 0.5,
-  width: "fit-content",
-};
-const compactButton = {
-  fontSize: 10,
-  py: 0.25,
-  px: 1,
-  minWidth: 0,
-  "&.Mui-disabled": {
-    color: "#666",
-    borderColor: "#444",
-  },
-};
-const switchStyles = {
-  small: { "& .MuiSwitch-thumb": { width: 12, height: 12 }, "& .MuiSwitch-switchBase": { padding: "4px" } },
-};
-const sliderStyles = {
-  small: { py: 0, "& .MuiSlider-thumb": { width: 10, height: 10 }, "& .MuiSlider-rail": { height: 2 }, "& .MuiSlider-track": { height: 2 } },
-};
+import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-controls";
 
 function Show2D() {
   // Theme
@@ -561,7 +537,10 @@ function Show2D() {
         if (bitmaps && bitmaps[0]) {
           for (let i = 0; i < bitmaps.length; i++) {
             const offscreen = mainOffscreensRef.current[i];
-            if (offscreen && bitmaps[i]) offscreen.getContext("2d")?.drawImage(bitmaps[i], 0, 0);
+            if (offscreen && bitmaps[i]) {
+              offscreen.getContext("2d")?.drawImage(bitmaps[i], 0, 0);
+              bitmaps[i].close();  // release external memory
+            }
           }
           setOffscreenVersion(v => v + 1);
         }
@@ -1334,6 +1313,7 @@ function Show2D() {
             if (!offscreen || !bitmaps[i]) continue;
             const ctx = offscreen.getContext("2d");
             if (ctx) ctx.drawImage(bitmaps[i], 0, 0);
+            bitmaps[i].close();  // release external memory
           }
           setOffscreenVersion(v => v + 1);
           return;
@@ -2128,6 +2108,7 @@ function Show2D() {
           const ctx = oc.getContext("2d");
           if (ctx) {
             ctx.drawImage(bitmaps[0], 0, 0);
+            bitmaps[0].close();  // release external memory
             fftOffscreenRef.current = oc;
             setFftOffscreenVersion(v => v + 1);
             return;
@@ -4265,4 +4246,5 @@ function Show2D() {
   );
 }
 
-export const render = createRender(Show2D);
+const render = createRender(Show2D);
+export default { render };
