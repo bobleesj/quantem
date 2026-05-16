@@ -2,6 +2,7 @@ from typing import Any, Self
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib.patches import Circle, Wedge
 from numpy.typing import NDArray
 
@@ -301,6 +302,15 @@ class Dataset4dstem(Dataset4d):
         Dataset
             A new Dataset with the median diffraction pattern
         """
+        if isinstance(self.array, torch.Tensor):
+            raise NotImplementedError(
+                f"Dataset4dstem.get_dp_median() does not yet support torch.Tensor storage "
+                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
+                f"torch.median has different tie-breaking than numpy. "
+                f"Workaround: convert to numpy first with "
+                f"`dset.array = dset.array.detach().cpu().numpy()`. "
+                f"Tracked as follow-up; open a quantem issue if you need it."
+            )
         dp_median = np.median(self.array, axis=(0, 1))
 
         dp_median_dataset = Dataset2d.from_array(
@@ -356,6 +366,14 @@ class Dataset4dstem(Dataset4d):
         Dataset2d
             A new Dataset2d with the virtual image
         """
+        if isinstance(self.array, torch.Tensor):
+            raise NotImplementedError(
+                f"Dataset4dstem.get_virtual_image() does not yet support torch.Tensor storage "
+                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
+                f"Workaround: convert to numpy first with "
+                f"`dset.array = dset.array.detach().cpu().numpy()`. "
+                f"Tracked as follow-up; open a quantem issue if you need it."
+            )
         if mask is not None:
             # Use provided mask
             if mask.shape != self.array.shape[-2:]:
@@ -719,6 +737,15 @@ class Dataset4dstem(Dataset4d):
             specifies the width of the median kernel
 
         """
+        if isinstance(self.array, torch.Tensor):
+            raise NotImplementedError(
+                f"Dataset4dstem.median_filter_masked_pixels() does not yet support torch.Tensor storage "
+                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
+                f"torch.median has different tie-breaking than numpy. "
+                f"Workaround: convert to numpy first with "
+                f"`dset.array = dset.array.detach().cpu().numpy()`. "
+                f"Tracked as follow-up; open a quantem issue if you need it."
+            )
         if kernel_width % 2 == 0:
             width_max = kernel_width // 2
             width_min = kernel_width // 2

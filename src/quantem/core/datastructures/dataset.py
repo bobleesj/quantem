@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
 import numpy as np
+import torch
 from numpy.typing import DTypeLike, NDArray
 
 from quantem.core.io.serialize import AutoSerialize
@@ -51,9 +52,9 @@ class Dataset(AutoSerialize):
             raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
         super().__init__()
         arr = ensure_valid_array(array)
-        if not isinstance(arr, np.ndarray):
+        if not isinstance(arr, (np.ndarray, torch.Tensor)):
             raise TypeError(
-                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+                "Dataset requires a NumPy array or torch.Tensor."
             )
         self._array = arr
         self.name = name
@@ -98,9 +99,9 @@ class Dataset(AutoSerialize):
             A Dataset object with the validated array and metadata.
         """
         validated_array = ensure_valid_array(array)
-        if not isinstance(validated_array, np.ndarray):
+        if not isinstance(validated_array, (np.ndarray, torch.Tensor)):
             raise TypeError(
-                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+                "Dataset requires a NumPy array or torch.Tensor."
             )
         _ndim = validated_array.ndim
 
@@ -127,11 +128,11 @@ class Dataset(AutoSerialize):
         return self._array
 
     @array.setter
-    def array(self, value: NDArray) -> None:
+    def array(self, value: NDArray | torch.Tensor) -> None:
         arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
-        if not isinstance(arr, np.ndarray):
+        if not isinstance(arr, (np.ndarray, torch.Tensor)):
             raise TypeError(
-                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+                "Dataset requires a NumPy array or torch.Tensor."
             )
         self._array = arr
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
@@ -208,13 +209,9 @@ class Dataset(AutoSerialize):
 
     @property
     def device(self) -> str:
-        """
-        Outputting a string is likely temporary -- once we have our use cases we can
-        figure out a more permanent device solution that enables easier translation between
-        numpy <-> torch <-> numpy, etc.
-
-        For NumPy-only datasets, this is always "cpu".
-        """
+        """Device the array lives on: ``"cpu"`` for numpy; torch device string (e.g. ``"cuda:0"``, ``"mps"``) for torch tensors."""
+        if isinstance(self._array, torch.Tensor):
+            return str(self._array.device)
         return "cpu"
 
     # --- Summaries ---
@@ -252,9 +249,11 @@ class Dataset(AutoSerialize):
             are always deep-copied. Default is True.
         """
         # Metadata arrays (origin, sampling) are numpy, use copy()
-        # Units list is copied by slicing
+        # Units list is copied by slicing. Array uses .clone() for torch, .copy() for numpy.
+        arr = self.array
+        array_copy = arr.clone() if isinstance(arr, torch.Tensor) else arr.copy()
         new_dataset = type(self).from_array(
-            array=self.array.copy(),
+            array=array_copy,
             name=self.name,
             origin=self.origin.copy(),
             sampling=self.sampling.copy(),
@@ -356,36 +355,18 @@ class Dataset(AutoSerialize):
         return self.array.mean(axis=axes)
 
     def max(self, axes: int | tuple[int, ...] | None = None) -> Any:
-        """
-        Computes and returns max of the data array.
-
-        Parameters
-        ----------
-        axes: int or tuple of ints, optional
-            Axes over which to compute max. If None specified, max of all elements is computed.
-
-        Returns
-        --------
-        maximum: scalar or array (np.ndarray)
-            Maximum of the data.
-        """
-        return self.array.max(axis=axes)
+        """Compute max of the data array. Output matches storage type (numpy / torch)."""
+        arr = self.array
+        if isinstance(arr, torch.Tensor):
+            return arr.amax(dim=axes) if axes is not None else arr.amax()
+        return arr.max(axis=axes)
 
     def min(self, axes: int | tuple[int, ...] | None = None) -> Any:
-        """
-        Computes and returns min of the data array.
-
-        Parameters
-        ----------
-        axes: int or tuple of ints, optional
-            Axes over which to compute min. If None specified, min of all elements is computed.
-
-        Returns
-        --------
-        minimum: scalar or array (np.ndarray)
-            Minimum of the data.
-        """
-        return self.array.min(axis=axes)
+        """Compute min of the data array. Output matches storage type (numpy / torch)."""
+        arr = self.array
+        if isinstance(arr, torch.Tensor):
+            return arr.amin(dim=axes) if axes is not None else arr.amin()
+        return arr.min(axis=axes)
 
     @overload
     def pad(
@@ -433,6 +414,14 @@ class Dataset(AutoSerialize):
         Dataset or None
             Padded Dataset if modify_in_place is False, otherwise None.
         """
+        if isinstance(self.array, torch.Tensor):
+            raise NotImplementedError(
+                f"Dataset.pad() does not yet support torch.Tensor storage "
+                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
+                f"Workaround: convert to numpy first with "
+                f"`dset.array = dset.array.detach().cpu().numpy()`. "
+                f"Tracked as follow-up; open a quantem issue if you need it."
+            )
         if pad_width is not None:
             if output_shape is not None:
                 raise ValueError("pad_width and output_shape cannot both be specified.")
@@ -696,7 +685,10 @@ class Dataset(AutoSerialize):
                 running_axis += 1
 
         array_view = self.array[tuple(slices)].reshape(tuple(reshape_dims))
-        array_binned = np.sum(array_view, axis=tuple(reduce_axes))
+        if isinstance(array_view, torch.Tensor):
+            array_binned = array_view.sum(dim=tuple(reduce_axes))
+        else:
+            array_binned = np.sum(array_view, axis=tuple(reduce_axes))
         if reducer_norm == "mean":
             block_volume = 1
             for fac_b in axis_to_factor.values():
@@ -760,6 +752,14 @@ class Dataset(AutoSerialize):
         Dataset or None
             A new resampled dataset if `modify_in_place` is False, otherwise None.
         """
+        if isinstance(self.array, torch.Tensor):
+            raise NotImplementedError(
+                f"Dataset.fourier_resample() does not yet support torch.Tensor storage "
+                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
+                f"Workaround: convert to numpy first with "
+                f"`dset.array = dset.array.detach().cpu().numpy()`. "
+                f"Tracked as follow-up; open a quantem issue if you need it."
+            )
         if axes is None:
             axes = tuple(range(self.ndim))
         elif isinstance(axes, int | float):

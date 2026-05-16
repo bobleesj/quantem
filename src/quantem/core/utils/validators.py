@@ -51,13 +51,16 @@ def ensure_valid_array(
     TypeError
         If the input could not be converted to a NumPy array
     """
-    is_cupy = False
-    if config.get("has_cupy"):
-        if isinstance(array, cp.ndarray):
-            is_cupy = True
-    if isinstance(array, np.ndarray) or is_cupy:
+    import torch as _torch
+    # Cupy arrays auto-convert to torch via dlpack (zero-copy, stays on GPU).
+    if config.get("has_cupy") and isinstance(array, cp.ndarray):
+        array = _torch.from_dlpack(array)
+    is_torch = isinstance(array, _torch.Tensor)
+    if is_torch:
+        validated_array = array.to(dtype) if dtype is not None else array
+    elif isinstance(array, np.ndarray):
         if dtype is not None:
-            validated_array = array.astype(dtype)  # copies the array
+            validated_array = array.astype(dtype)
         else:
             validated_array = array
     else:  # default to numpy
