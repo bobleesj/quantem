@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,51 +19,68 @@ _ORIGIN_CHUNK_BYTES = 112 * 1024 * 1024
 _FLOAT32_EXACT_INTEGER_LIMIT = 2**24
 
 
-def _mean_dp_torch_chunked(
-    array_4d: NDArray,
+def _is_torch_tensor(arr: Any) -> bool:
+    """Array is a torch tensor (any device: CPU, CUDA, MPS, ...)."""
+    return isinstance(arr, torch.Tensor)
+
+
+def _polar_step(
+    dp_f: torch.Tensor,
+    row_origins: torch.Tensor,
+    col_origins: torch.Tensor,
+    base_col_norm: torch.Tensor,
+    base_row_norm: torch.Tensor,
+    col_norm_scale: float,
+    row_norm_scale: float,
+) -> torch.Tensor:
+    """Per-batch polar-sample inner step: build the sampling grid and run
+    grid_sample. ``dp_f`` must already be float32 with shape ``(B, 1, H, W)`` so
+    the compiled variant stays pure-float and works on MPS.
+    """
+    grid_col = base_col_norm.unsqueeze(0) + (col_origins * col_norm_scale - 1.0)[:, None, None]
+    grid_row = base_row_norm.unsqueeze(0) + (row_origins * row_norm_scale - 1.0)[:, None, None]
+    grids = torch.stack([grid_col, grid_row], dim=-1)
+    return F.grid_sample(
+        dp_f, grids, mode="bilinear", padding_mode="zeros", align_corners=True
+    ).squeeze(1)
+
+
+_polar_step_compiled = torch.compile(_polar_step, mode="reduce-overhead", dynamic=False)
+
+
+def mean_dp_torch(
+    array_4d: Any,
     n_row: int,
     n_col: int,
     device: str,
     *,
     chunk_bytes: int = _MEAN_DP_CHUNK_BYTES,
 ) -> NDArray:
-    """Compute the mean DP in chunks while preserving NumPy integer-mean semantics."""
-    flat_dps = array_4d.reshape(-1, n_row, n_col)
-    n_pos = flat_dps.shape[0]
-    dtype = flat_dps.dtype
+    """Mean DP. Integer inputs use a chunked int64 accumulator; floats use ``mean()``.
 
-    if np.issubdtype(dtype, np.integer):
-        bytes_per_position = np.dtype(np.float32).itemsize * n_row * n_col
-        chunk_positions = max(1, chunk_bytes // bytes_per_position)
-        sum_dp_float = torch.zeros((n_row, n_col), dtype=torch.float32, device=device)
-        max_abs_value = torch.zeros((), dtype=torch.float32, device=device)
-        for start in range(0, n_pos, chunk_positions):
-            end = min(start + chunk_positions, n_pos)
-            chunk_t = torch.asarray(flat_dps[start:end], dtype=torch.float32, device=device)
-            sum_dp_float += chunk_t.sum(dim=0)
-            chunk_abs_max = (
-                chunk_t.abs().max() if np.issubdtype(dtype, np.signedinteger) else chunk_t.max()
-            )
-            max_abs_value = torch.maximum(max_abs_value, chunk_abs_max)
-        if float(max_abs_value.cpu().item()) * n_pos <= _FLOAT32_EXACT_INTEGER_LIMIT:
-            sum_dp_np = sum_dp_float.cpu().numpy()
-            return (sum_dp_np.astype(np.float64) / float(n_pos)).astype(np.float32)
-        del sum_dp_float
-
-        info = np.iinfo(dtype)
-        int64_info = np.iinfo(np.int64)
-        if info.min * n_pos >= int64_info.min and info.max * n_pos <= int64_info.max:
-            bytes_per_position = np.dtype(np.int64).itemsize * n_row * n_col
-            chunk_positions = max(1, chunk_bytes // bytes_per_position)
-            sum_dp = torch.zeros((n_row, n_col), dtype=torch.int64, device=device)
-            for start in range(0, n_pos, chunk_positions):
-                end = min(start + chunk_positions, n_pos)
-                chunk_t = torch.asarray(flat_dps[start:end], dtype=torch.int64, device=device)
-                sum_dp += chunk_t.sum(dim=0)
-            sum_dp_np = sum_dp.cpu().numpy()
-            return (sum_dp_np.astype(np.float64) / float(n_pos)).astype(np.float32)
-
-    return array_4d.mean(axis=(0, 1)).astype(np.float32)
+    Already-on-device torch tensors reduce in place; numpy inputs stage to ``device``
+    in int64 chunks bounded by ``chunk_bytes``.
+    """
+    if _is_torch_tensor(array_4d):
+        device = str(array_4d.device)
+    flat = array_4d.reshape(-1, n_row, n_col)
+    n_pos = flat.shape[0]
+    is_int = (
+        not flat.is_floating_point() if isinstance(flat, torch.Tensor)
+        else np.issubdtype(flat.dtype, np.integer)
+    )
+    if not is_int:
+        if isinstance(flat, torch.Tensor):
+            return flat.mean(dim=0).to(torch.float32).cpu().numpy()
+        return flat.mean(axis=0).astype(np.float32)
+    bytes_per_position = 8 * n_row * n_col
+    chunk_positions = max(1, chunk_bytes // bytes_per_position)
+    sum_t = torch.zeros((n_row, n_col), dtype=torch.int64, device=device)
+    for start in range(0, n_pos, chunk_positions):
+        end = min(start + chunk_positions, n_pos)
+        sum_t += torch.asarray(flat[start:end], dtype=torch.int64, device=device).sum(dim=0)
+    # Divide on host in float64 to keep precision; MPS lacks float64 support.
+    return (sum_t.cpu().to(torch.float64) / float(n_pos)).to(torch.float32).numpy()
 
 
 def _array_chunk_to_device_float32(chunk: NDArray, device: str) -> torch.Tensor:
@@ -75,7 +94,7 @@ def _array_chunk_to_device_float32(chunk: NDArray, device: str) -> torch.Tensor:
 
 @torch.inference_mode()
 def auto_origin_id(
-    data: Dataset4dstem,
+    data: Dataset4dstem | NDArray | torch.Tensor | Any,
     *,
     ellipse_params: tuple[float, float, float] | None = None,
     num_annular_bins: int = 180,
@@ -83,10 +102,8 @@ def auto_origin_id(
     radial_max: float | None = None,
     radial_step: float = 2.0,
     two_fold_rotation_symmetry: bool = False,
-    device: str = "cpu",
     batch_size: int = 48,
     local_margin: int = 25,
-    preload_to_device: bool = False,
     show_progress: bool = True,
 ) -> NDArray:
     """
@@ -101,8 +118,12 @@ def auto_origin_id(
 
     Parameters
     ----------
-    data : Dataset4dstem
-        A 4D-STEM dataset (or 2D wrapped as 4D)
+    data : Dataset4dstem | numpy.ndarray | torch.Tensor
+        A 4D-STEM dataset (or 2D wrapped as 4D). When ``data.array`` (or
+        the raw input) is a torch tensor, the entire computation stays
+        on that tensor's device and no host staging happens. Cupy and
+        numpy inputs are accepted via ``Dataset4dstem.from_array``,
+        which auto-converts cupy → torch (dlpack, zero-copy).
     ellipse_params : tuple or None
         Ellipse parameters (a, b, theta_deg) for distortion correction
     num_annular_bins : int
@@ -115,8 +136,6 @@ def auto_origin_id(
         Radial step size in pixels for the search polar grid
     two_fold_rotation_symmetry : bool
         If True, use only 0 to pi range for angles
-    device : str
-        Torch device for computation
     batch_size : int
         Number of scan positions evaluated per coarse-stage kernel call.
         Larger values reduce per-iteration overhead but use more memory.
@@ -127,10 +146,6 @@ def auto_origin_id(
         ``(2*local_margin+1)`` square window centered on the global
         origin. Set this large enough to cover the worst-case descan
         drift across the scan.
-    preload_to_device : bool
-        If True, copy the flattened diffraction stack to the torch device once
-        before per-scan refinement. This can reduce host/device transfer
-        overhead on MPS/CUDA at the cost of higher peak device memory use.
     show_progress : bool
         If True, show a tqdm progress bar during per-scan origin refinement.
 
@@ -140,21 +155,32 @@ def auto_origin_id(
         Array of shape (scan_row, scan_col, 2) containing (row, col) origin
         estimates in pixels.
     """
-    if len(data.array.shape) == 2:
-        n_row, n_col = data.array.shape
+    raw_array = data.array if hasattr(data, "array") else data
+    if len(raw_array.shape) == 2:
+        n_row, n_col = raw_array.shape
         scan_row, scan_col = 1, 1
-    elif len(data.array.shape) == 4:
-        scan_row, scan_col, n_row, n_col = data.array.shape
+    elif len(raw_array.shape) == 4:
+        scan_row, scan_col, n_row, n_col = raw_array.shape
     else:
         raise ValueError(
-            f" Got array with shape {data.array.shape}."
+            f" Got array with shape {raw_array.shape}."
             "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
         )
 
     origin_shape = (scan_row, scan_col, 2)
     # first get COM of mean DP because it gives a robust rough center
-    array_4d = data.array if data.array.ndim == 4 else data.array[None, None, :, :]
-    mean_dp_np = _mean_dp_torch_chunked(array_4d, n_row, n_col, device)
+    array_4d = raw_array if raw_array.ndim == 4 else raw_array[None, None, :, :]
+    if _is_torch_tensor(array_4d):
+        # Torch input: compute follows the tensor's device.
+        device = str(array_4d.device)
+    else:
+        # NumPy input → CPU torch. NumPy is a host-only container; defaulting
+        # compute to CPU keeps numerical output bit-stable with Karen's tutorial
+        # baseline. Users who want GPU compute pass a torch tensor or cupy
+        # array to ``Dataset4dstem.from_array`` instead.
+        device = "cpu"
+        array_4d = torch.from_numpy(np.ascontiguousarray(array_4d)).to(device)
+    mean_dp_np = mean_dp_torch(array_4d, n_row, n_col, device)
     total_intensity = mean_dp_np.sum()
     row_grid, col_grid = np.mgrid[0:n_row, 0:n_col]
     com_row = int(round(float((row_grid * mean_dp_np).sum() / total_intensity)))
@@ -293,11 +319,10 @@ def auto_origin_id(
     fine_drow, fine_dcol = (
         m.reshape(-1) for m in torch.meshgrid(fine_rel, fine_rel, indexing="ij")
     )
-    flat_dps = array_4d.reshape(-1, n_row, n_col)
-    flat_dps_t = None
-    if preload_to_device:
-        flat_dps_t = _array_chunk_to_device_float32(flat_dps, device)
-    n_pos = flat_dps.shape[0]
+    # Input is already a torch tensor on device (numpy callers were converted
+    # upfront). Use a native-dtype view; per-batch float32 cast is tiny.
+    flat_dps_t = array_4d.reshape(-1, n_row, n_col)
+    n_pos = flat_dps_t.shape[0]
     origin_flat_t = torch.empty((n_pos, 2), dtype=torch.int32, device=device)
     med_grid_buffer = torch.empty(
         (
@@ -369,55 +394,39 @@ def auto_origin_id(
         if show_progress
         else None
     )
-    max_transfer_chunk_bytes = _ORIGIN_CHUNK_BYTES
-    max_transfer_chunk_positions = max(
-        batch_size,
-        max_transfer_chunk_bytes // (np.dtype(np.float32).itemsize * n_row * n_col),
-    )
-    transfer_chunk_size = min(
-        n_pos,
-        max(batch_size, (max_transfer_chunk_positions // batch_size) * batch_size),
-    )
-    if flat_dps_t is not None:
-        transfer_chunk_size = n_pos
-
-    for chunk_start in range(0, n_pos, transfer_chunk_size):
-        chunk_end = min(chunk_start + transfer_chunk_size, n_pos)
-        if flat_dps_t is None:
-            chunk_t = _array_chunk_to_device_float32(flat_dps[chunk_start:chunk_end], device)
-        else:
-            chunk_t = flat_dps_t[chunk_start:chunk_end]
-
-        for start in range(chunk_start, chunk_end, batch_size):
-            end = min(start + batch_size, chunk_end)
-            bsz = end - start
-            chunk_offset = start - chunk_start
-            dp_b = chunk_t[chunk_offset : chunk_offset + bsz].unsqueeze(1)
-            # Coarse (shared grids): broadcast B DPs across n_coarse candidate
-            # grids in one grid_sample call by stacking DPs in the channel dim
-            # and stride-0 expanding along the candidate dim
-            polars_coarse = F.grid_sample(
-                dp_b.transpose(0, 1).expand(n_coarse, bsz, n_row, n_col),
-                coarse_grids,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-            scores_coarse = polars_coarse.var(dim=2, correction=1).sqrt().sum(dim=2)
-            best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
-            current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
-            # Medium: per-DP search around the coarse winner
-            current_row, current_col = refine(
-                dp_b, current_row, current_col, med_drow, med_dcol, med_grid_buffer
-            )
-            # Fine: per-DP ±1 around the medium winner
-            current_row, current_col = refine(
-                dp_b, current_row, current_col, fine_drow, fine_dcol, fine_grid_buffer
-            )
-            origin_flat_t[start:end, 0] = current_row
-            origin_flat_t[start:end, 1] = current_col
-            if pbar is not None:
-                pbar.update(bsz)
+    # Data is already on device; iterate in flat batches.
+    for start in range(0, n_pos, batch_size):
+        end = min(start + batch_size, n_pos)
+        bsz = end - start
+        dp_b = flat_dps_t[start:end]
+        if dp_b.dtype != torch.float32:
+            dp_b = dp_b.to(torch.float32)
+        dp_b = dp_b.unsqueeze(1)
+        # Coarse (shared grids): broadcast B DPs across n_coarse candidate
+        # grids in one grid_sample call by stacking DPs in the channel dim
+        # and stride-0 expanding along the candidate dim
+        polars_coarse = F.grid_sample(
+            dp_b.transpose(0, 1).expand(n_coarse, bsz, n_row, n_col),
+            coarse_grids,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        scores_coarse = polars_coarse.var(dim=2, correction=1).sqrt().sum(dim=2)
+        best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
+        current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
+        # Medium: per-DP search around the coarse winner
+        current_row, current_col = refine(
+            dp_b, current_row, current_col, med_drow, med_dcol, med_grid_buffer
+        )
+        # Fine: per-DP ±1 around the medium winner
+        current_row, current_col = refine(
+            dp_b, current_row, current_col, fine_drow, fine_dcol, fine_grid_buffer
+        )
+        origin_flat_t[start:end, 0] = current_row
+        origin_flat_t[start:end, 1] = current_col
+        if pbar is not None:
+            pbar.update(bsz)
     if pbar is not None:
         pbar.close()
     return origin_flat_t.cpu().numpy().astype(float, copy=False).reshape(origin_shape)
@@ -435,15 +444,41 @@ def polar_transform(
     name: str | None = None,
     signal_units: str | None = None,
     scan_pos: tuple[int, int] | None = None,
-    device: str = "cpu",
-    batch_size: int = 128,
+    batch_size: int = 1024,
 ) -> Polar4dstem | torch.Tensor:
-    if data.array.ndim != 4:
+    """Re-sample each diffraction pattern onto a polar grid centered on ``origin_array``.
+
+    Parameters
+    ----------
+    data : Dataset4dstem | numpy.ndarray | torch.Tensor
+        4D-STEM dataset (or raw 4D array). Torch-backed ``data.array``
+        stays on its tensor's device; cupy is converted zero-copy to
+        torch in ``Dataset4dstem.from_array``. NumPy-backed data is
+        uploaded to CPU torch for bit-stable parity with the legacy
+        numpy baseline.
+    origin_array : ndarray | torch.Tensor | None
+        Per-scan origin in pixel coordinates, shape ``(scan_row, scan_col, 2)``,
+        ``(2,)`` for a broadcast, or None for image center.
+    batch_size : int
+        Scan positions per ``grid_sample`` call. The compiled fast path fires
+        on shape-stable full batches.
+    """
+    raw_array = data.array if hasattr(data, "array") else data
+    if raw_array.ndim != 4:
         raise ValueError(
-            f"Found array with shape: {data.array.shape}. "
+            f"Found array with shape: {raw_array.shape}. "
             "polar_transform requires a 4D-STEM dataset (ndim=4)."
         )
-    scan_row, scan_col, n_row, n_col = data.array.shape
+    scan_row, scan_col, n_row, n_col = raw_array.shape
+    input_is_numpy = not _is_torch_tensor(raw_array)
+    if input_is_numpy:
+        # NumPy input → CPU torch. Keeps output bit-stable with the numpy baseline.
+        # Users opt into GPU by passing a torch / cupy array into
+        # ``Dataset4dstem.from_array``.
+        device = "cpu"
+        raw_array = torch.from_numpy(np.ascontiguousarray(raw_array)).to(device)
+    else:
+        device = str(raw_array.device)
 
     # Standardize origin_array input
     if isinstance(origin_array, torch.Tensor):
@@ -466,7 +501,7 @@ def polar_transform(
     # If scan_pos is provided, compute polar transform only for that position
     if scan_pos is not None:
         i_row, i_col = scan_pos
-        dp = torch.from_numpy(data.array[i_row, i_col].astype(np.float32)).to(device)
+        dp = raw_array[i_row, i_col].to(torch.float32)
         r0 = float(origins[i_row, i_col, 0])
         c0 = float(origins[i_row, i_col, 1])
         # Clamp radial range to image bounds for this origin
@@ -532,36 +567,55 @@ def polar_transform(
 
     # Flatten scan dims so we can iterate in flat batches
     n_pos = scan_row * scan_col
-    dp_view = data.array.reshape(n_pos, n_row, n_col)
+    dp_view = raw_array.reshape(n_pos, n_row, n_col)
     origins_t = torch.from_numpy(
         np.ascontiguousarray(origins.reshape(n_pos, 2), dtype=np.float32)
     ).to(device)
 
-    out = np.empty((n_pos, n_phi, n_r), dtype=np.float32)
+    out_t = torch.empty((n_pos, n_phi, n_r), dtype=torch.float32, device=device)
+    # The compile cache only pays off when launch overhead is the bottleneck;
+    # use it on accelerator backends, run eager on CPU.
+    step_fn = _polar_step_compiled if dp_view.device.type != "cpu" else _polar_step
     for start in tqdm(range(0, n_pos, batch_size), desc="Polar transform"):
         end = min(start + batch_size, n_pos)
-        # Translate the precomputed offsets to each origin in this batch
+        bsz = end - start
         row_origins = origins_t[start:end, 0]
         col_origins = origins_t[start:end, 1]
-        grid_col = base_col_norm.unsqueeze(0) + (col_origins * col_norm_scale - 1.0)[:, None, None]
-        grid_row = base_row_norm.unsqueeze(0) + (row_origins * row_norm_scale - 1.0)[:, None, None]
-        # grid_sample requires (col, row) ordering in the last dim
-        grids = torch.stack([grid_col, grid_row], dim=-1)
 
-        dp_batch = torch.from_numpy(np.ascontiguousarray(dp_view[start:end], dtype=np.float32)).to(
-            device
-        )
-        polars = F.grid_sample(
-            dp_batch.unsqueeze(1),
-            grids,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        out[start:end] = to_numpy(polars.squeeze(1))
-    out = out.reshape(scan_row, scan_col, n_phi, n_r)
+        if bsz == batch_size:
+            # Fast path: shape-stable batches reuse the cached compile.
+            dp_f = dp_view[start:end].to(torch.float32).unsqueeze(1)
+            out_t[start:end] = step_fn(
+                dp_f,
+                row_origins,
+                col_origins,
+                base_col_norm,
+                base_row_norm,
+                col_norm_scale,
+                row_norm_scale,
+            )
+        else:
+            # Last partial batch: skip the compile cache (different shape).
+            grid_col = (
+                base_col_norm.unsqueeze(0) + (col_origins * col_norm_scale - 1.0)[:, None, None]
+            )
+            grid_row = (
+                base_row_norm.unsqueeze(0) + (row_origins * row_norm_scale - 1.0)[:, None, None]
+            )
+            grids = torch.stack([grid_col, grid_row], dim=-1)
+            dp_batch = dp_view[start:end]
+            if dp_batch.dtype != torch.float32:
+                dp_batch = dp_batch.to(torch.float32)
+            polars = F.grid_sample(
+                dp_batch.unsqueeze(1),
+                grids,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            out_t[start:end] = polars.squeeze(1)
 
-    # Get polar axes in physical units matching the input dataset's calibration
+    # Build the shared metadata (works regardless of array backend)
     phi_range = np.pi if two_fold_rotation_symmetry else 2.0 * np.pi
     phi_step_deg = (phi_range / float(n_phi)) * (180.0 / np.pi)
     sampling = np.zeros(4, dtype=float)
@@ -572,13 +626,8 @@ def polar_transform(
     origin[0:2] = np.asarray(data.origin)[0:2]
     origin[2] = 0.0
     origin[3] = radial_min * float(np.asarray(data.sampling)[-1])
-    units = [
-        data.units[0],
-        data.units[1],
-        "deg",
-        data.units[-1],
-    ]
-    metadata = dict(data.metadata)
+    units = [data.units[0], data.units[1], "deg", data.units[-1]]
+    metadata = dict(getattr(data, "metadata", {}))
     metadata.update(
         {
             "polar_radial_min": float(radial_min),
@@ -589,17 +638,36 @@ def polar_transform(
             "polar_ellipticity": tuple(ellipse_params) if ellipse_params is not None else None,
         }
     )
-    return Polar4dstem(
-        array=out,
-        name=name if name is not None else f"{data.name}_polar",
-        origin=origin,
-        sampling=sampling,
-        units=units,
-        signal_units=signal_units if signal_units is not None else data.signal_units,
-        metadata=metadata,
-        origin_array=origins,
-        _token=Polar4dstem._token,
-    )
+
+    out_t = out_t.reshape(scan_row, scan_col, n_phi, n_r)
+    if input_is_numpy:
+        # Caller passed numpy; return a regular Polar4dstem with numpy backing.
+        return Polar4dstem(
+            array=out_t.cpu().numpy(),
+            name=name if name is not None else f"{data.name}_polar",
+            origin=origin,
+            sampling=sampling,
+            units=units,
+            signal_units=signal_units if signal_units is not None else data.signal_units,
+            metadata=metadata,
+            origin_array=origins,
+            _token=Polar4dstem._token,
+        )
+
+    # Real-time path: keep the polar tensor on device. Construct Polar4dstem
+    # directly via __new__ because Dataset.from_array rejects non-numpy.
+    # ``_array`` is the Polar4dstem/Dataset internal storage attribute.
+    result = Polar4dstem.__new__(Polar4dstem)
+    result._array = out_t
+    result._name = name if name is not None else f"{data.name}_polar"
+    result._origin = origin
+    result._sampling = sampling
+    result._units = units
+    result._signal_units = signal_units if signal_units is not None else data.signal_units
+    result._metadata = metadata
+    result._file_path = None
+    result.origin_array = origins
+    return result
 
 
 def _polar_to_cartesian_offsets(

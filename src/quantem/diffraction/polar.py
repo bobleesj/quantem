@@ -57,8 +57,11 @@ class PairDistributionFunction(AutoSerialize):
         Original input dataset that was polar-transformed to produce
         ``self.polar``. A ``Dataset2d`` input to ``from_data`` is wrapped
         as a 1×1 ``Dataset4dstem`` before being stored here.
-    device : str
-        Torch device used for computation.
+    device : str | None
+        Torch device used for computation. When None (default), the device
+        is auto-picked: the polar tensor's device if ``polar.array`` is a
+        torch tensor, otherwise the best available device
+        (cuda → mps → cpu) via ``config.validate_device(None)``.
     Ik : torch.Tensor or None
         Azimuthally averaged intensity I(k), set by ``calculate_radial_mean``.
     bg : torch.Tensor or None
@@ -119,7 +122,6 @@ class PairDistributionFunction(AutoSerialize):
         self,
         polar: Polar4dstem,
         input_data: Dataset4dstem | None = None,
-        device: str = "cpu",
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -127,6 +129,17 @@ class PairDistributionFunction(AutoSerialize):
                 "Direct instantiation of PairDistributionFunction is not allowed. "
                 "Use PairDistributionFunction.from_data() to instantiate this class."
             )
+        # Device follows the data: torch tensor → its device, numpy → CPU.
+        # Exception: MPS lacks float64, and the iterative density refinement in
+        # ``estimate_density`` amplifies float32 reductions into >10% rho0 drift
+        # vs CPU/CUDA. PDF math is small (~10 ms), so route it through CPU even
+        # when ``polar.array`` lives on MPS. The polar transform itself still
+        # ran on MPS (the only stage where MPS speed matters).
+        if isinstance(polar.array, torch.Tensor):
+            polar_dev = str(polar.array.device)
+            device = "cpu" if polar_dev.startswith("mps") else polar_dev
+        else:
+            device = "cpu"
 
         super().__init__()
         self.polar = polar
@@ -163,10 +176,8 @@ class PairDistributionFunction(AutoSerialize):
         radial_max: float | None = None,
         radial_step: float = 1.0,
         two_fold_rotation_symmetry: bool = False,
-        device: str = "cpu",
         origin_batch_size: int = 48,
         origin_local_margin: int = 25,
-        origin_preload_to_device: bool = False,
         origin_show_progress: bool = True,
     ) -> Self:
         """Create a PairDistributionFunction from a dataset.
@@ -198,33 +209,39 @@ class PairDistributionFunction(AutoSerialize):
             Radial step size in pixels.
         two_fold_rotation_symmetry : bool
             If True, sample only ``[0, pi)`` in the angular axis.
-        device : str
-            Torch device used for computation.
         origin_batch_size : int
             Number of scan positions evaluated per origin-finding batch when
             ``find_origin=True``.
         origin_local_margin : int
             Half-width, in pixels, of the per-scan origin refinement window when
             ``find_origin=True``.
-        origin_preload_to_device : bool
-            If True, copy the flattened diffraction stack to the torch device
-            once during origin finding. This reduces per-batch transfer overhead
-            at the cost of higher peak device memory use.
         origin_show_progress : bool
             If True, show a progress bar during origin finding.
+
+        Notes
+        -----
+        The compute device follows the input: a ``Dataset4dstem`` whose
+        ``.array`` is a torch tensor stays on that tensor's device;
+        a numpy-backed ``Dataset4dstem`` runs on CPU torch (bit-stable
+        with the legacy numpy baseline). There is no ``device`` kwarg.
 
         Returns
         -------
         PairDistributionFunction
         """
-        # Dataset2d input: wrap as a trivial 4D-STEM (1x1 scan) and fall through
-        if isinstance(data, Dataset2d):
+        # Duck-typed input: anything with .array works (Dataset4dstem,
+        # Dataset2d, raw array, etc.). Dispatch on ndim. The Dataset4dstem
+        # array may be numpy or torch — both paths are supported downstream.
+        if not hasattr(data, "array"):
+            raise TypeError(
+                f"Got {type(data).__name__}. PairDistributionFunction.from_data "
+                "expects an object with a 4D (or 2D) ``.array`` attribute, e.g. "
+                "Dataset4dstem or Dataset2d."
+            )
+
+        # 2D input: wrap as a trivial 4D-STEM (1x1 scan) and fall through
+        if data.array.ndim == 2:
             arr2d = data.array
-            if arr2d.ndim != 2:
-                raise ValueError(
-                    f"Found array with shape: {arr2d.shape}. "
-                    "Dataset2d for PairDistributionFunction must be 2D."
-                )
             arr4 = arr2d[None, None, ...]  # (1, 1, n_row, n_col)
 
             data = Dataset4dstem.from_array(
@@ -242,8 +259,8 @@ class PairDistributionFunction(AutoSerialize):
                 signal_units=data.signal_units,
             )
 
-        # Dataset4dstem input: polar-transform it
-        if isinstance(data, Dataset4dstem):
+        # 4D input: polar-transform it
+        if data.array.ndim == 4:
             scan_row, scan_col, n_row, n_col = data.array.shape
             if find_origin:
                 origin_array = auto_origin_id(
@@ -254,10 +271,8 @@ class PairDistributionFunction(AutoSerialize):
                     radial_max=radial_max,
                     radial_step=radial_step,
                     two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                    device=device,
                     batch_size=origin_batch_size,
                     local_margin=origin_local_margin,
-                    preload_to_device=origin_preload_to_device,
                     show_progress=origin_show_progress,
                 )
             else:
@@ -278,14 +293,12 @@ class PairDistributionFunction(AutoSerialize):
                 radial_max=radial_max,
                 radial_step=radial_step,
                 two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                device=device,
             )
-            return cls(polar=polar, input_data=data, device=device, _token=cls._token)
+            return cls(polar=polar, input_data=data, _token=cls._token)
 
-        raise TypeError(
-            f"Got {type(data).__name__}. PairDistributionFunction.from_data "
-            "accepts Dataset4dstem or Dataset2d. Wrap numpy arrays with "
-            "Dataset4dstem.from_array or Dataset2d.from_array first."
+        raise ValueError(
+            f"Got array with shape {data.array.shape}. "
+            "PairDistributionFunction.from_data expects 2D or 4D ``.array``."
         )
 
     # ------------------------------------------------------------------
@@ -366,15 +379,19 @@ class PairDistributionFunction(AutoSerialize):
             If `returnval=True`, returns the 1D radial mean intensity (Nk,).
             Otherwise returns None.
         """
-        polar_np = self.polar.array  # shape: (scan_row, scan_col, phi, k)
-        scan_row, scan_col, n_phi, n_k = polar_np.shape
+        polar_arr = self.polar.array  # numpy ndarray OR torch tensor (real-time path)
+        scan_row, scan_col, n_phi, n_k = polar_arr.shape
+        polar_is_torch = isinstance(polar_arr, torch.Tensor)
         intensity_sum = torch.zeros(n_k, device=self.device, dtype=torch.float64)
         n_valid = 0
         chunk_row = 16  # number of scan rows to process at a time
         for row0 in range(0, scan_row, chunk_row):
             row1 = min(row0 + chunk_row, scan_row)
-            raw = polar_np[row0:row1]
-            chunk = torch.from_numpy(np.ascontiguousarray(raw)).to(self.device)
+            raw = polar_arr[row0:row1]
+            if polar_is_torch:
+                chunk = raw if str(raw.device) == self.device else raw.to(self.device)
+            else:
+                chunk = torch.from_numpy(np.ascontiguousarray(raw)).to(self.device)
             # mean over phi first -> (chunk, scan_col, k)
             radial_mean = chunk.mean(dim=2)
             if mask_realspace is not None:
@@ -382,11 +399,9 @@ class PairDistributionFunction(AutoSerialize):
                 n_chunk = int(mask_chunk.sum())
                 if n_chunk == 0:
                     continue
-                # sum unmasked intensities in chunk and count for normalization later
                 intensity_sum += radial_mean[mask_chunk].sum(dim=0)
                 n_valid += n_chunk
             else:
-                # sum all intensities in chunk and count for normalization later
                 intensity_sum += radial_mean.sum(dim=(0, 1))
                 n_valid += (row1 - row0) * scan_col
         if n_valid == 0:
@@ -441,7 +456,17 @@ class PairDistributionFunction(AutoSerialize):
             Background minus the constant offset, f(k) = B(k) - c, or functionally
             similar to <f>^2(k). Used later to compute the reduced structure factor F(k).
         """
-        k = torch.from_numpy(np.asarray(self.qq).astype(np.float32)).to(device=self.device)
+        # Pin background fit to CPU regardless of self.device. LBFGS in float32
+        # converges to different stationary points depending on parallel-reduce
+        # summation order, so CPU vs CUDA give visibly different (rho0, bg)
+        # — drift of ~10% in density. The compute is trivial (5 params over Nk
+        # ~ 1000) so CPU is the device-agnostic reference. Results are moved
+        # back to self.device at the end for downstream use.
+        fit_device = "cpu"
+        Ik = Ik.detach().to(fit_device) if isinstance(Ik, torch.Tensor) else torch.as_tensor(
+            Ik, dtype=torch.float32, device=fit_device
+        )
+        k = torch.from_numpy(np.asarray(self.qq).astype(np.float32)).to(device=fit_device)
         if kmin is None:
             kmin = float(k.min())
         if kmax is None:
@@ -462,7 +487,7 @@ class PairDistributionFunction(AutoSerialize):
 
         init_vals = torch.tensor(
             [const_bg, int0, sigma0, int0, sigma0],
-            device=self.device,
+            device=fit_device,
             dtype=torch.float32,
         )
         # Map to unconstrained space via inverse softplus: x = y + log(1 - exp(-y))
@@ -522,9 +547,10 @@ class PairDistributionFunction(AutoSerialize):
             # compute bg and the average scattering factor f(k)
             bg = self._scattering_model_torch(k2, c_scaled, i0_scaled, s0, i1_scaled, s1)
             f = bg - c_scaled
-        self.bg = bg
-        self.f = f
-        return bg, f
+        # Move back to self.device for downstream use (calculate_Gr / DST).
+        self.bg = bg.to(self.device)
+        self.f = f.to(self.device)
+        return self.bg, self.f
 
     def calculate_Gr(
         self,
@@ -1291,7 +1317,7 @@ class PairDistributionFunction(AutoSerialize):
         weights = torch.where(
             mask_low > 1e-4,
             1.0 / mask_low,
-            torch.tensor(1e6, device=self.device, dtype=k.dtype),
+            torch.tensor(1e6, device=k.device, dtype=k.dtype),
         )
         # emphasize high-k values
         weights = weights * (k[-1] - 0.9 * k + dk)

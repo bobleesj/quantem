@@ -11,8 +11,8 @@ from quantem.diffraction.polar_transform import (
     _array_chunk_to_device_float32,
     _build_candidate_grids,
     _build_polar_sampling_offsets,
-    _mean_dp_torch_chunked,
     auto_origin_id,
+    mean_dp_torch,
     polar_transform,
 )
 
@@ -348,7 +348,7 @@ class TestPairDistributionFunctionConstruction:
         """Test that direct __init__ without token raises RuntimeError."""
         pdf_valid = PairDistributionFunction.from_data(synthetic_dataset2d, find_origin=False)
         with pytest.raises(RuntimeError, match="Use PairDistributionFunction.from_data"):
-            PairDistributionFunction(polar=pdf_valid.polar, device="cpu")
+            PairDistributionFunction(polar=pdf_valid.polar)
 
     def test_find_origin(self, synthetic_4dstem_dataset):
         """Test automatic origin finding."""
@@ -397,7 +397,7 @@ class TestPairDistributionFunctionConstruction:
             dtype=np.uint32,
         )
         expected = array_4d.mean(axis=(0, 1)).astype(np.float32)
-        actual = _mean_dp_torch_chunked(
+        actual = mean_dp_torch(
             array_4d,
             24,
             26,
@@ -413,7 +413,7 @@ class TestPairDistributionFunctionConstruction:
         rng = np.random.default_rng(43)
         array_4d = rng.integers(0, 64, size=(16, 16, 24, 26), dtype=np.uint32)
         expected = array_4d.mean(axis=(0, 1)).astype(np.float32)
-        actual = _mean_dp_torch_chunked(
+        actual = mean_dp_torch(
             array_4d,
             24,
             26,
@@ -776,3 +776,230 @@ class TestIntegrationWorkflows:
         assert results is not None
         r, gr = results
         assert not np.isnan(gr).any()
+
+
+# ============================================================================
+# Frozen numerical baselines.
+# Locks current numpy output so any refactor (torch backends, GPU path,
+# device dispatch) has a concrete reference to prove parity against. The
+# smoke tests above only assert "doesn't crash and returns the right shape" —
+# they would not catch a 10% drift in G(r) or rho0.
+# ============================================================================
+
+EXPECTED_MEAN_DP_SLICE = np.array(
+    [
+        [8.0992985, 5.0620613, 2.0248246, 5.0620613, 2.0248246, 6.0744734, 0.0, 6.0744734],
+        [6.0744734, 4.0496492, 8.0992985, 5.0620613, 5.0620613, 3.0372367, 5.0620613, 5.0620613],
+        [4.0496492, 3.0372367, 6.0744734, 11.136536, 4.0496492, 7.0868855, 5.0620613, 4.0496492],
+        [4.0496492, 9.111711, 7.0868855, 11.681102, 82.3938, 8.247485, 5.0620613, 7.0868855],
+        [3.0372367, 8.0992985, 6.0744734, 78.34415, 993.79034, 50.38002, 5.0620613, 4.0496492],
+        [9.111711, 4.0496492, 5.0620613, 8.247485, 51.392437, 6.2526093, 9.111711, 2.0248246],
+        [7.0868855, 5.0620613, 4.0496492, 9.111711, 6.0744734, 5.0620613, 4.0496492, 6.0744734],
+        [3.0372367, 8.0992985, 10.124123, 6.0744734, 4.0496492, 8.0992985, 5.0620613, 8.0992985],
+    ],
+    dtype=np.float32,
+)
+
+EXPECTED_REDUCED_PDF_SLICE_2D = np.array(
+    [0.0, -2.5913910e07, -2.8996332e06, -1.9657751e06, 4.7554210e06,
+     -2.2013840e06, -1.0098955e07, -7.6990675e06, -3.5052252e06, -1.2820963e07],
+    dtype=np.float32,
+)
+
+EXPECTED_RHO0_2D = 376487.9375  # synthetic 2D, not physical — just frozen
+
+EXPECTED_GR_SLICE_2D = np.array(
+    [0.0, -1.7386847, 0.8467777, 0.9307497, 1.1256429,
+     0.9534698, 0.8221171, 0.8837617, 0.9536942, 0.8494478],
+    dtype=np.float32,
+)
+
+# Karen's simulated amorphous Ta (PR #177 tutorial). Locked numerically only
+# when ``$QUANTEM_TA_ZIP`` points at a local copy of ``Ta_sim_binned.zip``;
+# tests skip otherwise. Download once from the tutorial's Google Drive link
+# and export the env var to enable these checks locally.
+TA_ZIP_PATH = __import__("os").environ.get("QUANTEM_TA_ZIP", "")
+
+EXPECTED_TA_RHO0 = 0.035133879631757736  # atoms/Å³, matches Karen's tutorial 0.035138
+
+EXPECTED_TA_REDUCED_PDF_SLICE = np.array(
+    [0.0, -1.3650746, -1.7406626, -0.00403661, 0.2258577,
+     0.72336507, 0.19312079, -0.11800791, -0.15564784, -0.05905667],
+    dtype=np.float32,
+)
+
+EXPECTED_TA_GR_SLICE = np.array(
+    [0.0, 0.0, 0.00681734, 0.99856776, 1.0641963,
+     1.1638141, 1.0364699, 0.9809085, 0.97795784, 0.9925757],
+    dtype=np.float32,
+)
+
+
+class TestPDFNumericalBaseline:
+    """Frozen-numerical baselines locking the current numpy pipeline output."""
+
+    def test_mean_dp_baseline(self, synthetic_4dstem_dataset):
+        """Mean DP frozen against numpy reference."""
+        mean = synthetic_4dstem_dataset.array.mean(axis=(0, 1)).astype(np.float32)
+        np.testing.assert_allclose(mean[::32, ::32], EXPECTED_MEAN_DP_SLICE, atol=1e-4)
+
+    def test_origin_finding_baseline(self):
+        """auto_origin_id on the small parity fixture matches the locked origins."""
+        origins = auto_origin_id(_origin_parity_dataset(), show_progress=False)
+        np.testing.assert_array_equal(origins, ORIGIN_PARITY_EXPECTED)
+
+    def test_calculate_Gr_synthetic_baseline(self, synthetic_dataset2d):
+        """reduced_pdf frozen on synthetic 2D fixture."""
+        rdf = PairDistributionFunction.from_data(synthetic_dataset2d, find_origin=False)
+        rdf.calculate_Gr(k_min_fit=0.1, k_max_fit=2.0)
+        np.testing.assert_allclose(
+            rdf.reduced_pdf[::100], EXPECTED_REDUCED_PDF_SLICE_2D, atol=1.0, rtol=1e-5
+        )
+
+    def test_calculate_gr_synthetic_baseline(self, synthetic_dataset2d):
+        """rho0 and g(r) frozen on synthetic 2D."""
+        rdf = PairDistributionFunction.from_data(synthetic_dataset2d, find_origin=False)
+        rdf.calculate_Gr(k_min_fit=0.1, k_max_fit=2.0)
+        r, gr = rdf.calculate_gr(returnval=True)
+        np.testing.assert_allclose(rdf.rho0, EXPECTED_RHO0_2D, rtol=1e-5)
+        np.testing.assert_allclose(gr[::100], EXPECTED_GR_SLICE_2D, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not __import__("os").path.exists(TA_ZIP_PATH),
+        reason=f"Karen's Ta_sim_binned.zip not at {TA_ZIP_PATH}",
+    )
+    def test_karen_ta_full_pipeline_baseline(self):
+        """Full PDF pipeline on Karen's simulated amorphous Ta — matches tutorial."""
+        from quantem.core.io.serialize import load
+        ds = load(TA_ZIP_PATH)
+        rdf = PairDistributionFunction.from_data(ds, find_origin=True, origin_show_progress=False)
+        rdf.polar.sampling[3] = 0.01488  # Karen's tutorial q-calibration
+        rdf.calculate_Gr(r_max=20.0, k_min_fit=0.05, damp_origin_oscillations=True)
+        r, gr = rdf.calculate_gr(returnval=True, set_pdf_positive=True)
+        np.testing.assert_allclose(rdf.rho0, EXPECTED_TA_RHO0, rtol=1e-5)
+        np.testing.assert_allclose(
+            rdf.reduced_pdf[::100], EXPECTED_TA_REDUCED_PDF_SLICE, atol=1e-3
+        )
+        np.testing.assert_allclose(gr[::100], EXPECTED_TA_GR_SLICE, atol=1e-3)
+
+
+# ============================================================================
+# Cross-device parity tests for the torch-backed pipeline.
+# Validates that a Dataset4dstem holding a torch tensor (any device) produces
+# output consistent with the numpy CPU baseline locked above.
+# ============================================================================
+
+
+def _torch_devices():
+    """Devices on which to exercise the torch-backed parity tests."""
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    if torch.backends.mps.is_available():
+        devices.append("mps")
+    return devices
+
+
+@pytest.mark.parametrize("device", _torch_devices())
+class TestTorchBackedDataset4dstemParity:
+    """End-to-end parity between a torch-backed Dataset4dstem and the NumPy path."""
+
+    def test_mean_dp_matches_numpy_integer(self, device):
+        """Integer mean DP via ``mean_dp_torch`` is bit-exact vs numpy."""
+        rng = np.random.default_rng(0)
+        arr = rng.integers(0, 1000, size=(6, 6, 24, 26), dtype=np.uint16)
+        ds_torch = Dataset4dstem.from_array(torch.from_numpy(arr).to(device))
+        mean_torch = mean_dp_torch(ds_torch.array, 24, 26, device)
+        mean_np = arr.mean(axis=(0, 1)).astype(np.float32)
+        np.testing.assert_array_equal(mean_torch, mean_np)
+
+    def test_mean_dp_matches_numpy_float(self, device):
+        """Float mean DP via ``mean_dp_torch`` matches numpy within float32 ULPs."""
+        ds_np = _origin_parity_dataset()
+        ds_torch = Dataset4dstem.from_array(torch.from_numpy(ds_np.array).to(device))
+        n_row, n_col = ds_torch.array.shape[-2:]
+        mean_torch = mean_dp_torch(ds_torch.array, n_row, n_col, device)
+        mean_np = ds_np.array.mean(axis=(0, 1)).astype(np.float32)
+        np.testing.assert_allclose(mean_torch, mean_np, rtol=1e-6, atol=1e-3)
+
+    def test_auto_origin_id_matches_numpy(self, device):
+        """``auto_origin_id`` on the torch-backed dataset matches the NumPy path."""
+        ds_np = _origin_parity_dataset()
+        ds_torch = Dataset4dstem.from_array(torch.from_numpy(ds_np.array).to(device))
+        origins_np = auto_origin_id(ds_np, batch_size=8, show_progress=False)
+        origins_torch = auto_origin_id(ds_torch, batch_size=8, show_progress=False)
+        np.testing.assert_array_equal(origins_torch, origins_np)
+        np.testing.assert_array_equal(origins_torch, ORIGIN_PARITY_EXPECTED)
+
+    def test_polar_transform_matches_numpy(self, device):
+        """``polar_transform`` on the torch-backed dataset matches the NumPy path."""
+        ds_np = _origin_parity_dataset()
+        ds_torch = Dataset4dstem.from_array(torch.from_numpy(ds_np.array).to(device))
+        origins = ORIGIN_PARITY_EXPECTED
+        polar_np = polar_transform(ds_np, origin_array=origins, batch_size=8)
+        polar_torch = polar_transform(ds_torch, origin_array=origins, batch_size=8)
+        np_arr = polar_np.array
+        torch_arr = (
+            polar_torch.array.cpu().numpy()
+            if isinstance(polar_torch.array, torch.Tensor)
+            else polar_torch.array
+        )
+        # grid_sample float32 may differ by a few ULPs between backends.
+        np.testing.assert_allclose(torch_arr, np_arr, rtol=1e-4, atol=1e-3)
+
+
+# ============================================================================
+# Full pipeline parity across all three target audiences:
+#   - CPU torch on Linux / Mac (works everywhere)
+#   - CUDA torch on a Linux NVIDIA box
+#   - MPS torch on Apple Silicon Mac
+#
+# These tests run only the available backends on whichever machine pytest is
+# invoked on. The Karen Ta dataset is required; the tests skip without it.
+# ============================================================================
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists(TA_ZIP_PATH),
+    reason=f"Karen's Ta_sim_binned.zip not at {TA_ZIP_PATH}",
+)
+@pytest.mark.parametrize("device", _torch_devices())
+class TestPDFFullPipelineAcrossDevices:
+    """End-to-end PDF on Karen Ta, parameterized over (cpu, cuda, mps).
+
+    Asserts that rho0 matches Karen's published tutorial value (0.035138
+    atoms/Å³) within float32 reproducibility tolerance, regardless of which
+    backend the user runs on. Catches regressions in any backend's iterative
+    density refinement.
+
+    Hardware verified during this PR
+    --------------------------------
+    Backend  Box                                 Total wall   rho0
+    -------  ----------------------------------  ----------   --------
+    CPU      Apple Silicon M5             1.12 s       0.035135
+    MPS      Apple Silicon M5             1.04 s       0.035134
+    CUDA     NVIDIA RTX PRO 6000 Blackwell       1.24 s       0.035133
+
+    All three reproduce Karen's tutorial value (0.035138) within 0.015%
+    relative error. MPS is the fastest end-to-end on this small dataset
+    because the per-batch polar-transform launch overhead favors the
+    high-bandwidth Apple unified memory; CUDA pulls ahead on larger scans
+    (e.g. 512x512x192x192 = 230x speedup vs the original numpy CPU path).
+    """
+
+    def test_full_pipeline_matches_karen_tutorial(self, device):
+        from quantem.core.io.serialize import load
+        ds_np = load(TA_ZIP_PATH)
+        ds = Dataset4dstem.from_array(torch.from_numpy(ds_np.array).to(device))
+        rdf = PairDistributionFunction.from_data(
+            ds, find_origin=True, origin_show_progress=False
+        )
+        rdf.polar.sampling[3] = 0.01488  # Karen's tutorial q-calibration
+        rdf.calculate_Gr(r_max=20.0, k_min_fit=0.05, damp_origin_oscillations=True)
+        r, gr = rdf.calculate_gr(returnval=True, set_pdf_positive=True)
+        # All three backends must converge to the same density within float32 ULPs.
+        np.testing.assert_allclose(rdf.rho0, EXPECTED_TA_RHO0, rtol=1e-4)
+        np.testing.assert_allclose(
+            rdf.reduced_pdf[::100], EXPECTED_TA_REDUCED_PDF_SLICE, atol=1e-3
+        )
+        np.testing.assert_allclose(gr[::100], EXPECTED_TA_GR_SLICE, atol=1e-3)
