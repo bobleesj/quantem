@@ -304,12 +304,8 @@ class Dataset4dstem(Dataset4d):
         """
         if isinstance(self.array, torch.Tensor):
             raise NotImplementedError(
-                f"Dataset4dstem.get_dp_median() does not yet support torch.Tensor storage "
-                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
-                f"torch.median has different tie-breaking than numpy. "
-                f"Workaround: convert to numpy first with "
-                f"`dset.array = dset.array.detach().cpu().numpy()`. "
-                f"Tracked as follow-up; open a quantem issue if you need it."
+                f"Dataset4dstem.get_dp_median() not implemented for torch (device={self.device}). "
+                f"Convert first: `dset.array = dset.array.detach().cpu().numpy()`."
             )
         dp_median = np.median(self.array, axis=(0, 1))
 
@@ -368,11 +364,8 @@ class Dataset4dstem(Dataset4d):
         """
         if isinstance(self.array, torch.Tensor):
             raise NotImplementedError(
-                f"Dataset4dstem.get_virtual_image() does not yet support torch.Tensor storage "
-                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
-                f"Workaround: convert to numpy first with "
-                f"`dset.array = dset.array.detach().cpu().numpy()`. "
-                f"Tracked as follow-up; open a quantem issue if you need it."
+                f"Dataset4dstem.get_virtual_image() not implemented for torch (device={self.device}). "
+                f"Convert first: `dset.array = dset.array.detach().cpu().numpy()`."
             )
         if mask is not None:
             # Use provided mask
@@ -739,12 +732,8 @@ class Dataset4dstem(Dataset4d):
         """
         if isinstance(self.array, torch.Tensor):
             raise NotImplementedError(
-                f"Dataset4dstem.median_filter_masked_pixels() does not yet support torch.Tensor storage "
-                f"(got tensor on {self.device}, shape {tuple(self.shape)}). "
-                f"torch.median has different tie-breaking than numpy. "
-                f"Workaround: convert to numpy first with "
-                f"`dset.array = dset.array.detach().cpu().numpy()`. "
-                f"Tracked as follow-up; open a quantem issue if you need it."
+                f"Dataset4dstem.median_filter_masked_pixels() not implemented for torch (device={self.device}). "
+                f"Convert first: `dset.array = dset.array.detach().cpu().numpy()`."
             )
         if kernel_width % 2 == 0:
             width_max = kernel_width // 2
