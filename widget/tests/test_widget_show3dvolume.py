@@ -321,7 +321,7 @@ def test_show3dvolume_z_stretch_clamp_max():
     vol = np.random.rand(4, 4, 4).astype(np.float32)
     w = Show3DVolume(vol)
     w.z_stretch = 100
-    assert w.z_stretch == pytest.approx(16.0)
+    assert w.z_stretch == pytest.approx(30.0)
 
 
 def test_show3dvolume_z_stretch_rejects_nan():
@@ -447,27 +447,28 @@ def test_show3dvolume_reverse_kwarg():
 
 
 def test_show3dvolume_auto_z_stretch_thin_z():
-    # nz=14, nxy=730 ptycho — ratio 52, should auto-pick z_stretch>1 and compact=True
+    # nz=14, nxy=730 ptycho - ratio 52, should auto-pick z_stretch>1 and compact=True
     vol = np.random.rand(14, 730, 730).astype(np.float32)
     w = Show3DVolume(vol)
     assert w.z_stretch > 1.0
-    assert w.z_stretch <= 16.0
+    assert w.z_stretch <= 30.0
     assert w.compact is True
 
 
 def test_show3dvolume_no_auto_for_cubic():
-    # nz=ny=nx — ratio 1, should stay at defaults
+    # nz=ny=nx - ratio 1, should keep z_stretch neutral. Compact layout is now
+    # the only supported widget layout.
     vol = np.random.rand(64, 64, 64).astype(np.float32)
     w = Show3DVolume(vol)
     assert w.z_stretch == 1.0
-    assert w.compact is False
+    assert w.compact is True
 
 
 def test_show3dvolume_user_z_stretch_wins():
     vol = np.random.rand(14, 730, 730).astype(np.float32)
     w = Show3DVolume(vol, z_stretch=2.0, compact=False)
     assert w.z_stretch == 2.0
-    assert w.compact is False
+    assert w.compact is True
 
 
 def test_show3dvolume_export_diff_in_dual_mode():

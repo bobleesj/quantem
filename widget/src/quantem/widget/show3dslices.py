@@ -1,16 +1,17 @@
 """
-Show3DVolume: orthogonal slice viewer for 3D volumetric data.
+Show3DSlices: ptycho-oriented orthogonal slice viewer.
 
-Displays XY, XZ, YZ planes with interactive sliders. All slicing happens
-in JavaScript for instant response. Useful for ptychography reconstruction
-volumes, tomograms, and any voxel data where the user wants three-plane
-inspection rather than a frame stack.
+Displays orthogonal top/row/column slices with interactive sliders plus a
+contextual 3D orientation view. All slicing happens in JavaScript for instant
+response. This widget is intentionally focused on single-object iterative
+ptychography volumes; comparison and tomography-specific workflows belong in
+Show3DVolume.
 """
 import json
 import math
 import pathlib
 from numbers import Real
-from typing import Self
+from typing import Self, Sequence
 
 import anywidget
 import numpy as np
@@ -19,7 +20,6 @@ import traitlets
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.show2d import _reject_unknown_kwargs
 from quantem.widget.state import (
-    build_json_header,
     resolve_widget_version,
     save_state_file,
     unwrap_state_payload,
@@ -34,19 +34,15 @@ _VALID_CMAPS = frozenset({
 })
 
 
-class Show3DVolume(anywidget.AnyWidget):
-    """3D volume viewer with three orthogonal slice planes.
+class Show3DSlices(anywidget.AnyWidget):
+    """Ptycho multislice viewer with three orthogonal slice planes.
 
     Parameters
     ----------
     data : array_like
         3D array of shape (nz, ny, nx).
-    data_b : array_like, optional
-        Second volume for side-by-side comparison. Must match `data` shape.
     title : str, optional
         Title displayed above the viewer.
-    title_b : str, optional
-        Title for volume B (dual mode).
     cmap : str, default "inferno"
         Colormap name. One of {valid set above}.
     pixel_size : float or sequence of 3 floats, optional
@@ -54,26 +50,28 @@ class Show3DVolume(anywidget.AnyWidget):
         3-tuple `(pz, py, px)` for anisotropic data (e.g. multislice ptycho
         with z-thickness >> xy-sampling). Per-axis values flow to JS via the
         `pixel_size_axes` trait for correct scale bars on each panel.
-    show_stats : bool, default True
+    show_stats : bool, default False
         Compute per-slice statistics traits on each slice change (`widget.stats_mean`,
         `stats_min`, `stats_max`, `stats_std`, each a list of 3 floats: XY/XZ/YZ).
         Python-side only; the JS widget does not render a stats bar. Set False to
         skip 12 reductions per slice scrub on multi-MB volumes when you don't
         need the values.
     show_controls : bool, default True
-        Show the secondary control row (Z stretch, Color, Smooth, Colorbar).
-        Top toolbar (FFT, Export, Copy, Reset) and the slice/playback sliders are
-        always visible.
-    show_crosshair : bool, default False
-        Deprecated compatibility no-op. Crosshair overlays are no longer rendered.
+        Show secondary controls for color, colorbar, smoothing, crosshair,
+        z-stretch, contrast, and playback. The slice toolbar keeps only FFT
+        and Reset Zoom visible.
+    show_crosshair : bool, default True
+        Show slice intersection guides across orthogonal panels.
     show_fft : bool, default False
         Toggle FFT panel for the active plane.
-    show_diff : bool, default False
-        In dual mode, display |A - B| (absolute difference) as a third row.
+    fft_window : bool, default False
+        Apply a 2D Hann window to each displayed slice before FFT. Useful for
+        suppressing edge leakage/streaking in reciprocal-space panels.
     log_scale : bool, default False
         Use signed log1p for intensity mapping.
-    auto_contrast : bool, default False
-        Use percentile-based contrast (2nd-98th).
+    auto_contrast : bool, default True
+        Use percentile-based contrast (2nd-98th). On for ptycho phase data
+        (long-tailed histogram - manual contrast usually crushes the signal).
     vmin, vmax : float, optional
         Manual contrast limits.
     fps : float, default 5.0
@@ -81,25 +79,25 @@ class Show3DVolume(anywidget.AnyWidget):
     play_axis : int, default 0
         Which axis to animate (0=Z, 1=Y, 2=X, 3=cycle all).
     dim_labels : list of str, optional
-        Labels for data axes 0, 1, 2 in that order. Default ["Z", "Y", "X"]
-        matches numpy-style indexing (axis 0 is the slice dim). For multislice
-        ptycho with shape (nz, ny, nx), pass ["Z (slice)", "Y", "X"].
+        Labels for data axes 0, 1, 2 in that order. Default ["slice", "row", "col"]
+        matches the project-wide detector-plane convention (axis 0 = multislice
+        depth, axis 1 = row, axis 2 = col). Pass any 3-string list to override.
 
     Examples
     --------
     >>> import numpy as np
-    >>> from quantem.widget import Show3DVolume
+    >>> from quantem.widget import Show3DSlices
     >>> volume = np.random.rand(64, 64, 64).astype(np.float32)
-    >>> Show3DVolume(volume, title="My Volume", cmap="viridis")
+    >>> Show3DSlices(volume, title="My Volume", cmap="viridis")
     """
 
-    _esm = pathlib.Path(__file__).parent / "static" / "show3dvolume.js"
-    _css = pathlib.Path(__file__).parent / "static" / "show3dvolume.css"
-    _widget_name = "Show3DVolume"
-    _viewer_kind = "volume"
+    _esm = pathlib.Path(__file__).parent / "static" / "show3dslices.js"
+    _css = pathlib.Path(__file__).parent / "static" / "show3dslices.css"
+    _widget_name = "Show3DSlices"
+    _viewer_kind = "slices"
 
     widget_version = traitlets.Unicode("unknown").tag(sync=True)
-    viewer_kind = traitlets.Unicode("volume").tag(sync=True)
+    viewer_kind = traitlets.Unicode("slices").tag(sync=True)
 
     # Volume dimensions
     nx = traitlets.Int(1).tag(sync=True)
@@ -111,25 +109,11 @@ class Show3DVolume(anywidget.AnyWidget):
     slice_z = traitlets.CInt(0).tag(sync=True)
     # Raw volume data (sent once)
     volume_bytes = traitlets.Bytes(b"").tag(sync=True)
-    # Dual-volume comparison mode
-    volume_bytes_b = traitlets.Bytes(b"").tag(sync=True)
-    title_b = traitlets.Unicode("").tag(sync=True)
-    dual_mode = traitlets.Bool(False).tag(sync=True)
-    show_diff = traitlets.Bool(False).tag(sync=True)
-    linked_contrast = traitlets.Bool(True).tag(sync=True)
-    # Stats for volume B (3 values: xy, xz, yz)
-    # stats_*_b: programmatic Python access only (no JS consumer). Don't sync,
-    # otherwise every slice scrub ships 4 lists of 3 floats across the websocket
-    # for nothing.
-    stats_mean_b = traitlets.List(traitlets.Float())
-    stats_min_b = traitlets.List(traitlets.Float())
-    stats_max_b = traitlets.List(traitlets.Float())
-    stats_std_b = traitlets.List(traitlets.Float())
     # Display
     title = traitlets.Unicode("").tag(sync=True)
     cmap = traitlets.Unicode("inferno").tag(sync=True)
     log_scale = traitlets.Bool(False).tag(sync=True)
-    auto_contrast = traitlets.Bool(False).tag(sync=True)
+    auto_contrast = traitlets.Bool(True).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
     # Scale bar. `pixel_size` is a scalar (lateral sampling, used by XY/XZ/YZ width-axis
@@ -146,20 +130,19 @@ class Show3DVolume(anywidget.AnyWidget):
     z_stretch = traitlets.Float(1.0).tag(sync=True)
     # UI
     show_controls = traitlets.Bool(True).tag(sync=True)
-    show_stats = traitlets.Bool(True).tag(sync=True)
-    # Deprecated compatibility no-op. Crosshair overlays are no longer rendered.
-    show_crosshair = traitlets.Bool(False).tag(sync=True)
+    show_stats = traitlets.Bool(False).tag(sync=True)
+    show_crosshair = traitlets.Bool(True).tag(sync=True)
     show_fft = traitlets.Bool(False).tag(sync=True)
+    fft_window = traitlets.Bool(False).tag(sync=True)
     orthographic = traitlets.Bool(False).tag(sync=True)
     smooth = traitlets.Bool(False).tag(sync=True)
     # Deprecated compatibility no-op. The JS widget always renders the compact layout.
     compact = traitlets.Bool(True).tag(sync=True)
     flip = traitlets.Bool(False).tag(sync=True)
-    # Axis labels (dim 0, 1, 2)
-    # Default labels follow numpy-style data-axis order: axis 0 is the slice dim (Z),
-    # axis 1 is Y, axis 2 is X. The XY/XZ/YZ panel headers display
-    # "<dl[1]><dl[2]> (<dl[0]>=...)" etc, so default labels show as e.g. "YX (Z=7)".
-    dim_labels = traitlets.List(traitlets.Unicode(), default_value=["Z", "Y", "X"]).tag(sync=True)
+    # Axis labels (dim 0, 1, 2). Use detector-plane convention: axis 0 = slice
+    # (multislice depth), axis 1 = row, axis 2 = col. Panel headers display as
+    # "<dl[1]><dl[2]> (<dl[0]>=...)" so default reads as e.g. "row col (slice=7)".
+    dim_labels = traitlets.List(traitlets.Unicode(), default_value=["slice", "row", "col"]).tag(sync=True)
     # Stats (3 values: xy, xz, yz)
     # stats_*: programmatic Python access only (no JS consumer). Don't sync.
     stats_mean = traitlets.List(traitlets.Float())
@@ -173,14 +156,6 @@ class Show3DVolume(anywidget.AnyWidget):
     fps = traitlets.Float(5.0).tag(sync=True)
     loop = traitlets.Bool(True).tag(sync=True)
     play_axis = traitlets.Int(0).tag(sync=True)  # 0=Z, 1=Y, 2=X, 3=All
-    # Export
-    _export_axis = traitlets.Int(0).tag(sync=True)
-    _gif_export_requested = traitlets.Bool(False).tag(sync=True)
-    _gif_data = traitlets.Bytes(b"").tag(sync=True)
-    _gif_metadata_json = traitlets.Unicode("").tag(sync=True)
-    _zip_export_requested = traitlets.Bool(False).tag(sync=True)
-    _zip_data = traitlets.Bytes(b"").tag(sync=True)
-
     # Validators (consistent with Show3D)
 
     @traitlets.validate("cmap")
@@ -229,13 +204,6 @@ class Show3DVolume(anywidget.AnyWidget):
         val = int(proposal["value"])
         if val not in (0, 1, 2, 3):
             raise traitlets.TraitError(f"play_axis must be 0/1/2/3, got {val}")
-        return val
-
-    @traitlets.validate("_export_axis")
-    def _validate_export_axis(self, proposal):
-        val = int(proposal["value"])
-        if val not in (0, 1, 2):
-            raise traitlets.TraitError(f"_export_axis must be 0/1/2, got {val}")
         return val
 
     @traitlets.validate("z_stretch")
@@ -298,19 +266,20 @@ class Show3DVolume(anywidget.AnyWidget):
         title: str = "",
         title_b: str = "",
         cmap: str = "inferno",
-        pixel_size: float = 0.0,
+        pixel_size: float | Sequence[float] | None = 0.0,
         scale_bar_visible: bool = True,
         z_stretch: float | None = None,
         show_controls: bool = True,
-        show_stats: bool = True,
-        show_crosshair: bool = False,
+        show_stats: bool = False,
+        show_crosshair: bool = True,
         show_fft: bool = False,
+        fft_window: bool = False,
         orthographic: bool = False,
         smooth: bool = False,
         flip: bool = False,
         show_diff: bool = False,
         log_scale: bool = False,
-        auto_contrast: bool = False,
+        auto_contrast: bool = True,
         vmin: float | None = None,
         vmax: float | None = None,
         fps: float = 5.0,
@@ -324,41 +293,80 @@ class Show3DVolume(anywidget.AnyWidget):
         **kwargs,
     ):
         _reject_unknown_kwargs(type(self), kwargs)
+        if data_b is not None:
+            raise ValueError(
+                "Show3DSlices is a single-object ptycho slice viewer. "
+                "Use Show3DVolume for dual-volume comparison workflows."
+            )
+        if show_diff:
+            raise ValueError(
+                "Show3DSlices does not support difference/dual mode. "
+                "Pass a single 3D object and inspect its orthogonal slices."
+            )
+        if title_b:
+            raise ValueError(
+                "Show3DSlices accepts only one title. "
+                "Use the title= argument for the single ptycho object."
+            )
+        if linked_contrast is not True:
+            raise ValueError(
+                "Show3DSlices does not support linked_contrast; it has no dual-volume mode."
+            )
         super().__init__(**kwargs)
         self.widget_version = resolve_widget_version()
         self.viewer_kind = self._viewer_kind
         # Pre-seed so free() / __repr__ / summary() are safe even if a validator
         # raises before _data is assigned below (e.g. wrong ndim or complex data).
         self._data: np.ndarray | None = None
-        self._data_b: np.ndarray | None = None
 
-        # Duck-typed Dataset3d extraction (matches Show2D / Show3D pattern). When the
-        # dataset exposes a per-axis sampling tuple [pz, py, px], pass it through as
-        # the full anisotropic triple instead of collapsing to a scalar.
-        if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
-            if not title and data.name:
-                title = data.name
+        # Duck-typed Dataset3d extraction (matches Show2D / Show3D pattern).
+        # `array` is the required payload; title/sampling/units are optional
+        # metadata so lightweight Dataset3d-like wrappers work naturally.
+        if hasattr(data, "array"):
+            name = getattr(data, "name", "")
+            if not title and name:
+                title = name
             pixel_size_is_default = pixel_size is None or (
                 np.isscalar(pixel_size) and float(pixel_size) == 0.0
             )
-            if pixel_size_is_default and hasattr(data, "units"):
+            if pixel_size_is_default and hasattr(data, "sampling"):
                 try:
-                    units = list(data.units)
+                    units = list(getattr(data, "units", []) or [])
                     samp = list(data.sampling)
-                    # Unit conversion → Å (lateral unit assumed consistent across axes)
-                    scale = 10.0 if (units and units[-1] in ("nm",)) else 1.0
-                    if units and units[-1] in ("nm", "Å", "angstrom", "A"):
-                        if len(samp) >= 3:
-                            pixel_size = [float(samp[i]) * scale for i in (-3, -2, -1)]
-                        elif len(samp) >= 1:
-                            pixel_size = float(samp[-1]) * scale
-                except (IndexError, TypeError):
+                    # Unit conversion to Å per axis. If units are absent, assume
+                    # sampling is already in Å so Dataset3d-like objects remain
+                    # easy to use. A single unit applies to every sampling axis.
+                    def unit_scale(unit):
+                        if not unit:
+                            return 1.0
+                        u = str(unit).strip().lower()
+                        if u == "nm":
+                            return 10.0
+                        if u in ("a", "å", "angstrom", "angstroms"):
+                            return 1.0
+                        raise ValueError(f"unsupported Dataset3d unit: {unit!r}")
+
+                    def axis_unit(axis_index: int):
+                        if not units:
+                            return ""
+                        if len(units) == 1:
+                            return units[0]
+                        return units[axis_index]
+
+                    if len(samp) >= 3:
+                        pixel_size = [
+                            float(samp[i]) * unit_scale(axis_unit(i))
+                            for i in (-3, -2, -1)
+                        ]
+                    elif len(samp) >= 1:
+                        pixel_size = float(samp[-1]) * unit_scale(axis_unit(-1))
+                except (IndexError, TypeError, ValueError):
                     pass
             data = data.array
 
         data = to_numpy(data)
         if data.ndim != 3:
-            raise ValueError(f"Show3DVolume requires 3D data, got {data.ndim}D")
+            raise ValueError(f"Show3DSlices requires 3D data, got {data.ndim}D")
         if 0 in data.shape:
             raise ValueError(f"Empty volume: shape {data.shape}. All dims must be >= 1.")
         if not np.isfinite(data).all():
@@ -368,7 +376,7 @@ class Show3DVolume(anywidget.AnyWidget):
             )
         if np.iscomplexobj(data):
             raise TypeError(
-                "Show3DVolume does not accept complex data. Convert first: "
+                "Show3DSlices does not accept complex data. Convert first: "
                 "np.abs(arr) for magnitude or np.angle(arr) for phase."
             )
         with np.errstate(over="ignore", invalid="ignore"):
@@ -376,7 +384,7 @@ class Show3DVolume(anywidget.AnyWidget):
         if not np.isfinite(self._data).all():
             raise ValueError(
                 "Data exceeds float32 range (|value| > 3.4e38) after cast; "
-                "rescale first before passing to Show3DVolume."
+                "rescale first before passing to Show3DSlices."
             )
         self.nz, self.ny, self.nx = self._data.shape
 
@@ -423,15 +431,17 @@ class Show3DVolume(anywidget.AnyWidget):
             # Round to half-step matching slider; clamp to validator range [1, 30].
             z_stretch = max(1.0, min(30.0, round(thin_z_ratio * 2) / 2)) if thin_z_ratio > 4 else 1.0
         self.z_stretch = float(z_stretch)
+        # Slices viewer is always compact. The 3D panel is an orientation/context
+        # view, while detailed comparison/tomography workflows stay in Show3DVolume.
         self.compact = True
         self.show_controls = show_controls
         self.show_stats = show_stats
-        self.show_crosshair = False
+        self.show_crosshair = show_crosshair
         self.show_fft = show_fft
+        self.fft_window = fft_window
         self.orthographic = orthographic
         self.smooth = smooth
         self.flip = flip
-        self.show_diff = show_diff
         self.log_scale = log_scale
         self.auto_contrast = auto_contrast
         self.vmin = vmin
@@ -440,54 +450,15 @@ class Show3DVolume(anywidget.AnyWidget):
         self.loop = loop
         self.reverse = reverse
         self.boomerang = boomerang
-        self.linked_contrast = linked_contrast
         self.play_axis = play_axis
         if dim_labels is not None:
             self.dim_labels = dim_labels
-
-        # Optional second volume (dual comparison). _data_b pre-seeded above.
-        if data_b is not None:
-            if hasattr(data_b, "array") and hasattr(data_b, "name") and hasattr(data_b, "sampling"):
-                if not title_b and data_b.name:
-                    title_b = data_b.name
-                data_b = data_b.array
-            data_b = to_numpy(data_b)
-            if data_b.ndim != 3:
-                raise ValueError(f"data_b must be 3D, got {data_b.ndim}D")
-            if np.iscomplexobj(data_b):
-                raise TypeError(
-                    "data_b complex data not accepted. Convert first: "
-                    "np.abs(arr) for magnitude or np.angle(arr) for phase."
-                )
-            if data_b.shape != self._data.shape:
-                raise ValueError(
-                    f"data_b shape {data_b.shape} must match data shape {self._data.shape}"
-                )
-            # NaN/inf in data_b silently propagates into stats (UI shows NaN) and breaks
-            # the diff panel (|A - B| explodes). Reject up front like primary data.
-            if not np.isfinite(data_b).all():
-                raise ValueError(
-                    "data_b contains NaN or inf. Clean first: "
-                    "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
-                )
-            with np.errstate(over="ignore", invalid="ignore"):
-                self._data_b = data_b.astype(np.float32, copy=False)
-            if not np.isfinite(self._data_b).all():
-                raise ValueError(
-                    "data_b exceeds float32 range (|value| > 3.4e38) after cast; "
-                    "rescale first before passing to Show3DVolume."
-                )
-            self.dual_mode = True
-            self.title_b = title_b
-            self.volume_bytes_b = self._data_b.tobytes()
 
         self._compute_stats()
         self.volume_bytes = self._data.tobytes()
         self.observe(self._on_slice_change, names=["slice_x", "slice_y", "slice_z"])
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_show_stats_change, names=["show_stats"])
-        self.observe(self._on_gif_export, names=["_gif_export_requested"])
-        self.observe(self._on_zip_export, names=["_zip_export_requested"])
 
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
@@ -501,10 +472,10 @@ class Show3DVolume(anywidget.AnyWidget):
             self.load_state_dict(state)
 
     def __repr__(self) -> str:
-        base = f"{self._widget_name}({self.nz}×{self.ny}×{self.nx}, slices=({self.slice_z},{self.slice_y},{self.slice_x}), cmap={self.cmap}"
-        if self.dual_mode:
-            base += ", dual=True"
-        return base + ")"
+        return (
+            f"{self._widget_name}({self.nz}×{self.ny}×{self.nx}, "
+            f"slices=({self.slice_z},{self.slice_y},{self.slice_x}), cmap={self.cmap})"
+        )
 
     def state_dict(self) -> dict:
         return {
@@ -517,7 +488,9 @@ class Show3DVolume(anywidget.AnyWidget):
             "vmax": self.vmax,
             "show_stats": self.show_stats,
             "show_controls": self.show_controls,
+            "show_crosshair": self.show_crosshair,
             "show_fft": self.show_fft,
+            "fft_window": self.fft_window,
             "orthographic": self.orthographic,
             "smooth": self.smooth,
             "flip": self.flip,
@@ -534,10 +507,6 @@ class Show3DVolume(anywidget.AnyWidget):
             "boomerang": self.boomerang,
             "play_axis": self.play_axis,
             "dim_labels": list(self.dim_labels),
-            "dual_mode": self.dual_mode,
-            "title_b": self.title_b,
-            "show_diff": self.show_diff,
-            "linked_contrast": self.linked_contrast,
         }
 
     def save(self, path: str) -> None:
@@ -545,23 +514,21 @@ class Show3DVolume(anywidget.AnyWidget):
 
     def load_state_dict(self, state: dict) -> None:
         # Surface validator errors. Warn on unknown keys (typo / wrong widget version).
-        # Reject dual_mode=True when no data_b — would render an empty B panel.
-        if state.get("dual_mode") and self._data_b is None:
+        if state.get("dual_mode") or state.get("show_diff"):
             raise ValueError(
-                "Saved state has dual_mode=True but this widget was constructed "
-                "without data_b. Re-instantiate with data_b before loading."
+                "Show3DSlices only supports a single 3D object. "
+                "Use Show3DVolume for saved dual/diff comparison states."
             )
         allowed = {
             "title", "cmap", "log_scale", "auto_contrast", "vmin", "vmax",
             "viewer_kind",
             "show_stats", "show_controls", "show_crosshair", "show_fft",
-            "orthographic", "smooth", "flip", "pixel_size", "pixel_size_axes",
+            "fft_window", "orthographic", "smooth", "flip", "pixel_size", "pixel_size_axes",
             "scale_bar_visible", "z_stretch", "compact", "slice_x",
             "slice_y", "slice_z", "fps", "loop", "reverse", "boomerang",
-            "play_axis", "dim_labels", "title_b", "show_diff",
-            "linked_contrast",
+            "play_axis", "dim_labels",
         }
-        unknown = [k for k in state if k not in allowed and k != "dual_mode"]
+        unknown = [k for k in state if k not in allowed and k not in {"dual_mode", "show_diff", "title_b", "linked_contrast"}]
         if unknown:
             import warnings
             warnings.warn(
@@ -571,7 +538,6 @@ class Show3DVolume(anywidget.AnyWidget):
             )
         state = {k: v for k, v in state.items() if k in allowed}
         state.pop("viewer_kind", None)
-        state.pop("show_crosshair", None)
         # Saved states from older versions may include compact=False. The current
         # widget intentionally ignores it and always uses the compact layout.
         state.pop("compact", None)
@@ -595,7 +561,6 @@ class Show3DVolume(anywidget.AnyWidget):
         for key, val in state.items():
             if self.has_trait(key):
                 setattr(self, key, val)
-        self.dual_mode = self._data_b is not None
         # Forward-compat: state saved before pixel_size_axes existed only has the
         # scalar pixel_size. Mirror it across all three axes so depth scale bars
         # don't desync from the lateral one after a load.
@@ -609,8 +574,7 @@ class Show3DVolume(anywidget.AnyWidget):
         if self._data is None:
             return
         self._data = None
-        self._data_b = None
-        for trait in ("volume_bytes", "volume_bytes_b", "_gif_data", "_zip_data"):
+        for trait in ("volume_bytes",):
             setattr(self, trait, b"")
         import gc
         gc.collect()
@@ -631,12 +595,6 @@ class Show3DVolume(anywidget.AnyWidget):
             lines.append(
                 f"Data:     min={float(arr.min()):.4g}  max={float(arr.max()):.4g}  mean={float(arr.mean()):.4g}"
             )
-        if self.dual_mode and self._data_b is not None:
-            lines.append(f"Volume B: {self.title_b or 'Volume B'}")
-            arr_b = self._data_b
-            lines.append(
-                f"Data B:   min={float(arr_b.min()):.4g}  max={float(arr_b.max()):.4g}  mean={float(arr_b.mean()):.4g}"
-            )
         scale = "log" if self.log_scale else "linear"
         if self.vmin is not None and self.vmax is not None:
             contrast = f"vmin={self.vmin:.4g}, vmax={self.vmax:.4g}"
@@ -647,8 +605,8 @@ class Show3DVolume(anywidget.AnyWidget):
         display = f"{self.cmap} | {contrast} | {scale}"
         if self.show_fft:
             display += " | FFT"
-        if self.show_diff and self.dual_mode:
-            display += " | diff"
+            if self.fft_window:
+                display += " Hann"
         lines.append(f"Display:  {display}")
         print("\n".join(lines))
 
@@ -671,16 +629,6 @@ class Show3DVolume(anywidget.AnyWidget):
             self.stats_min = [float(np.min(s)) for s in slices]
             self.stats_max = [float(np.max(s)) for s in slices]
             self.stats_std = [float(np.std(s, dtype=np.float64)) for s in slices]
-            if self._data_b is not None:
-                slices_b = [
-                    self._data_b[self.slice_z, :, :],
-                    self._data_b[:, self.slice_y, :],
-                    self._data_b[:, :, self.slice_x],
-                ]
-                self.stats_mean_b = [float(np.mean(s, dtype=np.float64)) for s in slices_b]
-                self.stats_min_b = [float(np.min(s)) for s in slices_b]
-                self.stats_max_b = [float(np.max(s)) for s in slices_b]
-                self.stats_std_b = [float(np.std(s, dtype=np.float64)) for s in slices_b]
 
     def _on_slice_change(self, change) -> None:
         if self.playing:
@@ -710,51 +658,12 @@ class Show3DVolume(anywidget.AnyWidget):
         self.slice_x = self.nx // 2
         return self
 
-    def _on_gif_export(self, change=None) -> None:
-        if not self._gif_export_requested:
-            return
-        self._gif_export_requested = False
-        try:
-            self._generate_gif()
-        except Exception as e:
-            # On error: clear _gif_data so JS observer fires and resets
-            # exporting=False. Without this the UI shows "..." forever.
-            import warnings
-            warnings.warn(f"GIF export failed: {type(e).__name__}: {e}")
-            self._gif_data = b""
-
-    def _on_zip_export(self, change=None) -> None:
-        if not self._zip_export_requested:
-            return
-        self._zip_export_requested = False
-        try:
-            self._generate_zip()
-        except Exception as e:
-            import warnings
-            warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
-            self._zip_data = b""
-
-    def _get_export_slices(self) -> list[np.ndarray]:
-        # Pick which volume to export. In dual+show_diff mode, export |A - B|; in dual mode
-        # without diff, export Volume A; otherwise Volume A. Single-volume mode always exports A.
-        if self.dual_mode and self.show_diff and self._data_b is not None:
-            vol = np.abs(self._data.astype(np.float64) - self._data_b.astype(np.float64))
-        else:
-            vol = self._data
-        axis = self._export_axis
-        if axis == 0:
-            return [vol[z, :, :] for z in range(self.nz)]
-        if axis == 1:
-            return [vol[:, y, :] for y in range(self.ny)]
-        return [vol[:, :, x] for x in range(self.nx)]
-
     def _normalize_slice(self, slc: np.ndarray) -> np.ndarray:
         if self.log_scale:
-            # Signed log so diff frames (in dual mode) don't collapse to zero.
             slc = np.sign(slc) * np.log1p(np.abs(slc))
         # Mirror JS path: when flip=True the on-screen renderer negates the data
-        # and flips the contrast range (min<->max with sign). Exports must do the
-        # same so saved GIF/ZIP/PNG frames match what the user sees on screen.
+        # and flips the contrast range (min<->max with sign). Python-side saved
+        # images should match what the user sees on screen.
         if self.flip:
             slc = -slc
         if self.vmin is not None and self.vmax is not None:
@@ -774,112 +683,6 @@ class Show3DVolume(anywidget.AnyWidget):
         if vmax > vmin:
             return np.clip((slc - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
         return np.zeros(slc.shape, dtype=np.uint8)
-
-    def _generate_gif(self) -> None:
-        import io
-        from matplotlib import colormaps
-        from PIL import Image
-
-        slices = self._get_export_slices()
-        cmap_fn = colormaps.get_cmap(self.cmap)
-        pil_frames = []
-        for slc in slices:
-            normalized = self._normalize_slice(slc)
-            rgba = cmap_fn(normalized / 255.0)
-            rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-            pil_frames.append(Image.fromarray(rgb))
-        if not pil_frames:
-            with self.hold_sync():
-                self._gif_data = b""
-                self._gif_metadata_json = ""
-            return
-        buf = io.BytesIO()
-        duration_ms = int(1000 / max(0.1, self.fps))
-        # Shared palette to avoid per-frame quantization flicker.
-        pil_p = [f.convert("P", palette=Image.ADAPTIVE, colors=256) for f in pil_frames]
-        pil_p[0].save(
-            buf, format="GIF", save_all=True, append_images=pil_p[1:],
-            duration=duration_ms, loop=0, disposal=2,
-        )
-        metadata = {
-            **build_json_header(self._widget_name),
-            "format": "gif",
-            "export_kind": "animated_slices",
-            "export_axis": int(self._export_axis),
-            "n_slices": int(len(pil_frames)),
-            "duration_ms": int(duration_ms),
-            "display": {
-                "cmap": self.cmap,
-                "log_scale": bool(self.log_scale),
-                "auto_contrast": bool(self.auto_contrast),
-            },
-        }
-        gif_bytes = buf.getvalue()
-        # Comm channel chokes on ~50 MB single buffers (VS Code IPC bridge is worse).
-        # Warn so the user knows to reduce frame count / resolution if the download stalls.
-        if len(gif_bytes) > 50 * 1024 * 1024:
-            import warnings
-            warnings.warn(
-                f"GIF export is {len(gif_bytes) / 1e6:.1f} MB. Jupyter Comm transport "
-                f"can stall or fail above ~50 MB. Reduce n_slices or export a smaller "
-                f"region if the download does not start.",
-                stacklevel=2,
-            )
-        # Reset to empty first so a re-export with identical bytes still fires the
-        # JS trait-change effect (see note in _generate_zip).
-        with self.hold_sync():
-            self._gif_metadata_json = ""
-            self._gif_data = b""
-        with self.hold_sync():
-            self._gif_metadata_json = json.dumps(metadata, indent=2)
-            self._gif_data = gif_bytes
-
-    def _generate_zip(self) -> None:
-        import io
-        import zipfile
-        from matplotlib import colormaps
-        from PIL import Image
-
-        slices = self._get_export_slices()
-        cmap_fn = colormaps.get_cmap(self.cmap)
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            metadata = {
-                **build_json_header(self._widget_name),
-                "format": "zip",
-                "export_kind": "png_slices",
-                "export_axis": int(self._export_axis),
-                "n_slices": int(len(slices)),
-                "display": {"cmap": self.cmap, "log_scale": bool(self.log_scale)},
-            }
-            zf.writestr("metadata.json", json.dumps(metadata, indent=2))
-            for i, slc in enumerate(slices):
-                normalized = self._normalize_slice(slc)
-                rgba = cmap_fn(normalized / 255.0)
-                rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-                img = Image.fromarray(rgb)
-                img_buf = io.BytesIO()
-                img.save(img_buf, format="PNG")
-                zf.writestr(f"slice_{i:04d}.png", img_buf.getvalue())
-        zip_bytes = buf.getvalue()
-        if len(zip_bytes) > 50 * 1024 * 1024:
-            import warnings
-            warnings.warn(
-                f"ZIP export is {len(zip_bytes) / 1e6:.1f} MB. Jupyter Comm transport "
-                f"can stall or fail above ~50 MB. Consider saving slices individually "
-                f"via save_image() if the download does not start.",
-                stacklevel=2,
-            )
-        # Reset to empty first so a re-export with identical bytes still fires the
-        # JS trait-change effect (traitlets equality-elides identical Bytes writes).
-        # Without this the second click sends the same bytes, JS useEffect on
-        # `_zip_data` does not re-run, and the "Exporting..." button stays stuck.
-        # Two separate hold_sync blocks force two distinct Comm messages - without
-        # this, back-to-back assignments on the same tick coalesce into one.
-        with self.hold_sync():
-            self._zip_data = b""
-        with self.hold_sync():
-            self._zip_data = zip_bytes
 
     def save_image(
         self,
@@ -940,16 +743,6 @@ class Show3DVolume(anywidget.AnyWidget):
             slc = self._data[:, idx, :]
         else:
             slc = self._data[:, :, idx]
-
-        # Respect dual+show_diff so saved slice matches displayed |A-B|.
-        if self.dual_mode and self.show_diff and self._data_b is not None:
-            if plane == "xy":
-                slc_b = self._data_b[idx]
-            elif plane == "xz":
-                slc_b = self._data_b[:, idx, :]
-            else:
-                slc_b = self._data_b[:, :, idx]
-            slc = np.abs(slc.astype(np.float64) - slc_b.astype(np.float64))
 
         normalized = self._normalize_slice(slc)
         cmap_fn = colormaps.get_cmap(self.cmap)

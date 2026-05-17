@@ -28,6 +28,7 @@ export interface VolumeRenderParams {
 export interface CameraState {
   yaw: number;       // radians, horizontal rotation
   pitch: number;     // radians, vertical rotation (clamped ±89°)
+  roll?: number;     // radians, screen-plane rotation around the view direction
   distance: number;  // camera distance from volume center
   panX: number;      // horizontal pan
   panY: number;      // vertical pan
@@ -36,6 +37,7 @@ export interface CameraState {
 export const DEFAULT_CAMERA: CameraState = {
   yaw: Math.PI / 6,     // 30°
   pitch: Math.PI / 8,   // 22.5°
+  roll: 0,
   distance: 1.8,
   panX: 0,
   panY: 0,
@@ -144,6 +146,21 @@ function perspective(fov: number, aspect: number, near: number, far: number): Fl
   m[10] = (far + near) * rangeInv;
   m[11] = -1;
   m[14] = 2 * far * near * rangeInv;
+  return m;
+}
+
+function orthographic(left: number, right: number, bottom: number, top: number, near: number, far: number): Float32Array {
+  const lr = 1 / (left - right);
+  const bt = 1 / (bottom - top);
+  const nf = 1 / (near - far);
+  const m = new Float32Array(16);
+  m[0] = -2 * lr;
+  m[5] = -2 * bt;
+  m[10] = 2 * nf;
+  m[12] = (left + right) * lr;
+  m[13] = (top + bottom) * bt;
+  m[14] = (far + near) * nf;
+  m[15] = 1;
   return m;
 }
 
@@ -537,19 +554,27 @@ export class VolumeRenderer {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
 
-    // Upload data — WebGPU requires bytesPerRow aligned to 256
+    // Upload data. WebGPU requires bytesPerRow aligned to 256. When nx is
+    // already a multiple of 256 the row stride matches and we can skip the
+    // padded copy entirely (saves a transient nx*ny*nz Uint8Array allocation
+    // and one full pass).
     const bytesPerRow = Math.ceil(nx / 256) * 256;
-    const padded = new Uint8Array(bytesPerRow * ny * nz);
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        const srcOffset = (z * ny + y) * nx;
-        const dstOffset = (z * ny + y) * bytesPerRow;
-        padded.set(normalized.subarray(srcOffset, srcOffset + nx), dstOffset);
+    let payload: Uint8Array;
+    if (bytesPerRow === nx) {
+      payload = normalized;
+    } else {
+      payload = new Uint8Array(bytesPerRow * ny * nz);
+      for (let z = 0; z < nz; z++) {
+        for (let y = 0; y < ny; y++) {
+          const srcOffset = (z * ny + y) * nx;
+          const dstOffset = (z * ny + y) * bytesPerRow;
+          payload.set(normalized.subarray(srcOffset, srcOffset + nx), dstOffset);
+        }
       }
     }
     this.device.queue.writeTexture(
       { texture: this.volumeTexture },
-      padded,
+      payload as unknown as GPUAllowSharedBufferSource,
       { bytesPerRow, rowsPerImage: ny },
       { width: nx, height: ny, depthOrArrayLayers: nz },
     );
@@ -585,7 +610,7 @@ export class VolumeRenderer {
     this.rebuildBindGroup();
   }
 
-  render(params: VolumeRenderParams, camera: CameraState, bgColor: [number, number, number], dprOverride?: number, numStepsOverride?: number, zStretch: number = 1): void {
+  render(params: VolumeRenderParams, camera: CameraState, bgColor: [number, number, number], dprOverride?: number, numStepsOverride?: number, zStretch: number = 1, orthographicView: boolean = false): void {
     if (this.deviceLost) return;
     const canvas = this.canvas;
 
@@ -614,8 +639,31 @@ export class VolumeRenderer {
     const eyeY = camera.distance * sp + camera.panY;
     const eyeZ = camera.distance * cp * cy;
 
-    const viewMatrix = lookAt(eyeX, eyeY, eyeZ, camera.panX, camera.panY, 0, 0, 1, 0);
-    const projMatrix = perspective(Math.PI / 4, displayW / displayH, 0.01, 100.0);
+    const targetX = camera.panX, targetY = camera.panY, targetZ = 0;
+    let fx = targetX - eyeX, fy = targetY - eyeY, fz = targetZ - eyeZ;
+    const fLen = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1;
+    fx /= fLen; fy /= fLen; fz /= fLen;
+    let sideX = fy * 0 - fz * 1, sideY = fz * 0 - fx * 0, sideZ = fx * 1 - fy * 0;
+    const sLen = Math.sqrt(sideX * sideX + sideY * sideY + sideZ * sideZ) || 1;
+    sideX /= sLen; sideY /= sLen; sideZ /= sLen;
+    const ux = sideY * fz - sideZ * fy, uy = sideZ * fx - sideX * fz, uz = sideX * fy - sideY * fx;
+    const roll = camera.roll ?? 0;
+    const cr = Math.cos(roll), sr = Math.sin(roll);
+    const upX = ux * cr + sideX * sr;
+    const upY = uy * cr + sideY * sr;
+    const upZ = uz * cr + sideZ * sr;
+    const viewMatrix = lookAt(eyeX, eyeY, eyeZ, targetX, targetY, targetZ, upX, upY, upZ);
+    const fov = Math.PI / 4;
+    const aspect = displayW / displayH;
+    const projMatrix = orthographicView
+      ? (() => {
+          // Match apparent scale at the volume center when toggling from
+          // perspective, while keeping wheel zoom semantics via camera.distance.
+          const viewH = 2 * camera.distance * Math.tan(fov / 2);
+          const viewW = viewH * aspect;
+          return orthographic(-viewW / 2, viewW / 2, -viewH / 2, viewH / 2, 0.01, 100.0);
+        })()
+      : perspective(fov, aspect, 0.01, 100.0);
     const viewProjMatrix = mat4Multiply(projMatrix, viewMatrix);
     const invViewProj = mat4Inverse(viewProjMatrix);
 

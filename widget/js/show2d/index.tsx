@@ -67,7 +67,7 @@ import { getWebGPUFFT, WebGPUFFT, fft2d, fft2dAsync, fftshift, computeMagnitude,
 import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse, GPUColormapEngine, getGPUColormapEngine, getGPUMaxBufferSize } from "../colormaps";
 
 const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 20;
+const MAX_ZOOM = 30;
 
 const DPR = window.devicePixelRatio || 1;
 
@@ -316,7 +316,7 @@ const typography = {
   labelSmall: { fontSize: 10 },
   value: { fontSize: 10, fontFamily: "monospace" },
 };
-import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-controls";
+import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-styles";
 
 function Show2D() {
   // Theme
@@ -3680,7 +3680,19 @@ function Show2D() {
                 <Box key={i} sx={{ cursor: i === selectedIdx ? ((isDraggingResize || isDraggingResizeInner || isHoveringResize || isHoveringResizeInner) ? "nwse-resize" : isDraggingROI ? "move" : (draggingProfileEndpoint !== null || isDraggingProfileLine) ? "grabbing" : (profileActive && (hoveredProfileEndpoint !== null || isHoveringProfileLine)) ? "grab" : (profileActive || roiActive || measureActive) ? "crosshair" : "grab") : ("pointer") }}>
                   <Box
                     ref={(el: HTMLDivElement | null) => { imageContainerRefs.current[i] = el; }}
-                    sx={{ position: "relative", bgcolor: "#000", border: `2px solid ${i === selectedIdx ? themeColors.accent : themeColors.border}`, borderRadius: 0, width: canvasW, height: canvasH }}
+                    sx={{
+                      position: "relative",
+                      bgcolor: "#000",
+                      // Selected tile: 3px accent border + glow. Non-selected: 1px border, slight fade.
+                      border: i === selectedIdx ? `3px solid ${themeColors.accent}` : `1px solid ${themeColors.border}`,
+                      boxShadow: i === selectedIdx ? `0 0 0 1px ${themeColors.accent}55, 0 4px 12px ${themeColors.accent}44` : "none",
+                      opacity: i === selectedIdx ? 1 : 0.92,
+                      transition: "opacity 120ms, border-color 120ms, box-shadow 120ms",
+                      borderRadius: 0,
+                      width: canvasW,
+                      height: canvasH,
+                      "&:hover": { opacity: 1, borderColor: i === selectedIdx ? themeColors.accent : themeColors.textMuted },
+                    }}
                     onMouseDown={(e) => handleMouseDown(e, i)}
                     onMouseMove={(e) => handleMouseMove(e, i)}
                     onMouseUp={(e) => handleMouseUp(e, i)}
@@ -3701,8 +3713,17 @@ function Show2D() {
                     {(
                       <Box onMouseDown={handleCanvasResizeStart} sx={{ position: "absolute", bottom: 0, right: 0, width: 16, height: 16, cursor: "nwse-resize", opacity: 0.6, pointerEvents: "auto", background: `linear-gradient(135deg, transparent 50%, ${themeColors.accent} 50%)`, borderRadius: "0 0 4px 0", "&:hover": { opacity: 1 } }} />
                     )}
+                    {i === selectedIdx && (
+                      <Box sx={{
+                        position: "absolute", top: 4, left: 4,
+                        bgcolor: themeColors.accent, color: "#fff",
+                        fontSize: 10, fontFamily: "ui-monospace, monospace", fontWeight: "bold",
+                        px: 0.6, py: 0.15, lineHeight: 1.2,
+                        pointerEvents: "none",
+                      }}>{i + 1}</Box>
+                    )}
                   </Box>
-                  <Typography sx={{ fontSize: 10, color: themeColors.textMuted, textAlign: "center", mt: 0.25 }}>
+                  <Typography sx={{ fontSize: 10, color: i === selectedIdx ? themeColors.accent : themeColors.textMuted, textAlign: "center", mt: 0.25, fontWeight: i === selectedIdx ? 600 : 400 }}>
                     {labels?.[i] || `Image ${i + 1}`}
                     {(imageRotations?.[i] ?? 0) % 4 !== 0 && (
                       <Box

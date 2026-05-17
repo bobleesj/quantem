@@ -22,6 +22,17 @@ def test_show3d_torch():
     assert w.n_slices == 10
     assert w.height == 32
     assert w.width == 32
+    assert w._use_torch is True
+    assert w._device == data.device
+
+
+def test_show3d_numpy_does_not_auto_use_torch_when_gpu_exists(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    data = np.random.rand(4, 8, 8).astype(np.float32)
+    w = Show3D(data)
+    assert w._use_torch is False
+    assert w._data_torch is None
 
 
 def test_show3d_rejects_2d():
@@ -168,11 +179,13 @@ def test_show3d_multi_panel():
     assert w.n_slices == 5
 
 
-def test_show3d_multi_panel_mismatch():
+def test_show3d_multi_panel_frame_mismatch_auto_pads():
+    """Different frame counts auto-pad to longest; panel_real_frames records originals."""
     a = np.random.rand(5, 16, 16).astype(np.float32)
     b = np.random.rand(7, 16, 16).astype(np.float32)
-    with pytest.raises(ValueError, match="frames"):
-        Show3D(a, b)
+    w = Show3D(a, b)
+    assert w.n_slices == 7
+    assert list(w.panel_real_frames) == [5, 7]
 
 
 def test_show3d_multi_panel_shape_mismatch():

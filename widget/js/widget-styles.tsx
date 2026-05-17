@@ -19,6 +19,8 @@ export const controlRow = {
 
 export const compactButton = {
   fontSize: 10,
+  textTransform: "none" as const,
+  letterSpacing: 0,
   py: 0.25,
   px: 1,
   minWidth: 0,

@@ -5,7 +5,8 @@
  * Three side-by-side canvases showing XY, XZ, YZ planes with sliders.
  * All slicing done in JS from raw float32 volume data for instant response.
  *
- * Self-contained widget with all utilities inlined (matching Show3D pattern).
+ * Tomography/comparison-focused widget. Shared UI and math helpers live in the
+ * common widget modules so Show3D/Show3DSlices/Show3DVolume stay consistent.
  */
 import * as React from "react";
 import { createRender, useModelState } from "@anywidget/react";
@@ -19,7 +20,6 @@ import Switch from "@mui/material/Switch";
 import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
 import Menu from "@mui/material/Menu";
-import Tooltip from "@mui/material/Tooltip";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import PauseIcon from "@mui/icons-material/Pause";
 import FastForwardIcon from "@mui/icons-material/FastForward";
@@ -29,8 +29,9 @@ import { useTheme } from "../theme";
 import { VolumeRenderer, CameraState, DEFAULT_CAMERA } from "../webgpu-volume";
 import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, exportFigure, canvasToPDF } from "../figure";
 import { extractFloat32, formatNumber, downloadBlob, downloadDataView } from "../format";
-import { computeHistogramFromBytes } from "../stats";
 import { findDataRange, applyLogScale, percentileClip, sliderRange } from "../stats";
+import { Histogram, InfoTooltip, KeyboardShortcuts } from "../widget-components";
+import { extractXY, extractXZ, extractYZ, findFFTPeak, maybeFlip, reverseLut, shouldIgnoreWidgetShortcut, signedLog1p } from "../widget-utils";
 // control-customizer + tool-parity dropped in new monorepo (matches Show3D).
 
 // ============================================================================
@@ -43,14 +44,18 @@ const typography = {
   title: { fontWeight: "bold" as const },
 };
 
-import { SPACING, controlRow, compactButton, switchStyles, sliderStyles } from "../widget-controls";
+import { SPACING, controlRow, compactButton, switchStyles, sliderStyles, typographyLabel } from "../widget-styles";
+
+const controlLabel = { ...typography.label, ...typographyLabel };
 
 const controlPanel = {
   select: { minWidth: 90, fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
 };
 
 const container = {
-  root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "monospace", overflow: "visible" },
+  // overflowX:auto so panels stay reachable via horizontal scroll on narrow
+  // viewport instead of being silently clipped past the cell edge.
+  root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "monospace", overflowX: "auto", overflowY: "visible" },
   imageBox: { bgcolor: "#000", border: "1px solid #444", overflow: "hidden", position: "relative" as const },
 };
 
@@ -71,34 +76,6 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 10;
 
 // ============================================================================
-// Slice extraction from flat float32 buffer
-// ============================================================================
-function extractXY(vol: Float32Array, nx: number, ny: number, _nz: number, z: number): Float32Array {
-  if (z < 0 || z >= _nz) return new Float32Array(ny * nx);
-  const start = z * ny * nx;
-  return vol.subarray(start, start + ny * nx);
-}
-
-function extractXZ(vol: Float32Array, nx: number, ny: number, nz: number, y: number): Float32Array {
-  const out = new Float32Array(nz * nx);
-  if (y < 0 || y >= ny) return out;
-  for (let z = 0; z < nz; z++) {
-    const srcOffset = z * ny * nx + y * nx;
-    for (let x = 0; x < nx; x++) out[z * nx + x] = vol[srcOffset + x];
-  }
-  return out;
-}
-
-function extractYZ(vol: Float32Array, nx: number, ny: number, nz: number, x: number): Float32Array {
-  const out = new Float32Array(nz * ny);
-  if (x < 0 || x >= nx) return out;
-  for (let z = 0; z < nz; z++) {
-    for (let y = 0; y < ny; y++) out[z * ny + y] = vol[z * ny * nx + y * nx + x];
-  }
-  return out;
-}
-
-// ============================================================================
 // Constants
 // ============================================================================
 type ZoomState = { zoom: number; panX: number; panY: number };
@@ -106,163 +83,6 @@ const DEFAULT_ZOOM: ZoomState = { zoom: 1, panX: 0, panY: 0 };
 const CANVAS_TARGET = 430;
 const AXES = ["xy", "xz", "yz"] as const;
 const DPR = window.devicePixelRatio || 1;
-// Signed log1p: matches Python `np.sign(x) * np.log1p(np.abs(x))` so live render
-// matches GIF/PNG export when log_scale=true on data with negative values.
-const signedLog1p = (x: number): number => x >= 0 ? Math.log1p(x) : -Math.log1p(-x);
-
-// Reverse a 256-entry RGB LUT (768 bytes) so a flip toggle inverts the
-// colormap direction without re-uploading the volume. Per-entry reverse, not
-// per-byte: the i-th output triplet is the (255-i)-th input triplet.
-const reverseLut = (lut: Uint8Array): Uint8Array => {
-  const out = new Uint8Array(lut.length);
-  const n = lut.length / 3;
-  for (let i = 0; i < n; i++) {
-    const src = (n - 1 - i) * 3;
-    const dst = i * 3;
-    out[dst + 0] = lut[src + 0];
-    out[dst + 1] = lut[src + 1];
-    out[dst + 2] = lut[src + 2];
-  }
-  return out;
-};
-// Negate values when flip=true. Returns same array when flip=false (no alloc).
-const maybeFlip = (data: Float32Array, flip: boolean): Float32Array => {
-  if (!flip) return data;
-  const out = new Float32Array(data.length);
-  for (let i = 0; i < data.length; i++) out[i] = -data[i];
-  return out;
-};
-
-// ============================================================================
-// InfoTooltip
-// ============================================================================
-function InfoTooltip({ text, theme = "dark" }: { text: React.ReactNode; theme?: "light" | "dark" }) {
-  const isDark = theme === "dark";
-  const content = typeof text === "string"
-    ? <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>{text}</Typography>
-    : text;
-  return (
-    <Tooltip
-      title={content}
-      arrow placement="bottom"
-      componentsProps={{
-        tooltip: { sx: { bgcolor: isDark ? "#333" : "#fff", color: isDark ? "#ddd" : "#333", border: `1px solid ${isDark ? "#555" : "#ccc"}`, maxWidth: 280, p: 1 } },
-        arrow: { sx: { color: isDark ? "#333" : "#fff", "&::before": { border: `1px solid ${isDark ? "#555" : "#ccc"}` } } },
-      }}
-    >
-      <Typography component="span" sx={{ fontSize: 12, color: isDark ? "#888" : "#666", cursor: "help", ml: 0.5, "&:hover": { color: isDark ? "#aaa" : "#444" } }}>ⓘ</Typography>
-    </Tooltip>
-  );
-}
-
-function KeyboardShortcuts({ items }: { items: [string, string][] }) {
-  return (
-    <Box component="table" sx={{ borderCollapse: "collapse", "& td": { py: 0.25, fontSize: 11, lineHeight: 1.3, verticalAlign: "top" }, "& td:first-of-type": { pr: 1.5, opacity: 0.7, fontFamily: "monospace", fontSize: 10, whiteSpace: "nowrap" } }}>
-      <tbody>
-        {items.map(([key, desc], i) => (
-          <tr key={i}><td>{key}</td><td>{desc}</td></tr>
-        ))}
-      </tbody>
-    </Box>
-  );
-}
-
-// ============================================================================
-// Histogram Component
-// ============================================================================
-
-interface HistogramProps {
-  data: Float32Array | null;
-  vminPct: number;
-  vmaxPct: number;
-  onRangeChange: (min: number, max: number) => void;
-  width?: number;
-  height?: number;
-  theme?: "light" | "dark";
-  dataMin?: number;
-  dataMax?: number;
-}
-
-function Histogram({ data, vminPct, vmaxPct, onRangeChange, width = 110, height = 40, theme = "dark", dataMin = 0, dataMax = 1 }: HistogramProps) {
-  const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const bins = React.useMemo(() => computeHistogramFromBytes(data), [data]);
-  const colors = theme === "dark" ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" } : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" };
-
-  React.useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.fillStyle = colors.bg;
-    ctx.fillRect(0, 0, width, height);
-    const displayBins = 64;
-    const binRatio = Math.floor(bins.length / displayBins);
-    const reducedBins: number[] = [];
-    for (let i = 0; i < displayBins; i++) {
-      let sum = 0;
-      for (let j = 0; j < binRatio; j++) sum += bins[i * binRatio + j] || 0;
-      reducedBins.push(sum / binRatio);
-    }
-    const maxVal = Math.max(...reducedBins, 0.001);
-    const barWidth = width / displayBins;
-    const vminBin = Math.floor((vminPct / 100) * displayBins);
-    const vmaxBin = Math.floor((vmaxPct / 100) * displayBins);
-    for (let i = 0; i < displayBins; i++) {
-      const barHeight = (reducedBins[i] / maxVal) * (height - 2);
-      ctx.fillStyle = (i >= vminBin && i <= vmaxBin) ? colors.barActive : colors.barInactive;
-      ctx.fillRect(i * barWidth + 0.5, height - barHeight, Math.max(1, barWidth - 1), barHeight);
-    }
-  }, [bins, vminPct, vmaxPct, width, height, colors]);
-
-  return (
-    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25 }}>
-      <canvas ref={canvasRef} style={{ width, height, border: `1px solid ${colors.border}` }} />
-      <Slider
-        value={[vminPct, vmaxPct]}
-        onChange={(_, v) => { const [newMin, newMax] = v as number[]; onRangeChange(Math.min(newMin, newMax - 1), Math.max(newMax, newMin + 1)); }}
-        min={0} max={100} size="small" valueLabelDisplay="auto"
-        valueLabelFormat={(pct) => { const val = dataMin + (pct / 100) * (dataMax - dataMin); return val >= 1000 ? val.toExponential(1) : val.toFixed(1); }}
-        sx={{ width, py: 0, "& .MuiSlider-thumb": { width: 8, height: 8 }, "& .MuiSlider-rail": { height: 2 }, "& .MuiSlider-track": { height: 2 }, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }}
-      />
-      <Box sx={{ display: "flex", justifyContent: "space-between", width }}><Typography sx={{ fontSize: 8, fontFamily: "monospace", opacity: 0.6, lineHeight: 1 }}>{(() => { const v = dataMin + (vminPct / 100) * (dataMax - dataMin); return v >= 1000 ? v.toExponential(1) : v.toFixed(1); })()}</Typography><Typography sx={{ fontSize: 8, fontFamily: "monospace", opacity: 0.6, lineHeight: 1 }}>{(() => { const v = dataMin + (vmaxPct / 100) * (dataMax - dataMin); return v >= 1000 ? v.toExponential(1) : v.toFixed(1); })()}</Typography></Box>
-    </Box>
-  );
-}
-
-// ============================================================================
-// Main Component
-// ============================================================================
-// ============================================================================
-// FFT peak finder (snap to Bragg spot with sub-pixel centroid refinement)
-// ============================================================================
-function findFFTPeak(mag: Float32Array, width: number, height: number, col: number, row: number, radius: number): { row: number; col: number } {
-  const c0 = Math.max(0, Math.floor(col) - radius);
-  const r0 = Math.max(0, Math.floor(row) - radius);
-  const c1 = Math.min(width - 1, Math.floor(col) + radius);
-  const r1 = Math.min(height - 1, Math.floor(row) + radius);
-  let bestCol = Math.round(col), bestRow = Math.round(row), bestVal = -Infinity;
-  for (let ir = r0; ir <= r1; ir++) {
-    for (let ic = c0; ic <= c1; ic++) {
-      const val = mag[ir * width + ic];
-      if (val > bestVal) { bestVal = val; bestCol = ic; bestRow = ir; }
-    }
-  }
-  const wc0 = Math.max(0, bestCol - 1), wc1 = Math.min(width - 1, bestCol + 1);
-  const wr0 = Math.max(0, bestRow - 1), wr1 = Math.min(height - 1, bestRow + 1);
-  let sumW = 0, sumWC = 0, sumWR = 0;
-  for (let ir = wr0; ir <= wr1; ir++) {
-    for (let ic = wc0; ic <= wc1; ic++) {
-      const w = mag[ir * width + ic];
-      sumW += w; sumWC += w * ic; sumWR += w * ir;
-    }
-  }
-  if (sumW > 0) return { row: sumWR / sumW, col: sumWC / sumW };
-  return { row: bestRow, col: bestCol };
-}
 
 const FFT_SNAP_RADIUS = 5;
 
@@ -304,8 +124,8 @@ function Show3DVolume() {
   const [traitVmin] = useModelState<number | null>("vmin");
   const [traitVmax] = useModelState<number | null>("vmax");
   const [showControls] = useModelState<boolean>("show_controls");
-  const [showCrosshair, setShowCrosshair] = useModelState<boolean>("show_crosshair");
   const [showFft, setShowFft] = useModelState<boolean>("show_fft");
+  const [orthographic, setOrthographic] = useModelState<boolean>("orthographic");
   const [smooth, setSmooth] = useModelState<boolean>("smooth");
   const [flip, setFlip] = useModelState<boolean>("flip");
   // No disabled_tools / hidden_tools traits in new monorepo Show3DVolume.
@@ -314,7 +134,7 @@ function Show3DVolume() {
   // Per-axis sampling [pz, py, px] for anisotropic data; falls back to [pixelSize]*3.
   const [pixelSizeAxes] = useModelState<number[]>("pixel_size_axes");
   const [scaleBarVisible] = useModelState<boolean>("scale_bar_visible");
-  const [zStretch, setZStretch] = useModelState<number>("z_stretch");
+  const [zStretch] = useModelState<number>("z_stretch");
 
   // No tool-parity in new monorepo. Everything visible + unlocked.
   const hideDisplay = false;
@@ -364,6 +184,7 @@ function Show3DVolume() {
   const fftImgDataRefs = React.useRef<(ImageData | null)[]>([null, null, null]);
   const fftMagCacheRefs = React.useRef<(Float32Array | null)[]>([null, null, null]);
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
+  const fftComputeGenerationRef = React.useRef(0);
   const [gpuReady, setGpuReady] = React.useState(false);
   // Counter to trigger FFT redraw after async compute finishes
   const [fftVersion, setFftVersion] = React.useState(0);
@@ -449,10 +270,9 @@ function Show3DVolume() {
   // Colorbar state
   const [showColorbar, setShowColorbar] = React.useState(false);
 
-  // Compact mode: hide axis headers, stats, FFT — just canvases
-  const [compact, setCompact] = useModelState<boolean>("compact");
-  // Compact mode hides FFT panels (line 2513); also skip the GPU compute to avoid wasted work.
-  const effectiveShowFft = showFft && !hideDisplay && !compact;
+  // Show3DVolume always uses the compact widget layout. The old Python
+  // `compact` trait is kept only as a compatibility no-op.
+  const effectiveShowFft = showFft && !hideDisplay;
 
   // Cursor readout state
   const [cursorInfo, setCursorInfo] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
@@ -602,13 +422,30 @@ function Show3DVolume() {
     };
   }, [allFloats, effectiveShowFft, isDual, allFloatsDiff]);
 
-  // Compute histogram from full volume (stable range across slices)
-  React.useEffect(() => {
-    if (!allFloats || allFloats.length === 0) return;
-    const processed = logScale ? applyLogScale(allFloats) : allFloats;
-    setImageHistogramData(processed);
-    setImageDataRange(findDataRange(processed));
+  // log-scaled volume Float32Array, shared by 3D upload AND histogram useEffects.
+  // applyLogScale allocates a fresh 32 MB buffer per call; without memoization a
+  // 200³ volume with logScale=True allocates ~5 copies (3 histograms + 2 volume
+  // uploads) on every toggle. Cache once per (volume, logScale) tuple.
+  const volumeFloats = React.useMemo(() => {
+    if (!allFloats) return null;
+    return logScale ? applyLogScale(allFloats) : allFloats;
   }, [allFloats, logScale]);
+  const volumeFloatsB = React.useMemo(() => {
+    if (!allFloatsB) return null;
+    return logScale ? applyLogScale(allFloatsB) : allFloatsB;
+  }, [allFloatsB, logScale]);
+  const volumeFloatsDiff = React.useMemo(() => {
+    if (!allFloatsDiff) return null;
+    return logScale ? applyLogScale(allFloatsDiff) : allFloatsDiff;
+  }, [allFloatsDiff, logScale]);
+
+  // Compute histogram from full volume (stable range across slices).
+  // Read the shared `volumeFloats` memo so we don't re-allocate on logScale toggle.
+  React.useEffect(() => {
+    if (!volumeFloats || volumeFloats.length === 0) return;
+    setImageHistogramData(volumeFloats);
+    setImageDataRange(findDataRange(volumeFloats));
+  }, [volumeFloats]);
 
   // Initial-mount Auto snap: when autoContrast is true from Python and histogram data
   // just loaded with default 0/100 slider, snap thumbs to 2/98 percentile so user sees
@@ -652,18 +489,17 @@ function Show3DVolume() {
     }
   }, [autoContrast, diffHistogramData, diffDataRange]);
 
-  // Compute Volume B histogram from full volume
+  // Compute Volume B histogram from full volume (shares volumeFloatsB memo).
   React.useEffect(() => {
-    if (!allFloatsB || allFloatsB.length === 0) return;
-    const processed = logScale ? applyLogScale(allFloatsB) : allFloatsB;
-    setImageHistogramDataB(processed);
-    setImageDataRangeB(findDataRange(processed));
-  }, [allFloatsB, logScale]);
+    if (!volumeFloatsB || volumeFloatsB.length === 0) return;
+    setImageHistogramDataB(volumeFloatsB);
+    setImageDataRangeB(findDataRange(volumeFloatsB));
+  }, [volumeFloatsB]);
 
-  // Compute diff histogram from FULL diff volume — keeps stats stable as slices move.
+  // Compute diff histogram from FULL diff volume - keeps stats stable as slices move.
   // Clear diff caches when diff turns off so memory drops.
   React.useEffect(() => {
-    if (!allFloatsDiff) {
+    if (!volumeFloatsDiff) {
       setDiffHistogramData(null);
       setDiffDataRange({ min: 0, max: 1 });
       for (let a = 0; a < 3; a++) {
@@ -672,10 +508,9 @@ function Show3DVolume() {
       }
       return;
     }
-    const processed = logScale ? applyLogScale(allFloatsDiff) : allFloatsDiff;
-    setDiffHistogramData(processed);
-    setDiffDataRange(findDataRange(processed));
-  }, [allFloatsDiff, logScale]);
+    setDiffHistogramData(volumeFloatsDiff);
+    setDiffDataRange(findDataRange(volumeFloatsDiff));
+  }, [volumeFloatsDiff]);
 
   // Download GIF when data arrives from Python
   React.useEffect(() => {
@@ -716,14 +551,6 @@ function Show3DVolume() {
     return () => { disposed = true; volumeRendererRef.current?.dispose(); volumeRendererRef.current = null; };
   }, []);
 
-  const volumeFloats = React.useMemo(() => {
-    if (!allFloats) return null;
-    return logScale ? applyLogScale(allFloats) : allFloats;
-  }, [allFloats, logScale]);
-  const volumeFloatsB = React.useMemo(() => {
-    if (!allFloatsB) return null;
-    return logScale ? applyLogScale(allFloatsB) : allFloatsB;
-  }, [allFloatsB, logScale]);
 
   // Upload volume data
   React.useEffect(() => {
@@ -833,8 +660,8 @@ function Show3DVolume() {
     if (volumeDrag) return; // Skip during drag — rAF handles it directly
     const renderer = volumeRendererRef.current;
     if (!renderer || !volumeFloats || volumeFloats.length === 0) return;
-    renderer.render(volumeRenderParamsRef.current, camera, bgColorRef.current, undefined, undefined, zStretch);
-  }, [volumeFloats, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, volTexRange, opacityA, zStretch]);
+    renderer.render(volumeRenderParamsRef.current, camera, bgColorRef.current, undefined, undefined, zStretch, orthographic);
+  }, [volumeFloats, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, volTexRange, opacityA, zStretch, orthographic, flip]);
 
   // Prevent scroll on volume canvas
   React.useEffect(() => {
@@ -885,8 +712,8 @@ function Show3DVolume() {
     if (volumeDrag) return; // Skip during drag — rAF handles it directly
     const renderer = volumeRendererRefB.current;
     if (!renderer || !volumeFloatsB || volumeFloatsB.length === 0) return;
-    renderer.render(volumeRenderParamsBRef.current, camera, bgColorRef.current, undefined, undefined, zStretch);
-  }, [volumeFloatsB, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, vminBEff, vmaxBEff, volTexRangeB, opacityB, zStretch]);
+    renderer.render(volumeRenderParamsBRef.current, camera, bgColorRef.current, undefined, undefined, zStretch, orthographic);
+  }, [volumeFloatsB, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, camera, volumeCanvasSize, tc.bg, showSlicePlanes, slicePlaneOpacity, volumeDrag, rendererReady, vminBEff, vmaxBEff, volTexRangeB, opacityB, zStretch, orthographic, flip]);
 
   React.useEffect(() => {
     const canvas = volumeCanvasRefB.current;
@@ -904,7 +731,7 @@ function Show3DVolume() {
   // Live z_stretch ref for rAF drag path — keeps latest value without re-binding closure.
   const zStretchRef = React.useRef(zStretch);
   zStretchRef.current = zStretch;
-  liveCameraRef.current = camera;
+  if (!volumeDrag) liveCameraRef.current = camera;
   const volumeDragDataRef = React.useRef<{ button: number; x: number; y: number; yaw: number; pitch: number; panX: number; panY: number } | null>(null);
 
   const handleVolumeMouseDown = (e: React.MouseEvent) => {
@@ -947,9 +774,9 @@ function Show3DVolume() {
           const params = volumeRenderParamsRef.current;
           const bg = bgColorRef.current;
           const rendererA = volumeRendererRef.current;
-          if (rendererA) rendererA.render(params, cam, bg, undefined, undefined, zStretchRef.current);
+          if (rendererA) rendererA.render(params, cam, bg, undefined, undefined, zStretchRef.current, orthographic);
           const rendererB = volumeRendererRefB.current;
-          if (rendererB) rendererB.render(volumeRenderParamsBRef.current, cam, bg, undefined, undefined, zStretchRef.current);
+          if (rendererB) rendererB.render(volumeRenderParamsBRef.current, cam, bg, undefined, undefined, zStretchRef.current, orthographic);
         });
       }
     };
@@ -961,7 +788,7 @@ function Show3DVolume() {
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
     return () => { document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
-  }, [volumeDrag]);
+  }, [volumeDrag, orthographic]);
 
   const handleVolumeWheel = (e: React.WheelEvent) => {
     const factor = e.deltaY > 0 ? 1.1 : 0.9;
@@ -1009,13 +836,6 @@ function Show3DVolume() {
   }, [volumeResizing]);
 
   const cameraChanged = camera.yaw !== DEFAULT_CAMERA.yaw || camera.pitch !== DEFAULT_CAMERA.pitch || camera.distance !== DEFAULT_CAMERA.distance || camera.panX !== DEFAULT_CAMERA.panX || camera.panY !== DEFAULT_CAMERA.panY;
-
-  // Slice-panel dirty: slice zoom only. FFT zoom is owned by the FFT panel's
-  // own Reset and shouldn't be reset by the slice header (and vice versa).
-  const needsResetAxis = (a: number) => {
-    const z = zooms[a];
-    return z.zoom !== 1 || z.panX !== 0 || z.panY !== 0;
-  };
 
   // Top toolbar Reset is the same scope as the 'r' shortcut: camera, all slice
   // and FFT zooms, loop bounds, and the percentile sliders for A / B / |A-B|.
@@ -1261,15 +1081,11 @@ function Show3DVolume() {
   }, [allFloats, allFloatsB, allFloatsDiff, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, cmap, logScale, autoContrast, zooms, sliceDims, canvasSizes, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, linkedContrast, diffVminPct, diffVmaxPct, smooth, flip]);
 
   // -------------------------------------------------------------------------
-  // Render overlays (crosshair lines)
+  // Clear slice overlay canvases. Crosshair rendering was removed to keep the
+  // slice panels visually quiet; scale bars/colorbars live on the UI overlays.
   // -------------------------------------------------------------------------
   React.useEffect(() => {
     if (!allFloats) return;
-    const crossPositions: [number, number][] = [
-      [sliceX, sliceY],
-      [sliceX, sliceZ],
-      [sliceY, sliceZ],
-    ];
     const overlayRefSets = [overlayRefs];
     if (isDual) overlayRefSets.push(overlayRefsB);
     if (allFloatsDiff) overlayRefSets.push(overlayRefsDiff);
@@ -1279,29 +1095,11 @@ function Show3DVolume() {
         if (!overlay) continue;
         const ctx = overlay.getContext("2d");
         if (!ctx) continue;
-        const { w: cw, h: ch, displayH: dh, scale } = canvasSizes[a];
-        const stretchY = dh / ch;
+        const { w: cw, displayH: dh } = canvasSizes[a];
         ctx.clearRect(0, 0, cw, dh);
-        if (showCrosshair) {
-          const zs = zooms[a];
-          const [dataX, dataY] = crossPositions[a];
-          const cx = cw / 2, cy = dh / 2;
-          let canvasX = dataX * scale;
-          let canvasY = dataY * scale * stretchY;
-          if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
-            canvasX = (canvasX - cx) * zs.zoom + cx + zs.panX;
-            canvasY = (canvasY - cy) * zs.zoom + cy + zs.panY * stretchY;
-          }
-          ctx.strokeStyle = tc.accentYellow + "80";
-          ctx.lineWidth = 1;
-          ctx.setLineDash([4, 4]);
-          ctx.beginPath(); ctx.moveTo(canvasX, 0); ctx.lineTo(canvasX, dh); ctx.stroke();
-          ctx.beginPath(); ctx.moveTo(0, canvasY); ctx.lineTo(cw, canvasY); ctx.stroke();
-          ctx.setLineDash([]);
-        }
       }
     }
-  }, [allFloats, isDual, allFloatsDiff, sliceX, sliceY, sliceZ, zooms, showCrosshair, tc, sliceDims, canvasSizes]);
+  }, [allFloats, isDual, allFloatsDiff, canvasSizes]);
 
   // -------------------------------------------------------------------------
   // Scale bar (HiDPI UI overlay)
@@ -1346,8 +1144,13 @@ function Show3DVolume() {
         if (showColorbar) {
           const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
           const useTraitRange = role === "A" && traitVmin != null && traitVmax != null;
-          const baseMin = useTraitRange ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : cbRange.min;
-          const baseMax = useTraitRange ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : cbRange.max;
+          const rawMin = useTraitRange ? (logScale ? signedLog1p(traitVmin!) : traitVmin!) : cbRange.min;
+          const rawMax = useTraitRange ? (logScale ? signedLog1p(traitVmax!) : traitVmax!) : cbRange.max;
+          // Mirror slice render (line ~1084): flip negates data + swaps min/max with sign.
+          // Diff panel is always non-negative |A - B|, so the flip toggle doesn't apply.
+          const applyFlip = flip && role !== "diff";
+          const baseMin = applyFlip ? -rawMax : rawMin;
+          const baseMax = applyFlip ? -rawMin : rawMax;
           const { vmin, vmax } = sliderRange(baseMin, baseMax, cbMinPct, cbMaxPct);
           const cssW = uiCanvas.width / DPR;
           const cssH = uiCanvas.height / DPR;
@@ -1358,7 +1161,7 @@ function Show3DVolume() {
         }
       }
     }
-  }, [pixelSize, pixelSizeAxes, scaleBarVisible, zooms, canvasSizes, sliceDims, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, imageDataRangeB, linkedContrast, diffVminPct, diffVmaxPct, diffDataRange, traitVmin, traitVmax, logScale, themeInfo.theme, isDual, allFloatsDiff]);
+  }, [pixelSize, pixelSizeAxes, scaleBarVisible, zooms, canvasSizes, sliceDims, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, imageVminPctB, imageVmaxPctB, imageDataRangeB, linkedContrast, diffVminPct, diffVmaxPct, diffDataRange, traitVmin, traitVmax, logScale, flip, themeInfo.theme, isDual, allFloatsDiff]);
 
   // -------------------------------------------------------------------------
   // FFT computation and caching (per-axis: only recompute changed axes)
@@ -1398,6 +1201,8 @@ function Show3DVolume() {
     ];
 
     const lut = COLORMAPS[fftColormap] || COLORMAPS.inferno;
+    const generation = ++fftComputeGenerationRef.current;
+    let cancelled = false;
 
     const computeFFTsForVolume = async (
       floats: Float32Array,
@@ -1471,21 +1276,41 @@ function Show3DVolume() {
     };
 
     const computeAllFFTs = async () => {
-      await computeFFTsForVolume(allFloats, fftMagCacheRefs, fftOffscreenRefs, fftImgDataRefs, fftCanvasRefs, false);
+      const dataBChanged = isDual && allFloatsB ? allFloatsB !== prevFFT.allFloatsB : false;
+      const fftAxisChangedB = fftAxisChanged.map(changed => changed || dataBChanged);
+      const localMagCache = { current: fftMagCacheRefs.current.map((value, axis) => fftAxisChanged[axis] ? null : value) } as React.MutableRefObject<(Float32Array | null)[]>;
+      const localOffscreenCache = { current: fftOffscreenRefs.current.map((value, axis) => fftAxisChanged[axis] ? null : value) } as React.MutableRefObject<(HTMLCanvasElement | null)[]>;
+      const localImgDataCache = { current: fftImgDataRefs.current.map((value, axis) => fftAxisChanged[axis] ? null : value) } as React.MutableRefObject<(ImageData | null)[]>;
+      const localMagCacheB = { current: fftMagCacheRefsB.current.map((value, axis) => fftAxisChangedB[axis] ? null : value) } as React.MutableRefObject<(Float32Array | null)[]>;
+      const localOffscreenCacheB = { current: fftOffscreenRefsB.current.map((value, axis) => fftAxisChangedB[axis] ? null : value) } as React.MutableRefObject<(HTMLCanvasElement | null)[]>;
+      const localImgDataCacheB = { current: fftImgDataRefsB.current.map((value, axis) => fftAxisChangedB[axis] ? null : value) } as React.MutableRefObject<(ImageData | null)[]>;
+      await computeFFTsForVolume(allFloats, localMagCache, localOffscreenCache, localImgDataCache, fftCanvasRefs, false);
       if (isDual && allFloatsB) {
-        const dataBChanged = allFloatsB !== prevFFT.allFloatsB;
-        await computeFFTsForVolume(allFloatsB, fftMagCacheRefsB, fftOffscreenRefsB, fftImgDataRefsB, fftCanvasRefsB, dataBChanged);
+        await computeFFTsForVolume(allFloatsB, localMagCacheB, localOffscreenCacheB, localImgDataCacheB, fftCanvasRefsB, dataBChanged);
       }
+      if (cancelled || generation !== fftComputeGenerationRef.current) return false;
+      fftMagCacheRefs.current = localMagCache.current;
+      fftOffscreenRefs.current = localOffscreenCache.current;
+      fftImgDataRefs.current = localImgDataCache.current;
+      if (isDual && allFloatsB) {
+        fftMagCacheRefsB.current = localMagCacheB.current;
+        fftOffscreenRefsB.current = localOffscreenCacheB.current;
+        fftImgDataRefsB.current = localImgDataCacheB.current;
+      } else {
+        fftMagCacheRefsB.current = [null, null, null];
+        fftOffscreenRefsB.current = [null, null, null];
+        fftImgDataRefsB.current = [null, null, null];
+      }
+      prevFFTCacheRef.current = { sliceX, sliceY, sliceZ, allFloats, allFloatsB, fftColormap, fftLogScale, fftAuto, gpuReady, effectiveShowFft };
+      return true;
     };
 
     // Debounce FFT compute during slider scrubbing: defer 80 ms so a 60 Hz drag
     // collapses to ~12 Hz, freeing the main thread for image redraws.
-    let cancelled = false;
     const debounceMs = 80;
     const timeoutId = setTimeout(() => {
       if (cancelled) return;
-      computeAllFFTs().then(() => { if (!cancelled) setFftVersion(v => v + 1); });
-      prevFFTCacheRef.current = { sliceX, sliceY, sliceZ, allFloats, allFloatsB, fftColormap, fftLogScale, fftAuto, gpuReady, effectiveShowFft };
+      computeAllFFTs().then((committed) => { if (committed) setFftVersion(v => v + 1); });
     }, debounceMs);
     return () => { cancelled = true; clearTimeout(timeoutId); };
   }, [effectiveShowFft, allFloats, allFloatsB, isDual, sliceX, sliceY, sliceZ, nx, ny, nz, fftColormap, fftLogScale, fftAuto, gpuReady]);
@@ -1799,15 +1624,34 @@ function Show3DVolume() {
     setZooms(prev => { const next = [...prev]; next[axis] = { zoom: newZoom, panX: newPanX, panY: newPanY }; return next; });
   };
 
+  const clickJumpTimerRef = React.useRef<number | null>(null);
+
   const handleDoubleClick = (axis: number) => {
+    if (clickJumpTimerRef.current !== null) {
+      window.clearTimeout(clickJumpTimerRef.current);
+      clickJumpTimerRef.current = null;
+    }
     setZooms(prev => { const next = [...prev]; next[axis] = DEFAULT_ZOOM; return next; });
   };
 
+  // Synchronous click-detection ref: synthetic events (CDP, automation) fire
+  // mousedown→mouseup back-to-back before React commits setDragStart. The ref
+  // is always current, so handleMouseUp can detect a stationary click even
+  // when dragStart state hasn't been flushed yet.
+  const clickStartRef = React.useRef<{ x: number; y: number; axis: number } | null>(null);
   const handleMouseDown = (e: React.MouseEvent, axis: number) => {
+    if (clickJumpTimerRef.current !== null) {
+      window.clearTimeout(clickJumpTimerRef.current);
+      clickJumpTimerRef.current = null;
+    }
     const zs = liveZoomsRef.current[axis];
     setDragAxis(axis);
     setDragStart({ x: e.clientX, y: e.clientY, pX: zs.panX, pY: zs.panY });
+    clickStartRef.current = { x: e.clientX, y: e.clientY, axis };
   };
+  React.useEffect(() => () => {
+    if (clickJumpTimerRef.current !== null) window.clearTimeout(clickJumpTimerRef.current);
+  }, []);
 
   // Single mousemove helper for A / B / Diff panels. Same drag-pan fast path,
   // same readout math; only the canvas array, data array, and setter differ.
@@ -1867,9 +1711,44 @@ function Show3DVolume() {
   const handleMouseMoveB = makeMouseMoveHandler(canvasRefsB, allFloatsB, setCursorInfoB);
   const handleMouseMoveDiff = makeMouseMoveHandler(canvasRefsDiff, allFloatsDiff, setCursorInfoDiff);
 
-  const handleMouseUp = () => {
+  // Stationary click on a slice panel = jump-to-voxel. Convert the click's
+  // canvas-pixel position into image-pixel coords (same math as handleMouseMove
+  // cursor readout), then set the OTHER two slice indices. XY click → updates
+  // sliceY+sliceX; XZ click → sliceZ+sliceX; YZ click → sliceZ+sliceY.
+  const handleMouseUp = (e?: React.MouseEvent, axis?: number, refs?: React.RefObject<(HTMLCanvasElement | null)[]>) => {
     if (zoomRafRef.current) { cancelAnimationFrame(zoomRafRef.current); zoomRafRef.current = 0; }
     setZooms(liveZoomsRef.current);
+    const click = clickStartRef.current;
+    if (e && axis !== undefined && refs && click && click.axis === axis && !lockPlayback) {
+      const moved = Math.abs(e.clientX - click.x) + Math.abs(e.clientY - click.y);
+      if (moved < 4) {
+        const canvas = refs.current?.[axis];
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const canvasX = (e.clientX - rect.left) * (canvas.width / rect.width);
+          const canvasY = (e.clientY - rect.top) * (canvas.height / rect.height);
+          const { w: cw, h: ch, scale } = canvasSizes[axis];
+          const zs = liveZoomsRef.current[axis];
+          const cx = cw / 2, cy = ch / 2;
+          const imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
+          const imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
+          const px = Math.floor(imgX), py = Math.floor(imgY);
+          const [sliceH, sliceW] = sliceDims[axis];
+          if (px >= 0 && px < sliceW && py >= 0 && py < sliceH) {
+            if (clickJumpTimerRef.current !== null) {
+              window.clearTimeout(clickJumpTimerRef.current);
+            }
+            clickJumpTimerRef.current = window.setTimeout(() => {
+              if (axis === 0) { setSliceY(py); setSliceX(px); }
+              else if (axis === 1) { setSliceZ(py); setSliceX(px); }
+              else { setSliceZ(py); setSliceY(px); }
+              clickJumpTimerRef.current = null;
+            }, 220);
+          }
+        }
+      }
+    }
+    clickStartRef.current = null;
     setDragAxis(null); setDragStart(null);
   };
   // Don't kill the drag when the cursor briefly leaves the panel - users routinely
@@ -1921,11 +1800,6 @@ function Show3DVolume() {
     }
   };
 
-  const handleResetAxis = (a: number) => {
-    if (lockView) return;
-    setZooms(prev => { const next = [...prev]; next[a] = DEFAULT_ZOOM; return next; });
-  };
-
   // -------------------------------------------------------------------------
   // Keyboard shortcuts
   // -------------------------------------------------------------------------
@@ -1936,12 +1810,7 @@ function Show3DVolume() {
   // Space             : play/pause
   // r / R             : reset all (zooms, camera, contrast, loop bounds)
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Ignore key events that originate inside an editable field (text input, textarea).
-    // Lets users type into the title input without triggering shortcuts.
-    const tag = (e.target as HTMLElement | null)?.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement | null)?.isContentEditable) {
-      return;
-    }
+    if (shouldIgnoreWidgetShortcut(e.target)) return;
     const axisSetters = [setSliceZ, setSliceY, setSliceX];
     const axisValues = [sliceZ, sliceY, sliceX];
     const axisMaxes = [nz - 1, ny - 1, nx - 1];
@@ -1959,14 +1828,16 @@ function Show3DVolume() {
         }
         break;
       case "ArrowLeft":
-        // Shift+ArrowLeft -> X axis -1; plain ArrowLeft -> Z axis -1
-        advance(e.shiftKey ? 2 : 0, -1);
+        // ← / →  scrub the ACTIVE axis (matches the popup help + Space/Home/End
+        // semantics + the play_axis dropdown). Shift+← / → still scrubs X
+        // as an explicit override regardless of active axis.
+        advance(e.shiftKey ? 2 : activeAxis, -1);
         break;
       case "ArrowRight":
-        advance(e.shiftKey ? 2 : 0, 1);
+        advance(e.shiftKey ? 2 : activeAxis, 1);
         break;
       case "ArrowUp":
-        // Up = Y axis -1 (image-coords convention: up means smaller Y)
+        // ↑ / ↓ scrub Y (image-coords: up = smaller row index).
         advance(1, -1);
         break;
       case "ArrowDown":
@@ -2073,6 +1944,12 @@ function Show3DVolume() {
       if (!offscreen) continue;
       const axisLabel = AXES[a].toUpperCase();
       const sliceIndices = [sliceZ, sliceY, sliceX];
+      // Width-direction sampling per panel: XY/XZ width → px (axes[2]), YZ width → py (axes[1]).
+      // Use per-axis sampling for anisotropic volumes so the PDF scale bar matches the
+      // live overlay (same convention as drawScaleBarHiDPI above at line ~1337).
+      const widthAxis = [2, 2, 1][a];
+      const axesTriple = pixelSizeAxes && pixelSizeAxes.length === 3 ? pixelSizeAxes : null;
+      const figPxSize = axesTriple ? axesTriple[widthAxis] : pixelSize;
       const figCanvas = exportFigure({
         imageCanvas: offscreen,
         title: `${title || "Volume"}: ${axisLabel} slice ${sliceIndices[a]}`,
@@ -2080,10 +1957,10 @@ function Show3DVolume() {
         vmin,
         vmax,
         logScale,
-        pixelSize: pixelSize > 0 ? pixelSize : undefined,
-        pixelUnit: pixelSize > 0 ? "Å" : "pixels",
+        pixelSize: figPxSize > 0 ? figPxSize : undefined,
+        pixelUnit: figPxSize > 0 ? "Å" : "pixels",
         showColorbar: withColorbar,
-        showScaleBar: pixelSize > 0,
+        showScaleBar: figPxSize > 0,
       });
       canvasToPDF(figCanvas).then((blob) => downloadBlob(blob, `show3dvolume_figure_${AXES[a]}.pdf`));
     }
@@ -2261,12 +2138,9 @@ function Show3DVolume() {
   // -------------------------------------------------------------------------
   // Labels and setters
   // -------------------------------------------------------------------------
-  const dl = dimLabels || ["X", "Y", "Z"];
-  const axisLabels = [
-    `${dl[1]}${dl[2]} (${dl[0]}=${sliceZ})`,
-    `${dl[0]}${dl[2]} (${dl[1]}=${sliceY})`,
-    `${dl[0]}${dl[1]} (${dl[2]}=${sliceX})`,
-  ];
+  // Default mirrors Python's dim_labels default ["Z", "Y", "X"]: axis 0 is the slice
+  // dim. Fallback fires only when the trait is briefly undefined (initial mount race).
+  const dl = dimLabels || ["Z", "Y", "X"];
   const sliceValues = [sliceZ, sliceY, sliceX];
   // Mirror of slice values for playback intervals to read between renders.
   // The interval's `sliceValuesRef.current[a] = next` writes are load-bearing
@@ -2282,6 +2156,22 @@ function Show3DVolume() {
     (_: Event, v: number | number[]) => setSliceY(v as number),
     (_: Event, v: number | number[]) => setSliceX(v as number),
   ];
+  // Over-clip detection: user dragged hist thumbs past data peak → image goes black.
+  // Compute effective vmin/vmax in data units, compare against 1st/99th percentile of histogram.
+  // If vmin > 99% of data OR vmax < 1% of data, no visible content.
+  const imageClipBounds = React.useMemo(() => {
+    if (!imageHistogramData || imageHistogramData.length === 0) return null;
+    return percentileClip(imageHistogramData, 1, 99);
+  }, [imageHistogramData]);
+  const isOverClipped = React.useMemo(() => {
+    if (!imageClipBounds) return false;
+    const span = imageDataRange.max - imageDataRange.min;
+    if (span <= 0) return false;
+    const vmin = imageDataRange.min + (imageVminPct / 100) * span;
+    const vmax = imageDataRange.min + (imageVmaxPct / 100) * span;
+    return vmin >= imageClipBounds.vmax || vmax <= imageClipBounds.vmin;
+  }, [imageClipBounds, imageDataRange, imageVminPct, imageVmaxPct]);
+
   // Thin-Z layout: depth axis much smaller than lateral. Stack YZ/XZ panels vertically beside XY.
   const thinZ = nz < Math.min(nx, ny) / 4;
   const thinZGridTemplate = thinZ
@@ -2290,6 +2180,7 @@ function Show3DVolume() {
   const panelTotalW = (canvasSizes[0]?.w ?? CANVAS_TARGET) + (thinZ
     ? Math.max(canvasSizes[1]?.w ?? 0, canvasSizes[2]?.w ?? 0)
     : ((canvasSizes[1]?.w ?? 0) + (canvasSizes[2]?.w ?? 0) + SPACING.SM)) + SPACING.SM;
+  const primaryPanelW = canvasSizes[0]?.w ?? CANVAS_TARGET;
 
   // -------------------------------------------------------------------------
   // Render
@@ -2298,20 +2189,19 @@ function Show3DVolume() {
     <Box className="show3dvolume-root" tabIndex={0} onKeyDown={handleKeyDown} sx={{ ...container.root, bgcolor: tc.bg, color: tc.text }}>
       {/* 3D Volume Renderer */}
       {!hideVolume && (
-      <Box sx={{ mb: `${SPACING.LG}px` }}>
+      <Box sx={{ mb: 0 }}>
         {/* Title row */}
         <Typography variant="caption" sx={{ ...typography.label, color: tc.accent, mb: `${SPACING.XS}px`, display: "block", height: 16, lineHeight: "16px", overflow: "hidden" }}>
           {title || "Volume 3D"}<InfoTooltip text={<Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
             <Typography sx={{ fontSize: 11, fontWeight: "bold" }}>Controls</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>FFT: Show power spectrum (Fourier transform) below each slice.</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Auto: Percentile-based contrast (2nd-98th percentile). FFT Auto masks DC + clips to 99.9th.</Typography>
-            <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Cross: Show crosshair lines indicating orthogonal slice positions.</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Colorbar: Display colorbar overlay on each slice canvas.</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Loop: Loop playback. Drag end markers on slider for loop range.</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Bounce: Ping-pong playback — alternates forward and reverse.</Typography>
             <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Planes: Show/hide slice planes in 3D volume view.</Typography>
             <Typography sx={{ fontSize: 11, fontWeight: "bold", mt: 0.5 }}>Keyboard</Typography>
-            <KeyboardShortcuts items={[["Space", "Play / Pause"], ["← / →", "Prev / Next slice"], ["Home / End", "First / Last slice"], ["R", "Reset zoom"], ["Scroll", "Zoom"], ["Dbl-click", "Reset view"]]} />
+            <KeyboardShortcuts items={[["Space", "Play / Pause"], ["← / →", "Active axis -/+"], ["↑ / ↓", "Y slice -/+"], ["Shift+← / →", "X slice -/+"], ["Home / End", "First / Last on active axis"], ["R", "Reset zoom"], ["Click panel", "Jump to voxel"], ["Scroll", "Zoom"], ["Dbl-click", "Reset view"]]} />
           </Box>} theme={themeInfo.theme} />
           {/* ControlCustomizer dropped in new monorepo */}
         </Typography>
@@ -2329,32 +2219,35 @@ function Show3DVolume() {
         {/* 3D volume controls row — above canvases */}
         {webgpuSupported && !hideVolume && (
           <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mb: `${SPACING.XS}px` }}>
-            <Typography sx={{ ...typography.label, fontSize: 10 }}>Planes:</Typography>
-            <Switch checked={showSlicePlanes} onChange={(e) => setShowSlicePlanes(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} />
+            <Typography sx={{ ...controlLabel }}>Planes:</Typography>
+            <Switch checked={showSlicePlanes} onChange={(e) => setShowSlicePlanes(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle slice planes in 3D volume" }} />
+            <Typography sx={{ ...controlLabel }}>Ortho:</Typography>
+            <Switch checked={orthographic} onChange={(e) => setOrthographic(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle orthographic 3D projection" }} />
             {showSlicePlanes && (
               <>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Opacity:</Typography>
-                <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+                <Typography sx={{ ...controlLabel }}>Opacity:</Typography>
+                <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Slice plane opacity" valueLabelDisplay="auto" />
               </>
             )}
-            <Typography sx={{ ...typography.label, fontSize: 10 }}>{isDual ? "Vol A:" : "Vol Strength:"}</Typography>
-            <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+            <Typography sx={{ ...controlLabel }}>{isDual ? "Vol A:" : "Vol Strength:"}</Typography>
+            <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label={isDual ? "Volume A opacity" : "Volume strength"} valueLabelDisplay="auto" />
             {isDual && (
               <>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Vol B:</Typography>
-                <Slider value={opacityB} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityB(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} />
+                <Typography sx={{ ...controlLabel }}>Vol B:</Typography>
+                <Slider value={opacityB} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityB(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Volume B opacity" valueLabelDisplay="auto" />
               </>
             )}
           </Box>
         )}
         {webgpuSupported ? (
-          <Stack direction="row" spacing={`${SPACING.LG}px`}>
+          <Stack direction="row" spacing={`${SPACING.SM}px`}>
             {/* Volume A */}
             <Box>
               {isDual && <Typography variant="caption" sx={{ ...typography.label, mb: `${SPACING.XS}px`, display: "block" }}>{title || "Volume A"}</Typography>}
               <Box
                 sx={{
                   ...container.imageBox,
+                  border: `1px solid ${tc.border}`,
                   width: volumeCanvasSize,
                   height: volumeCanvasSize,
                   cursor: lockVolume ? "default" : (volumeDrag ? "grabbing" : "grab"),
@@ -2367,7 +2260,21 @@ function Show3DVolume() {
                 <canvas
                   ref={volumeCanvasRef}
                   style={{ width: volumeCanvasSize, height: volumeCanvasSize, display: "block" }}
+                  role="img"
+                  aria-label={`3D volume rendering${isDual ? ` (${title || "Volume A"})` : title ? `: ${title}` : ""} (${nx} by ${ny} by ${nz} voxels). Drag to rotate, wheel to zoom.`}
                 />
+                {cameraChanged && (
+                  <Button
+                    size="small"
+                    sx={{ ...compactButton, position: "absolute", top: 4, right: 4, minWidth: 0, px: 0.75, bgcolor: "rgba(255,255,255,0.75)", "&:hover": { bgcolor: "rgba(255,255,255,0.9)" } }}
+                    onClick={(e) => { e.stopPropagation(); if (!lockVolume) setCamera(DEFAULT_CAMERA); }}
+                    disabled={lockVolume}
+                    aria-label="Reset 3D volume view"
+                    title="Reset 3D view"
+                  >
+                    Reset
+                  </Button>
+                )}
                 <Box
                   onMouseDown={(e) => { if (!lockVolume) handleVolumeResizeStart(e); }}
                   sx={{
@@ -2398,7 +2305,21 @@ function Show3DVolume() {
                   <canvas
                     ref={volumeCanvasRefB}
                     style={{ width: volumeCanvasSize, height: volumeCanvasSize, display: "block" }}
-                  />
+                    role="img"
+                    aria-label={`3D volume rendering (${titleB || "Volume B"}) (${nx} by ${ny} by ${nz} voxels). Drag to rotate, wheel to zoom.`}
+                    />
+                  {cameraChanged && (
+                    <Button
+                      size="small"
+                      sx={{ ...compactButton, position: "absolute", top: 4, right: 4, minWidth: 0, px: 0.75, bgcolor: "rgba(255,255,255,0.75)", "&:hover": { bgcolor: "rgba(255,255,255,0.9)" } }}
+                      onClick={(e) => { e.stopPropagation(); if (!lockVolume) setCamera(DEFAULT_CAMERA); }}
+                      disabled={lockVolume}
+                      aria-label="Reset 3D volume view"
+                      title="Reset 3D view"
+                    >
+                      Reset
+                    </Button>
+                  )}
                   <Box
                     onMouseDown={(e) => { if (!lockVolume) handleVolumeResizeStart(e); }}
                     sx={{
@@ -2426,19 +2347,12 @@ function Show3DVolume() {
       )}
       {/* Slice canvases row — Volume A.
           In dual + show_diff mode we hide A and B and render the |A − B| panel alone. */}
-      {isDual && !compact && !showDiff && (
-        <Typography variant="caption" sx={{ ...typography.label, ...typography.title, mb: `${SPACING.XS}px`, mt: `${SPACING.SM}px`, display: "block" }}>
-          {title || "Volume A"}
-        </Typography>
-      )}
-      {/* Top toolbar inline above panels — no border. Width pegged to panel grid total so flex-end aligns with right edge of slice panels. */}
-      <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mb: `${SPACING.XS}px`, justifyContent: "flex-end", width: panelTotalW }}>
+      {/* Top toolbar inline above panels - right edge aligns with slice panel grid. */}
+      <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mb: `${SPACING.XS}px`, justifyContent: "flex-end", width: panelTotalW, maxWidth: panelTotalW, boxSizing: "border-box" }}>
         {!hideDisplay && (
           <>
-            <Typography sx={{ ...typography.label, fontSize: 10 }}>Compact:</Typography>
-            <Switch checked={compact} onChange={(e) => { if (!lockDisplay) setCompact(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-            <Typography sx={{ ...typography.label, fontSize: 10, opacity: compact ? 0.4 : 1 }} title={compact ? "Disable Compact to see FFT panels" : ""}>FFT:</Typography>
-            <Switch checked={showFft} onChange={(e) => { if (!lockDisplay && !compact) setShowFft(e.target.checked); }} disabled={lockDisplay || compact} size="small" sx={switchStyles.small} />
+            <Typography sx={{ ...controlLabel }}>FFT:</Typography>
+            <Switch checked={showFft} onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panels" }} />
           </>
         )}
         {!hideExport && (
@@ -2461,32 +2375,23 @@ function Show3DVolume() {
           </>
         )}
         {!hideView && (
-          <Button size="small" sx={compactButton} disabled={lockView || !anythingDirty} onClick={() => { if (!lockView) handleResetAll(); }} title="Reset camera, slice/FFT zooms, loop bounds, and contrast sliders (shortcut: r)">Reset</Button>
+          <Button size="small" sx={compactButton} disabled={lockView || !anythingDirty} onClick={() => { if (!lockView) handleResetAll(); }} title="Reset camera, slice/FFT zooms, loop bounds, and contrast sliders (shortcut: r)" aria-label="Reset all (camera, zoom/pan, loop bounds, contrast)">Reset</Button>
         )}
       </Box>
-      {!(isDual && showDiff) && (
-      <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start" }}>
-        {AXES.map((_, a) => {
+      {!(isDual && showDiff) && (() => {
+        const panels = AXES.map((_, a) => {
           const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
           // In thin-Z stacked layout, hide headers for axes 1+2 (Y, X depth panels) so
           // they butt up against each other with zero whitespace. Colored borders + slider
           // labels still identify axes.
-          const hideHeader = compact || (thinZ && a > 0);
           return (
             <Box key={a} sx={{ minWidth: cw, gridArea: `a${a}` }}>
-              {/* Header row matching Show3D */}
-              {!hideHeader && (
-                <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-                  <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
-                  <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
-                </Stack>
-              )}
               {/* Canvas with plane-colored border. dh = displayH (stretched for depth panels). */}
               <Box
                 sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
                 onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                 onMouseMove={(e) => handleMouseMove(e, a)}
-                onMouseUp={handleMouseUp}
+                onMouseUp={(e) => handleMouseUp(e, a, canvasRefs)}
                 onMouseLeave={handleMouseLeave}
                 onWheel={(e) => { if (!lockView) handleWheel(e, a); }}
                 onDoubleClick={() => { if (!lockView) handleDoubleClick(a); }}
@@ -2496,18 +2401,22 @@ function Show3DVolume() {
                   width={cw}
                   height={ch}
                   style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
+                  role="img"
+                  aria-label={`${["XY", "XZ", "YZ"][a]} slice ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1} along ${dl[a]} axis${title ? `: ${title}` : ""} (${cw} by ${ch} pixels)`}
                 />
                 <canvas
                   ref={(el) => { overlayRefs.current[a] = el; }}
                   width={cw}
                   height={dh}
                   style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                  aria-hidden="true"
                 />
                 <canvas
                   ref={(el) => { uiRefs.current[a] = el; }}
                   width={Math.round(cw * DPR)}
                   height={Math.round(dh * DPR)}
                   style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                  aria-hidden="true"
                 />
                 {/* Cursor readout overlay */}
                 {cursorInfo && cursorInfo.view === ["XY", "XZ", "YZ"][a] && (
@@ -2515,6 +2424,13 @@ function Show3DVolume() {
                     <Typography sx={{ fontSize: 9, fontFamily: "monospace", color: "rgba(255,255,255,0.7)", whiteSpace: "nowrap", lineHeight: 1.2 }}>
                       ({cursorInfo.row}, {cursorInfo.col}) {formatNumber(cursorInfo.value)}
                     </Typography>
+                  </Box>
+                )}
+                {/* Over-clip warning: image is mostly black because histogram thumbs sit outside data range */}
+                {isOverClipped && a === 0 && (
+                  <Box sx={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", bgcolor: "rgba(255, 180, 0, 0.85)", color: "#000", px: 1, py: 0.5, fontSize: 11, fontWeight: "bold", borderRadius: 0.5, textAlign: "center", lineHeight: 1.3, pointerEvents: "none", maxWidth: cw - 20 }}>
+                    No data visible<br/>
+                    <span style={{ fontSize: 9, fontWeight: "normal" }}>Adjust contrast range or enable Auto</span>
                   </Box>
                 )}
                 {/* Resize handle */}
@@ -2529,7 +2445,7 @@ function Show3DVolume() {
                 />
               </Box>
               {/* FFT canvas (inline, below stats) */}
-              {effectiveShowFft && !compact && (
+              {effectiveShowFft && (
                 <Box sx={{ mt: `${SPACING.SM}px` }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 20 }}>
                     <Stack direction="row" alignItems="center" sx={{ overflow: "hidden" }}>
@@ -2546,7 +2462,7 @@ function Show3DVolume() {
                         </Typography>
                       )}
                     </Stack>
-                    <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsResetAxis(a)} onClick={() => handleFftResetAxis(a)}>Reset</Button>
+                    <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsResetAxis(a)} onClick={() => handleFftResetAxis(a)} aria-label={`Reset ${["XY", "XZ", "YZ"][a]} FFT zoom and pan`}>Reset</Button>
                   </Stack>
                   <Box
                     sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
@@ -2562,12 +2478,15 @@ function Show3DVolume() {
                       width={cw}
                       height={ch}
                       style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
+                      role="img"
+                      aria-label={`FFT power spectrum of ${["XY", "XZ", "YZ"][a]} slice (reciprocal space, ${cw} by ${ch} pixels)`}
                     />
                     <canvas
                       ref={(el) => { fftOverlayRefs.current[a] = el; }}
                       width={Math.round(cw * DPR)}
                       height={Math.round(dh * DPR)}
                       style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                      aria-hidden="true"
                     />
                   </Box>
                   {fftZooms[a].zoom !== 1 && (
@@ -2580,7 +2499,7 @@ function Show3DVolume() {
               {/* Slider row — only in single mode; dual mode renders sliders below Volume B */}
               {!isDual && !hidePlayback && (
               <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: cw, maxWidth: cw, boxSizing: "border-box" }}>
-                <Typography sx={{ ...typography.labelSmall, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
+                <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
                 {loop ? (
                   <Slider
                     value={[loopStarts[a], sliceValues[a], effectiveLoopEnds[a]]}
@@ -2606,6 +2525,7 @@ function Show3DVolume() {
                       "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: tc.textMuted },
                       "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" },
                     }}
+                    aria-label={`Loop range and current ${dl[a]} slice (${sliceValues[a] + 1} of ${sliceMaxes[a] + 1}, loop ${loopStarts[a] + 1} to ${effectiveLoopEnds[a] + 1})`}
                   />
                 ) : (
                   <Slider
@@ -2616,6 +2536,8 @@ function Show3DVolume() {
                     disabled={lockPlayback}
                     size="small"
                     sx={{ ...sliderStyles.small, flex: 1, minWidth: 40 }}
+                    aria-label={`${dl[a]} slice ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1}`}
+                    valueLabelDisplay="auto"
                   />
                 )}
                 <Typography sx={{ ...typography.value, color: tc.textMuted, minWidth: 28, textAlign: "right", flexShrink: 0 }}>
@@ -2628,38 +2550,37 @@ function Show3DVolume() {
               )}
             </Box>
           );
-        })}
-      </Box>
-      )}
+        });
+        return thinZ ? (
+          <Box sx={{ display: "flex", alignItems: "flex-start", gap: `${SPACING.SM}px`, justifyContent: "flex-start" }}>
+            {panels[0]}
+            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px` }}>
+              {panels[1]}
+              {panels[2]}
+            </Box>
+          </Box>
+        ) : (
+          <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start" }}>
+            {panels}
+          </Box>
+        );
+      })()}
       {/* Slice canvases row — Volume B (dual mode only).
           When show_diff is ON we hide the B image grid and FFT block, then render only the
           standalone diff panel (rendered as a sibling below). The shared slider row stays
           shared between A/B/diff. */}
       {isDual && (
         <>
-          {!compact && !showDiff && (
-            <Typography variant="caption" sx={{ ...typography.label, ...typography.title, mb: `${SPACING.XS}px`, mt: `${SPACING.LG}px`, display: "block" }}>
-              {titleB || "Volume B"}
-            </Typography>
-          )}
-          {!showDiff && (
-          <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", ...(compact ? { mt: `${SPACING.XS}px` } : {}) }}>
-            {AXES.map((_, a) => {
+          {!showDiff && (() => {
+            const panelsB = AXES.map((_, a) => {
               const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
-              const hideHeaderB = compact || (thinZ && a > 0);
               return (
                 <Box key={`b${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
-                  {!hideHeaderB && (
-                    <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-                      <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
-                      <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
-                    </Stack>
-                  )}
                   <Box
                     sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
                     onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                     onMouseMove={(e) => handleMouseMoveB(e, a)}
-                    onMouseUp={handleMouseUp}
+                    onMouseUp={(e) => handleMouseUp(e, a, canvasRefsB)}
                     onMouseLeave={handleMouseLeaveB}
                     onWheel={(e) => { if (!lockView) handleWheel(e, a); }}
                     onDoubleClick={() => { if (!lockView) handleDoubleClick(a); }}
@@ -2669,18 +2590,22 @@ function Show3DVolume() {
                       width={cw}
                       height={ch}
                       style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
+                      role="img"
+                      aria-label={`${["XY", "XZ", "YZ"][a]} slice ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1} along ${dl[a]} axis (Volume B${titleB ? `: ${titleB}` : ""}) (${cw} by ${ch} pixels)`}
                     />
                     <canvas
                       ref={(el) => { overlayRefsB.current[a] = el; }}
                       width={cw}
                       height={dh}
                       style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                      aria-hidden="true"
                     />
                     <canvas
                       ref={(el) => { uiRefsB.current[a] = el; }}
                       width={Math.round(cw * DPR)}
                       height={Math.round(dh * DPR)}
                       style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                      aria-hidden="true"
                     />
                     {cursorInfoB && cursorInfoB.view === ["XY", "XZ", "YZ"][a] && (
                       <Box sx={{ position: "absolute", top: 3, right: 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", minWidth: 100, textAlign: "right" }}>
@@ -2690,10 +2615,10 @@ function Show3DVolume() {
                       </Box>
                     )}
                   </Box>
-                  {effectiveShowFft && !compact && (
+                  {effectiveShowFft && (
                     <Box sx={{ mt: `${SPACING.SM}px` }}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 20 }}>
-                        <Typography variant="caption" sx={{ ...typography.label, fontSize: 10 }}>
+                        <Typography variant="caption" sx={{ ...controlLabel }}>
                           {`FFT ${[`${dl[1]}${dl[2]}`, `${dl[0]}${dl[2]}`, `${dl[0]}${dl[1]}`][a]} ${gpuReady ? "" : " (CPU fallback)"}`}
                         </Typography>
                       </Stack>
@@ -2711,12 +2636,15 @@ function Show3DVolume() {
                           width={cw}
                           height={ch}
                           style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
+                          role="img"
+                          aria-label={`FFT power spectrum of ${["XY", "XZ", "YZ"][a]} slice (Volume B, reciprocal space, ${cw} by ${ch} pixels)`}
                         />
                         <canvas
                           ref={(el) => { fftOverlayRefsB.current[a] = el; }}
                           width={Math.round(cw * DPR)}
                           height={Math.round(dh * DPR)}
                           style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                          aria-hidden="true"
                         />
                       </Box>
                       {fftZooms[a].zoom !== 1 && (
@@ -2728,35 +2656,35 @@ function Show3DVolume() {
                   )}
                 </Box>
               );
-            })}
-          </Box>
-          )}
+            });
+            return thinZ ? (
+              <Box sx={{ display: "flex", alignItems: "flex-start", gap: `${SPACING.SM}px`, justifyContent: "flex-start", mt: `${SPACING.XS}px` }}>
+                {panelsB[0]}
+                <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px` }}>
+                  {panelsB[1]}
+                  {panelsB[2]}
+                </Box>
+              </Box>
+            ) : (
+              <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", mt: `${SPACING.XS}px` }}>
+                {panelsB}
+              </Box>
+            );
+          })()}
           {/* Diff row — |A − B| (dual mode + show_diff only).
               When show_diff is ON this is the only image grid shown (A and B hidden above). */}
           {showDiff && allFloatsDiff && (
             <>
-              {!compact && (
-                <Typography variant="caption" sx={{ ...typography.label, ...typography.title, mb: `${SPACING.XS}px`, mt: `${SPACING.LG}px`, display: "block" }}>
-                  |A − B|
-                </Typography>
-              )}
-              <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", ...(compact ? { mt: `${SPACING.XS}px` } : {}) }}>
+              <Box sx={{ display: "grid", gridTemplate: thinZGridTemplate, rowGap: 0, columnGap: `${SPACING.SM}px`, justifyContent: "start", mt: `${SPACING.XS}px` }}>
                 {AXES.map((_, a) => {
                   const { w: cw, h: ch, displayH: dh } = canvasSizes[a];
-                  const hideHeaderDiff = compact || (thinZ && a > 0);
                   return (
                     <Box key={`diff${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
-                      {!hideHeaderDiff && (
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-                          <Typography variant="caption" sx={{ ...typography.label }}>{axisLabels[a]}</Typography>
-                          <Button size="small" sx={compactButton} disabled={lockView || !needsResetAxis(a)} onClick={() => handleResetAxis(a)}>Reset</Button>
-                        </Stack>
-                      )}
                       <Box
                         sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: "#ff8c00" }}
                         onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
                         onMouseMove={(e) => handleMouseMoveDiff(e, a)}
-                        onMouseUp={handleMouseUp}
+                        onMouseUp={(e) => handleMouseUp(e, a, canvasRefsDiff)}
                         onMouseLeave={handleMouseLeaveDiff}
                         onWheel={(e) => { if (!lockView) handleWheel(e, a); }}
                         onDoubleClick={() => { if (!lockView) handleDoubleClick(a); }}
@@ -2766,18 +2694,22 @@ function Show3DVolume() {
                           width={cw}
                           height={ch}
                           style={{ width: cw, height: dh, imageRendering: smooth ? "auto" : "pixelated" }}
+                          role="img"
+                          aria-label={`${["XY", "XZ", "YZ"][a]} slice difference |A - B| ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1} along ${dl[a]} axis (${cw} by ${ch} pixels)`}
                         />
                         <canvas
                           ref={(el) => { overlayRefsDiff.current[a] = el; }}
                           width={cw}
                           height={dh}
                           style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                          aria-hidden="true"
                         />
                         <canvas
                           ref={(el) => { uiRefsDiff.current[a] = el; }}
                           width={Math.round(cw * DPR)}
                           height={Math.round(dh * DPR)}
                           style={{ position: "absolute", top: 0, left: 0, width: cw, height: dh, pointerEvents: "none" }}
+                          aria-hidden="true"
                         />
                         {cursorInfoDiff && cursorInfoDiff.view === ["XY", "XZ", "YZ"][a] && (
                           <Box sx={{ position: "absolute", top: 3, right: 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", minWidth: 100, textAlign: "right" }}>
@@ -2805,7 +2737,7 @@ function Show3DVolume() {
                 return (
                   <Box key={`slider${a}`} sx={{ minWidth: cw, gridArea: `a${a}` }}>
                     <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: cw, maxWidth: cw, boxSizing: "border-box" }}>
-                      <Typography sx={{ ...typography.labelSmall, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
+                      <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
                       {loop ? (
                         <Slider
                           value={[loopStarts[a], sliceValues[a], effectiveLoopEnds[a]]}
@@ -2831,6 +2763,7 @@ function Show3DVolume() {
                             "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: tc.textMuted },
                             "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" },
                           }}
+                          aria-label={`Loop range and current ${dl[a]} slice (${sliceValues[a] + 1} of ${sliceMaxes[a] + 1}, loop ${loopStarts[a] + 1} to ${effectiveLoopEnds[a] + 1})`}
                         />
                       ) : (
                         <Slider
@@ -2841,6 +2774,8 @@ function Show3DVolume() {
                           disabled={lockPlayback}
                           size="small"
                           sx={{ ...sliderStyles.small, flex: 1, minWidth: 40 }}
+                          aria-label={`${dl[a]} slice ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1}`}
+                          valueLabelDisplay="auto"
                         />
                       )}
                       <Typography sx={{ ...typography.value, color: tc.textMuted, minWidth: 28, textAlign: "right", flexShrink: 0 }}>
@@ -2860,58 +2795,62 @@ function Show3DVolume() {
       {/* FFT controls row */}
       {effectiveShowFft && (
         <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg }}>
-          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Scale:</Typography>
-          <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
+          <Typography sx={{ ...controlLabel }}>FFT Scale:</Typography>
+          <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
             <MenuItem value="linear">Lin</MenuItem>
             <MenuItem value="log">Log</MenuItem>
           </Select>
-          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Color:</Typography>
-          <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps}>
+          <Typography sx={{ ...controlLabel }}>FFT Color:</Typography>
+          <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
             {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
           </Select>
-          <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT Auto:</Typography>
-          <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+          <Typography sx={{ ...controlLabel }}>FFT Auto:</Typography>
+          <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
         </Box>
       )}
-      {/* Controls row with histogram on right.
-          Inner controls Box width pinned to total panel width (sum of canvasSizes.w + gaps)
-          so all three controlRows + Z-slider align flush with the slice panels above. */}
+      {/* Controls row with histogram anchored to the slice panel columns. */}
       {showControls && (!hideDisplay || !hideHistogram) && (() => {
+        const depthPanelW = Math.max(canvasSizes[1]?.w ?? 0, canvasSizes[2]?.w ?? 0);
         return (
-        <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, alignItems: "stretch" }}>
+        <Box sx={{
+          mt: `${SPACING.SM}px`,
+          display: "grid",
+          gridTemplateColumns: thinZ ? `${primaryPanelW}px ${depthPanelW}px` : "minmax(0, 1fr) auto",
+          columnGap: `${SPACING.SM}px`,
+          rowGap: `${SPACING.XS}px`,
+          alignItems: "end",
+          width: panelTotalW,
+          boxSizing: "border-box",
+        }}>
           {!hideDisplay && (
-            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "center", width: panelTotalW }}>
-              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: "100%", boxSizing: "border-box" }}>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
-                <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps}>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "center", minWidth: 0, gridColumn: hideHistogram ? "1 / -1" : "1" }}>
+              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: primaryPanelW, maxWidth: primaryPanelW, boxSizing: "border-box", flexWrap: "wrap" }}>
+                <Typography sx={{ ...controlLabel }}>Scale:</Typography>
+                <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Intensity scale (linear or logarithmic)" }}>
                   <MenuItem value="linear">Lin</MenuItem>
                   <MenuItem value="log">Log</MenuItem>
                 </Select>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
-                <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }}>
+                <Typography sx={{ ...controlLabel }}>Color:</Typography>
+                <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} inputProps={{ "aria-label": "Image colormap" }}>
                   {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                 </Select>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Colorbar:</Typography>
-                <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                <Typography sx={{ ...typography.label, fontSize: 10 }} title="CSS bilinear interpolation on image canvas. Off = pixelated.">Smooth:</Typography>
-                <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                <Typography sx={{ ...controlLabel }}>Colorbar:</Typography>
+                <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
+                <Typography sx={{ ...controlLabel }} title="CSS bilinear interpolation on image canvas. Off = pixelated.">Smooth:</Typography>
+                <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
               </Box>
-              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: "100%", boxSizing: "border-box" }}>
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Cross:</Typography>
-                <Switch checked={showCrosshair} onChange={(e) => { if (!lockDisplay) setShowCrosshair(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                <Typography sx={{ ...typography.label, fontSize: 10 }} title="Depth-axis display height multiplier (1-16x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch:</Typography>
-                <Slider value={zStretch} min={1} max={16} step={0.5} onChange={(_, v) => { if (!lockDisplay) setZStretch(v as number); }} disabled={lockDisplay} size="small" valueLabelDisplay="auto" sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
-                <Typography sx={{ ...typography.label, fontSize: 10 }} title="Negate displayed values. Useful when phase sign is inverted.">Flip:</Typography>
-                <Switch checked={flip} onChange={(e) => { if (!lockDisplay) setFlip(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+              <Box sx={{ ...controlRow, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: primaryPanelW, maxWidth: primaryPanelW, boxSizing: "border-box", flexWrap: "wrap" }}>
+                <Typography sx={{ ...controlLabel }} title="Negate displayed values. Useful when phase sign is inverted.">Flip:</Typography>
+                <Switch checked={flip} onChange={(e) => { if (!lockDisplay) setFlip(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Flip (negate) displayed values" }} />
                 {isDual && (
                   <>
-                    <Typography sx={{ ...typography.label, fontSize: 10 }}>Diff:</Typography>
-                    <Switch checked={showDiff} onChange={(e) => setShowDiff(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} />
-                    <Typography sx={{ ...typography.label, fontSize: 10 }}>Link Contrast:</Typography>
-                    <Switch checked={linkedContrast} onChange={(e) => { if (!lockDisplay) setLinkedContrast(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                    <Typography sx={{ ...controlLabel }}>Diff:</Typography>
+                    <Switch checked={showDiff} onChange={(e) => setShowDiff(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Show absolute difference panel (|A - B|)" }} />
+                    <Typography sx={{ ...controlLabel }}>Link Contrast:</Typography>
+                    <Switch checked={linkedContrast} onChange={(e) => { if (!lockDisplay) setLinkedContrast(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link contrast sliders between Volume A and B" }} />
                   </>
                 )}
-                <Typography sx={{ ...typography.label, fontSize: 10 }}>Auto:</Typography>
+                <Typography sx={{ ...controlLabel }}>Auto:</Typography>
                 <Switch checked={autoContrast} onChange={(e) => {
                   if (lockDisplay) return;
                   const on = e.target.checked;
@@ -2955,12 +2894,12 @@ function Show3DVolume() {
                       setDiffVmaxPct(100);
                     }
                   }
-                }} disabled={lockDisplay} size="small" sx={switchStyles.small} />
+                }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
               </Box>
             </Box>
           )}
           {!hideHistogram && (
-            <Box sx={{ display: "flex", flexDirection: "row", gap: `${SPACING.SM}px`, alignItems: "flex-end" }}>
+            <Box sx={{ display: "flex", flexDirection: "row", gap: `${SPACING.SM}px`, alignItems: "flex-end", justifySelf: thinZ ? "start" : "end", gridColumn: hideDisplay ? "1 / -1" : "2" }}>
               <Box sx={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto" }}>
                 {isDual && <Typography sx={{ ...typography.label, fontSize: 9, color: tc.textMuted, textAlign: "center", mb: 0.25 }}>{linkedContrast ? "A+B" : (title || "A")}</Typography>}
                 <Histogram
@@ -2976,10 +2915,11 @@ function Show3DVolume() {
                     }
                   }}
                   width={110}
-                  height={46}
+                  height={62}
                   theme={themeInfo.theme === "dark" ? "dark" : "light"}
                   dataMin={flip ? -imageDataRange.max : imageDataRange.min}
                   dataMax={flip ? -imageDataRange.min : imageDataRange.max}
+                  pinBinsToRange={false}
                 />
               </Box>
               {isDual && !linkedContrast && imageHistogramDataB && (
@@ -2997,10 +2937,11 @@ function Show3DVolume() {
                       }
                     }}
                     width={110}
-                    height={46}
+                    height={62}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
                     dataMin={flip ? -imageDataRangeB.max : imageDataRangeB.min}
                     dataMax={flip ? -imageDataRangeB.min : imageDataRangeB.max}
+                    pinBinsToRange={false}
                   />
                 </Box>
               )}
@@ -3019,10 +2960,11 @@ function Show3DVolume() {
                       }
                     }}
                     width={110}
-                    height={46}
+                    height={62}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
                     dataMin={diffDataRange.min}
                     dataMax={diffDataRange.max}
+                    pinBinsToRange={false}
                   />
                 </Box>
               )}
@@ -3034,7 +2976,7 @@ function Show3DVolume() {
       {/* Playback: transport + axis selector + fps + loop + bounce */}
       {!hidePlayback && (() => {
         return (
-      <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: panelTotalW, boxSizing: "border-box" }}>
+      <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: primaryPanelW, maxWidth: primaryPanelW, boxSizing: "border-box", flexWrap: "wrap" }}>
         <Select
           value={playAxis}
           onChange={(e) => { if (!lockPlayback) { setPlaying(false); setPlayAxis(Number(e.target.value)); } }}
@@ -3042,6 +2984,7 @@ function Show3DVolume() {
           size="small"
           sx={{ ...themedSelect, minWidth: 40, fontSize: 10 }}
           MenuProps={themedMenuProps}
+          inputProps={{ "aria-label": "Playback axis (Z, Y, X, or All)" }}
         >
           <MenuItem value={0}>{dl[0]}</MenuItem>
           <MenuItem value={1}>{dl[1]}</MenuItem>
@@ -3049,13 +2992,13 @@ function Show3DVolume() {
           <MenuItem value={3}>All</MenuItem>
         </Select>
         <Stack direction="row" spacing={0} sx={{ flexShrink: 0 }}>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }}>
+          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
             <FastRewindIcon sx={{ fontSize: 18 }} />
           </IconButton>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: tc.accent, p: 0.25 }}>
+          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: tc.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
             {playing ? <PauseIcon sx={{ fontSize: 18 }} /> : <PlayArrowIcon sx={{ fontSize: 18 }} />}
           </IconButton>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }}>
+          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
             <FastForwardIcon sx={{ fontSize: 18 }} />
           </IconButton>
           <IconButton size="small" disabled={lockPlayback} onClick={() => {
@@ -3067,17 +3010,17 @@ function Show3DVolume() {
                 sliceSettersRef.current[playAxis](loopStarts[playAxis]);
               }
             }
-          }} sx={{ color: tc.textMuted, p: 0.25 }}>
+          }} sx={{ color: tc.textMuted, p: 0.25 }} aria-label="Stop and rewind to loop start" title="Stop">
             <StopIcon sx={{ fontSize: 16 }} />
           </IconButton>
         </Stack>
-        <Typography sx={{ ...typography.label, color: tc.textMuted, flexShrink: 0 }}>fps</Typography>
-        <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} />
-        <Typography sx={{ ...typography.label, color: tc.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
-        <Typography sx={{ ...typography.label, color: tc.textMuted, flexShrink: 0 }}>Loop</Typography>
-        <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} />
-        <Typography sx={{ ...typography.label, color: tc.textMuted, flexShrink: 0 }}>Bounce</Typography>
-        <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} />
+        <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>fps</Typography>
+        <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
+        <Typography sx={{ ...controlLabel, color: tc.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
+        <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>Loop</Typography>
+        <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
+        <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>Bounce</Typography>
+        <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce (ping-pong) playback" }} />
       </Box>
         );
       })()}

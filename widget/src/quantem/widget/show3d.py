@@ -101,11 +101,11 @@ class Show3D(anywidget.AnyWidget):
         Pixel size in Å for scale bar display.
     log_scale : bool, default False
         Use log scale for intensity mapping.
-    auto_contrast : bool, default False
+    auto_contrast : bool, default True
         Use percentile-based contrast (ignores vmin/vmax).
-    percentile_low : float, default 1.0
+    percentile_low : float, default 0.5
         Lower percentile for auto-contrast.
-    percentile_high : float, default 99.0
+    percentile_high : float, default 99.5
         Upper percentile for auto-contrast.
     fps : float, default 5.0
         Frames per second for playback.
@@ -120,6 +120,29 @@ class Show3D(anywidget.AnyWidget):
         alongside a control panel.  This controls **display only** — the
         underlying stack resolution is never resampled; scrubbing and zoom
         still see every pixel of the full-resolution frame.
+    max_cols : int, default 4
+        Multi-panel grid wrap.  ``0`` = single row (no wrap), ``N>0`` = wrap into
+        rows of at most ``N`` panels.  Default ``4`` is a good fit for a
+        13"–16" laptop screen; bump to ``6`` on wide monitors or drop to ``3``
+        for a portrait split layout.  Empty trailing cells in a partial last
+        row are not rendered (transparent, non-interactive).
+    panel_gap : int, default 10
+        Gap in CSS pixels between adjacent panels.  ``0`` = flush (panels share
+        an edge — useful for tiled montages), ``20`` = roomy (clear separation
+        for slides).  Single-panel widgets ignore this.
+    panel_title_font_size : int, default 11
+        Font size in CSS pixels for the per-panel title drawn at the top of
+        each multi-panel slot.  Bump to ``14–16`` for slide-projection clarity;
+        drop to ``9`` to fit titles inside narrow panels on a small screen.
+    show_resize_handles : bool, default True
+        Render the bottom-right corner triangle on every real panel.  Dragging
+        any handle resizes the entire multi-panel canvas (linked).  Set
+        ``False`` to declutter a screenshot or printed figure where the
+        operator already has the layout they want.
+    show_zoom_indicator : bool, default True
+        Draw the ``1.0×`` zoom readout at the bottom-left of every panel.
+        Set ``False`` for clean static layouts or when the scale bar alone
+        is enough to communicate scale.
 
     Attributes
     ----------
@@ -181,9 +204,31 @@ class Show3D(anywidget.AnyWidget):
     cmap = traitlets.Unicode("magma").tag(sync=True)
     dim_label = traitlets.Unicode("Frame").tag(sync=True)
 
-    # Multi-Panel (synchronized side-by-side stacks)
+    # Multi-Panel (side-by-side stacks, independent zoom by default with optional link)
     n_panels = traitlets.Int(1).tag(sync=True)
     panel_titles = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    panel_width_px = traitlets.Int(0).tag(sync=True)  # pixel width of ONE panel inside frame_bytes (0 for single-panel)
+    # Real frame count per panel for stack comparison: stacks of different
+    # lengths get auto-padded to the longest; this trait lets JS mark
+    # "end-of-stack" frames (frame idx >= real[panel]). Empty = all real.
+    panel_real_frames = traitlets.List(traitlets.Int()).tag(sync=True)
+    # Single Link toggle controls both zoom AND pan (independent axes proved confusing).
+    link_zoom = traitlets.Bool(True).tag(sync=True)
+    link_pan = traitlets.Bool(True).tag(sync=True)
+    link_panels = traitlets.Bool(True).tag(sync=True)
+    link_contrast = traitlets.Bool(True).tag(sync=True)  # share vmin/vmax across panels
+    # 0 = single row (no wrap). N > 0 = wrap into rows of at most N panels.
+    max_cols = traitlets.Int(4).tag(sync=True)
+    # Per-widget customization for multi-panel display.
+    show_resize_handles = traitlets.Bool(True).tag(sync=True)
+    show_zoom_indicator = traitlets.Bool(True).tag(sync=True)
+    panel_title_font_size = traitlets.Int(11).tag(sync=True)
+    panel_gap = traitlets.Int(10).tag(sync=True)
+    # Hover-x hide feature: enables UI to drop frames from scrubber without
+    # rebuilding the widget. hidden_indices is the live state; visible_indices
+    # is derived (read-only).
+    hideable = traitlets.Bool(False).tag(sync=True)
+    hidden_indices = traitlets.List(traitlets.Int()).tag(sync=True)
 
     # =========================================================================
     # Playback Controls
@@ -202,19 +247,24 @@ class Show3D(anywidget.AnyWidget):
     # Statistics Panel
     # =========================================================================
     show_controls = traitlets.Bool(True).tag(sync=True)
-    show_stats = traitlets.Bool(True).tag(sync=True)
+    show_stats = traitlets.Bool(False).tag(sync=True)
     stats_mean = traitlets.Float(0.0).tag(sync=True)
     stats_min = traitlets.Float(0.0).tag(sync=True)
     stats_max = traitlets.Float(0.0).tag(sync=True)
     stats_std = traitlets.Float(0.0).tag(sync=True)
+    # Per-panel stats (length = n_panels). Empty for single-panel.
+    stats_mean_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
+    stats_min_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
+    stats_max_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
+    stats_std_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
 
     # =========================================================================
     # Display Options
     # =========================================================================
     log_scale = traitlets.Bool(False).tag(sync=True)
-    auto_contrast = traitlets.Bool(False).tag(sync=True)
-    percentile_low = traitlets.Float(1.0).tag(sync=True)
-    percentile_high = traitlets.Float(99.0).tag(sync=True)
+    auto_contrast = traitlets.Bool(True).tag(sync=True)
+    percentile_low = traitlets.Float(0.5).tag(sync=True)
+    percentile_high = traitlets.Float(99.5).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
     data_min = traitlets.Float(0.0).tag(sync=True)
@@ -507,6 +557,7 @@ class Show3D(anywidget.AnyWidget):
         *data_args,
         labels: list[str] | None = None,
         panel_titles: list[str] | None = None,
+        panel_real_frames: list[int] | None = None,
         title: str = "",
         cmap: str | Colormap = Colormap.MAGMA,
         vmin: float | None = None,
@@ -516,16 +567,16 @@ class Show3D(anywidget.AnyWidget):
         smooth: bool = False,
         image_rotation: int = 0,
         log_scale: bool = False,
-        auto_contrast: bool = False,
-        percentile_low: float = 1.0,
-        percentile_high: float = 99.0,
+        auto_contrast: bool = True,
+        percentile_low: float = 0.5,
+        percentile_high: float = 99.5,
         fps: float = 5.0,
         timestamps: list[float] | None = None,
         timestamp_unit: str = "s",
         show_fft: bool = False,
         fft_window: bool = True,
         show_playback: bool = False,
-        show_stats: bool = True,
+        show_stats: bool = False,
         show_controls: bool = True,
         size: int = 0,
         diff_mode: str = "off",
@@ -534,9 +585,27 @@ class Show3D(anywidget.AnyWidget):
         use_torch: bool | None = None,
         device: str | None = None,
         display_bin: int | str = "auto",
+        hideable: bool = False,
         state=None,
+        max_cols: int | None = None,
+        panel_gap: int | None = None,
+        panel_title_font_size: int | None = None,
+        show_resize_handles: bool | None = None,
+        show_zoom_indicator: bool | None = None,
         **kwargs,
     ):
+        if hideable:
+            kwargs["hideable"] = True
+        if max_cols is not None:
+            kwargs["max_cols"] = int(max_cols)
+        if panel_gap is not None:
+            kwargs["panel_gap"] = int(panel_gap)
+        if panel_title_font_size is not None:
+            kwargs["panel_title_font_size"] = int(panel_title_font_size)
+        if show_resize_handles is not None:
+            kwargs["show_resize_handles"] = bool(show_resize_handles)
+        if show_zoom_indicator is not None:
+            kwargs["show_zoom_indicator"] = bool(show_zoom_indicator)
         import time as _time
         _t0 = _time.perf_counter()
         # Reject unknown kwargs so typos raise instead of being silently ignored.
@@ -546,6 +615,8 @@ class Show3D(anywidget.AnyWidget):
         # sent when the context manager exits.  Without this, each self.x = y
         # fires a separate round-trip over the ZMQ/websocket channel, which
         # can add 30+ seconds for a large stack in VS Code Jupyter.
+        if panel_real_frames is not None:
+            self.panel_real_frames = list(panel_real_frames)
         with self.hold_sync():
             self._init_sync(data_args, labels=labels, panel_titles=panel_titles,
                             title=title, cmap=cmap, vmin=vmin, vmax=vmax,
@@ -572,35 +643,38 @@ class Show3D(anywidget.AnyWidget):
         import time as _time
         self.widget_version = resolve_widget_version()
 
-        # Optional torch GPU acceleration
+        # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
+        # merely because CUDA/MPS exists: real multi-panel ptycho stacks can be
+        # many GB, and an implicit copy can OOM before the widget renders.
         self._use_torch = False
         self._device = None
         self._data_torch = None
         self._display_torch = None
-        # Auto-detect: use torch when input is already a Tensor OR a CUDA/MPS GPU
-        # is available. Lets users skip `use_torch=True` boilerplate.
+        first_tensor_device = None
         if use_torch is None:
-            any_tensor = _HAS_TORCH and any(
-                isinstance(d, torch.Tensor) for d in data_args if d is not None
-            )
-            gpu_available = _HAS_TORCH and (
-                torch.cuda.is_available()
-                or torch.backends.mps.is_available()
-            )
-            use_torch = any_tensor or gpu_available
+            use_torch = False
+            if _HAS_TORCH:
+                for d in data_args:
+                    if isinstance(d, torch.Tensor):
+                        use_torch = True
+                        first_tensor_device = d.device
+                        break
         if use_torch:
             if not _HAS_TORCH:
                 raise ImportError(
                     "use_torch=True requires PyTorch. Install it with: pip install torch"
                 )
             self._use_torch = True
-            self._device = torch.device(
-                device or (
+            if device is not None:
+                self._device = torch.device(device)
+            elif first_tensor_device is not None:
+                self._device = first_tensor_device
+            else:
+                self._device = torch.device(
                     "mps" if torch.backends.mps.is_available()
                     else "cuda" if torch.cuda.is_available()
                     else "cpu"
                 )
-            )
 
         # ── Parse data args: single or multi-panel ──
         # Show3D(data) → single panel
@@ -689,96 +763,59 @@ class Show3D(anywidget.AnyWidget):
                         f"Panel {i}: complex data not accepted. Convert first: "
                         "np.abs(arr) for magnitude or np.angle(arr) for phase."
                     )
-                if arr.shape[0] != panels[0].shape[0]:
-                    raise ValueError(
-                        f"Panel {i} has {arr.shape[0]} frames, but panel 0 has "
-                        f"{panels[0].shape[0]} frames. All panels must match."
-                    )
+                # Image (H,W) must match across panels — viewer cannot composite
+                # different image sizes into one canvas.
                 if arr.shape[1:] != panels[0].shape[1:]:
                     raise ValueError(
                         f"Panel {i} image shape {arr.shape[1:]} must match panel 0 image shape {panels[0].shape[1:]}."
                     )
+                # Slice counts can differ — caller compares trials with different
+                # iteration counts. We auto-pad shorter stacks below.
                 panels.append(_as_valid_panel(arr, f"Panel {i}"))
             self.n_panels = len(panels)
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
             else:
                 self.panel_titles = [f"Panel {i+1}" for i in range(len(panels))]
-            # Bin each panel FIRST (before normalize), then normalize the
-            # small binned data, then concatenate. Order matters for 4K:
-            #   Old: normalize 768MB×3 (4.8s) → concat 2.3GB → bin (2.3s) = 7.1s
-            #   New: bin 768MB×3 (1.8s) → normalize 48MB×3 (0.1s) → concat = 1.9s
-            from quantem.widget.array_utils import bin2d as _bin2d
-            orig_h = panels[0].shape[1]
-            frame_mb = orig_h * panels[0].shape[2] * 4 / (1024 * 1024)
-            # Compute per-panel bin factor (same auto-bin logic as single panel)
+            # Auto-pad short stacks to longest, auto-fill panel_real_frames so
+            # JS marks end-of-stack frames. Pad by repeating each panel's last
+            # frame — visually obvious vs zeros and keeps colormap range stable.
+            real_n = [p.shape[0] for p in panels]
+            max_n = max(real_n)
+            if any(n != max_n for n in real_n):
+                padded = []
+                for p, n in zip(panels, real_n):
+                    if n == max_n:
+                        padded.append(p)
+                    else:
+                        last = p[-1:]
+                        pad = np.broadcast_to(last, (max_n - n, *p.shape[1:]))
+                        padded.append(np.concatenate([p, pad], axis=0))
+                panels = padded
+                if not self.panel_real_frames:
+                    self.panel_real_frames = real_n
+            # NEVER BIN (CLAUDE.md rule). Operator wants full source resolution
+            # on every multi-panel surface — pixel-exact for microscopy.
+            # Memory: bumped JS-side buffer cap (see _buffer_size logic) so
+            # 10 panels × 1366² × 4B fits.
             panel_bin = 1
-            total_w = sum(p.shape[2] for p in panels) + 2 * (len(panels) - 1)
-            combined_frame_mb = orig_h * total_w * 4 / (1024 * 1024)
-            if combined_frame_mb > 32:
-                for bf in [2, 4, 8]:
-                    if combined_frame_mb / (bf * bf) <= 32:
-                        panel_bin = bf
-                        break
+            orig_h = panels[0].shape[1]
+            normalized = []
+            for p in panels:
+                if p.size > 10_000_000:
+                    sample = p.flat[::max(1, p.size // 1_000_000)]
+                    p2, p98 = np.percentile(sample, [2, 98])
                 else:
-                    panel_bin = 8
+                    p2, p98 = np.percentile(p, [2, 98])
+                rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
+                normalized.append((p - np.float32(p2)) * rng_inv)
 
-            if panel_bin > 1:
-                # Bin each panel with direct reshape+mean (no copy overhead)
-                binned_panels = []
-                for p in panels:
-                    n_f, h_f, w_f = p.shape
-                    oh = h_f // panel_bin * panel_bin
-                    ow = w_f // panel_bin * panel_bin
-                    binned_panels.append(
-                        p[:, :oh, :ow]
-                        .reshape(n_f, oh // panel_bin, panel_bin, ow // panel_bin, panel_bin)
-                        .mean(axis=(2, 4)).astype(np.float32)
-                    )
-                # Normalize the SMALL binned data. We center each panel on its
-                # 2/98 percentile band so panels with different intensity scales
-                # become visually comparable, but we do NOT clip — clipping piled
-                # all outliers at 0 and 1 and killed the visible histogram
-                # distribution. Without clipping, JS-side Auto-contrast + slider
-                # both reflect the real distribution shape.
-                # Multiply by precomputed float32 reciprocal instead of dividing
-                # by float64 — keeps the whole op in float32 (no upcast to
-                # float64 intermediate), 3x faster on 120 MB panels.
-                normalized = []
-                for bp in binned_panels:
-                    if bp.size > 10_000_000:
-                        sample = bp.flat[::max(1, bp.size // 1_000_000)]
-                        p2, p98 = np.percentile(sample, [2, 98])
-                    else:
-                        p2, p98 = np.percentile(bp, [2, 98])
-                    rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
-                    normalized.append((bp - np.float32(p2)) * rng_inv)
-            else:
-                # No binning needed — normalize at full res (no clip; see note above)
-                normalized = []
-                for p in panels:
-                    if p.size > 10_000_000:
-                        sample = p.flat[::max(1, p.size // 1_000_000)]
-                        p2, p98 = np.percentile(sample, [2, 98])
-                    else:
-                        p2, p98 = np.percentile(p, [2, 98])
-                    rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
-                    normalized.append((p - np.float32(p2)) * rng_inv)
-
-            # Concatenate horizontally with 2px black separator
-            sep_w = 2
-            sep = np.zeros(
-                (normalized[0].shape[0], normalized[0].shape[1], sep_w),
-                dtype=np.float32,
-            )
-            parts = []
-            for j, p in enumerate(normalized):
-                if j > 0:
-                    parts.append(sep)
-                parts.append(p)
-            data = np.concatenate(parts, axis=2)
-            self._panel_width = panels[0].shape[2] // max(panel_bin, 1)
-            # Multi-panel already binned — skip auto-bin below
+            # Concatenate panels back-to-back. JS paints clean bg-color gaps
+            # between them at render time (so the gap matches the page theme
+            # instead of becoming colormap[0]).
+            data = np.concatenate(normalized, axis=2)
+            self._panel_width = panels[0].shape[2]
+            self.panel_width_px = self._panel_width
             self._multi_panel_bin = panel_bin
         else:
             self.n_panels = 1
@@ -816,34 +853,13 @@ class Show3D(anywidget.AnyWidget):
         orig_h = int(self._data.shape[1])
         orig_w = int(self._data.shape[2])
 
-        # Auto-bin for display: reduce per-frame size to speed up trait sync.
-        # Multi-panel data is already binned in the multi-panel path above.
+        # NEVER BIN (CLAUDE.md rule). Display data is always source-pixel-exact.
+        # Honor explicit display_bin=N>1 only if caller asks; "auto" stays 1.
         self._display_bin = 1
-        if self._multi_panel_bin > 0:
-            # Multi-panel already binned — _data IS the display data
-            self._display_bin = self._multi_panel_bin
-        elif display_bin == "auto":
-            frame_mb = orig_h * orig_w * 4 / (1024 * 1024)
-            if frame_mb > 32:
-                for bf in [2, 4, 8]:
-                    if frame_mb / (bf * bf) <= 32:
-                        self._display_bin = bf
-                        break
-                else:
-                    self._display_bin = 8
-        elif isinstance(display_bin, int) and display_bin > 1:
+        if isinstance(display_bin, int) and display_bin > 1:
             self._display_bin = display_bin
 
-        if self._multi_panel_bin > 0:
-            # Multi-panel already binned — _data IS the display data
-            self._display_data = self._data
-            self.height = orig_h
-            self.width = orig_w
-            self._display_bin_factor = self._multi_panel_bin
-            if pixel_size > 0:
-                pixel_size = pixel_size * self._multi_panel_bin
-            print(f"  Display bin {self._multi_panel_bin}× (multi-panel): {self.height}×{self.width} ({self._display_data[0].nbytes // 1024 // 1024} MB/frame)")
-        elif self._display_bin > 1:
+        if self._display_bin > 1:
             from quantem.widget.array_utils import bin2d
             self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
             self.height = int(self._display_data.shape[1])
@@ -851,7 +867,7 @@ class Show3D(anywidget.AnyWidget):
             self._display_bin_factor = self._display_bin
             if pixel_size > 0:
                 pixel_size = pixel_size * self._display_bin
-            print(f"  Display bin {self._display_bin}×: {orig_h}×{orig_w} → {self.height}×{self.width} ({self._display_data[0].nbytes // 1024 // 1024} MB/frame)")
+            print(f"  Display bin {self._display_bin}× (explicit): {orig_h}×{orig_w} → {self.height}×{self.width}")
         else:
             self._display_data = self._data
             self.height = orig_h
@@ -921,7 +937,7 @@ class Show3D(anywidget.AnyWidget):
         # 256 MB buffer cap. Holds 16 frames at 16 MB/frame (4K binned) so
         # scrubbing within window is paint-limited (no Comm round-trip).
         # Sliding window prefetches outside the cached zone.
-        max_buffer_bytes = 256 * 1024 * 1024
+        max_buffer_bytes = 4 * 1024 * 1024 * 1024  # 4 GB cap, NEVER BIN
         min_buffer_frames = 8
         max_frames = max(min_buffer_frames, max_buffer_bytes // frame_bytes)
         self._buffer_size = min(buffer_size, self.n_slices, max_frames)
@@ -1096,7 +1112,7 @@ class Show3D(anywidget.AnyWidget):
         # Recompute buffer_size against new frame size, then invalidate JS-side
         # buffer (otherwise JS would slice the new H×W out of the old buffer).
         frame_bytes_n = self.height * self.width * 4
-        max_buffer_bytes = 256 * 1024 * 1024
+        max_buffer_bytes = 4 * 1024 * 1024 * 1024  # 4 GB cap, NEVER BIN
         max_frames = max(8, max_buffer_bytes // max(1, frame_bytes_n))
         self._buffer_size = min(self._buffer_size, self.n_slices, max_frames)
         with self.hold_sync():
@@ -1280,6 +1296,42 @@ class Show3D(anywidget.AnyWidget):
         elif device.startswith("cuda"):
             torch.cuda.empty_cache()
 
+    @property
+    def visible_indices(self) -> list[int]:
+        """Live list of frame indices NOT in hidden_indices. Read-only;
+        mutate via set_hidden() / show_all() / hide()."""
+        hidden = set(self.hidden_indices)
+        return [i for i in range(self.n_slices) if i not in hidden]
+
+    def hide(self, *indices: int) -> "Show3D":
+        """Hide one or more frames from the scrubber. Idempotent."""
+        keep = set(self.hidden_indices) | {int(i) for i in indices}
+        # Always keep at least one frame visible.
+        if len(keep) >= self.n_slices:
+            return self
+        self.hidden_indices = sorted(keep)
+        return self
+
+    def show(self, *indices: int) -> "Show3D":
+        """Restore frames previously hidden. Idempotent."""
+        drop = {int(i) for i in indices}
+        self.hidden_indices = sorted(set(self.hidden_indices) - drop)
+        return self
+
+    def set_hidden(self, indices: list[int]) -> "Show3D":
+        """Replace the hidden set wholesale."""
+        clean = sorted({int(i) for i in indices if 0 <= int(i) < self.n_slices})
+        # Always keep at least one frame visible.
+        if len(clean) >= self.n_slices:
+            clean = clean[:-1]
+        self.hidden_indices = clean
+        return self
+
+    def show_all(self) -> "Show3D":
+        """Restore every frame."""
+        self.hidden_indices = []
+        return self
+
     def summary(self):
         lines = [self.title or "Show3D", "═" * 32]
         lines.append(f"Stack:    {self.n_slices}×{self.height}×{self.width}")
@@ -1415,6 +1467,21 @@ class Show3D(anywidget.AnyWidget):
             self.stats_min = float(display_frame.min())
             self.stats_max = float(display_frame.max())
             self.stats_std = float(display_frame.std())
+            # Per-panel stats so multi-panel widgets show each panel's range
+            # separately rather than a misleading global aggregate.
+            if self.n_panels > 1 and self._panel_width > 0:
+                pw = self._panel_width
+                means, mins, maxs, stds = [], [], [], []
+                for i in range(self.n_panels):
+                    sl = display_frame[:, i * pw:(i + 1) * pw]
+                    means.append(float(sl.mean()))
+                    mins.append(float(sl.min()))
+                    maxs.append(float(sl.max()))
+                    stds.append(float(sl.std()))
+                self.stats_mean_per_panel = means
+                self.stats_min_per_panel = mins
+                self.stats_max_per_panel = maxs
+                self.stats_std_per_panel = stds
             if self.timestamps and self.slice_idx < len(self.timestamps):
                 self.current_timestamp = self.timestamps[self.slice_idx]
             if self.roi_active:

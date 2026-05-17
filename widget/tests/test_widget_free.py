@@ -133,6 +133,35 @@ def test_show3dvolume_free_releases_ram():
     assert w.volume_bytes == b""
 
 
+def test_show3dvolume_free_releases_dual_mode_buffers():
+    """Dual mode holds 2 volumes + 2 byte buffers; free() must clear all four
+    plus the GIF/ZIP export buffers, otherwise tens of MB stay pinned."""
+    a = np.random.rand(8, 64, 64).astype(np.float32)
+    b = np.random.rand(8, 64, 64).astype(np.float32)
+    w = Show3DVolume(a, data_b=b, dual_mode=True)
+    assert w._data is not None and w._data_b is not None
+    assert len(w.volume_bytes) > 0 and len(w.volume_bytes_b) > 0
+    w.free()
+    assert w._data is None
+    assert w._data_b is None
+    assert w.volume_bytes == b""
+    assert w.volume_bytes_b == b""
+    assert w._gif_data == b""
+    assert w._zip_data == b""
+
+
+def test_show3dvolume_slice_change_after_free_does_not_crash():
+    """JS may send a slice trait update after the user clicks free() but before
+    the comm message round-trips. Without a guard, _on_slice_change indexes a
+    None _data and the kernel raises an unhelpful TypeError into the comm."""
+    data = np.random.rand(8, 64, 64).astype(np.float32)
+    w = Show3DVolume(data)
+    w.free()
+    w.slice_z = 3
+    w.slice_y = 10
+    w.show_stats = True
+
+
 def test_show3d_roi_timer_canceled_on_free():
     """Pending ROI debounce timer must be canceled by free(), otherwise
     its callback fires 500ms later and crashes on nulled _display_data."""

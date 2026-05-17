@@ -12,7 +12,6 @@ export function findDataRange(data: Float32Array): { min: number; max: number } 
   return { min, max };
 }
 
-/** Apply log1p scale: result[i] = log(1 + max(0, data[i])). Returns a new array. */
 /** Signed log1p. For non-negative inputs identical to log1p(x); for negatives
  *  returns -log1p(|x|) so diff_mode frames don't collapse to zero. */
 export function applyLogScale(data: Float32Array): Float32Array {
