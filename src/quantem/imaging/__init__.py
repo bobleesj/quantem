@@ -15,3 +15,5 @@ from quantem.imaging.drift_simulation import (
     scan_time_drift_field as scan_time_drift_field,
     simulate_drifted_4dstem as simulate_drifted_4dstem,
 )
+from quantem.imaging.lattice import Lattice as Lattice
+from quantem.imaging.lattice_visualization import PLOT_REGISTRY as PLOT_REGISTRY
