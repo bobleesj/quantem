@@ -378,12 +378,26 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._path_points: list[tuple[int, int]] = []
         # Suppress per-trait recompute during apply_preset batch writes
         self._suppress_roi_recompute = False
+        # CuPy ndarray -> torch via zero-copy DLPack, stays on the same GPU.
+        # Avoids a 19 GB host-RAM round-trip for typical 4D-STEM workloads.
+        if not isinstance(data, (torch.Tensor, np.ndarray)):
+            try:
+                import cupy as _cp
+                if isinstance(data, _cp.ndarray):
+                    data = torch.from_dlpack(data)
+            except ImportError:
+                pass
         # Torch tensor input keeps its device (lets user pin a specific GPU via
         # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
         if isinstance(data, torch.Tensor):
             self._device = data.device
             self._data_pre = data
             data_np = None
+            self._saturation_value = (
+                65535 if data.dtype == torch.uint16
+                else 255 if data.dtype == torch.uint8
+                else None
+            )
         else:
             device_str, _ = validate_device(None)
             self._device = torch.device(device_str)
