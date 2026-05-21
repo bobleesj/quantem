@@ -4,6 +4,16 @@ These helpers generate drifted scan-axis-leading datasets from a clean
 reference dataset. They are intentionally separate from drift correction:
 the functions here create known synthetic acquisitions so correction and
 ptychography code can be tested against a controlled ground truth.
+
+Conventions
+-----------
+All drift vectors use ``(down_px, right_px)`` order in a shared specimen
+row/column frame. A positive lab-frame drift means the specimen moved
+down/right during the scan, so the clean data are sampled at
+``rotated_scan_position - drift``. The detector axes are never shifted,
+rolled, or warped. Subpixel drift is handled by interpolating over the
+scan axes, which can mix neighboring whole diffraction patterns but does
+not resample pixels inside any diffraction pattern.
 """
 from __future__ import annotations
 
@@ -193,6 +203,119 @@ def raw_raster_drift_effect(
     else:
         effect = np.stack([right, -down], axis=-1)
     return effect.astype(np.float32, copy=False)
+
+
+def valid_scan_position_mask(
+    positions_px: np.ndarray | torch.Tensor,
+    source_shape: tuple[int, int],
+) -> np.ndarray:
+    """Return where probe positions fall inside a source scan field.
+
+    Parameters
+    ----------
+    positions_px : ndarray or Tensor
+        Probe positions with trailing dimension ``(down_px, right_px)``.
+    source_shape : tuple[int, int]
+        Source scan shape ``(rows, cols)`` that can be sampled.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with shape ``positions_px.shape[:-1]``. A true value
+        means the corresponding probe position is inside the source scan.
+    """
+    positions = np.asarray(
+        positions_px.detach().cpu().numpy()
+        if isinstance(positions_px, torch.Tensor)
+        else positions_px,
+        dtype=np.float32,
+    )
+    if positions.ndim < 1 or positions.shape[-1] != 2:
+        raise ValueError(
+            f"positions_px must have trailing dimension 2, got shape {positions.shape}"
+        )
+    source_h, source_w = map(int, source_shape)
+    return (
+        (positions[..., 0] >= 0)
+        & (positions[..., 0] <= source_h - 1)
+        & (positions[..., 1] >= 0)
+        & (positions[..., 1] <= source_w - 1)
+    )
+
+
+def find_valid_square_scan_crop(
+    valid_mask: np.ndarray | torch.Tensor,
+    size: int,
+    *,
+    target_origin: tuple[float, float] | None = None,
+) -> tuple[slice, slice]:
+    """Find the valid square scan crop closest to a target origin.
+
+    This is the crop selector used by known-drift forward-model exports.
+    It keeps the policy in QuantEM instead of notebook code: choose a
+    square crop whose every scan position is valid, preferring the crop
+    closest to the centered scan window unless ``target_origin`` is given.
+
+    Parameters
+    ----------
+    valid_mask : ndarray or Tensor
+        Boolean map of valid raw scan pixels.
+    size : int
+        Square crop size in scan pixels.
+    target_origin : tuple[float, float], optional
+        Preferred ``(row_start, col_start)`` for the returned crop.
+
+    Returns
+    -------
+    tuple[slice, slice]
+        Row and column slices for the selected crop.
+    """
+    valid = np.asarray(
+        valid_mask.detach().cpu().numpy()
+        if isinstance(valid_mask, torch.Tensor)
+        else valid_mask,
+        dtype=bool,
+    )
+    if valid.ndim != 2:
+        raise ValueError(f"valid_mask must be 2-D, got shape {valid.shape}")
+    crop_size = int(size)
+    if crop_size < 1:
+        raise ValueError("size must be >= 1")
+    scan_h, scan_w = valid.shape
+    if crop_size > scan_h or crop_size > scan_w:
+        raise ValueError(
+            f"size {crop_size} cannot exceed valid_mask shape {valid.shape}"
+        )
+    if target_origin is None:
+        target_row = (scan_h - crop_size) / 2.0
+        target_col = (scan_w - crop_size) / 2.0
+    else:
+        target_row, target_col = map(float, target_origin)
+
+    valid_u8 = valid.astype(np.uint8, copy=False)
+    integral = np.pad(valid_u8, ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    needed = crop_size * crop_size
+    best: tuple[slice, slice] | None = None
+    best_score: float | None = None
+    for row0 in range(0, scan_h - crop_size + 1):
+        row1 = row0 + crop_size
+        for col0 in range(0, scan_w - crop_size + 1):
+            col1 = col0 + crop_size
+            count = (
+                integral[row1, col1]
+                - integral[row0, col1]
+                - integral[row1, col0]
+                + integral[row0, col0]
+            )
+            if count != needed:
+                continue
+            score = (row0 - target_row) ** 2 + (col0 - target_col) ** 2
+            if best is None or score < best_score:
+                best = (slice(row0, row1), slice(col0, col1))
+                best_score = float(score)
+    if best is None:
+        raise RuntimeError(f"could not find a valid {crop_size} x {crop_size} crop")
+    return best
 
 
 def plot_lab_drift_vectors(

@@ -1,0 +1,732 @@
+plan_version: 3
+name: bto18_crop400_clean0_recipe_refine_it10_20trials_20260520
+kind: explore
+description: Focused twenty-trial, 10-iteration regular BTO_18 clean0 crop400/bin2
+  recipe refinement around prior best trials 2001 and 2004. Every trial is a natural
+  400 x 400 crop from raw BTO_18_master.h5; no combined 0/90 stacking.
+gpus: 0,1
+pull_snapshots: true
+auto_pull_on_save_done: true
+auto_pull_mode: preview
+warm_worker: true
+trials:
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p8_olr0p15_plr0p15_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 01/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=8, obj_lr=0.15, probe_lr=0.15,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 8
+    obj_lr: 0.15
+    probe_lr: 0.15
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p8_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 02/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=8, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p8_olr0p25_plr0p25_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 03/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=8, obj_lr=0.25, probe_lr=0.25,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 8
+    obj_lr: 0.25
+    probe_lr: 0.25
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p10_olr0p15_plr0p15_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 04/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=10, obj_lr=0.15, probe_lr=0.15,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 10
+    obj_lr: 0.15
+    probe_lr: 0.15
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p10_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 05/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=10, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 10
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p10_olr0p25_plr0p25_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 06/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=10, obj_lr=0.25, probe_lr=0.25,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 10
+    obj_lr: 0.25
+    probe_lr: 0.25
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p12_olr0p15_plr0p15_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 07/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=12, obj_lr=0.15, probe_lr=0.15,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.15
+    probe_lr: 0.15
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p12_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 08/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p12_olr0p25_plr0p25_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 09/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=12, obj_lr=0.25, probe_lr=0.25,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.25
+    probe_lr: 0.25
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p16_olr0p15_plr0p15_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 10/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=16, obj_lr=0.15, probe_lr=0.15,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 16
+    obj_lr: 0.15
+    probe_lr: 0.15
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p16_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 11/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=16, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 16
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_core_lr_probe_s6_t15_p16_olr0p25_plr0p25_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 12/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=16, obj_lr=0.25, probe_lr=0.25,
+    batch_size=4096, iters=10. Screen tag: core_lr_probe.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 16
+    obj_lr: 0.25
+    probe_lr: 0.25
+    batch_size: 4096
+- name: BTO18_c400_refine_batch2048_s6_t15_p8_olr0p2_plr0p2_b2048_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 13/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=8, obj_lr=0.2, probe_lr=0.2,
+    batch_size=2048, iters=10. Screen tag: batch2048.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 2048
+- name: BTO18_c400_refine_batch2048_s6_t15_p12_olr0p2_plr0p2_b2048_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 14/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=2048, iters=10. Screen tag: batch2048.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 2048
+- name: BTO18_c400_refine_batch2048_s6_t15_p16_olr0p2_plr0p2_b2048_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 15/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=16, obj_lr=0.2, probe_lr=0.2,
+    batch_size=2048, iters=10. Screen tag: batch2048.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 16
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 2048
+- name: BTO18_c400_refine_slice_count_s5_t15_p12_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 16/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=5, slice_thickness=15 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: slice_count.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 5
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_slice_count_s7_t15_p12_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 17/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=7, slice_thickness=15 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: slice_count.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 7
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_slice_thickness_s6_t12_p12_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 18/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=12 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: slice_thickness.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 12
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_slice_thickness_s6_t18_p12_olr0p2_plr0p2_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 19/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=18 A, probe_modes=12, obj_lr=0.2, probe_lr=0.2,
+    batch_size=4096, iters=10. Screen tag: slice_thickness.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 18
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_refine_probe_lr_lower_s6_t15_p12_olr0p2_plr0p1_b4096_it10
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'Focused BTO_18 regular clean0 crop400/bin2 refinement trial 20/20 around
+    prior winners 2001/2004. Raw source scan is 512 x 512; live crop rows/cols 56:456
+    gives a physical 400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking
+    and no 800 x 400 interpretation. Locked calibration: rotation 158.9 deg, defocus
+    781 A. Recipe: S=6, slice_thickness=15 A, probe_modes=12, obj_lr=0.2, probe_lr=0.1,
+    batch_size=4096, iters=10. Screen tag: probe_lr_lower.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    slice_thickness: 15
+    iters: 10
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 1
+    slices: 6
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.1
+    batch_size: 4096

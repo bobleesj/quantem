@@ -633,29 +633,41 @@ def plot_radial_power(
 def plot_warped_images(
     dc: "DriftCorrection",
     show_knots: bool = True,
+    axsize: tuple[int, int] = (8, 8),
+    max_display_px: int = 1024,
     **kwargs,
 ) -> tuple[Figure, np.ndarray]:
     """Plot each warped image with optional knot overlays.
 
-    Parameters
-    ----------
-    dc : DriftCorrection
-    show_knots : bool, default True
-        Overlay current knot positions on each image.
-    **kwargs
-        Forwarded to :func:`show_2d`.
-
-    Returns
-    -------
-    fig : Figure
-    axes : np.ndarray of Axes
+    Each image normalized + downsampled on GPU; matplotlib only receives uint8.
     """
     dc._ensure_warped_images()
-    fig, ax = show_2d(list(dc.imgs_warped.array), **kwargs)
+    arr_np = dc.imgs_warped.array
+    arr_t = torch.as_tensor(arr_np, device=dc._device, dtype=dc._dtype)
+    h, w = arr_t.shape[-2:]
+    if max_display_px and max(h, w) > max_display_px:
+        factor = int(max(h, w) // max_display_px)
+        if factor > 1:
+            arr_t = torch.nn.functional.avg_pool2d(arr_t.unsqueeze(0), factor).squeeze(0)
+    flat = arr_t.reshape(arr_t.shape[0], -1)
+    lo = torch.quantile(flat, 0.01, dim=1)
+    hi = torch.quantile(flat, 0.99, dim=1)
+    scale = torch.clamp(hi - lo, min=1e-9)
+    norm = ((arr_t - lo[:, None, None]) / scale[:, None, None]).clamp_(0, 1)
+    u8 = (norm * 255).to(torch.uint8).cpu().numpy()
+    n = u8.shape[0]
+    fig, ax = plt.subplots(1, n, figsize=(axsize[0] * n, axsize[1]))
+    if n == 1:
+        ax = np.array([ax])
+    for i in range(n):
+        ax[i].imshow(u8[i], cmap="gray", vmin=0, vmax=255)
+        ax[i].set_xticks([]); ax[i].set_yticks([])
     if show_knots:
+        scale_y = u8.shape[-2] / dc.shape[1]
+        scale_x = u8.shape[-1] / dc.shape[2]
         for img_idx in range(dc.shape[0]):
             knots_np = dc.knots[img_idx].cpu().numpy()
-            ax[img_idx].plot(knots_np[1], knots_np[0], color="r")
+            ax[img_idx].plot(knots_np[1] * scale_x, knots_np[0] * scale_y, color="r")
     return fig, ax
 
 
@@ -714,33 +726,196 @@ def plot_convergence(
     return fig, ax
 
 
+def _render_uint8_gpu(
+    dc: "DriftCorrection",
+    rgb: bool,
+    low: float = 1.0,
+    high: float = 99.0,
+    max_display_px: int = 1024,
+) -> np.ndarray:
+    """GPU-only normalize + (optional) RGB stack -> uint8 image for fast display.
+
+    All work in torch on dc._device. Downsamples via avg_pool2d if the canvas
+    is larger than ``max_display_px``. Single D2H at the end.
+    """
+    arr_np = dc.imgs_warped.array
+    arr_t = torch.as_tensor(arr_np, device=dc._device, dtype=dc._dtype)
+    h, w = arr_t.shape[-2:]
+    if max_display_px and max(h, w) > max_display_px:
+        factor = int(max(h, w) // max_display_px)
+        if factor > 1:
+            arr_t = torch.nn.functional.avg_pool2d(arr_t.unsqueeze(0), factor).squeeze(0)
+    if rgb and arr_t.shape[0] <= 3:
+        H, W = arr_t.shape[-2:]
+        rgb_t = torch.zeros(H, W, 3, device=arr_t.device, dtype=arr_t.dtype)
+        for i in range(arr_t.shape[0]):
+            chan = arr_t[i].flatten()
+            lo = torch.quantile(chan, low / 100.0)
+            hi = torch.quantile(chan, high / 100.0)
+            scale = torch.clamp(hi - lo, min=1e-9)
+            rgb_t[..., i] = ((arr_t[i] - lo) / scale).clamp_(0, 1)
+        out = (rgb_t * 255).to(torch.uint8).cpu().numpy()
+        return out
+    merged = arr_t.mean(0)
+    flat = merged.flatten()
+    lo = torch.quantile(flat, low / 100.0)
+    hi = torch.quantile(flat, high / 100.0)
+    scale = torch.clamp(hi - lo, min=1e-9)
+    g = ((merged - lo) / scale).clamp_(0, 1)
+    out = (g * 255).to(torch.uint8).cpu().numpy()
+    return out
+
+
 def plot_merged_images(
     dc: "DriftCorrection",
     show_knots: bool = True,
+    rgb: bool = False,
+    axsize: tuple[int, int] = (8, 8),
+    max_display_px: int = 1024,
     **kwargs,
 ) -> tuple[Figure, Axes]:
     """Plot the mean of all warped images with optional knot overlays.
 
+    Normalize + colormap + downsample done entirely on GPU; matplotlib only
+    receives pre-baked uint8 pixels. Order-of-magnitude faster than the
+    numpy/matplotlib path for large canvases.
+
+    If rgb=True (and 2 or 3 images), display an RGB overlay where image 0 -> red,
+    image 1 -> green, image 2 -> blue. Misalignment is visible as colour fringes.
+    """
+    dc._ensure_warped_images()
+    img_u8 = _render_uint8_gpu(dc, rgb=rgb and dc.shape[0] <= 3, max_display_px=max_display_px)
+    title = kwargs.pop("title", "Merged (RGB overlay)" if rgb else None)
+    kwargs.pop("cmap", None)
+    fig, ax = plt.subplots(figsize=axsize)
+    if img_u8.ndim == 3:
+        ax.imshow(img_u8)
+    else:
+        ax.imshow(img_u8, cmap="gray", vmin=0, vmax=255)
+    if title is not None:
+        ax.set_title(title)
+    ax.set_xticks([]); ax.set_yticks([])
+    if show_knots:
+        scale_y = img_u8.shape[0] / dc.shape[1]
+        scale_x = img_u8.shape[1] / dc.shape[2]
+        for img_idx in range(dc.shape[0]):
+            knots_np = dc.knots[img_idx].cpu().numpy()
+            ax.plot(knots_np[1] * scale_x, knots_np[0] * scale_y)
+    return fig, ax
+
+
+def interactive_drift(
+    dc: "DriftCorrection",
+    drift_range: float = 0.2,
+    drift_step: float = 0.001,
+    axsize: tuple[int, int] = (8, 8),
+    crop_fraction: float = 0.5,
+):
+    """Interactive manual drift correction for the 2nd image relative to the 1st.
+
+    Use when align_affine cannot disambiguate (e.g. periodic atomic lattice).
+    Drag sliders to apply a per-scanline drift to image 1's knots; live RGB
+    overlay updates so atoms can be aligned by eye.
+
     Parameters
     ----------
-    dc : DriftCorrection
-    show_knots : bool, default True
-        Overlay current knot positions for each image.
-    **kwargs
-        Forwarded to :func:`show_2d`.
+    drift_range : float
+        Slider range (±) in px/line.
+    drift_step : float
+        Slider step in px/line.
+    axsize : tuple
+        (width, height) of the RGB preview.
+    crop_fraction : float
+        Fraction of the canvas to render (centered). Smaller = faster live updates.
 
     Returns
     -------
-    fig : Figure
-    ax : Axes
+    box : ipywidgets.VBox
+        Displayable widget. Slider state lives on `box.dr_slider`, `box.dc_slider`
+        for programmatic access. "Lock in" commits current drift to drift.knots
+        permanently.
     """
-    dc._ensure_warped_images()
-    fig, ax = show_2d(dc.imgs_warped.array.mean(0), **kwargs)
-    if show_knots:
+    import ipywidgets as wd
+    from IPython.display import display, clear_output
+
+    if not hasattr(dc, "_initial_knots"):
+        raise RuntimeError("Call preprocess() first.")
+    if dc.shape[0] != 2:
+        raise NotImplementedError(
+            "interactive_drift currently supports exactly 2 images."
+        )
+    init_knots = [k.clone() for k in dc._initial_knots]
+    canvas_shape = (dc.shape[1], dc.shape[2])
+
+    def _norm(x):
+        x = x - np.percentile(x, 1)
+        denom = np.percentile(x, 99)
+        return np.clip(x / denom, 0, 1) if denom > 0 else x
+
+    dr_slider = wd.FloatSlider(
+        value=0.0, min=-drift_range, max=drift_range, step=drift_step,
+        description='drift row (px/line)', readout_format='.4f',
+        continuous_update=False, layout=wd.Layout(width='600px'))
+    dc_slider = wd.FloatSlider(
+        value=0.0, min=-drift_range, max=drift_range, step=drift_step,
+        description='drift col (px/line)', readout_format='.4f',
+        continuous_update=False, layout=wd.Layout(width='600px'))
+    lock_btn = wd.Button(description='Lock in', button_style='success')
+    reset_btn = wd.Button(description='Reset', button_style='warning')
+    out = wd.Output()
+
+    def _render(drift_row, drift_col):
+        for i in range(dc.shape[0]):
+            dc.knots[i] = init_knots[i].clone()
+        drift_t = torch.as_tensor(
+            [drift_row, drift_col],
+            dtype=dc.knots[0].dtype, device=dc.knots[0].device)
         for img_idx in range(dc.shape[0]):
-            knots_np = dc.knots[img_idx].cpu().numpy()
-            ax.plot(knots_np[1], knots_np[0])
-    return fig, ax
+            dc._interpolator(img_idx).apply_affine_shift(drift_t)
+        for img_idx in range(dc.shape[0]):
+            warped, _ = dc._interpolator(img_idx).warp_to_canvas(
+                dc.imgs_t[img_idx], canvas_shape,
+                dc.kde_sigma, dc.pad_value[img_idx])
+            dc.imgs_warped.array[img_idx] = warped.cpu().numpy()
+        stack = dc.imgs_warped.array
+        h, w = stack[0].shape
+        half = int(min(h, w) * crop_fraction / 2)
+        ch, cw = h // 2, w // 2
+        sl_r = slice(max(0, ch - half), min(h, ch + half))
+        sl_c = slice(max(0, cw - half), min(w, cw + half))
+        rgb = np.stack(
+            [_norm(stack[0][sl_r, sl_c]), _norm(stack[1][sl_r, sl_c]),
+             np.zeros_like(stack[0][sl_r, sl_c])], axis=-1)
+        with out:
+            clear_output(wait=True)
+            fig, ax = plt.subplots(figsize=axsize)
+            ax.imshow(rgb)
+            ax.set_title(
+                f'drift=({drift_row:+.4f}, {drift_col:+.4f}) px/line  '
+                f'(R=img0, G=img1)')
+            ax.set_xticks([]); ax.set_yticks([])
+            plt.tight_layout(); plt.show()
+
+    def _on_change(_=None):
+        _render(dr_slider.value, dc_slider.value)
+
+    def _on_lock(_):
+        dc._interactive_drift_applied = (dr_slider.value, dc_slider.value)
+        print(f"Locked drift=({dr_slider.value:+.4f}, {dc_slider.value:+.4f}) px/line into drift.knots")
+
+    def _on_reset(_):
+        dr_slider.value = 0.0
+        dc_slider.value = 0.0
+
+    dr_slider.observe(_on_change, names='value')
+    dc_slider.observe(_on_change, names='value')
+    lock_btn.on_click(_on_lock)
+    reset_btn.on_click(_on_reset)
+    box = wd.VBox([dr_slider, dc_slider, wd.HBox([lock_btn, reset_btn]), out])
+    box.dr_slider = dr_slider
+    box.dc_slider = dc_slider
+    _on_change()
+    return box
 
 
 def print_drift_stats(dc: "DriftCorrection", image_index: int = -1) -> None:
@@ -1097,3 +1272,123 @@ def _auto_sample_positions(
             break
 
     return positions[:n_samples]
+
+
+
+def plot_global_canvas_vectors(
+    ax,
+    background,
+    start_positions,
+    end_positions,
+    title: str,
+    note: str,
+    *,
+    stride: int = 64,
+    color: str = "tab:blue",
+    cmap: str = "gray",
+):
+    """Plot vector displacements in a shared physical scan canvas.
+
+    This is used by known 4D-STEM drift forward-model workflows. Coordinates
+    are in row/column scan pixels; arrows are drawn from ``start_positions``
+    to ``end_positions``. The detector axes are not represented here.
+    """
+    ax.imshow(background, cmap=cmap, origin="upper", alpha=0.75)
+    start = np.asarray(start_positions)[::stride, ::stride]
+    delta = np.asarray(end_positions)[::stride, ::stride] - start
+    ax.quiver(
+        start[..., 1],
+        start[..., 0],
+        delta[..., 1],
+        delta[..., 0],
+        color=color,
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        width=0.0045,
+    )
+    ax.text(
+        0.02,
+        0.02,
+        note,
+        transform=ax.transAxes,
+        color=color,
+        fontsize=10,
+        va="bottom",
+        ha="left",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 3},
+    )
+    ax.set_title(title)
+    ax.set_xlim(0, background.shape[1] - 1)
+    ax.set_ylim(background.shape[0] - 1, 0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("right / column in physical sample")
+    ax.set_ylabel("down / row in physical sample")
+    return ax
+
+
+def plot_known_4dstem_forward_model_vectors(
+    clean_virtual_image,
+    drift_field_px,
+    nominal_0,
+    nominal_90,
+    positions_0,
+    positions_90,
+    *,
+    stride: int = 64,
+    figsize: tuple[float, float] = (16.0, 5.4),
+):
+    """Plot known sample drift and the resulting 0/90 probe positions.
+
+    The plot is intentionally scan-coordinate focused: it explains where each
+    diffraction pattern is sampled from in the specimen frame. It does not
+    imply any detector-pixel rolling or warping.
+    """
+    import matplotlib.pyplot as plt
+
+    drift = np.asarray(drift_field_px, dtype=np.float32)
+    drift_start = np.asarray(nominal_0, dtype=np.float32)
+    drift_end = drift_start + drift
+    drift_note = (
+        "known sample drift\n"
+        f"down {drift[..., 0].min():.1f} -> {drift[..., 0].max():.1f} px\n"
+        f"right {drift[..., 1].min():.1f} -> {drift[..., 1].max():.1f} px"
+    )
+    position_note = (
+        "raw DPs stay raw\n"
+        "blue positions are scan/probe positions\n"
+        "shared physical coordinates"
+    )
+
+    fig, axs = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+    plot_global_canvas_vectors(
+        axs[0],
+        clean_virtual_image,
+        drift_start,
+        drift_end,
+        "known physical sample drift vector\nfull global sample canvas",
+        drift_note,
+        stride=stride,
+        color="tab:red",
+    )
+    plot_global_canvas_vectors(
+        axs[1],
+        clean_virtual_image,
+        nominal_0,
+        positions_0,
+        "image 0 adjusted probe positions\nfor downstream reconstruction",
+        position_note,
+        stride=stride,
+        color="tab:blue",
+    )
+    plot_global_canvas_vectors(
+        axs[2],
+        clean_virtual_image,
+        nominal_90,
+        positions_90,
+        "image 1 adjusted probe positions\nfor downstream reconstruction",
+        position_note,
+        stride=stride,
+        color="tab:blue",
+    )
+    return fig, axs

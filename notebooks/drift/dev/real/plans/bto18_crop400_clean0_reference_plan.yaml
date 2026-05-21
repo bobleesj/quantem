@@ -1,0 +1,53 @@
+plan_version: 5
+name: bto18_crop400_clean0_reference_plan_scan512crop400_20260520
+kind: refine
+
+note: >
+  BTO_18 no-added-drift crop400/bin2 ptychography reference for the scan-drift
+  forward-model workflow. This uses the original BTO_18 master, crops the scan
+  rows/cols 56:456, bins the detector from 192 to 96 pixels through det: 96,
+  and locks the clean0 SSB calibration used by the drift comparisons.
+
+pull_snapshots: true
+auto_pull_on_save_done: true
+auto_pull_mode: preview
+warm_worker: true
+
+dataset:
+  session: dasol/20260415_BTOSTO
+  files: [18]
+
+gpu:
+  host: mjgoat
+  ids: [0, 1]
+
+defaults:
+  scan_size: 512
+  scan_sampling_A: 0.264
+  voltage_kV: 300
+  semiangle_mrad: 30
+  det: 96
+  crop_row_start: 56
+  crop_row_end: 456
+  crop_col_start: 56
+  crop_col_end: 456
+  slices: 6
+  slice_thickness_A: 15
+  probes: 8
+  obj_lr: 0.2
+  probe_lr: 0.2
+  lr_schedule: decay
+  obj_type: pure_phase
+  padding_px: 64
+  defocus_A: 781
+  batch_size: 8192
+  rotation_deg: 158.9
+  seed: 42
+  denoise: tv
+  snapshot_every: 1
+
+sweep:
+  iters: [10, 50]
+
+trial_name: "BTO_18_crop400_clean0_det96_it{iters}_locked"
+hypothesis: "BTO_18 clean0 crop400/bin2 no-added-drift reference, det96, S=6, t=15 A, P=8, iters={iters}, rotation=158.9 deg, defocus=781 A"

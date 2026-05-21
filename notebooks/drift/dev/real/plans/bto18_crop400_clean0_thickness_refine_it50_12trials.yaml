@@ -1,0 +1,444 @@
+plan_version: 3
+name: bto18_crop400_clean0_thickness_refine_it50_12trials_20260520
+kind: explore
+description: Twelve-trial, 50-iteration regular BTO_18 clean0 crop400/bin2 thickness
+  screen around prior 10-iter winners. Every trial is a natural 400 x 400 crop from
+  raw BTO_18_master.h5; no combined 0/90 stacking.
+gpus: 0,1
+pull_snapshots: true
+auto_pull_on_save_done: true
+auto_pull_mode: preview
+warm_worker: true
+trials:
+- name: BTO18_c400_thick50_anchor_p8_s6_t15_p8_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    01/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=6, slice_thickness=15 A, total modeled thickness=90 A, probe_modes=8, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: anchor_p8.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 6
+    slice_thickness: 15
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_anchor_p12_s6_t15_p12_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    02/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=6, slice_thickness=15 A, total modeled thickness=90 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: anchor_p12.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 6
+    slice_thickness: 15
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s8_s8_t15_p8_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    03/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=15 A, total modeled thickness=120 A, probe_modes=8, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s8.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 15
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s8_s8_t15_p12_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    04/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=15 A, total modeled thickness=120 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s8.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 15
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s10_s10_t15_p8_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    05/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=10, slice_thickness=15 A, total modeled thickness=150 A, probe_modes=8, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s10.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 10
+    slice_thickness: 15
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s10_s10_t15_p12_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    06/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=10, slice_thickness=15 A, total modeled thickness=150 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s10.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 10
+    slice_thickness: 15
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_t18_s6_t18_p8_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    07/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=6, slice_thickness=18 A, total modeled thickness=108 A, probe_modes=8, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_t18.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 6
+    slice_thickness: 18
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_t18_s6_t18_p12_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    08/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=6, slice_thickness=18 A, total modeled thickness=108 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_t18.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 6
+    slice_thickness: 18
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s8t18_s8_t18_p8_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    09/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=18 A, total modeled thickness=144 A, probe_modes=8, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s8t18.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 18
+    probes: 8
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thicker_s8t18_s8_t18_p12_olr0p2_plr0p2_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    10/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=18 A, total modeled thickness=144 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.2, batch_size=4096, iters=50. Screen tag: thicker_s8t18.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 18
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.2
+    batch_size: 4096
+- name: BTO18_c400_thick50_thick_lr015_s8_t18_p12_olr0p15_plr0p15_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    11/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=18 A, total modeled thickness=144 A, probe_modes=12, obj_lr=0.15,
+    probe_lr=0.15, batch_size=4096, iters=50. Screen tag: thick_lr015.'
+  host: mjgoat
+  gpu: 0
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 18
+    probes: 12
+    obj_lr: 0.15
+    probe_lr: 0.15
+    batch_size: 4096
+- name: BTO18_c400_thick50_thick_probe_lr01_s8_t18_p12_olr0p2_plr0p1_b4096
+  session: dasol/20260415_BTOSTO
+  file: 18
+  hypothesis: 'BTO_18 regular clean0 crop400/bin2 thickness-focused 50-iteration trial
+    12/12. Raw source scan is 512 x 512; live crop rows/cols 56:456 gives a physical
+    400 x 400 scan; detector is binned 192 -> 96. No 0/90 stacking and no 800 x 400
+    interpretation. Locked calibration: rotation 158.9 deg, defocus 781 A. Recipe:
+    S=8, slice_thickness=18 A, total modeled thickness=144 A, probe_modes=12, obj_lr=0.2,
+    probe_lr=0.1, batch_size=4096, iters=50. Screen tag: thick_probe_lr01.'
+  host: mjgoat
+  gpu: 1
+  args:
+    scan: 512
+    scan_sampling: 0.264
+    voltage_kV: 300
+    semiangle: 30
+    det: 96
+    crop_row_start: 56
+    crop_row_end: 456
+    crop_col_start: 56
+    crop_col_end: 456
+    iters: 50
+    lr_schedule: decay
+    obj_type: pure_phase
+    padding: 64
+    defocus: 781
+    rotation: 158.9
+    seed: 42
+    denoise: tv
+    snapshot_every: 5
+    slices: 8
+    slice_thickness: 18
+    probes: 12
+    obj_lr: 0.2
+    probe_lr: 0.1
+    batch_size: 4096

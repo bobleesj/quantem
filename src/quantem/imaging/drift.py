@@ -2151,6 +2151,7 @@ class DriftCorrection(AutoSerialize):
     plot_warped_images = drift_visualization.plot_warped_images
     plot_convergence = drift_visualization.plot_convergence
     plot_merged_images = drift_visualization.plot_merged_images
+    interactive_drift = drift_visualization.interactive_drift
     plot_knots = drift_visualization.plot_knots
     plot_probe_positions = drift_visualization.plot_probe_positions
     plot_diffraction = drift_visualization.plot_4dstem_correction
