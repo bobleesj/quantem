@@ -9,7 +9,7 @@ crop bounds, detector shape, and optional probe-position datasets.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ import quantem as em
 
 DRIFT_METADATA_GROUP = "entry/quantem/drift"
 DEFAULT_POSITION_UNITS = "scan pixels in shared physical sample coordinates"
+CANONICAL_SCAN_AXES_FRAME = "global"
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,10 @@ class KnownDriftMetadata:
     det_bin: int | None
     known_drift_total_px_down_right: tuple[float, float] | None
     position_units: str | None
+    scan_axes_frame: str | None
+    scan_direction_degrees: float | None
+    raw_scan_crop_rows: tuple[int, int] | None
+    raw_scan_crop_cols: tuple[int, int] | None
     probe_positions_shape: tuple[int, ...] | None
     positions_offset_shape: tuple[int, ...] | None
 
@@ -64,6 +69,12 @@ class KnownDriftMetadata:
             "detector_shape_px": self.detector_shape_px,
             "source_master": self.source_master,
             "position_units": self.position_units,
+            "scan_axes_frame": self.scan_axes_frame,
+            "scan_direction_degrees": self.scan_direction_degrees,
+            "raw_scan_crop_row_start": None if self.raw_scan_crop_rows is None else self.raw_scan_crop_rows[0],
+            "raw_scan_crop_row_stop": None if self.raw_scan_crop_rows is None else self.raw_scan_crop_rows[1],
+            "raw_scan_crop_col_start": None if self.raw_scan_crop_cols is None else self.raw_scan_crop_cols[0],
+            "raw_scan_crop_col_stop": None if self.raw_scan_crop_cols is None else self.raw_scan_crop_cols[1],
         }
 
 
@@ -119,6 +130,22 @@ def _optional_float_pair(value: Any, *, name: str) -> tuple[float, float] | None
     return float(arr[0]), float(arr[1])
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(np.asarray(value).reshape(-1)[0])
+
+
+def _right_angle_turns(scan_direction_degrees: float) -> int:
+    turns = round(float(scan_direction_degrees) / 90.0)
+    if not np.isclose(float(scan_direction_degrees), 90.0 * turns, atol=1e-6):
+        raise ValueError(
+            "scan_direction_degrees must be one of the right-angle scan "
+            f"directions 0, 90, -90, or 180; got {scan_direction_degrees!r}"
+        )
+    return int(turns) % 4
+
+
 def _crop_to_bounds(
     scan_crop: tuple[slice, slice] | tuple[tuple[int, int], tuple[int, int]],
 ) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -149,6 +176,48 @@ def drift_crop_slices(
 
 def _slice_4dstem_scan_crop(data: Any, scan_crop: tuple[slice, slice]) -> Any:
     return data[scan_crop[0], scan_crop[1]]
+
+
+def reindex_right_angle_scan_axes_to_global(
+    data: Any,
+    scan_direction_degrees: float,
+) -> Any:
+    """Reindex leading scan axes from raw right-angle acquisition order to global order.
+
+    The detector axes and any trailing metadata dimensions are left untouched.
+    For a +90 degree scan, this is ``rot90(..., k=-1, axes=(0, 1))``.
+    """
+    turns = _right_angle_turns(scan_direction_degrees)
+    if turns == 0:
+        return data
+    k = -turns
+    if _is_torch_tensor(data):
+        import torch
+
+        return torch.rot90(data, k=k, dims=(0, 1)).contiguous()
+    if _is_cupy_array(data):
+        import cupy as cp
+
+        return cp.ascontiguousarray(cp.rot90(data, k=k, axes=(0, 1)))
+    return np.ascontiguousarray(np.rot90(np.asarray(data), k=k, axes=(0, 1)))
+
+
+def right_angle_scan_crop_to_global_bounds(
+    scan_crop: tuple[slice, slice] | tuple[tuple[int, int], tuple[int, int]],
+    source_shape: tuple[int, int],
+    scan_direction_degrees: float,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the global-frame bounds of a raw right-angle scan crop."""
+    (row0, row1), (col0, col1) = _crop_to_bounds(scan_crop)
+    source_h, source_w = map(int, source_shape)
+    turns = _right_angle_turns(scan_direction_degrees)
+    if turns == 0:
+        return (row0, row1), (col0, col1)
+    if turns == 1:
+        return (col0, col1), (source_w - row1, source_w - row0)
+    if turns == 2:
+        return (source_h - row1, source_h - row0), (source_w - col1, source_w - col0)
+    return (source_h - col1, source_h - col0), (row0, row1)
 
 
 def _is_torch_tensor(value: Any) -> bool:
@@ -311,12 +380,20 @@ def save_known_4dstem_drift_export(
     dtype: str = "u16",
     overwrite: bool = False,
     save_kwargs: dict[str, Any] | None = None,
+    scan_direction_degrees: float = 0.0,
+    scan_axes_frame: str = CANONICAL_SCAN_AXES_FRAME,
+    nominal_positions_px: np.ndarray | None = None,
 ) -> Known4DSTEMExportResult:
     """Quantize, save, and annotate one known-drift 4D-STEM export.
 
     ``save_func`` is usually ``quantem.live.io.save``. It is injected instead
     of imported here so QuantEM's drift metadata helpers remain a clean bridge
     to ``quantem.live`` without making import-time dependencies heavier.
+
+    By default, the saved scan axes are canonicalized into the shared global
+    specimen frame. For a raw +90 degree acquisition, the leading scan axes are
+    reindexed with ``rot90(k=-1)`` before writing the H5. Detector pixels are
+    never rotated.
     """
     path = Path(master_path)
     if path.exists() and not overwrite:
@@ -327,7 +404,42 @@ def save_known_4dstem_drift_export(
             stats=None,
         )
 
-    quantized, stats = quantize_4dstem_scan_crop_uint16(data, scan_crop)
+    raw_crop_rows, raw_crop_cols = _crop_to_bounds(scan_crop)
+    raw_crop = drift_crop_slices(raw_crop_rows, raw_crop_cols)
+    output_frame = str(scan_axes_frame)
+    if output_frame not in {"raw", CANONICAL_SCAN_AXES_FRAME}:
+        raise ValueError('scan_axes_frame must be "raw" or "global"')
+
+    if output_frame == CANONICAL_SCAN_AXES_FRAME:
+        cropped_data = _slice_4dstem_scan_crop(data, raw_crop)
+        cropped_positions = positions_px[raw_crop[0], raw_crop[1]]
+        if nominal_positions_px is None:
+            cropped_offsets = positions_offset_px[raw_crop[0], raw_crop[1]]
+        else:
+            cropped_nominal = nominal_positions_px[raw_crop[0], raw_crop[1]]
+            cropped_offsets = cropped_positions - cropped_nominal
+
+        export_data = reindex_right_angle_scan_axes_to_global(
+            cropped_data, scan_direction_degrees
+        )
+        export_positions = reindex_right_angle_scan_axes_to_global(
+            cropped_positions, scan_direction_degrees
+        )
+        export_offsets = reindex_right_angle_scan_axes_to_global(
+            cropped_offsets, scan_direction_degrees
+        )
+        meta_rows, meta_cols = right_angle_scan_crop_to_global_bounds(
+            raw_crop, tuple(map(int, data.shape[:2])), scan_direction_degrees
+        )
+        full_export_crop = (slice(0, int(scan_shape[0])), slice(0, int(scan_shape[1])))
+        quantized, stats = quantize_4dstem_scan_crop_uint16(export_data, full_export_crop)
+        stats = replace(stats, scan_crop_rows=meta_rows, scan_crop_cols=meta_cols)
+    else:
+        export_positions = positions_px[raw_crop[0], raw_crop[1]]
+        export_offsets = positions_offset_px[raw_crop[0], raw_crop[1]]
+        meta_rows, meta_cols = raw_crop_rows, raw_crop_cols
+        quantized, stats = quantize_4dstem_scan_crop_uint16(data, raw_crop)
+
     metadata = {
         "quantem_export_kind": label,
         "source_master": str(source_master),
@@ -336,6 +448,8 @@ def save_known_4dstem_drift_export(
             known_drift_total_px_down_right,
             dtype=np.float32,
         ),
+        "scan_axes_frame": output_frame,
+        "scan_direction_degrees": float(scan_direction_degrees),
     }
     save_func(
         str(path),
@@ -347,14 +461,20 @@ def save_known_4dstem_drift_export(
     )
     write_known_4dstem_drift_metadata(
         path,
-        positions_px=positions_px[scan_crop[0], scan_crop[1]],
-        positions_offset_px=positions_offset_px[scan_crop[0], scan_crop[1]],
-        scan_crop=scan_crop,
+        positions_px=export_positions,
+        positions_offset_px=export_offsets,
+        scan_crop=(meta_rows, meta_cols),
         detector_shape_px=stats.detector_shape_px,
         label=label,
         source_master=source_master,
         det_bin=det_bin,
         known_drift_total_px_down_right=known_drift_total_px_down_right,
+        extra_attrs={
+            "scan_axes_frame": output_frame,
+            "scan_direction_degrees": float(scan_direction_degrees),
+            "raw_scan_crop_rows": np.asarray(raw_crop_rows, dtype=np.int32),
+            "raw_scan_crop_cols": np.asarray(raw_crop_cols, dtype=np.int32),
+        },
     )
     return Known4DSTEMExportResult(
         path=str(path),
@@ -462,6 +582,10 @@ def read_known_drift_metadata(master_path: str | Path) -> KnownDriftMetadata:
                 if "probe_positions_px" in group
                 else None
             ),
+            scan_axes_frame=_decode_attr(attrs.get("scan_axes_frame")),
+            scan_direction_degrees=_optional_float(attrs.get("scan_direction_degrees")),
+            raw_scan_crop_rows=_optional_int_tuple(attrs.get("raw_scan_crop_rows")),
+            raw_scan_crop_cols=_optional_int_tuple(attrs.get("raw_scan_crop_cols")),
             positions_offset_shape=(
                 tuple(int(x) for x in group["positions_offset_px"].shape)
                 if "positions_offset_px" in group

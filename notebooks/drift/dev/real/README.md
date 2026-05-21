@@ -89,12 +89,10 @@ The locked regular-raster SSB outputs live under:
 
 Important SSB convention:
 
+- final H5 scan axes are canonicalized into the global/image-0 specimen frame
 - clean0 supplies the microscope calibration
-- drift0 keeps the same `C10/C12/phi12` and same rotation
-- drift90 keeps the same `C10/C12/phi12`, tries `clean0 - 90` and
-  `clean0 + 90`, and picks the lower-loss branch
-- 90-degree phases are rotated into the clean0 display frame with
-  `np.rot90(phase, k=-1)` for figures and comparisons
+- drift0 and drift90 keep the same `C10/C12/phi12` and the same locked rotation
+- no `clean0 + 90` branch is used after the 90-degree H5 has been globalized
 
 ## Active Workflow Notebooks
 
@@ -194,30 +192,29 @@ handled by Fourier phase ramps on the probe.
 
 ## 0/90 Position Geometry
 
-Known-drift export metadata stores `probe_positions_px` in one shared physical
-sample row/column frame. It is a global specimen frame, not detector pixels and
-not a per-image display frame. The ptychography runners subtract the scan crop
-origin to get crop-local coordinates, but image 0 and image 1 remain in the
-same physical frame.
+The final known-drift H5 files are canonical global-frame files. This is the
+bookkeeping-minimizing contract:
 
-Use this rule to avoid double-rotating the 90-degree acquisition:
+- H5 scan axes are in the global/image-0 specimen frame
+- `probe_positions_px` is in that same global frame
+- `positions_offset_px` is the local offset from the global raster pixel that
+  indexes the saved diffraction pattern
+- detector pixels inside each diffraction pattern are unchanged
+- raw 90-degree acquisition order is provenance only, stored through
+  `scan_direction_degrees` and `raw_scan_crop_*` metadata
 
-- regular image-0 raster without explicit positions: lock rotation to `clean0`
-- regular image-1/90 raster without explicit global positions: lock rotation to
-  `clean0 + 90`
-- image-1/90 with explicit global/sample-frame probe positions: those positions
-  already encode the 90-degree scan geometry, so lock the reconstruction in the
-  common image-0/sample frame
-- 0/90 combined corrected runs should stack the same DPs as the uncorrected
-  combined run and change only the stacked probe-position array
+For a 90-degree acquisition, the export rotates the leading scan axes back into
+the global frame with `rot90(k=-1)`. After that, downstream SSB and
+ptychography use the same locked clean0 calibration rotation.
 
-If a 90-degree-only reconstruction is intended to stay in the raw 90 display
-frame, first convert the probe positions into that raw frame and then use the
-`clean0 + 90` calibration branch. Do not use global-frame positions and
-`clean0 + 90` together.
+Use this rule for ptychography comparisons:
 
+- raster runs use the nominal global raster positions
+- corrected runs use `probe_positions_px` from the H5
+- combined 0/90 corrected runs stack the same DPs as the uncorrected combined
+  run and change only the stacked probe-position array
 
-Run the 90-degree counterpart with explicit sample-frame image1 positions:
+Run the 90-degree counterpart with explicit global-frame image1 positions:
 
 ```bash
 env CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python \
@@ -233,6 +230,4 @@ Then build the 90-degree comparison manifest and QA figure:
 PYTHONPATH=src python notebooks/drift/dev/real/make_bto18_crop400_drift90_three_way_qa.py
 ```
 
-The 90-degree runner uses explicit image1 probe positions for clean, drifted,
-and corrected cases, and locks the common base rotation. It does not combine
-sample-frame positions with `clean0 + 90`.
+The 90-degree runner uses canonical global-frame image1 H5 scan axes and locks the common base rotation. It does not use `clean0 + 90`.

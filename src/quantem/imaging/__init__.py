@@ -6,6 +6,7 @@ from quantem.imaging.drift_align import (
     backward_warp as backward_warp,
 )
 from quantem.imaging.drift_io import (
+    CANONICAL_SCAN_AXES_FRAME as CANONICAL_SCAN_AXES_FRAME,
     DEFAULT_POSITION_UNITS as DEFAULT_POSITION_UNITS,
     DRIFT_METADATA_GROUP as DRIFT_METADATA_GROUP,
     Known4DSTEMExportResult as Known4DSTEMExportResult,
@@ -13,10 +14,12 @@ from quantem.imaging.drift_io import (
     KnownDriftMetadata as KnownDriftMetadata,
     drift_crop_slices as drift_crop_slices,
     quantize_4dstem_scan_crop_uint16 as quantize_4dstem_scan_crop_uint16,
+    reindex_right_angle_scan_axes_to_global as reindex_right_angle_scan_axes_to_global,
     read_emd_pair as read_emd_pair,
     read_emd_with_metadata as read_emd_with_metadata,
     read_known_4dstem_drift_metadata as read_known_4dstem_drift_metadata,
     read_known_drift_metadata as read_known_drift_metadata,
+    right_angle_scan_crop_to_global_bounds as right_angle_scan_crop_to_global_bounds,
     save_known_4dstem_drift_export as save_known_4dstem_drift_export,
     write_known_4dstem_drift_metadata as write_known_4dstem_drift_metadata,
     write_known_drift_metadata as write_known_drift_metadata,

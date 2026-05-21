@@ -3,8 +3,8 @@
 This is an active-development runner for the four-case comparison:
 
 1. drifted image 0 alone, regular raster positions
-2. drifted image 1 alone, regular raster positions with +90 deg locked rotation
-3. image 0 + image 1 stacked, regular raster positions in the image-0 frame
+2. drifted image 1 alone, regular raster positions in the global image-0 frame
+3. image 0 + image 1 stacked, regular raster positions in the global image-0 frame
 4. image 0 + image 1 stacked, known drift-adjusted probe positions
 
 The combined trials intentionally use the same stacked diffraction patterns.
@@ -25,10 +25,6 @@ import cupy as cp
 import h5py
 import numpy as np
 
-from quantem.imaging.drift_simulation import (
-    rotated_scan_positions,
-    scan_time_drift_field,
-)
 from quantem.live.engine.ptycho.dataset import Dataset4dstemGPU
 from quantem.live.engine.ptycho.pipeline import run_reconstruction
 from quantem.live.engine.ptycho.save import save_trial
@@ -53,7 +49,6 @@ TRIALS_DIR = SESSION_DIR / "quantem/ptycho/BTO_18/trials"
 
 ITERS = 10
 BASE_ROTATION_DEG = 158.9
-ROTATION_90_DEG = BASE_ROTATION_DEG + 90.0
 SCAN_SHAPE = (400, 400)
 DET_SHAPE = (96, 96)
 SCAN_SAMPLING_A = 0.264
@@ -106,9 +101,9 @@ CASES = (
     ),
     Case(
         1983,
-        "1983_det96_crop400_right30_img1_drift_raster_plus90_s6_t15_p8_it10_locked",
-        "90 deg drifted image alone, raster positions, +90 deg locked rotation",
-        ROTATION_90_DEG,
+        "1983_det96_crop400_right30_img1_drift_raster_global_s6_t15_p8_it10_locked",
+        "90 deg drifted image alone, global-frame raster positions",
+        BASE_ROTATION_DEG,
         (IMAGE1_H5,),
         "raster",
     ),
@@ -172,23 +167,34 @@ def load_cube(path: Path) -> cp.ndarray:
     return cp.ascontiguousarray(data)
 
 
-def h5_drift_metadata(path: Path) -> tuple[np.ndarray, tuple[slice, slice], tuple[float, float]]:
+def h5_drift_metadata(path: Path) -> tuple[np.ndarray, np.ndarray, tuple[slice, slice]]:
     with h5py.File(path, "r") as f:
         group = f["entry/quantem/drift"]
         positions = group["probe_positions_px"][...].astype(np.float32)
+        offsets = group["positions_offset_px"][...].astype(np.float32)
         row0, row1 = (int(x) for x in group.attrs["scan_crop_rows"])
         col0, col1 = (int(x) for x in group.attrs["scan_crop_cols"])
-        drift_total = tuple(float(x) for x in group.attrs["known_drift_total_px_down_right"])
-    return positions, (slice(row0, row1), slice(col0, col1)), drift_total
+        frame = group.attrs.get("scan_axes_frame", "global")
+        if isinstance(frame, bytes):
+            frame = frame.decode("utf-8")
+        if frame != "global":
+            raise ValueError(f"{path} is not a canonical global-frame drift H5")
+    return positions, offsets, (slice(row0, row1), slice(col0, col1))
 
 
-def crop_local_positions(path: Path, scan_direction_deg: float) -> tuple[np.ndarray, np.ndarray]:
-    corrected_global, scan_crop, drift_total = h5_drift_metadata(path)
-    source_shape = (512, 512)
-    nominal_global = rotated_scan_positions(source_shape, scan_direction_deg)[scan_crop]
-    drift_field = scan_time_drift_field(source_shape, total_drift_px=drift_total)[scan_crop]
-    expected_corrected = nominal_global - drift_field
-    np.testing.assert_allclose(corrected_global, expected_corrected, rtol=0, atol=1e-5)
+def _nominal_global_positions(scan_crop: tuple[slice, slice]) -> np.ndarray:
+    rows, cols = np.meshgrid(
+        np.arange(scan_crop[0].start, scan_crop[0].stop, dtype=np.float32),
+        np.arange(scan_crop[1].start, scan_crop[1].stop, dtype=np.float32),
+        indexing="ij",
+    )
+    return np.stack([rows, cols], axis=-1)
+
+
+def crop_local_positions(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    corrected_global, offsets, scan_crop = h5_drift_metadata(path)
+    nominal_global = _nominal_global_positions(scan_crop)
+    np.testing.assert_allclose(corrected_global - nominal_global, offsets, rtol=0, atol=1e-5)
 
     crop_origin = np.array([scan_crop[0].start, scan_crop[1].start], dtype=np.float32)
     raster_local = nominal_global - crop_origin
@@ -197,8 +203,8 @@ def crop_local_positions(path: Path, scan_direction_deg: float) -> tuple[np.ndar
 
 
 def load_position_sets() -> dict[str, np.ndarray]:
-    raster0, corrected0 = crop_local_positions(IMAGE0_H5, 0.0)
-    raster1, corrected1 = crop_local_positions(IMAGE1_H5, 90.0)
+    raster0, corrected0 = crop_local_positions(IMAGE0_H5)
+    raster1, corrected1 = crop_local_positions(IMAGE1_H5)
     return {
         "image0_raster": raster0,
         "image1_raster": raster1,
@@ -375,7 +381,7 @@ def extra_config(case: Case, cfg: TrialConfig, data: cp.ndarray, elapsed_s: floa
             "total_thickness_A": SLICES * SLICE_THICKNESS_A,
             "forced_rotation_deg": float(case.rotation_deg),
             "locked_base_rotation_deg": BASE_ROTATION_DEG,
-            "locked_image1_rotation_deg": ROTATION_90_DEG,
+            "locked_image1_rotation_deg": BASE_ROTATION_DEG,
             "seed": SEED,
             "kernel": f"fused_{DET_SHAPE[0]}_pfa",
         },
@@ -390,9 +396,8 @@ def extra_config(case: Case, cfg: TrialConfig, data: cp.ndarray, elapsed_s: floa
                 else None
             ),
             "notes": (
-                "Single 90 degree run locks rotation to base+90. "
-                "Combined runs use explicit image-0-frame positions and lock "
-                "the global rotation to the base angle."
+                "All final H5 scan axes are canonical/global. "
+                "Single and combined 90-degree runs lock the global rotation to the base angle."
             ),
         },
         "results": {

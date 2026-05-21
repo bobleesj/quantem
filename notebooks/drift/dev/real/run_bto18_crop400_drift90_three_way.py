@@ -3,15 +3,15 @@
 This active-development runner mirrors the image-0 control, but keeps the
 90-degree geometry explicit:
 
-1. clean 90 degree, no added drift, raw 90 DP order
-2. 90 degree with known right drift, raw 90 DP order, uncorrected positions
+1. clean global-frame reference, no added drift
+2. 90 degree with known right drift saved in the global/image-0 frame,
+   uncorrected raster positions
 3. the same 90 degree drifted diffraction patterns, but known drift-corrected
    probe positions
 
-All three cases pass explicit probe positions in the shared physical sample
-frame and lock the reconstruction to the common clean0/base rotation. This
-avoids double-counting 90 degrees: the 90-degree scan geometry is in the
-position arrays, not in an added +90 rotation.
+All three cases lock the reconstruction to the common clean0/base rotation.
+The final H5 export has already reindexed the 90-degree scan axes into the
+global frame, so no +90 rotation branch is used here.
 """
 
 from __future__ import annotations
@@ -44,10 +44,10 @@ def case_note(
 ) -> str:
     shared = (
         "BTO_18 crop400/bin2 image-1/90-degree drift three-way comparison. "
-        "DPs are in raw 90-degree scan order; probe positions are explicit "
-        "crop-local coordinates in the shared physical sample frame. "
+        "Final H5 scan axes are in the global/image-0 specimen frame; probe positions are explicit "
+        "crop-local coordinates in that same frame. "
         "Calibration is locked to clean0/base rotation 158.9 deg and defocus 781 A; "
-        "the 90-degree geometry is carried by probe positions, not by adding +90 deg. "
+        "no +90 branch is used after canonical export. "
         f"Recipe: S={slices}, slice_thickness={thickness} A, total_thickness={slices * thickness} A, "
         f"probe_modes={probes}, obj_lr={obj_lr}, probe_lr={probe_lr}, batch_size={batch}, iters={iters}. "
         "Ptychography position correction does not bilinear-interpolate DPs; "
@@ -56,14 +56,14 @@ def case_note(
     if case_key == "clean90":
         return (
             shared
-            + "Case 1/3. DP source is the clean0 crop export reindexed in memory into raw 90-degree scan order. "
-            + "Position source is the explicit image-1/90 no-drift raster in the shared sample frame."
+            + "Case 1/3. DP source is the clean0 crop export in the global frame. "
+            + "Position source is the explicit image-1/global no-drift raster."
         )
     if case_key == "drift90_raster":
         return (
             shared
-            + "Case 2/3. DP source is image 1 with known right30 scan drift. "
-            + "Position source is the explicit image-1/90 no-drift raster, intentionally uncorrected for drift."
+            + "Case 2/3. DP source is image 1 with known right30 scan drift, already saved in the global frame. "
+            + "Position source is the global no-drift raster, intentionally uncorrected for drift."
         )
     if case_key == "drift90_corrected":
         return (
@@ -93,9 +93,6 @@ def install_case_hooks(notes_by_case: dict[str, str]) -> None:
         return explicit
 
     def make_data(case: suite.Case, cubes: dict[Path, cp.ndarray]) -> cp.ndarray:
-        if case.position_mode == "image1_clean_raster_global":
-            clean0 = cubes[suite.GROUND_TRUTH_H5]
-            return cp.ascontiguousarray(cp.rot90(clean0, k=1, axes=(0, 1)))
         return original_make_data(case, cubes)
 
     def positions_for_case_with_clean(case: suite.Case, positions: dict[str, np.ndarray]) -> np.ndarray | None:
@@ -120,15 +117,11 @@ def install_case_hooks(notes_by_case: dict[str, str]) -> None:
             "case": case.name,
             "note": notes_by_case[case.name],
             "dp_source": [str(path) for path in case.h5_paths],
-            "dp_source_transform": (
-                "clean0_rot90_k1_raw_image1_order"
-                if case.position_mode == "image1_clean_raster_global"
-                else None
-            ),
+            "dp_source_transform": None,
             "position_source": case.position_mode,
             "same_dp_as": same_dp_as,
             "geometry_rule": (
-                "Explicit image-1 probe positions are in the shared physical sample frame; "
+                "Image-1 final H5 scan axes and probe positions are in the canonical global frame; "
                 "therefore this run locks the common clean0/base rotation and does not add +90 deg."
             ),
         }
@@ -146,7 +139,7 @@ def build_cases(args: argparse.Namespace) -> tuple[suite.Case, ...]:
         f"s{args.slices}_t{args.slice_thickness}_p{args.probes}_"
         f"olr{str(args.obj_lr).replace('.', 'p')}_"
         f"plr{str(args.probe_lr).replace('.', 'p')}_"
-        f"b{args.batch_size}_it{args.iters}_locked_commonframe"
+        f"b{args.batch_size}_it{args.iters}_locked_globalframe"
     )
     b = int(args.trial_id_base)
     return (

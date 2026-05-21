@@ -8,8 +8,9 @@ three acquisition files used by the downstream ptychography comparisons:
 * drift0: 0-degree scan with known right drift
 * drift90: 90-degree scan with the same known right drift
 
-The locked SSB section keeps the clean0 aberrations fixed. The 90-degree phase
-is saved both raw and display-aligned with ``np.rot90(phase, k=-1)``.
+The locked SSB section keeps the clean0 aberrations fixed. Final H5 scan axes
+are canonicalized into the global/image-0 frame, so drift90 uses the same
+locked rotation as clean0 and drift0.
 """
 
 from __future__ import annotations
@@ -121,7 +122,7 @@ def main() -> None:
     def virtual_image(data_t, mask_np):
         return as_numpy(integrate_virtual_detector_image(data_t, mask_np))
 
-    def save_one_export(name, data_t, scan_crop, positions, positions_offset, label):
+    def save_one_export(name, data_t, scan_crop, positions, positions_offset, label, *, scan_direction_degrees, nominal_positions):
         path = export_dir / f"{name}_master.h5"
         result = save_known_4dstem_drift_export(
             path,
@@ -137,6 +138,9 @@ def main() -> None:
             scan_shape=(save_crop, save_crop),
             dtype=save_dtype,
             overwrite=args.force_generate,
+            scan_direction_degrees=scan_direction_degrees,
+            scan_axes_frame="global",
+            nominal_positions_px=nominal_positions,
             save_kwargs={
                 "batch_size": 4096,
                 "frames_per_file": 32768,
@@ -148,7 +152,7 @@ def main() -> None:
             print(f"{name}: exists, skipping export ({path})")
         elif result.stats is not None:
             stats = result.stats
-            print(f"{name}: scan crop rows={stats.scan_crop_rows[0]}:{stats.scan_crop_rows[1]}, cols={stats.scan_crop_cols[0]}:{stats.scan_crop_cols[1]}")
+            print(f"{name}: global crop rows={stats.scan_crop_rows[0]}:{stats.scan_crop_rows[1]}, cols={stats.scan_crop_cols[0]}:{stats.scan_crop_cols[1]}")
             print(f"{name}: saved detector={stats.detector_shape_px}, no detector padding")
             print(f"{name}: pre-quant range=[{stats.min_value:.3f}, {stats.max_value:.3f}], clipped below/above uint16 = {stats.clipped_below}/{stats.clipped_above}")
         cp.get_default_memory_pool().free_all_blocks()
@@ -202,6 +206,7 @@ def main() -> None:
 
         source_shape = clean_4dstem.shape[:2]
         nominal_0 = rotated_scan_positions(source_shape, 0)
+        nominal_90 = rotated_scan_positions(source_shape, 90)
         positions_0 = sim_0["positions"]
         positions_90 = sim_90["positions"]
         clean_crop = find_valid_square_scan_crop(np.ones(source_shape, dtype=bool), save_crop)
@@ -211,9 +216,36 @@ def main() -> None:
         print(f"theoretical largest clean square = {clean_4dstem.shape[0] - int(np.ceil(np.max(np.abs(drift_field[..., 1]))))} px")
 
         paths = [
-            save_one_export(names["clean0"], clean_4dstem, clean_crop, nominal_0, zero_offset, "ground_truth_no_added_drift"),
-            save_one_export(names["drift0"], sim_0["data"], crop_0, positions_0, sim_0["positions_offset_px"], f"image_0_known_right{right_label}_drift"),
-            save_one_export(names["drift90"], sim_90["data"], crop_90, positions_90, sim_90["positions_offset_px"], f"image_1_known_right{right_label}_drift"),
+            save_one_export(
+                names["clean0"],
+                clean_4dstem,
+                clean_crop,
+                nominal_0,
+                zero_offset,
+                "ground_truth_no_added_drift",
+                scan_direction_degrees=0,
+                nominal_positions=nominal_0,
+            ),
+            save_one_export(
+                names["drift0"],
+                sim_0["data"],
+                crop_0,
+                positions_0,
+                sim_0["positions_offset_px"],
+                f"image_0_known_right{right_label}_drift",
+                scan_direction_degrees=0,
+                nominal_positions=nominal_0,
+            ),
+            save_one_export(
+                names["drift90"],
+                sim_90["data"],
+                crop_90,
+                positions_90,
+                sim_90["positions_offset_px"],
+                f"image_1_known_right{right_label}_drift",
+                scan_direction_degrees=90,
+                nominal_positions=nominal_90,
+            ),
         ]
         for path in paths:
             print(path)
@@ -259,7 +291,7 @@ def main() -> None:
         return (cp.asnumpy(phase) if hasattr(phase, "get") else np.asarray(phase)).astype(np.float32)
 
     def align_to_clean_frame(key, phase):
-        return np.rot90(phase, k=-1) if key == "drift90" else phase
+        return phase
 
     def run_locked_candidate_set(key, *, base_rotation_deg, aberrations, branch_offsets_deg):
         data, _ = live_load(str(masters[key]), verbose=False)
@@ -391,7 +423,7 @@ def main() -> None:
             "drift90",
             base_rotation_deg=clean0_rotation_deg,
             aberrations=clean0_aberrations,
-            branch_offsets_deg={"minus90": -90.0, "plus90": 90.0},
+            branch_offsets_deg={"same": 0.0},
         )
         locked_results["drift0"] = best0
         locked_results["drift90"] = best90

@@ -42,6 +42,8 @@ def px_token(value: float) -> str:
 
 def drift_label(drift_total_px_down_right: tuple[float, float]) -> str:
     down_px, right_px = drift_total_px_down_right
+    if np.isclose(float(down_px), 0.0):
+        return f"right{px_token(right_px)}"
     return f"down{px_token(down_px)}_right{px_token(right_px)}"
 
 
@@ -61,6 +63,7 @@ class KnownScanDriftConfig:
     scan_sampling_a: float = 0.264
     ssb_n_trials: int = 200
     ssb_refine: str = "nmead"
+    ssb_rotation_angle_deg: float | None = None
     gpu: int = 0
     export_base: Path | None = None
     output_base: Path = REPO / "notebooks" / "drift" / "dev" / "outputs"
@@ -193,7 +196,17 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
     def virtual_image(data_t, mask_np):
         return _as_numpy(integrate_virtual_detector_image(data_t, mask_np))
 
-    def save_one(key: str, data_t: Any, scan_crop: tuple[slice, slice], positions, offsets, label: str):
+    def save_one(
+        key: str,
+        data_t: Any,
+        scan_crop: tuple[slice, slice],
+        positions,
+        offsets,
+        label: str,
+        *,
+        scan_direction_degrees: float,
+        nominal_positions,
+    ):
         result = save_known_4dstem_drift_export(
             config.masters[key],
             data_t,
@@ -208,6 +221,9 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
             scan_shape=(config.save_crop, config.save_crop),
             dtype=config.save_dtype,
             overwrite=overwrite,
+            scan_direction_degrees=scan_direction_degrees,
+            scan_axes_frame="global",
+            nominal_positions_px=nominal_positions,
             save_kwargs={
                 "batch_size": 4096,
                 "frames_per_file": 32768,
@@ -220,7 +236,7 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
         elif result.stats is not None:
             stats = result.stats
             print(
-                f"{key}: crop rows={stats.scan_crop_rows[0]}:{stats.scan_crop_rows[1]}, "
+                f"{key}: global crop rows={stats.scan_crop_rows[0]}:{stats.scan_crop_rows[1]}, "
                 f"cols={stats.scan_crop_cols[0]}:{stats.scan_crop_cols[1]}"
             )
             print(
@@ -299,7 +315,16 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
     crop90 = find_valid_square_scan_crop(valid_scan_position_mask(sim90["positions"], source_shape), config.save_crop)
 
     results = {
-        "clean0": save_one("clean0", clean_4dstem, clean_crop, nominal0, zero_offset, "ground_truth_no_added_drift"),
+        "clean0": save_one(
+            "clean0",
+            clean_4dstem,
+            clean_crop,
+            nominal0,
+            zero_offset,
+            "ground_truth_no_added_drift",
+            scan_direction_degrees=0,
+            nominal_positions=nominal0,
+        ),
         "drift0": save_one(
             "drift0",
             sim0["data"],
@@ -307,6 +332,8 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
             sim0["positions"],
             sim0["positions_offset_px"],
             f"image_0_known_{config.drift_label}_drift",
+            scan_direction_degrees=0,
+            nominal_positions=nominal0,
         ),
         "drift90": save_one(
             "drift90",
@@ -315,6 +342,8 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
             sim90["positions"],
             sim90["positions_offset_px"],
             f"image_1_known_{config.drift_label}_drift",
+            scan_direction_degrees=90,
+            nominal_positions=nominal90,
         ),
     }
 
@@ -342,7 +371,7 @@ def generate_forward_model_exports(config: KnownScanDriftConfig, *, overwrite: b
         positions_0=sim0["positions"],
         positions_90=sim90["positions"],
         positions_offset_px_0=sim0["positions_offset_px"],
-        positions_offset_px_90=sim90["positions_offset_px"],
+        positions_offset_px_90_raw=sim90["positions_offset_px"],
         bf_mask=bf_mask,
         df_mask=df_mask,
         source=str(config.source_h5),
@@ -376,7 +405,7 @@ def _zero_mean(arr: np.ndarray) -> np.ndarray:
 
 
 def _align_to_clean_frame(key: str, phase: np.ndarray) -> np.ndarray:
-    return np.rot90(phase, k=-1) if key == "drift90" else phase
+    return phase
 
 
 def run_locked_ssb(config: KnownScanDriftConfig) -> dict[str, Any]:
@@ -401,6 +430,9 @@ def run_locked_ssb(config: KnownScanDriftConfig) -> dict[str, Any]:
 
     print("Fitting clean0 calibration reference")
     clean_input = load_numpy("clean0")
+    clean_kwargs = {}
+    if config.ssb_rotation_angle_deg is not None:
+        clean_kwargs["rotation_angle_deg"] = float(config.ssb_rotation_angle_deg)
     clean_result = live_ssb(
         clean_input,
         voltage_kV=config.voltage_kv,
@@ -410,6 +442,7 @@ def run_locked_ssb(config: KnownScanDriftConfig) -> dict[str, Any]:
         refine=config.ssb_refine,
         source_path=str(config.masters["clean0"]),
         verbose=True,
+        **clean_kwargs,
     )
     clean_phase = _phase_to_numpy(clean_result)
     clean_rotation = float(clean_result.rotation_angle_deg)
@@ -455,7 +488,7 @@ def run_locked_ssb(config: KnownScanDriftConfig) -> dict[str, Any]:
         return min(candidates, key=lambda item: np.inf if item["loss"] is None else item["loss"]), candidates
 
     best0, candidates0 = run_candidate_set("drift0", {"same": 0.0})
-    best90, candidates90 = run_candidate_set("drift90", {"minus90": -90.0, "plus90": 90.0})
+    best90, candidates90 = run_candidate_set("drift90", {"same": 0.0})
 
     locked_phases = {
         "clean0": clean_phase,
