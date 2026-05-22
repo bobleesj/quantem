@@ -4063,4 +4063,5 @@ function Show4DSTEM() {
   );
 }
 
-export const render = createRender(Show4DSTEM);
+const render = createRender(Show4DSTEM);
+export default { render };
