@@ -53,7 +53,10 @@ const controlPanel = {
 };
 
 const container = {
-  root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "monospace", overflow: "visible" },
+  // Match Show2D root font stack so Reset/Copy/Export buttons render in the
+  // same system sans-serif. Items that genuinely want monospace (stats values,
+  // numerical readouts, scale-bar labels) declare it explicitly.
+  root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif", overflow: "visible" },
   imageBox: { bgcolor: "transparent", overflow: "hidden", position: "relative" as const },
 };
 
@@ -3838,7 +3841,7 @@ function Show3D() {
               {/* Playback: 2 rows side-by-side with Display + Histogram. */}
               {!hidePlayback && (() => { const activeIdx = playing ? displaySliceIdx : sliceIdx; return (
                 <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, minWidth: 320, justifyContent: "center", opacity: lockPlayback ? 0.5 : 1, pointerEvents: lockPlayback ? "none" : "auto" }}>
-                  <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Stack direction="row" spacing={0} sx={{ flexShrink: 0, mr: 0.5 }}>
                       <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
                         <FastRewindIcon sx={{ fontSize: 18 }} />
@@ -3860,7 +3863,7 @@ function Show3D() {
                     )}
                     <Typography sx={{ ...typography.value, color: themeColors.textMuted, minWidth: `${String(nSlices).length * 2 + 2}ch`, textAlign: "right", flexShrink: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{hiddenSet.size ? `${activeIdx + 1}/${visibleCount} (${nSlices})` : `${activeIdx + 1}/${nSlices}`}</Typography>
                   </Box>
-                  <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>fps</Typography>
                     <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => { if (!lockPlayback) setFps(v as number); }} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
@@ -3878,16 +3881,12 @@ function Show3D() {
                 const { min: histMin, max: histMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
                 return (
                 <Box sx={{
-                  display: "flex", flexDirection: "column", alignItems: "stretch", justifyContent: "center",
+                  // Match Show2D histogram shell exactly so visual stays consistent
+                  // across widgets. alignItems: flex-end (not stretch) prevents the
+                  // inner Slider thumbs from overflowing onto the canvas, which was
+                  // the source of the "2.8 tooltip overlaps bars" overlap bug.
+                  display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start", gap: 0.5,
                   opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto",
-                  flex: "0 0 auto",
-                  // De-blue + match height to the Display/Playback control columns: shrink slider
-                  // thumbs/track so the histogram column total height (canvas + slider + labels)
-                  // matches 2 controlRow stacks (~60px). Color: themeColors.border (grey) instead
-                  // of MUI primary (blue).
-                  "& .MuiSlider-rail, & .MuiSlider-track": { backgroundColor: themeColors.border, color: themeColors.border, borderColor: themeColors.border },
-                  "& .MuiSlider-thumb": { backgroundColor: themeColors.textMuted, color: themeColors.textMuted, "&:hover, &.Mui-active, &.Mui-focusVisible": { boxShadow: "none" } },
-                  "& .MuiSlider-valueLabel": { backgroundColor: themeColors.bgAlt, color: themeColors.text },
                 }}>
                   <Histogram
                     data={imageHistogramData}
@@ -3899,8 +3898,8 @@ function Show3D() {
                       setImageVmaxPct(max);
                       if (autoContrast) setAutoContrast(false);
                     }}
-                    width={180}
-                    height={42}
+                    width={110}
+                    height={58}
                     theme={themeInfo.theme === "dark" ? "dark" : "light"}
                     dataMin={histMin}
                     dataMax={histMax}

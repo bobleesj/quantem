@@ -137,9 +137,11 @@ export function Histogram({
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.scale(dpr, dpr);
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    // Reset any prior transform before re-scaling - canvas resize clears it,
+    // but React 19 StrictMode double-invoke would otherwise stack scale.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, width, height);

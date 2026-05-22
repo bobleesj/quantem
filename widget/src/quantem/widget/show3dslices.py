@@ -425,11 +425,13 @@ class Show3DSlices(anywidget.AnyWidget):
         self.pixel_size = ps_scalar
         self.pixel_size_axes = ps_axes
         self.scale_bar_visible = scale_bar_visible
-        # Auto-pick z_stretch for thin-Z volumes (e.g. multislice ptycho nz=14, nxy=730).
+        # Default z_stretch = 15 for thin-Z multislice ptycho (nz~14, nxy~700+).
+        # Renders depth panels at a readable height without hiding lateral detail.
+        # User can override via constructor or runtime trait. For near-cubic data
+        # (nxy/nz <= 4) keep 1.0 so XZ/YZ panels stay square.
         thin_z_ratio = min(self.nx, self.ny) / max(self.nz, 1)
         if z_stretch is None:
-            # Round to half-step matching slider; clamp to validator range [1, 30].
-            z_stretch = max(1.0, min(30.0, round(thin_z_ratio * 2) / 2)) if thin_z_ratio > 4 else 1.0
+            z_stretch = 15.0 if thin_z_ratio > 4 else 1.0
         self.z_stretch = float(z_stretch)
         # Slices viewer is always compact. The 3D panel is an orientation/context
         # view, while detailed comparison/tomography workflows stay in Show3DVolume.

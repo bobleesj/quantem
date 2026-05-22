@@ -1674,9 +1674,12 @@ function Show3DSlices() {
   // -------------------------------------------------------------------------
   return (
     <Box className="show3dslices-root" tabIndex={0} onKeyDown={handleKeyDown} sx={{ ...container.root, bgcolor: tc.bg, color: tc.text }}>
-      {/* 3D Volume Renderer */}
+      {/* 3D volume on the LEFT, slice toolbar + projected slice panels on the RIGHT.
+          Side-by-side layout keeps the whole widget within a 13" laptop viewport. */}
+      <Box sx={{ display: "flex", flexDirection: "row", alignItems: "flex-start", gap: `${SPACING.SM}px` }}>
+      {/* 3D Volume Renderer (left column) */}
       {!hideVolume && (
-      <Box sx={{ mb: 0 }}>
+      <Box sx={{ mb: 0, flexShrink: 0 }}>
         {/* Title row */}
         <Typography variant="caption" sx={{ ...typography.label, color: tc.accent, mb: `${SPACING.XS}px`, display: "block", height: 16, lineHeight: "16px", overflow: "hidden" }}>
           {title || "Volume 3D"}<InfoTooltip text={<Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
@@ -1801,8 +1804,11 @@ function Show3DSlices() {
         )}
       </Box>
       )}
-      {/* Slice toolbar: compact row above the side column, without spanning the whole grid. */}
-      <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mt: 0, mb: 0, minHeight: 18, ml: thinZ ? `${primaryPanelW + SPACING.SM}px` : 0, justifyContent: "flex-end", width: thinZ ? Math.max(canvasSizes[1]?.w ?? 0, canvasSizes[2]?.w ?? 0) : panelTotalW, maxWidth: panelTotalW, boxSizing: "border-box" }}>
+      {/* Right column: slice toolbar + projected slice panels (grouped so they
+          sit beside the 3D volume rather than below it). */}
+      <Box sx={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+      {/* Slice toolbar: compact row above the side column. */}
+      <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mt: 0, mb: 0, minHeight: 18, justifyContent: "flex-end", width: panelTotalW, maxWidth: panelTotalW, boxSizing: "border-box" }}>
         {!hideDisplay && (
           <>
             <Typography sx={{ ...controlLabel }}>FFT</Typography>
@@ -1998,6 +2004,8 @@ function Show3DSlices() {
           </Box>
         );
       })()}
+      </Box> {/* end right column (toolbar + slices) */}
+      </Box> {/* end side-by-side row (3D volume + slices) */}
       {/* FFT controls row */}
       {effectiveShowFft && (
         <Box sx={{ ...panelControlRow, mt: `${SPACING.SM}px`, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
