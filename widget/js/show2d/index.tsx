@@ -592,6 +592,11 @@ function Show2D() {
   // Cursor readout state
   const [cursorInfo, setCursorInfo] = React.useState<{ row: number; col: number; value: number } | null>(null);
 
+  // Toggle stats bar visibility by re-clicking the already-selected gallery panel.
+  // Resets to visible whenever the user selects a different panel.
+  const [statsHidden, setStatsHidden] = React.useState(false);
+  React.useEffect(() => { setStatsHidden(false); }, [selectedIdx]);
+
   // Colorbar state (single image mode only)
   const [showColorbar, setShowColorbar] = React.useState(false);
 
@@ -3112,6 +3117,20 @@ function Show2D() {
         }
       }
     }
+    // Click-not-drag on the already-selected gallery panel toggles the stats bar.
+    // Skipped when a tool is active (profile / measure / roi) so toggling doesn't
+    // fight with point-placement.
+    if (
+      isGallery && idx === selectedIdx && clickStartRef.current &&
+      !profileActive && !measureActive && !roiActive &&
+      !isDraggingPan && panningIdx === null
+    ) {
+      const dx = e.clientX - clickStartRef.current.x;
+      const dy = e.clientY - clickStartRef.current.y;
+      if (Math.sqrt(dx * dx + dy * dy) < 3) {
+        setStatsHidden((v) => !v);
+      }
+    }
     clickStartRef.current = null;
     setDraggingProfileEndpoint(null);
     setIsDraggingProfileLine(false);
@@ -3832,7 +3851,7 @@ function Show2D() {
           )}
 
           {/* Stats bar - right below canvas (Show3D style) */}
-          {showStats && (
+          {showStats && !(isGallery && statsHidden) && (
             <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", gap: 2, alignItems: "center", boxSizing: "border-box", overflow: "hidden", whiteSpace: "nowrap", opacity: 1 }}>
               {isGallery && (
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>{labels?.[statsIdx] || `#${statsIdx + 1}`}</Typography>
