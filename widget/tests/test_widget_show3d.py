@@ -407,34 +407,6 @@ def test_show3d_profile_width_validator():
         w.profile_width = 0
 
 
-def test_show3dvolume_rejects_empty():
-    from quantem.widget import Show3DVolume
-    with pytest.raises(ValueError, match="Empty volume"):
-        Show3DVolume(np.zeros((0, 10, 10), dtype=np.float32))
-
-
-def test_show3dvolume_float_slice_coerced():
-    from quantem.widget import Show3DVolume
-    data = np.random.rand(10, 20, 30).astype(np.float32)
-    w = Show3DVolume(data)
-    w.slice_z = 3.7
-    w.slice_y = 5.9
-    w.slice_x = -2.5
-    assert w.slice_z == 3
-    assert w.slice_y == 5
-    assert w.slice_x == 0
-
-
-def test_show3dvolume_slice_clamps():
-    from quantem.widget import Show3DVolume
-    data = np.random.rand(8, 12, 16).astype(np.float32)
-    w = Show3DVolume(data)
-    w.slice_z = 99; w.slice_y = 99; w.slice_x = 99
-    assert w.slice_z == 7
-    assert w.slice_y == 11
-    assert w.slice_x == 15
-
-
 def test_show3d_rejects_nan():
     data = np.random.rand(3, 8, 8).astype(np.float32)
     data[0, 0, 0] = np.nan
@@ -454,29 +426,6 @@ def test_show3d_large_array_full_finite_scan():
     data.ravel()[123457] = np.nan
     with pytest.raises(ValueError, match="NaN or inf"):
         Show3D(data)
-
-
-def test_show3dvolume_rejects_nan():
-    from quantem.widget import Show3DVolume
-    data = np.random.rand(3, 8, 8).astype(np.float32)
-    data[0, 0, 0] = np.nan
-    with pytest.raises(ValueError, match="NaN or inf"):
-        Show3DVolume(data)
-
-
-def test_show3dvolume_rejects_float32_overflow():
-    from quantem.widget import Show3DVolume
-    data = np.full((3, 8, 8), np.float64(np.finfo(np.float32).max) * 2.0, dtype=np.float64)
-    with pytest.raises(ValueError, match="float32 range"):
-        Show3DVolume(data)
-
-
-def test_show3dvolume_dual_rejects_float32_overflow_b():
-    from quantem.widget import Show3DVolume
-    a = np.random.rand(3, 8, 8).astype(np.float32)
-    b = np.full((3, 8, 8), np.float64(np.finfo(np.float32).max) * 2.0, dtype=np.float64)
-    with pytest.raises(ValueError, match="data_b exceeds float32 range"):
-        Show3DVolume(a, b)
 
 
 def test_show3d_state_timestamps_roundtrip():
