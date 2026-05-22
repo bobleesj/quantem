@@ -10,6 +10,7 @@ const widgets = [
   { name: "show2d" },
   { name: "show3d" },
   { name: "show3dslices" },
+  { name: "show3dvolume" },
   { name: "show4dstem" },
 ];
 
