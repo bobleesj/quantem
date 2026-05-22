@@ -1,0 +1,10 @@
+{
+    "pythonPath": "/home/owner/miniforge3/envs/cuda-env/bin/python",
+    "venvPath": "/home/owner/miniforge3/envs",
+    "venv": "cuda-env",
+    "include": ["src", "notebooks"],
+    "exclude": ["**/__pycache__", "**/.ipynb_checkpoints", "**/node_modules"],
+    "useLibraryCodeForTypes": true,
+    "reportMissingImports": "warning",
+    "typeCheckingMode": "standard"
+}
