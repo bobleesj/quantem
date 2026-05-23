@@ -140,6 +140,29 @@ function resolveDisplayBounds(
   };
 }
 
+function cachedAutoRange(
+  vmins: number[] | null | undefined,
+  vmaxs: number[] | null | undefined,
+  idx: number,
+): { vmin: number; vmax: number } | null {
+  const vmin = vmins?.[idx];
+  const vmax = vmaxs?.[idx];
+  if (typeof vmin !== "number" || typeof vmax !== "number") return null;
+  return Number.isFinite(vmin) && Number.isFinite(vmax) && vmax > vmin ? { vmin, vmax } : null;
+}
+
+function show3dPerfDebug(): Record<string, unknown> | null {
+  if (typeof window === "undefined") return null;
+  const host = window as unknown as { __quantemShow3DPerf?: Record<string, unknown> };
+  if (!host.__quantemShow3DPerf) host.__quantemShow3DPerf = {};
+  return host.__quantemShow3DPerf;
+}
+
+const FRAME_SERVER_STREAM_CACHE_BYTES = 1024 * 1024 * 1024;
+const FRAME_SERVER_FULL_STACK_CACHE_BYTES = 3 * 1024 * 1024 * 1024;
+const FRAME_SERVER_MIN_CACHE_FRAMES = 6;
+const FRAME_SERVER_PREFETCH_FRAMES = 8;
+
 // ============================================================================
 // Inlined components (matches Show2D single-file convention)
 // ============================================================================
@@ -194,26 +217,42 @@ interface HistogramProps {
   dataMax?: number;
   pinBinsToRange?: boolean;
   ariaHidden?: boolean;
+  // Pre-computed 256-element bin array (e.g. from GPU). When provided, the
+  // CPU `computeHistogramFromBytes` fallback is skipped entirely.
+  bins?: number[] | null;
 }
 
-function Histogram({
+const Histogram = React.memo(function Histogram({
   data, vminPct, vmaxPct, onRangeChange,
   width = 110, height = 40, theme = "dark",
   dataMin = 0, dataMax = 1, pinBinsToRange = true, ariaHidden = false,
+  bins: precomputedBins = null,
 }: HistogramProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  // Bins source priority: GPU-precomputed > CPU memoized scan. The CPU path
+  // is an O(N) pass over 16.8 M Float32 at 4k (89% of scrub cost in profiling)
+  // so we only run it when the GPU path didn't produce bins.
   const bins = React.useMemo(
-    () => pinBinsToRange
-      ? computeHistogramFromBytes(data, 256, dataMin, dataMax)
-      : computeHistogramFromBytes(data),
-    [data, dataMin, dataMax, pinBinsToRange],
+    () => {
+      // Use GPU-precomputed bins only if non-empty. The GPU path can return
+      // an all-zero array when the engine slot has no data yet (e.g. the
+      // colormap render effect hasn't run yet), which would draw a blank
+      // histogram. Falling back to the CPU bin scan in that case keeps the
+      // first paint correct; subsequent renders use the GPU bins.
+      if (precomputedBins && precomputedBins.length === 256) {
+        let total = 0;
+        for (let i = 0; i < precomputedBins.length; i++) total += precomputedBins[i];
+        if (total > 0) return precomputedBins;
+      }
+      return pinBinsToRange
+        ? computeHistogramFromBytes(data, 256, dataMin, dataMax)
+        : computeHistogramFromBytes(data);
+    },
+    [precomputedBins, data, dataMin, dataMax, pinBinsToRange],
   );
-  const colors = React.useMemo(
-    () => theme === "dark"
-      ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" }
-      : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" },
-    [theme],
-  );
+  const colors = theme === "dark"
+    ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" }
+    : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" };
   React.useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -281,7 +320,7 @@ function Histogram({
       </Box>
     </Box>
   );
-}
+});
 
 const controlPanel = {
   select: { minWidth: 90, fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
@@ -531,6 +570,37 @@ function renderFramePlayback(
   }
 }
 
+function renderFrameScaledPlayback(
+  data: Float32Array,
+  rgba: Uint8ClampedArray,
+  xMap: Uint32Array,
+  yMap: Uint32Array,
+  outW: number,
+  outH: number,
+  lut: Uint8Array,
+  vmin: number,
+  vmax: number,
+  logScale: boolean,
+): void {
+  const range = vmax - vmin;
+  const invRange = range > 0 ? 255 / range : 0;
+  for (let y = 0; y < outH; y++) {
+    const srcRow = yMap[y];
+    const outRow = y * outW;
+    for (let x = 0; x < outW; x++) {
+      let v = data[srcRow + xMap[x]];
+      if (logScale) v = v >= 0 ? Math.log1p(v) : -Math.log1p(-v);
+      const idx = v <= vmin ? 0 : v >= vmax ? 255 : ((v - vmin) * invRange) | 0;
+      const j = (outRow + x) << 2;
+      const k = idx * 3;
+      rgba[j] = lut[k];
+      rgba[j + 1] = lut[k + 1];
+      rgba[j + 2] = lut[k + 2];
+      rgba[j + 3] = 255;
+    }
+  }
+}
+
 // ============================================================================
 // Crop ROI region from raw float32 data for ROI-scoped FFT
 // ============================================================================
@@ -539,25 +609,25 @@ function cropROIRegion(
   roi: ROIItem,
 ): { cropped: Float32Array; cropW: number; cropH: number } | null {
   const shape = roi.shape || "circle";
-  let x0: number, y0: number, x1: number, y1: number;
+  let col0: number, row0: number, col1: number, row1: number;
 
   if (shape === "rectangle") {
     const hw = roi.width / 2;
     const hh = roi.height / 2;
-    x0 = Math.max(0, Math.floor(roi.col - hw));
-    y0 = Math.max(0, Math.floor(roi.row - hh));
-    x1 = Math.min(imgW, Math.ceil(roi.col + hw));
-    y1 = Math.min(imgH, Math.ceil(roi.row + hh));
+    col0 = Math.max(0, Math.floor(roi.col - hw));
+    row0 = Math.max(0, Math.floor(roi.row - hh));
+    col1 = Math.min(imgW, Math.ceil(roi.col + hw));
+    row1 = Math.min(imgH, Math.ceil(roi.row + hh));
   } else {
     const r = roi.radius;
-    x0 = Math.max(0, Math.floor(roi.col - r));
-    y0 = Math.max(0, Math.floor(roi.row - r));
-    x1 = Math.min(imgW, Math.ceil(roi.col + r));
-    y1 = Math.min(imgH, Math.ceil(roi.row + r));
+    col0 = Math.max(0, Math.floor(roi.col - r));
+    row0 = Math.max(0, Math.floor(roi.row - r));
+    col1 = Math.min(imgW, Math.ceil(roi.col + r));
+    row1 = Math.min(imgH, Math.ceil(roi.row + r));
   }
 
-  const cropW = x1 - x0;
-  const cropH = y1 - y0;
+  const cropW = col1 - col0;
+  const cropH = row1 - row0;
   if (cropW < 2 || cropH < 2) return null;
 
   const cropped = new Float32Array(cropW * cropH);
@@ -567,15 +637,15 @@ function cropROIRegion(
     const rSq = r * r;
     for (let dy = 0; dy < cropH; dy++) {
       for (let dx = 0; dx < cropW; dx++) {
-        const imgX = x0 + dx;
-        const imgY = y0 + dy;
-        const distSq = (imgX - roi.col) * (imgX - roi.col) + (imgY - roi.row) * (imgY - roi.row);
-        cropped[dy * cropW + dx] = distSq <= rSq ? data[imgY * imgW + imgX] : 0;
+        const imgCol = col0 + dx;
+        const imgRow = row0 + dy;
+        const distSq = (imgCol - roi.col) * (imgCol - roi.col) + (imgRow - roi.row) * (imgRow - roi.row);
+        cropped[dy * cropW + dx] = distSq <= rSq ? data[imgRow * imgW + imgCol] : 0;
       }
     }
   } else {
     for (let dy = 0; dy < cropH; dy++) {
-      const srcOffset = (y0 + dy) * imgW + x0;
+      const srcOffset = (row0 + dy) * imgW + col0;
       cropped.set(data.subarray(srcOffset, srcOffset + cropW), dy * cropW);
     }
   }
@@ -591,40 +661,40 @@ function computeROIPixelStats(
   roi: ROIItem,
 ): { mean: number; min: number; max: number; std: number } | null {
   const shape = roi.shape || "circle";
-  let x0: number, y0: number, x1: number, y1: number;
+  let col0: number, row0: number, col1: number, row1: number;
 
   if (shape === "rectangle") {
     const hw = roi.width / 2;
     const hh = roi.height / 2;
-    x0 = Math.max(0, Math.floor(roi.col - hw));
-    y0 = Math.max(0, Math.floor(roi.row - hh));
-    x1 = Math.min(imgW, Math.ceil(roi.col + hw));
-    y1 = Math.min(imgH, Math.ceil(roi.row + hh));
+    col0 = Math.max(0, Math.floor(roi.col - hw));
+    row0 = Math.max(0, Math.floor(roi.row - hh));
+    col1 = Math.min(imgW, Math.ceil(roi.col + hw));
+    row1 = Math.min(imgH, Math.ceil(roi.row + hh));
   } else {
     const r = roi.radius;
-    x0 = Math.max(0, Math.floor(roi.col - r));
-    y0 = Math.max(0, Math.floor(roi.row - r));
-    x1 = Math.min(imgW, Math.ceil(roi.col + r));
-    y1 = Math.min(imgH, Math.ceil(roi.row + r));
+    col0 = Math.max(0, Math.floor(roi.col - r));
+    row0 = Math.max(0, Math.floor(roi.row - r));
+    col1 = Math.min(imgW, Math.ceil(roi.col + r));
+    row1 = Math.min(imgH, Math.ceil(roi.row + r));
   }
 
-  const cropW = x1 - x0;
-  const cropH = y1 - y0;
+  const cropW = col1 - col0;
+  const cropH = row1 - row0;
   if (cropW < 1 || cropH < 1) return null;
 
-  let sum = 0, sumSq = 0, mn = Infinity, mx = -Infinity, n = 0;
+  let sum = 0, sumSq = 0, minVal = Infinity, maxVal = -Infinity, n = 0;
 
   if (shape === "circle") {
     const rSq = roi.radius * roi.radius;
     for (let dy = 0; dy < cropH; dy++) {
       for (let dx = 0; dx < cropW; dx++) {
-        const imgX = x0 + dx, imgY = y0 + dy;
-        const distSq = (imgX - roi.col) ** 2 + (imgY - roi.row) ** 2;
+        const imgCol = col0 + dx, imgRow = row0 + dy;
+        const distSq = (imgCol - roi.col) ** 2 + (imgRow - roi.row) ** 2;
         if (distSq > rSq) continue;
-        const v = data[imgY * imgW + imgX];
+        const v = data[imgRow * imgW + imgCol];
         sum += v; sumSq += v * v;
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
         n++;
       }
     }
@@ -633,13 +703,13 @@ function computeROIPixelStats(
     const riSq = (roi.radius_inner || 0) ** 2;
     for (let dy = 0; dy < cropH; dy++) {
       for (let dx = 0; dx < cropW; dx++) {
-        const imgX = x0 + dx, imgY = y0 + dy;
-        const distSq = (imgX - roi.col) ** 2 + (imgY - roi.row) ** 2;
+        const imgCol = col0 + dx, imgRow = row0 + dy;
+        const distSq = (imgCol - roi.col) ** 2 + (imgRow - roi.row) ** 2;
         if (distSq > rSq || distSq < riSq) continue;
-        const v = data[imgY * imgW + imgX];
+        const v = data[imgRow * imgW + imgCol];
         sum += v; sumSq += v * v;
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
         n++;
       }
     }
@@ -647,10 +717,10 @@ function computeROIPixelStats(
     // square or rectangle - all pixels in bounding box
     for (let dy = 0; dy < cropH; dy++) {
       for (let dx = 0; dx < cropW; dx++) {
-        const v = data[(y0 + dy) * imgW + (x0 + dx)];
+        const v = data[(row0 + dy) * imgW + (col0 + dx)];
         sum += v; sumSq += v * v;
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
         n++;
       }
     }
@@ -659,7 +729,7 @@ function computeROIPixelStats(
   if (n === 0) return null;
   const mean = sum / n;
   const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
-  return { mean, min: mn, max: mx, std };
+  return { mean, min: minVal, max: maxVal, std };
 }
 
 // ============================================================================
@@ -718,9 +788,12 @@ function Show3D() {
   const [dimLabel] = useModelState<string>("dim_label");
   const [nPanels] = useModelState<number>("n_panels");
   const [panelTitles] = useModelState<string[]>("panel_titles");
+  const [panelWidthPx] = useModelState<number>("panel_width_px");
+  const [sharedPanelSource] = useModelState<boolean>("shared_panel_source");
   const [panelRealFrames] = useModelState<number[]>("panel_real_frames");
+  const [starred, setStarred] = useModelState<number[]>("starred");
   const [hiddenIndices] = useModelState<number[]>("hidden_indices");
-  const hiddenSet = React.useMemo(() => new Set(hiddenIndices || []), [hiddenIndices]);
+  const hiddenSet = new Set(hiddenIndices || []);
   const nextVisible = (from: number, dir: 1 | -1, allowWrap = true): number => {
     if (!hiddenSet.size) return from + dir;
     let n = from + dir;
@@ -787,6 +860,8 @@ function Show3D() {
   const [traitVmax] = useModelState<number | null>("vmax");
   const [dataMin] = useModelState<number>("data_min");
   const [dataMax] = useModelState<number>("data_max");
+  const [autoVmins] = useModelState<number[]>("auto_vmins");
+  const [autoVmaxs] = useModelState<number[]>("auto_vmaxs");
   // Scale bar
   const [pixelSize] = useModelState<number>("pixel_size");
   const [scaleBarVisible] = useModelState<boolean>("scale_bar_visible");
@@ -810,23 +885,6 @@ function Show3D() {
   // FFT
   const [showFft, setShowFft] = useModelState<boolean>("show_fft");
   const [fftWindow, setFftWindow] = useModelState<boolean>("fft_window");
-  const hideDisplay = false;
-  const hideHistogram = false;
-  const hideStats = false;
-  const hidePlayback = false;
-  const hideView = false;
-  const hideExport = false;
-  const hideRoi = false;
-  const hideProfile = false;
-
-  const lockDisplay = false;
-  const lockHistogram = false;
-  const lockStats = false;
-  const lockPlayback = false;
-  const lockView = false;
-  const lockExport = false;
-  const lockRoi = false;
-  const lockProfile = false;
   const effectiveShowFft = showFft;
 
   // Export
@@ -845,6 +903,8 @@ function Show3D() {
   const [bufferStart] = useModelState<number>("_buffer_start");
   const [bufferCount] = useModelState<number>("_buffer_count");
   const [, setPrefetchRequest] = useModelState<number>("_prefetch_request");
+  const [frameServerUrl] = useModelState<string>("frame_server_url");
+  const [frameServerVersion] = useModelState<number>("frame_server_version");
 
   // Canvas refs
   const rootRef = React.useRef<HTMLDivElement>(null);
@@ -862,7 +922,7 @@ function Show3D() {
   const [isHoveringResize, setIsHoveringResize] = React.useState(false);
   const [isHoveringResizeInner, setIsHoveringResizeInner] = React.useState(false);
   const resizeAspectRef = React.useRef<number | null>(null);
-  const roiItems = React.useMemo(() => (roiList || []).map((roi, i) => normalizeROI(roi, i)), [roiList]);
+  const roiItems = (roiList || []).map((roi, i) => normalizeROI(roi, i));
   const selectedRoi = roiSelectedIdx >= 0 && roiSelectedIdx < roiItems.length ? roiItems[roiSelectedIdx] : null;
   const [showRoiResizeHint, setShowRoiResizeHint] = React.useState(true);
   const pendingRoiAddRef = React.useRef<{ row: number; col: number } | null>(null);
@@ -878,12 +938,12 @@ function Show3D() {
   const previewOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
   const [previewVersion, setPreviewVersion] = React.useState(0);
 
-  const updateSelectedRoi = React.useCallback((updates: Partial<ROIItem>) => {
+  const updateSelectedRoi = (updates: Partial<ROIItem>) => {
     if (roiSelectedIdx < 0 || !roiList) return;
     const newList = [...roiList];
     newList[roiSelectedIdx] = { ...newList[roiSelectedIdx], ...updates };
     setRoiList(newList);
-  }, [roiList, roiSelectedIdx, setRoiList]);
+  };
   // Per-panel zoom/pan: index 0 is also used as the SHARED state for
   // single-panel widgets, and as the linked state when link_zoom or
   // link_pan are on. Each panel keeps its own state when unlinked.
@@ -959,6 +1019,15 @@ function Show3D() {
   // Reusable rendering buffers (avoid per-frame allocation)
   const mainOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
   const mainImgDataRef = React.useRef<ImageData | null>(null);
+  const scaledPlaybackImgDataRef = React.useRef<{ width: number; height: number; imageData: ImageData } | null>(null);
+  const scaledPlaybackMapRef = React.useRef<{
+    srcW: number;
+    srcH: number;
+    outW: number;
+    outH: number;
+    xMap: Uint32Array;
+    yMap: Uint32Array;
+  } | null>(null);
   const logBufferRef = React.useRef<Float32Array | null>(null);
 
   // Playback buffer refs (double-buffer: current + next to avoid overwrite stalls)
@@ -970,6 +1039,13 @@ function Show3D() {
   const nextBufferCountRef = React.useRef(0);
   const prefetchPendingRef = React.useRef(false);
   const playbackIdxRef = React.useRef(0);
+  const frameFetchCacheRef = React.useRef<Map<number, Float32Array>>(new Map());
+  const frameFetchPendingRef = React.useRef<Map<number, Promise<Float32Array | null>>>(new Map());
+  const frameFetchSerialRef = React.useRef(0);
+  const localAutoVminsRef = React.useRef<number[]>([]);
+  const localAutoVmaxsRef = React.useRef<number[]>([]);
+  const autoRangeComputeTokenRef = React.useRef(0);
+
   const [displaySliceIdx, setDisplaySliceIdx] = React.useState(sliceIdx);
   const [localStats, setLocalStats] = React.useState<{ mean: number; min: number; max: number; std: number } | null>(null);
   const [localPanelStats, setLocalPanelStats] = React.useState<{ mean: number; min: number; max: number; std: number }[] | null>(null);
@@ -981,6 +1057,43 @@ function Show3D() {
   // WebGPU colormap engine (GPU-accelerated colormap for 4K frames)
   const gpuCmapRef = React.useRef<GPUColormapEngine | null>(null);
   const gpuCmapReadyRef = React.useRef(false);
+  const gpuFrameCacheUploadedRef = React.useRef<Set<number>>(new Set());
+  const gpuUploadRef = React.useRef<{
+    source: Float32Array | null;
+    data: Float32Array | null;
+    width: number;
+    height: number;
+    logScale: boolean;
+  } | null>(null);
+  const gpuRenderSerialRef = React.useRef(0);
+
+  const ensureLocalAutoRange = React.useCallback((
+    idx: number,
+    data: Float32Array,
+    low: number,
+    high: number,
+  ): { vmin: number; vmax: number } => {
+    const synced = cachedAutoRange(autoVmins, autoVmaxs, idx);
+    if (synced) return synced;
+    const local = cachedAutoRange(localAutoVminsRef.current, localAutoVmaxsRef.current, idx);
+    if (local) return local;
+
+    const range = percentileClip(data, low, high);
+    const needed = Math.max(nSlices, idx + 1);
+    while (localAutoVminsRef.current.length < needed) {
+      localAutoVminsRef.current.push(Number.NaN);
+      localAutoVmaxsRef.current.push(Number.NaN);
+    }
+    localAutoVminsRef.current[idx] = range.vmin;
+    localAutoVmaxsRef.current[idx] = range.vmax;
+    return range;
+  }, [autoVmins, autoVmaxs, nSlices]);
+
+  React.useEffect(() => {
+    localAutoVminsRef.current = [];
+    localAutoVmaxsRef.current = [];
+    autoRangeComputeTokenRef.current++;
+  }, [percentileLow, percentileHigh, nSlices, width, height]);
 
   React.useEffect(() => {
     getWebGPUFFT().then(fft => {
@@ -994,11 +1107,160 @@ function Show3D() {
     });
   }, []);
 
+  const getFrameServerCacheLimit = React.useCallback(() => {
+    const frameByteLength = Math.max(1, width * height * 4);
+    const stackByteLength = frameByteLength * Math.max(1, nSlices);
+    const cacheBudget = stackByteLength <= FRAME_SERVER_FULL_STACK_CACHE_BYTES
+      ? stackByteLength
+      : FRAME_SERVER_STREAM_CACHE_BYTES;
+    const budgetFrames = Math.floor(cacheBudget / frameByteLength);
+    const minFrames = frameByteLength <= cacheBudget / FRAME_SERVER_MIN_CACHE_FRAMES
+      ? FRAME_SERVER_MIN_CACHE_FRAMES
+      : 1;
+    return Math.max(1, Math.min(Math.max(1, nSlices), Math.max(minFrames, budgetFrames)));
+  }, [width, height, nSlices]);
+
+  const getCachedServerFrame = React.useCallback((idx: number): Float32Array | null => {
+    const cache = frameFetchCacheRef.current;
+    const frame = cache.get(idx);
+    if (!frame) return null;
+    cache.delete(idx);
+    cache.set(idx, frame);
+    return frame;
+  }, []);
+
+  const putCachedServerFrame = React.useCallback((idx: number, frame: Float32Array) => {
+    const cache = frameFetchCacheRef.current;
+    if (cache.has(idx)) cache.delete(idx);
+    cache.set(idx, frame);
+    const limit = getFrameServerCacheLimit();
+    while (cache.size > limit) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+  }, [getFrameServerCacheLimit]);
+
+  React.useEffect(() => {
+    frameFetchSerialRef.current++;
+    frameFetchCacheRef.current.clear();
+    frameFetchPendingRef.current.clear();
+    gpuFrameCacheUploadedRef.current.clear();
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.frameServerUrl = frameServerUrl || "";
+      dbg.frameServerVersion = frameServerVersion;
+      dbg.frameFetchCacheSize = 0;
+      dbg.frameFetchPendingSize = 0;
+    }
+  }, [frameServerUrl, frameServerVersion, width, height, nSlices]);
+
+  const fetchFrameFromServer = React.useCallback(async (idx: number): Promise<Float32Array | null> => {
+    if (!frameServerUrl || width <= 0 || height <= 0 || nSlices <= 0) return null;
+    const normalized = ((Math.round(idx) % nSlices) + nSlices) % nSlices;
+    const cached = getCachedServerFrame(normalized);
+    const dbg = show3dPerfDebug();
+    if (cached) {
+      if (dbg) {
+        dbg.frameFetchHits = ((dbg.frameFetchHits as number | undefined) ?? 0) + 1;
+        dbg.frameFetchCacheSize = frameFetchCacheRef.current.size;
+      }
+      return cached;
+    }
+    const pending = frameFetchPendingRef.current.get(normalized);
+    if (pending) return pending;
+
+    let url: URL;
+    try {
+      url = new URL(frameServerUrl);
+    } catch {
+      return null;
+    }
+    url.searchParams.set("idx", String(normalized));
+    url.searchParams.set("version", String(frameServerVersion));
+
+    const serial = frameFetchSerialRef.current;
+    const t0 = performance.now();
+    let promise!: Promise<Float32Array | null>;
+    promise = (async () => {
+      try {
+        if (dbg) {
+          dbg.frameFetchMisses = ((dbg.frameFetchMisses as number | undefined) ?? 0) + 1;
+          dbg.frameFetchPendingSize = frameFetchPendingRef.current.size + 1;
+        }
+        const response = await fetch(url.toString(), { cache: "no-store" });
+        if (!response.ok) throw new Error(`frame fetch ${response.status}`);
+        const buffer = await response.arrayBuffer();
+        if (serial !== frameFetchSerialRef.current) return null;
+        const expectedBytes = width * height * 4;
+        if (buffer.byteLength !== expectedBytes) {
+          throw new Error(`expected ${expectedBytes} bytes, got ${buffer.byteLength}`);
+        }
+        const frame = new Float32Array(buffer);
+        putCachedServerFrame(normalized, frame);
+        if (dbg) {
+          dbg.lastFrameFetchMs = performance.now() - t0;
+          dbg.lastFetchedFrame = normalized;
+          dbg.frameFetchCacheSize = frameFetchCacheRef.current.size;
+        }
+        return frame;
+      } catch (err) {
+        if (dbg) {
+          dbg.lastFrameFetchError = err instanceof Error ? err.message : String(err);
+          dbg.lastFrameFetchErrorAt = performance.now();
+        }
+        return null;
+      }
+    })().finally(() => {
+      if (frameFetchPendingRef.current.get(normalized) === promise) {
+        frameFetchPendingRef.current.delete(normalized);
+      }
+      const d = show3dPerfDebug();
+      if (d) d.frameFetchPendingSize = frameFetchPendingRef.current.size;
+    });
+    frameFetchPendingRef.current.set(normalized, promise);
+    return promise;
+  }, [frameServerUrl, frameServerVersion, width, height, nSlices, getCachedServerFrame, putCachedServerFrame]);
+
+  const prefetchServerFrames = React.useCallback((
+    startIdx: number,
+    reversePlayback = false,
+    loopPlayback = false,
+    loopStartIdx = 0,
+    loopEndIdx = -1,
+  ) => {
+    if (!frameServerUrl || nSlices <= 0) return;
+    const dir = reversePlayback ? -1 : 1;
+    const rangeStart = loopPlayback ? Math.max(0, Math.min(loopStartIdx, nSlices - 1)) : 0;
+    const rangeEnd = loopPlayback
+      ? Math.max(rangeStart, Math.min(loopEndIdx < 0 ? nSlices - 1 : loopEndIdx, nSlices - 1))
+      : nSlices - 1;
+    const rangeSize = Math.max(1, rangeEnd - rangeStart + 1);
+    for (let step = 0; step < FRAME_SERVER_PREFETCH_FRAMES; step++) {
+      let next = Math.round(startIdx) + dir * step;
+      if (loopPlayback) {
+        while (next < rangeStart) next += rangeSize;
+        while (next > rangeEnd) next -= rangeSize;
+      } else {
+        next = ((next % nSlices) + nSlices) % nSlices;
+      }
+      void fetchFrameFromServer(next);
+    }
+  }, [frameServerUrl, nSlices, fetchFrameFromServer]);
+
   // Parse incoming playback buffer (double-buffer to avoid overwrite stalls)
   React.useEffect(() => {
     if (!bufferBytes || bufferBytes.byteLength === 0) return;
     const parsed = extractFloat32(bufferBytes);
     if (!parsed) return;
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.lastBufferByteLength = bufferBytes.byteLength;
+      dbg.lastParsedFloatLength = parsed.length;
+      dbg.lastBufferStart = bufferStart;
+      dbg.lastBufferCount = bufferCount;
+      dbg.lastBufferAt = performance.now();
+    }
     if (!bufferRef.current || bufferCountRef.current === 0) {
       // No active buffer - use as current (initial load)
       bufferRef.current = parsed;
@@ -1011,7 +1273,34 @@ function Show3D() {
       nextBufferCountRef.current = bufferCount;
     }
     prefetchPendingRef.current = false;
-  }, [bufferBytes, bufferStart, bufferCount]);
+
+    if (autoContrast && !logScale && width > 0 && height > 0 && nSlices > 0 && bufferCount > 0) {
+      const frameSize = width * height;
+      const availableFrames = Math.min(bufferCount, Math.floor(parsed.length / frameSize));
+      const hasSyncedRanges = (autoVmins?.length ?? 0) >= nSlices && (autoVmaxs?.length ?? 0) >= nSlices;
+      if (!hasSyncedRanges && availableFrames > 0) {
+        const token = ++autoRangeComputeTokenRef.current;
+        let j = 0;
+        const computeNextRange = () => {
+          if (token !== autoRangeComputeTokenRef.current) return;
+          const idx = (bufferStart + j) % nSlices;
+          const start = j * frameSize;
+          const end = start + frameSize;
+          if (!cachedAutoRange(localAutoVminsRef.current, localAutoVmaxsRef.current, idx)) {
+            ensureLocalAutoRange(idx, parsed.subarray(start, end), percentileLow, percentileHigh);
+          }
+          j++;
+          if (j < availableFrames) {
+            const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback;
+            if (ric) ric(computeNextRange, { timeout: 150 });
+            else window.setTimeout(computeNextRange, 0);
+          }
+        };
+        window.setTimeout(computeNextRange, 0);
+      }
+    }
+    return () => { autoRangeComputeTokenRef.current++; };
+  }, [bufferBytes, bufferStart, bufferCount, autoContrast, logScale, width, height, nSlices, autoVmins, autoVmaxs, percentileLow, percentileHigh, ensureLocalAutoRange]);
 
   // Sync displaySliceIdx with model when not playing
   React.useEffect(() => {
@@ -1022,6 +1311,9 @@ function Show3D() {
   const [imageVminPct, setImageVminPct] = React.useState(0);
   const [imageVmaxPct, setImageVmaxPct] = React.useState(100);
   const [imageHistogramData, setImageHistogramData] = React.useState<Float32Array | null>(null);
+  // GPU-computed 256-bin histogram. When non-null, the Histogram component
+  // uses these bins directly and skips its CPU bin-scan fallback.
+  const [imageHistogramBins, setImageHistogramBins] = React.useState<number[] | null>(null);
   const [imageDataRange, setImageDataRange] = React.useState<{ min: number; max: number }>({ min: 0, max: 1 });
 
   // Histogram state for FFT
@@ -1036,10 +1328,10 @@ function Show3D() {
   const [fftShowColorbar, setFftShowColorbar] = React.useState(false);
   const [showColorbar, setShowColorbar] = React.useState(false);
 
-  const handleRootMouseDownCapture = React.useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+  const handleRootMouseDownCapture = (e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement | null;
     if (target?.closest("canvas")) rootRef.current?.focus();
-  }, []);
+  };
 
   // FFT d-spacing measurement
   const [fftClickInfo, setFftClickInfo] = React.useState<{
@@ -1071,28 +1363,6 @@ function Show3D() {
   const profileBaseImageRef = React.useRef<ImageData | null>(null);
   const profileLayoutRef = React.useRef<{ padLeft: number; plotW: number; padTop: number; plotH: number; gMin: number; gMax: number; totalDist: number; xUnit: string } | null>(null);
 
-  React.useEffect(() => {
-    if (hideRoi && roiActive) {
-      setRoiActive(false);
-      setRoiSelectedIdx(-1);
-    }
-  }, [hideRoi, roiActive, setRoiActive, setRoiSelectedIdx]);
-
-  React.useEffect(() => {
-    if (hideProfile && profileActive) {
-      setProfileActive(false);
-      setProfileLine([]);
-      setProfileData(null);
-    }
-  }, [hideProfile, profileActive, setProfileLine]);
-
-  React.useEffect(() => {
-    if (hideDisplay && showLens) {
-      setShowLens(false);
-      setLensPos(null);
-    }
-  }, [hideDisplay, showLens]);
-
   // Sync sizes from Python and set initial minimum. In multi-panel mode the user
   // is comparing N images side-by-side; default ~300 px per panel so each is
   // readable instead of crushed when the widget concatenates them into one wide
@@ -1113,20 +1383,32 @@ function Show3D() {
     }
   }, [canvasSizeTrait, nPanels, maxCols]);
 
-  // Calculate display scale
-  const displayScale = mainCanvasSize / Math.max(width, height);
-  // For 90°/270° rotations, swap canvas dims so non-square images fit without clipping.
-  const rotSwap = (imageRotation % 2) !== 0;
-  const canvasW = Math.round((rotSwap ? height : width) * displayScale);
-  // Grid layout: when max_cols wraps panels into multiple rows, canvasH grows to fit `rows` rows.
+  // Calculate display scale. In multi-panel mode `width` may be either the
+  // concatenated source width or one shared source frame drawn into N slots.
+  // `panel_width_px` keeps the per-panel source geometry explicit.
   const _nPanelsLocal = Math.max(1, nPanels || 1);
   const _colsLocal = (maxCols && maxCols > 0) ? Math.min(maxCols, _nPanelsLocal) : _nPanelsLocal;
   const _rowsLocal = Math.ceil(_nPanelsLocal / _colsLocal);
+  const sourcePanelWidth = _nPanelsLocal > 1
+    ? Math.max(1, panelWidthPx || Math.round(width / _nPanelsLocal))
+    : Math.max(1, width);
+  const sourcePanelHeight = Math.max(1, height);
+  const displayScale = _nPanelsLocal > 1
+    ? mainCanvasSize / Math.max(1, sourcePanelWidth * _colsLocal)
+    : mainCanvasSize / Math.max(width, height);
+  // For 90°/270° rotations, swap canvas dims so non-square images fit without clipping.
+  const rotSwap = (imageRotation % 2) !== 0;
+  const canvasW = _nPanelsLocal > 1
+    ? Math.round(sourcePanelWidth * displayScale * _colsLocal)
+    : Math.round((rotSwap ? height : width) * displayScale);
+  // Grid layout: when max_cols wraps panels into multiple rows, canvasH grows to fit `rows` rows.
   const _canvasHSingleRow = Math.round((rotSwap ? width : height) * displayScale);
-  // In single-row mode the canvas spans the full concatenated width.
-  // In multi-row mode, derive canvas height by scaling the single-row height proportionally:
-  // each row gets canvasW/cols of width; for square per-panel, height per row = canvasW/cols.
-  const canvasH = _rowsLocal > 1 ? Math.round((canvasW / _colsLocal) * _rowsLocal * (height / (width / _nPanelsLocal))) : _canvasHSingleRow;
+  const _gapForLayout = _nPanelsLocal > 1 ? (panelGapTrait ?? 10) : 0;
+  const _slotWForLayout = (canvasW - _gapForLayout * (_colsLocal - 1)) / _colsLocal;
+  const _slotHForLayout = _slotWForLayout * (sourcePanelHeight / sourcePanelWidth);
+  const canvasH = _nPanelsLocal > 1
+    ? Math.round(_slotHForLayout * _rowsLocal + _gapForLayout * (_rowsLocal - 1))
+    : _canvasHSingleRow;
   const effectiveLoopEnd = loopEnd < 0 ? nSlices - 1 : loopEnd;
 
   // ROI FFT active: both ROI and FFT on, with a selected ROI
@@ -1134,11 +1416,11 @@ function Show3D() {
 
   // Preview panel visible: auto-shows when ROI active with a selected ROI
   const previewVisible = roiActive && roiSelectedIdx >= 0 && roiSelectedIdx < (roiList?.length ?? 0);
-  const selectedRoiKey = React.useMemo(() => {
+  const selectedRoiKey = (() => {
     if (!roiList || roiSelectedIdx < 0 || roiSelectedIdx >= roiList.length) return "";
     const r = roiList[roiSelectedIdx];
     return `${r.row},${r.col},${r.radius},${r.radius_inner},${r.width},${r.height},${r.shape}`;
-  }, [roiList, roiSelectedIdx]);
+  })();
 
   // Compute stats for ALL ROIs (memoized, recomputes on frame/ROI geometry change)
   const allRoiStats = React.useMemo(() => {
@@ -1157,6 +1439,8 @@ function Show3D() {
     canvas.height = height;
     mainOffscreenRef.current = canvas;
     mainImgDataRef.current = canvas.getContext("2d")!.createImageData(width, height);
+    scaledPlaybackImgDataRef.current = null;
+    scaledPlaybackMapRef.current = null;
     logBufferRef.current = new Float32Array(width * height);
   }, [width, height]);
 
@@ -1189,9 +1473,10 @@ function Show3D() {
     nSlices, width, height, displayScale, canvasW, canvasH,
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
+    autoVmins, autoVmaxs,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
-    traitVmin, traitVmax, smooth, imageRotation,
+    traitVmin, traitVmax, smooth, imageRotation, showStats,
   });
   React.useEffect(() => {
     playRef.current = {
@@ -1199,17 +1484,19 @@ function Show3D() {
       nSlices, width, height, displayScale, canvasW, canvasH,
       logScale, autoContrast, percentileLow, percentileHigh,
       dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
+      autoVmins, autoVmaxs,
       zoom, panX, panY, playbackPath,
       profileActive, profilePoints, profileWidth,
-      traitVmin, traitVmax, smooth, imageRotation,
+      traitVmin, traitVmax, smooth, imageRotation, showStats,
     };
   }, [fps, reverse, boomerang, loop, loopStart, effectiveLoopEnd,
     nSlices, width, height, displayScale, canvasW, canvasH,
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
+    autoVmins, autoVmaxs,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
-    traitVmin, traitVmax, smooth, imageRotation]);
+    traitVmin, traitVmax, smooth, imageRotation, showStats]);
 
   // Playback logic - rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
@@ -1218,11 +1505,7 @@ function Show3D() {
       if (playbackIdxRef.current !== sliceIdx && bufferRef.current) {
         setSliceIdx(playbackIdxRef.current);
       }
-      setLocalStats(null);
-      bufferRef.current = null;
-      bufferCountRef.current = 0;
-      nextBufferRef.current = null;
-      nextBufferCountRef.current = 0;
+      if (!playRef.current.showStats) setLocalStats(null);
       prefetchPendingRef.current = false;
       return;
     }
@@ -1239,6 +1522,10 @@ function Show3D() {
     const pathLen = playRef.current.playbackPath?.length ?? 0;
     pathIdxRef.current = pathLen > 0 ? (playRef.current.reverse ? pathLen : -1) : 0;
     bounceDirRef.current = playRef.current.reverse ? -1 : 1;
+    if (frameServerUrl) {
+      const c0 = playRef.current;
+      prefetchServerFrames(playbackIdxRef.current, c0.reverse, c0.loop, c0.loopStart, c0.loopEnd);
+    }
     let lastFrameTime = 0;
     let lastUIUpdate = 0;
     let animId: number;
@@ -1246,21 +1533,32 @@ function Show3D() {
     const tick = (now: number) => {
       const c = playRef.current;
       const intervalMs = 1000 / c.fps;
+      const dbg = show3dPerfDebug();
+      if (dbg) {
+        dbg.playing = true;
+        dbg.lastTickAt = now;
+        dbg.currentBufferFloatLength = bufferRef.current?.length ?? 0;
+        dbg.currentBufferStart = bufferStartRef.current;
+        dbg.currentBufferCount = bufferCountRef.current;
+        dbg.nextBufferFloatLength = nextBufferRef.current?.length ?? 0;
+        dbg.nextBufferStart = nextBufferStartRef.current;
+        dbg.nextBufferCount = nextBufferCountRef.current;
+      }
 
-      // First tick - just record time
+      // First tick paints immediately; otherwise every playback start drops
+      // one frame before the cadence timer is even allowed to run.
       if (lastFrameTime === 0) {
-        lastFrameTime = now;
+        lastFrameTime = now - intervalMs;
         lastUIUpdate = now;
-        animId = requestAnimationFrame(tick);
-        return;
       }
 
       const elapsed = now - lastFrameTime;
-      if (elapsed < intervalMs) {
+      const framePacingToleranceMs = Math.min(6, intervalMs * 0.2);
+      if (elapsed + framePacingToleranceMs < intervalMs) {
         animId = requestAnimationFrame(tick);
         return;
       }
-      lastFrameTime = now - (elapsed % intervalMs);
+      lastFrameTime = now - Math.max(0, elapsed - intervalMs);
 
       // Advance frame
       let next: number;
@@ -1303,6 +1601,7 @@ function Show3D() {
 
       // Try buffer path (zero round-trip) with double-buffer swap
       const frameSize = c.width * c.height;
+      let frameSource = "buffer";
       let frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
       if (!frame && nextBufferRef.current) {
         // Current buffer doesn't have this frame - swap to next buffer
@@ -1313,31 +1612,53 @@ function Show3D() {
         nextBufferCountRef.current = 0;
         frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
       }
+      if (!frame && frameServerUrl) {
+        frame = getCachedServerFrame(next);
+        if (frame) {
+          frameSource = "server";
+        } else {
+          prefetchServerFrames(next, c.reverse, c.loop, c.loopStart, c.loopEnd);
+        }
+      }
       if (!frame) {
         // Buffer not ready yet - keep requesting frames
+        if (dbg) {
+          dbg.missingFrame = next;
+          dbg.missingFrameAt = now;
+        }
         animId = requestAnimationFrame(tick);
         return;
+      }
+      if (dbg) {
+        dbg.missingFrame = null;
+        dbg.lastFrame = next;
+        dbg.lastFrameSource = frameSource;
+        dbg.renderedFrames = ((dbg.renderedFrames as number | undefined) ?? 0) + 1;
       }
 
       playbackIdxRef.current = next;
       rawFrameDataRef.current = frame;
 
-      // Render frame - fused single-pass when possible
+      // Render frame. The 4k playback hot path must stay off the JS CPU:
+      // one 4096^2 colormap loop alone is ~37 ms, before auto-contrast/canvas.
       const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
       if (mainOffscreenRef.current && mainImgDataRef.current) {
         let vmin: number, vmax: number;
+        let cpuData: Float32Array = frame;
+        let cpuDataAlreadyLogged = false;
         if (c.autoContrast) {
-          // Auto-contrast needs per-frame percentile (2 passes), but no stats
-          if (c.logScale && logBufferRef.current) {
+          const cached = !c.logScale ? ensureLocalAutoRange(next, frame, c.percentileLow, c.percentileHigh) : null;
+          if (cached) {
+            ({ vmin, vmax } = cached);
+          } else if (c.logScale && logBufferRef.current) {
             applyLogScaleInPlace(frame, logBufferRef.current);
             ({ vmin, vmax } = percentileClip(logBufferRef.current, c.percentileLow, c.percentileHigh));
-            renderToOffscreenReuse(logBufferRef.current, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
+            cpuData = logBufferRef.current;
+            cpuDataAlreadyLogged = true;
           } else {
             ({ vmin, vmax } = percentileClip(frame, c.percentileLow, c.percentileHigh));
-            renderToOffscreenReuse(frame, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
           }
         } else {
-          // Global range + slider - fused single-pass render (fastest path)
           ({ vmin, vmax } = resolveDisplayRange(
             c.dataMin,
             c.dataMax,
@@ -1347,33 +1668,173 @@ function Show3D() {
             c.imageVminPct,
             c.imageVmaxPct,
           ));
-          renderFramePlayback(frame, mainImgDataRef.current.data, lut, vmin, vmax, c.logScale);
-          mainOffscreenRef.current.getContext("2d")!.putImageData(mainImgDataRef.current, 0, 0);
+        }
+
+        let rendered = false;
+        let drewDisplayDirect = false;
+        const dw = Math.max(1, Math.round(c.width * c.displayScale));
+        const dh = Math.max(1, Math.round(c.height * c.displayScale));
+        const canSharedPanelScaledDirect =
+          !!sharedPanelSource &&
+          (nPanels || 1) > 1 &&
+          c.imageRotation % 4 === 0 &&
+          c.zoom === 1 &&
+          c.panX === 0 &&
+          c.panY === 0;
+        const canScaledDirect =
+          (nPanels === 1 || canSharedPanelScaledDirect) &&
+          c.imageRotation % 4 === 0 &&
+          c.zoom === 1 &&
+          c.panX === 0 &&
+          c.panY === 0 &&
+          dw <= c.canvasW &&
+          dh <= c.canvasH;
+        const drawSharedScaledBitmap = (ctx: CanvasRenderingContext2D, bitmap: ImageBitmap) => {
+          const n = Math.max(1, nPanels || 1);
+          const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+          const rows = Math.ceil(n / cols);
+          const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
+          const outPanelW = (c.canvasW - gap * (cols - 1)) / cols;
+          const outPanelH = (c.canvasH - gap * (rows - 1)) / rows;
+          ctx.clearRect(0, 0, c.canvasW, c.canvasH);
+          ctx.fillStyle = themeColors.bg;
+          ctx.imageSmoothingEnabled = c.smooth;
+          for (let i = 0; i < n; i++) {
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+            const slotX = col * (outPanelW + gap);
+            const slotY = row * (outPanelH + gap);
+            ctx.fillRect(slotX, slotY, outPanelW, outPanelH);
+            ctx.drawImage(bitmap, slotX, slotY, outPanelW, outPanelH);
+          }
+        };
+        if (canScaledDirect && !canSharedPanelScaledDirect && !c.smooth) {
+          const canvas = canvasRef.current;
+          const ctx = canvas?.getContext("2d");
+          if (ctx) {
+            let cached = scaledPlaybackImgDataRef.current;
+            if (!cached || cached.width !== dw || cached.height !== dh) {
+              cached = { width: dw, height: dh, imageData: ctx.createImageData(dw, dh) };
+              scaledPlaybackImgDataRef.current = cached;
+            }
+            let map = scaledPlaybackMapRef.current;
+            if (!map || map.srcW !== c.width || map.srcH !== c.height || map.outW !== dw || map.outH !== dh) {
+              const xMap = new Uint32Array(dw);
+              const yMap = new Uint32Array(dh);
+              for (let x = 0; x < dw; x++) {
+                xMap[x] = Math.min(c.width - 1, Math.floor(((x + 0.5) * c.width) / dw));
+              }
+              for (let y = 0; y < dh; y++) {
+                yMap[y] = Math.min(c.height - 1, Math.floor(((y + 0.5) * c.height) / dh)) * c.width;
+              }
+              map = { srcW: c.width, srcH: c.height, outW: dw, outH: dh, xMap, yMap };
+              scaledPlaybackMapRef.current = map;
+            }
+            renderFrameScaledPlayback(frame, cached.imageData.data, map.xMap, map.yMap, dw, dh, lut, vmin, vmax, c.logScale);
+            ctx.imageSmoothingEnabled = false;
+            ctx.clearRect(0, 0, c.canvasW, c.canvasH);
+            ctx.putImageData(cached.imageData, 0, 0);
+            rendered = true;
+            drewDisplayDirect = true;
+            if (dbg) dbg.lastRenderPath = "scaled-cpu";
+          }
+        }
+        const engine = gpuCmapRef.current;
+        if (!rendered && engine && gpuCmapReadyRef.current) {
+          try {
+            engine.uploadLUT(c.cmap, lut);
+            const stackByteLength = c.width * c.height * 4 * c.nSlices;
+            const canGpuFrameCache =
+              !!frameServerUrl &&
+              frameFetchCacheRef.current.size >= c.nSlices &&
+              stackByteLength <= FRAME_SERVER_FULL_STACK_CACHE_BYTES;
+            const slotIdx = canGpuFrameCache ? next : 0;
+            if (canGpuFrameCache) {
+              if (!gpuFrameCacheUploadedRef.current.has(slotIdx)) {
+                engine.uploadData(slotIdx, frame, c.width, c.height);
+                gpuFrameCacheUploadedRef.current.add(slotIdx);
+                if (dbg) dbg.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+              } else if (dbg) {
+                dbg.gpuFrameCacheHits = ((dbg.gpuFrameCacheHits as number | undefined) ?? 0) + 1;
+              }
+            } else {
+              engine.uploadData(0, frame, c.width, c.height);
+              if (dbg) dbg.gpuFrameCacheUploaded = 0;
+            }
+            if (canScaledDirect) {
+              const bitmap = engine.renderSlotScaledToImageBitmap(slotIdx, { vmin, vmax }, c.logScale, dw, dh);
+              const canvas = canvasRef.current;
+              const ctx = canvas?.getContext("2d");
+              if (bitmap && ctx) {
+                if (canSharedPanelScaledDirect) {
+                  drawSharedScaledBitmap(ctx, bitmap);
+                } else {
+                  ctx.imageSmoothingEnabled = c.smooth;
+                  ctx.clearRect(0, 0, c.canvasW, c.canvasH);
+                  ctx.drawImage(bitmap, 0, 0, dw, dh);
+                }
+                bitmap.close();
+                rendered = true;
+                drewDisplayDirect = true;
+                if (dbg) dbg.lastRenderPath = canSharedPanelScaledDirect ? "scaled-gpu-shared-panels" : "scaled-gpu";
+              } else {
+                bitmap?.close();
+              }
+            }
+            if (!rendered) {
+              const bitmaps = engine.renderSlotsToImageBitmap([slotIdx], [{ vmin, vmax }], c.logScale);
+              if (bitmaps && bitmaps[0]) {
+                const offCtx = mainOffscreenRef.current.getContext("2d");
+                if (offCtx) {
+                  offCtx.drawImage(bitmaps[0], 0, 0);
+                  rendered = true;
+                  if (dbg) dbg.lastRenderPath = "full-gpu";
+                }
+                bitmaps[0].close();
+              }
+            }
+          } catch {
+            rendered = false;
+            drewDisplayDirect = false;
+          }
+        }
+        if (!rendered) {
+          if (cpuDataAlreadyLogged) {
+            renderToOffscreenReuse(cpuData, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
+          } else {
+            renderFramePlayback(frame, mainImgDataRef.current.data, lut, vmin, vmax, c.logScale);
+            mainOffscreenRef.current.getContext("2d")!.putImageData(mainImgDataRef.current, 0, 0);
+          }
+          if (dbg) dbg.lastRenderPath = "cpu";
         }
 
         // Draw to display canvas. Apply image_rotation so playback matches the
         // static render path (lines 1444-1453); otherwise rotated stacks
         // silently lose their rotation when the user hits Play.
         const canvas = canvasRef.current;
-        if (canvas) {
+        if (canvas && !drewDisplayDirect) {
           const ctx = canvas.getContext("2d");
           if (ctx) {
-            ctx.imageSmoothingEnabled = c.smooth;
-            ctx.clearRect(0, 0, c.canvasW, c.canvasH);
-            ctx.save();
-            ctx.translate(c.panX, c.panY);
-            ctx.scale(c.zoom, c.zoom);
-            const dw = c.width * c.displayScale, dh = c.height * c.displayScale;
-            if (c.imageRotation % 4 !== 0) {
-              const cx = c.canvasW / 2 / c.zoom, cy = c.canvasH / 2 / c.zoom;
-              ctx.translate(cx, cy);
-              ctx.rotate((c.imageRotation * Math.PI) / 2);
-              ctx.translate(-dw / 2, -dh / 2);
-              ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+            if ((nPanels || 1) > 1) {
+              drawMain(ctx, mainOffscreenRef.current);
             } else {
-              ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+              ctx.imageSmoothingEnabled = c.smooth;
+              ctx.clearRect(0, 0, c.canvasW, c.canvasH);
+              ctx.save();
+              ctx.translate(c.panX, c.panY);
+              ctx.scale(c.zoom, c.zoom);
+              const dw = c.width * c.displayScale, dh = c.height * c.displayScale;
+              if (c.imageRotation % 4 !== 0) {
+                const cx = c.canvasW / 2 / c.zoom, cy = c.canvasH / 2 / c.zoom;
+                ctx.translate(cx, cy);
+                ctx.rotate((c.imageRotation * Math.PI) / 2);
+                ctx.translate(-dw / 2, -dh / 2);
+                ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+              } else {
+                ctx.drawImage(mainOffscreenRef.current, 0, 0, dw, dh);
+              }
+              ctx.restore();
             }
-            ctx.restore();
           }
         }
       }
@@ -1382,7 +1843,7 @@ function Show3D() {
       if (now - lastUIUpdate > 100) {
         lastUIUpdate = now;
         setDisplaySliceIdx(next);
-        setLocalStats(computeStats(frame));
+        if (c.showStats) setLocalStats(computeStats(frame));
         if (c.profileActive && c.profilePoints.length === 2) {
           const p0 = c.profilePoints[0], p1 = c.profilePoints[1];
           setProfileData(sampleLineProfile(frame, c.width, c.height, p0.row, p0.col, p1.row, p1.col, c.profileWidth));
@@ -1400,7 +1861,9 @@ function Show3D() {
 
       // Prefetch at 25% buffer consumed - only if no next buffer is already queued.
       // Respect loop range so we don't fetch frames outside [loop_start, loop_end].
-      if (!prefetchPendingRef.current && !nextBufferRef.current && bufferCountRef.current > 0) {
+      if (frameServerUrl) {
+        prefetchServerFrames(next, c.reverse, c.loop, c.loopStart, c.loopEnd);
+      } else if (!prefetchPendingRef.current && !nextBufferRef.current && bufferCountRef.current > 0) {
         let idxInBuffer = next - bufferStartRef.current;
         if (idxInBuffer < 0) idxInBuffer += c.nSlices;
         if (idxInBuffer >= Math.floor(bufferCountRef.current / 4)) {
@@ -1430,8 +1893,14 @@ function Show3D() {
     const parsed = extractFloat32(frameBytes);
     if (!parsed || parsed.length === 0) return;
     rawFrameDataRef.current = parsed;
-    // Recompute stats JS-side (mean/min/max/std + per-panel slices). Cheap
-    // (single pass over the frame), and avoids the Python round-trip.
+    gpuUploadRef.current = null;
+    if (!showStats) {
+      setLocalStats(null);
+      setLocalPanelStats(null);
+      return;
+    }
+    // Recompute stats JS-side only while visible. On 4k frames this is a full
+    // 16M-float scan, so keep the default hidden state paint-limited.
     const n = Math.max(1, nPanels || 1);
     const total = computeStats(parsed);
     setLocalStats(total);
@@ -1451,26 +1920,54 @@ function Show3D() {
     } else {
       setLocalPanelStats(null);
     }
-  }, [frameBytes, frameSeq, nPanels, width, height]);
+  }, [frameBytes, frameSeq, nPanels, width, height, showStats]);
 
-  // Update histogram data (reflects log scale state). During playback we throttle so
-  // a full O(N) bin pass on multi-MB frames doesn't blow the frame budget. We rely on
-  // `displaySliceIdx` ticking at ~10 Hz (the playback rAF's React-state throttle) and
-  // only update histogram every 2nd tick → ~5 Hz refresh, ~10 % CPU budget.
+  // Histogram bins are computed on the GPU via `engine.computeHistogramWithRange`
+  // when the colormap engine is ready. CPU fallback (computeHistogramFromBytes
+  // inside the Histogram component) still runs if WebGPU isn't available.
+  // Debounce: 100 ms past the last scrub frame so drag doesn't fire bin scans
+  // on every tick. Playback uses the established 2-tick (5 Hz) throttle.
   const playbackHistogramCounterRef = React.useRef(0);
+  const histogramTimerRef = React.useRef<number | null>(null);
+  const refreshHistogram = React.useCallback(async () => {
+    const raw = rawFrameDataRef.current;
+    if (!raw || raw.length === 0) return;
+    const data = logScale ? applyLogScale(raw) : raw;
+    setImageDataRange(resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+    // GPU bins: the colormap engine has the frame data uploaded to slot 0
+    // already (via the render effect). Reuse that slot's buffer for a
+    // 256-bin compute pass; fall back to CPU bins in the Histogram component
+    // when the engine isn't ready or returns null.
+    const engine = gpuCmapRef.current;
+    let bins: number[] | null = null;
+    if (engine && gpuCmapReadyRef.current && dataMax > dataMin) {
+      try {
+        bins = await engine.computeHistogramWithRange(0, dataMin, dataMax, logScale);
+      } catch {
+        bins = null;  // fall through to CPU path
+      }
+    }
+    setImageHistogramBins(bins);
+    setImageHistogramData(data);
+  }, [logScale, dataMin, dataMax]);
   React.useEffect(() => {
     const raw = rawFrameDataRef.current;
     if (!raw || raw.length === 0) return;
     if (playing) {
       playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
       if (playbackHistogramCounterRef.current !== 0) return;
-    } else {
-      playbackHistogramCounterRef.current = 0;
+      refreshHistogram();
+      return;
     }
-    const data = logScale ? applyLogScale(raw) : raw;
-    setImageHistogramData(data);
-    setImageDataRange(findDataRange(data));
-  }, [frameBytes, frameSeq, playing, logScale, displaySliceIdx]);
+    playbackHistogramCounterRef.current = 0;
+    if (histogramTimerRef.current !== null) {
+      window.clearTimeout(histogramTimerRef.current);
+    }
+    histogramTimerRef.current = window.setTimeout(() => {
+      refreshHistogram();
+      histogramTimerRef.current = null;
+    }, 100);
+  }, [frameBytes, frameSeq, playing, displaySliceIdx, refreshHistogram]);
 
   // Auto-snap thumbs to percentile-clip values while Auto is on. Fires once at mount
   // (so the slider visually reflects the percentile-clipped contrast that Python applies
@@ -1492,11 +1989,12 @@ function Show3D() {
     if (initialAutoSnappedRef.current && !logScaleChanged) return;
     const span = dataMax - dataMin;
     if (span <= 0) return;
-    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh);
+    const cached = !logScale ? ensureLocalAutoRange(sliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
+    const { vmin: pmin, vmax: pmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh);
     setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
     setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
     initialAutoSnappedRef.current = true;
-  }, [autoContrast, imageHistogramData, dataMin, dataMax, percentileLow, percentileHigh, logScale, imageVminPct, imageVmaxPct]);
+  }, [autoContrast, imageHistogramData, dataMin, dataMax, autoVmins, autoVmaxs, sliceIdx, percentileLow, percentileHigh, logScale, imageVminPct, imageVmaxPct]);
 
   React.useEffect(() => {
     if (!roiActive || roiItems.length === 0 || !showRoiResizeHint) return;
@@ -1532,10 +2030,20 @@ function Show3D() {
         imageVmaxPct,
       ));
     } else if (autoContrast) {
-      ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
+      const cached = !logScale ? ensureLocalAutoRange(sliceIdx, frameData, percentileLow, percentileHigh) : null;
+      if (cached) {
+        ({ vmin, vmax } = cached);
+      } else {
+        ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
+      }
     } else {
-      const { min: pMin, max: pMax } = findDataRange(processed);
-      ({ vmin, vmax } = sliderRange(pMin, pMax, imageVminPct, imageVmaxPct));
+      // Use the global data range (loaded once at widget mount) rather than
+      // re-scanning the frame on every scrub. findDataRange does an O(N) min/max
+      // pass which is ~8 ms at 4k - avoidable when the stack-wide bounds already
+      // bracket the per-frame range.
+      const lo = logScale ? (dataMin >= 0 ? Math.log1p(dataMin) : -Math.log1p(-dataMin)) : dataMin;
+      const hi = logScale ? (dataMax >= 0 ? Math.log1p(dataMax) : -Math.log1p(-dataMax)) : dataMax;
+      ({ vmin, vmax } = sliderRange(lo, hi, imageVminPct, imageVmaxPct));
     }
 
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
@@ -1550,15 +2058,32 @@ function Show3D() {
       // blits to a panel-sized OffscreenCanvas. No JS slab extraction, no
       // findDataRange loop, no CPU readback between range and colormap.
       const dataForGpu = logScale ? processed : frameData;
+      const ensureGpuUpload = () => {
+        const prev = gpuUploadRef.current;
+        if (
+          prev &&
+          prev.source === frameData &&
+          prev.data === dataForGpu &&
+          prev.width === width &&
+          prev.height === height &&
+          prev.logScale === logScale
+        ) {
+          return;
+        }
+        engine.uploadData(0, dataForGpu, width, height);
+        gpuUploadRef.current = { source: frameData, data: dataForGpu, width, height, logScale };
+      };
+      const renderSerial = ++gpuRenderSerialRef.current;
       if (perPanelContrast) {
         const pw = width / nP;
-        engine.uploadData(0, dataForGpu, width, height);
+        ensureGpuUpload();
         const regions = Array.from({ length: nP }, (_, p) => ({
           x: p * pw, y: 0, width: pw, height,
         }));
         const lowPct = Array(nP).fill(imageVminPct);
         const highPct = Array(nP).fill(imageVmaxPct);
         requestAnimationFrame(() => {
+          if (renderSerial !== gpuRenderSerialRef.current) return;
           if (!mainOffscreenRef.current) return;
           const bitmaps = engine.renderPerPanelGpu(0, regions, lowPct, highPct, false);
           if (bitmaps) {
@@ -1575,13 +2100,15 @@ function Show3D() {
           const canvas = canvasRef.current;
           if (!canvas) return;
           const ctx2 = canvas.getContext("2d");
+          if (renderSerial !== gpuRenderSerialRef.current) return;
           if (ctx2 && mainOffscreenRef.current) drawMain(ctx2, mainOffscreenRef.current);
         });
         return;
       }
-      engine.uploadData(0, dataForGpu, width, height);
+      ensureGpuUpload();
       const capturedVmin = vmin, capturedVmax = vmax;
       requestAnimationFrame(async () => {
+        if (renderSerial !== gpuRenderSerialRef.current) return;
         if (!mainOffscreenRef.current) return;
         // Zero-copy: GPU → OffscreenCanvas → ImageBitmap → drawImage
         const bitmaps = engine.renderSlotsToImageBitmap([0], [{ vmin: capturedVmin, vmax: capturedVmax }], false);
@@ -1598,6 +2125,7 @@ function Show3D() {
               [0], [{ vmin: capturedVmin, vmax: capturedVmax }],
               [mainOffscreenRef.current], [mainImgDataRef.current], false,
             );
+            if (renderSerial !== gpuRenderSerialRef.current) return;
             if (rendered === 0) {
               renderToOffscreenReuse(processed, lut, capturedVmin, capturedVmax, mainOffscreenRef.current!, mainImgDataRef.current!);
             }
@@ -1607,9 +2135,11 @@ function Show3D() {
         const canvas = canvasRef.current;
         if (!canvas) return;
         const ctx = canvas.getContext("2d");
+        if (renderSerial !== gpuRenderSerialRef.current) return;
         if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
       });
     } else {
+      gpuRenderSerialRef.current++;
       // CPU fallback
       renderToOffscreenReuse(processed, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
     }
@@ -1621,11 +2151,11 @@ function Show3D() {
       const ctx = canvas.getContext("2d");
       if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
     }
-  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, smooth, imageRotation, nPanels, linkContrast]);
+  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast]);
 
   // Per-panel render: each slot gets its own zoom/pan transform. 2px gap
   // between slots painted as the canvas bg (transparent through clearRect).
-  const drawMain = React.useCallback((ctx: CanvasRenderingContext2D, offscreen: HTMLCanvasElement | OffscreenCanvas) => {
+  const drawMain = (ctx: CanvasRenderingContext2D, offscreen: HTMLCanvasElement | OffscreenCanvas) => {
     ctx.imageSmoothingEnabled = smooth;
     // Clear entire canvas. Slot-level bg fill happens inside the per-panel
     // loop so empty grid cells (partial last row) stay transparent - the
@@ -1634,13 +2164,15 @@ function Show3D() {
     const n = Math.max(1, nPanels || 1);
     const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
     const rows = Math.ceil(n / cols);
-    const srcPanelW = offscreen.width / n;
+    const srcPanelW = sharedPanelSource
+      ? offscreen.width
+      : Math.max(1, panelWidthPx || offscreen.width / n);
     const srcH = offscreen.height;
     const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
     const outPanelW = (canvasW - gap * (cols - 1)) / cols;
     const outPanelH = (canvasH - gap * (rows - 1)) / rows;
     for (let i = 0; i < n; i++) {
-      const s = stateFor(i);
+      const panelState = stateFor(i);
       const col = i % cols;
       const row = Math.floor(i / cols);
       const slotX = col * (outPanelW + gap);
@@ -1653,22 +2185,23 @@ function Show3D() {
       // count, blur the (repeated last) frame + draw "end ({real}/{real})"
       // badge so operator sees they're scrubbing past real data.
       const realN = panelRealFrames && panelRealFrames[i];
-      const pastEnd = !!(realN && (playing ? displaySliceIdx : sliceIdx) >= realN);
+      const pastEnd = !!(realN && displaySliceIdx >= realN);
       ctx.save();
       ctx.beginPath();
       ctx.rect(slotX, slotY, outPanelW, outPanelH);
       ctx.clip();
-      ctx.translate(slotX + s.panX, slotY + s.panY);
-      ctx.scale(s.zoom, s.zoom);
+      ctx.translate(slotX + panelState.panX, slotY + panelState.panY);
+      ctx.scale(panelState.zoom, panelState.zoom);
       const w = outPanelW, h = outPanelH;
       if (imageRotation % 4 !== 0) {
-        const cx = w / 2 / s.zoom, cy = h / 2 / s.zoom;
+        const cx = w / 2 / panelState.zoom, cy = h / 2 / panelState.zoom;
         ctx.translate(cx, cy);
         ctx.rotate((imageRotation * Math.PI) / 2);
         ctx.translate(-w / 2, -h / 2);
       }
       if (pastEnd) ctx.filter = "blur(4px)";
-      ctx.drawImage(offscreen as CanvasImageSource, i * srcPanelW, 0, srcPanelW, srcH, 0, 0, w, h);
+      const srcX = sharedPanelSource ? 0 : i * srcPanelW;
+      ctx.drawImage(offscreen as CanvasImageSource, srcX, 0, srcPanelW, srcH, 0, 0, w, h);
       ctx.restore();
       // Per-panel title - drawn on canvas at top-center of each panel slot.
       // Lives on the canvas (not below it) so it follows grid layout when
@@ -1676,7 +2209,7 @@ function Show3D() {
       // don't bleed into the next column.
       if ((nPanels || 1) > 1 && panelTitles && panelTitles[i]) {
         const realN2 = panelRealFrames && panelRealFrames[i];
-        const cur = (playing ? displaySliceIdx : sliceIdx) + 1;
+        const cur = displaySliceIdx + 1;
         const total = realN2 || nSlices;
         const shown = realN2 ? Math.min(cur, realN2) : cur;
         const label = `${panelTitles[i]}  ${shown}/${total}`;
@@ -1697,13 +2230,115 @@ function Show3D() {
       }
       // No end badge - blur alone signals past-real-frame.
     }
-  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, panelGapTrait, panelTitleFontSize, sliceIdx, displaySliceIdx, playing, nSlices]);
+  };
+
+  const renderFloatFrameSlice = (frame: Float32Array, idx: number): boolean => {
+    const c = playRef.current;
+    if (!mainOffscreenRef.current || !mainImgDataRef.current) return false;
+
+    gpuRenderSerialRef.current++;
+    playbackIdxRef.current = idx;
+    rawFrameDataRef.current = frame;
+    setDisplaySliceIdx(idx);
+
+    const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
+    let vmin: number, vmax: number;
+    let cpuData: Float32Array = frame;
+    let cpuDataAlreadyLogged = false;
+    if (c.autoContrast) {
+      const cached = !c.logScale ? ensureLocalAutoRange(idx, frame, c.percentileLow, c.percentileHigh) : null;
+      if (cached) {
+        ({ vmin, vmax } = cached);
+      } else if (c.logScale && logBufferRef.current) {
+        applyLogScaleInPlace(frame, logBufferRef.current);
+        ({ vmin, vmax } = percentileClip(logBufferRef.current, c.percentileLow, c.percentileHigh));
+        cpuData = logBufferRef.current;
+        cpuDataAlreadyLogged = true;
+      } else {
+        ({ vmin, vmax } = percentileClip(frame, c.percentileLow, c.percentileHigh));
+      }
+    } else {
+      ({ vmin, vmax } = resolveDisplayRange(
+        c.dataMin,
+        c.dataMax,
+        c.traitVmin,
+        c.traitVmax,
+        c.logScale,
+        c.imageVminPct,
+        c.imageVmaxPct,
+      ));
+    }
+
+    let rendered = false;
+    const engine = gpuCmapRef.current;
+    if (engine && gpuCmapReadyRef.current) {
+      try {
+        engine.uploadLUT(c.cmap, lut);
+        engine.uploadData(0, frame, c.width, c.height);
+        const bitmaps = engine.renderSlotsToImageBitmap([0], [{ vmin, vmax }], c.logScale);
+        if (bitmaps && bitmaps[0]) {
+          const offCtx = mainOffscreenRef.current.getContext("2d");
+          if (offCtx) {
+            offCtx.drawImage(bitmaps[0], 0, 0);
+            rendered = true;
+          }
+          bitmaps[0].close();
+        }
+      } catch {
+        rendered = false;
+      }
+    }
+    if (!rendered) {
+      if (cpuDataAlreadyLogged) {
+        renderToOffscreenReuse(cpuData, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
+      } else {
+        renderFramePlayback(frame, mainImgDataRef.current.data, lut, vmin, vmax, c.logScale);
+        mainOffscreenRef.current.getContext("2d")!.putImageData(mainImgDataRef.current, 0, 0);
+      }
+    }
+
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (ctx) drawMain(ctx, mainOffscreenRef.current);
+    if (c.showStats) setLocalStats(computeStats(frame));
+    if (c.profileActive && c.profilePoints.length === 2) {
+      const p0 = c.profilePoints[0], p1 = c.profilePoints[1];
+      setProfileData(sampleLineProfile(frame, c.width, c.height, p0.row, p0.col, p1.row, p1.col, c.profileWidth));
+    }
+    return true;
+  };
+
+  const renderBufferedSlice = (idx: number): boolean => {
+    const c = playRef.current;
+    const frameSize = c.width * c.height;
+    let frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, idx, frameSize);
+    if (!frame && nextBufferRef.current) {
+      const nextFrame = getFrameFromBuffer(nextBufferRef.current, nextBufferStartRef.current, nextBufferCountRef.current, c.nSlices, idx, frameSize);
+      if (nextFrame) {
+        bufferRef.current = nextBufferRef.current;
+        bufferStartRef.current = nextBufferStartRef.current;
+        bufferCountRef.current = nextBufferCountRef.current;
+        nextBufferRef.current = null;
+        nextBufferCountRef.current = 0;
+        frame = nextFrame;
+      }
+    }
+    if (!frame) return false;
+    return renderFloatFrameSlice(frame, idx);
+  };
+
+  const renderFetchedSlice = async (idx: number): Promise<boolean> => {
+    const frame = getCachedServerFrame(idx) ?? await fetchFrameFromServer(idx);
+    if (!frame) return false;
+    return renderFloatFrameSlice(frame, idx);
+  };
 
   React.useLayoutEffect(() => {
     if (!mainOffscreenRef.current || !canvasRef.current) return;
     const ctx = canvasRef.current.getContext("2d");
     if (ctx) drawMain(ctx, mainOffscreenRef.current);
-  }, [drawMain]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, panelGapTrait, panelTitleFontSize, panelWidthPx, sharedPanelSource, sliceIdx, displaySliceIdx, playing, nSlices]);
 
   // Render overlay (ROI only) - HiDPI aware
   React.useEffect(() => {
@@ -1724,7 +2359,7 @@ function Show3D() {
       ctx.rotate((imageRotation * Math.PI) / 2);
       ctx.translate(-cx, -cy);
     }
-    if (!hideRoi && roiActive && roiItems.length > 0) {
+    if (roiActive && roiItems.length > 0) {
       const highlightedRois = roiItems.filter(r => r.highlight);
       if (highlightedRois.length > 0) {
         ctx.save();
@@ -1757,9 +2392,9 @@ function Show3D() {
         ctx.restore();
       }
 
-      for (let ri = 0; ri < roiItems.length; ri++) {
-        const roi = roiItems[ri];
-        const isSelected = ri === roiSelectedIdx;
+      for (let roiIdx = 0; roiIdx < roiItems.length; roiIdx++) {
+        const roi = roiItems[roiIdx];
+        const isSelected = roiIdx === roiSelectedIdx;
         const screenX = roi.col * displayScale * zoom + panX;
         const screenY = roi.row * displayScale * zoom + panY;
         const screenRadius = roi.radius * displayScale * zoom;
@@ -1768,7 +2403,7 @@ function Show3D() {
         const screenRadiusInner = roi.radius_inner * displayScale * zoom;
         const shape = (roi.shape || "circle") as "circle" | "square" | "rectangle" | "annular";
         ctx.lineWidth = roi.line_width || 2;
-        const color = roi.color || ROI_COLORS[ri % ROI_COLORS.length];
+        const color = roi.color || ROI_COLORS[roiIdx % ROI_COLORS.length];
         drawROI(ctx, screenX, screenY, shape, screenRadius, screenWidth, screenHeight, color, color, isSelected && isDraggingROI, screenRadiusInner);
         if (isSelected) {
           ctx.setLineDash([4, 3]);
@@ -1787,7 +2422,7 @@ function Show3D() {
     }
 
     // Line profile overlay
-    if (!hideProfile && profileActive && profilePoints.length > 0) {
+    if (profileActive && profilePoints.length > 0) {
       const toScreenX = (col: number) => col * displayScale * zoom + panX;
       const toScreenY = (row: number) => row * displayScale * zoom + panY;
 
@@ -1842,7 +2477,7 @@ function Show3D() {
         ctx.fill();
       }
     }
-  }, [roiActive, roiItems, roiSelectedIdx, isDraggingROI, canvasW, canvasH, displayScale, zoom, panX, panY, themeColors, profileActive, profilePoints, profileWidth, hideRoi, hideProfile, nPanels, panelTitles, imageRotation, width, height]);
+  }, [roiActive, roiItems, roiSelectedIdx, isDraggingROI, canvasW, canvasH, displayScale, zoom, panX, panY, themeColors, profileActive, profilePoints, profileWidth, nPanels, panelTitles, imageRotation, width, height]);
 
   // Lens inset rendering
   React.useEffect(() => {
@@ -1851,7 +2486,7 @@ function Show3D() {
       const lctx = lensCanvas.getContext("2d");
       if (lctx) lctx.clearRect(0, 0, lensCanvas.width, lensCanvas.height);
     }
-    if (!showLens || hideDisplay || !lensPos || !rawFrameDataRef.current) return;
+    if (!showLens || !lensPos || !rawFrameDataRef.current) return;
     if ((nPanels || 1) > 1) return;  // Lens disabled in multi-panel mode
     if (!lensCanvas) return;
     const ctx = lensCanvas.getContext("2d");
@@ -1939,12 +2574,12 @@ function Show3D() {
     ctx.font = "10px monospace";
     ctx.fillText(`${lensMag}×`, lx + 4, ly + lensSize - 4);
     ctx.restore();
-  }, [showLens, hideDisplay, lensPos, cmap, logScale, autoContrast, imageDataRange, imageVminPct, imageVmaxPct, dataMin, dataMax, traitVmin, traitVmax, width, height, canvasW, canvasH, themeColors, lensMag, lensDisplaySize, lensAnchor, percentileLow, percentileHigh, frameBytes, sliceIdx, displaySliceIdx, nPanels]);
+  }, [showLens, lensPos, cmap, logScale, autoContrast, imageDataRange, imageVminPct, imageVmaxPct, dataMin, dataMax, traitVmin, traitVmax, width, height, canvasW, canvasH, themeColors, lensMag, lensDisplaySize, lensAnchor, percentileLow, percentileHigh, frameBytes, sliceIdx, displaySliceIdx, nPanels]);
 
   // ROI sparkline plot
   React.useEffect(() => {
     const canvas = roiPlotCanvasRef.current;
-    if (!canvas || !showRoiPlot || !roiActive || hideRoi) return;
+    if (!canvas || !showRoiPlot || !roiActive) return;
     const plotW = canvasW;
     const plotH = 76;
     canvas.width = Math.round(plotW * DPR);
@@ -1981,15 +2616,15 @@ function Show3D() {
     ctx.stroke();
 
     // Draw current frame marker
-    const activeIdx = playing ? displaySliceIdx : sliceIdx;
+    const activeIdx = displaySliceIdx;
     const markerIdx = Math.max(0, Math.min(values.length - 1, activeIdx));
-    const mx = (markerIdx / denom) * plotW;
+    const markerX = (markerIdx / denom) * plotW;
     ctx.strokeStyle = themeColors.textMuted;
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
-    ctx.moveTo(mx, padY);
-    ctx.lineTo(mx, padY + drawH);
+    ctx.moveTo(markerX, padY);
+    ctx.lineTo(markerX, padY + drawH);
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -1998,7 +2633,7 @@ function Show3D() {
       const cy = padY + drawH - ((values[markerIdx] - min) / range) * drawH;
       ctx.fillStyle = themeColors.accent;
       ctx.beginPath();
-      ctx.arc(mx, cy, 3, 0, Math.PI * 2);
+      ctx.arc(markerX, cy, 3, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -2008,7 +2643,7 @@ function Show3D() {
     ctx.textAlign = "left";
     ctx.fillText(formatNumber(max), 2, padY - 2);
     ctx.fillText(formatNumber(min), 2, padY + drawH + 10);
-  }, [roiPlotData, roiActive, showRoiPlot, canvasW, themeColors, sliceIdx, displaySliceIdx, playing, hideRoi]);
+  }, [roiPlotData, roiActive, showRoiPlot, canvasW, themeColors, sliceIdx, displaySliceIdx, playing]);
 
   // Compute profile data when points/width/frame change
   React.useEffect(() => {
@@ -2139,7 +2774,7 @@ function Show3D() {
   }, [profileData, profilePoints, pixelSize, canvasW, themeInfo.theme, themeColors.accent, profileHeight]);
 
   // Profile hover handler - draws crosshair + value readout
-  const handleProfileMouseMove = React.useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleProfileMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = profileCanvasRef.current;
     const base = profileBaseImageRef.current;
     const layout = profileLayoutRef.current;
@@ -2197,16 +2832,16 @@ function Show3D() {
     }
 
     ctx.restore();
-  }, [profileData, themeInfo.theme, themeColors.accent]);
+  };
 
-  const handleProfileMouseLeave = React.useCallback(() => {
+  const handleProfileMouseLeave = () => {
     const canvas = profileCanvasRef.current;
     const base = profileBaseImageRef.current;
     if (!canvas || !base) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.putImageData(base, 0, 0);
-  }, []);
+  };
 
   // Profile height resize
   React.useEffect(() => {
@@ -2259,15 +2894,15 @@ function Show3D() {
       const margin = 12;
       ctx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
       for (let i = 0; i < n; i++) {
-        const s = stateFor(i);
+        const panelState = stateFor(i);
         const col = i % cols;
         const row = Math.floor(i / cols);
         const slotX = col * (slotW + gap);
         const slotY = row * (slotH + gap);
         // Cap bar at 25% of slot width so it never overflows a small slot.
         const targetBarPx = Math.min(targetBarPxSpec, slotW * 0.25);
-        const slotScale = slotW / width;
-        const effectiveZoom = s.zoom * slotScale;
+        const slotScale = slotW / sourcePanelWidth;
+        const effectiveZoom = panelState.zoom * slotScale;
         const targetPhysical = (targetBarPx / effectiveZoom) * pxSize;
         const nicePhysical = (function (v: number) {
           if (v <= 0) return 1;
@@ -2294,12 +2929,12 @@ function Show3D() {
         if (showZoomIndicator !== false) {
           ctx.textAlign = "left";
           ctx.textBaseline = "bottom";
-          ctx.fillText(`${s.zoom.toFixed(1)}×`, slotX + margin, slotY + slotH - margin + barThickness);
+          ctx.fillText(`${panelState.zoom.toFixed(1)}×`, slotX + margin, slotY + slotH - margin + barThickness);
         }
       }
       ctx.restore();
     }
-    if (!hideDisplay && showColorbar) {
+    if (showColorbar) {
       const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
       // Colorbar must match what's painted on the image, not the raw data range.
       // When autoContrast is on, the image uses percentileClip(low, high) of the
@@ -2316,7 +2951,8 @@ function Show3D() {
           imageVmaxPct,
         ));
       } else if (autoContrast && imageHistogramData && imageHistogramData.length > 0) {
-        ({ vmin, vmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh));
+        const cached = !logScale ? ensureLocalAutoRange(displaySliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
+        ({ vmin, vmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh));
       } else {
         ({ vmin, vmax } = sliderRange(imageDataRange.min, imageDataRange.max, imageVminPct, imageVmaxPct));
       }
@@ -2327,7 +2963,7 @@ function Show3D() {
       drawColorbar(ctx, cssW, cssH, lut, vmin, vmax, logScale);
       ctx.restore();
     }
-  }, [pixelSize, pixelUnit, scaleBarVisible, width, canvasW, canvasH, displayScale, zoom, nPanels, maxCols, panelStates, linkedState, linkZoom, panelGapTrait, showZoomIndicator, showColorbar, hideDisplay, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, percentileLow, percentileHigh, dataMin, dataMax, traitVmin, traitVmax]);
+  }, [pixelSize, pixelUnit, scaleBarVisible, width, sourcePanelWidth, canvasW, canvasH, displayScale, zoom, nPanels, maxCols, panelStates, linkedState, linkZoom, panelGapTrait, showZoomIndicator, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, autoVmins, autoVmaxs, displaySliceIdx, percentileLow, percentileHigh, dataMin, dataMax, traitVmin, traitVmax]);
 
   // Compute FFT magnitude (expensive, async - only re-run on data/GPU changes)
   // Supports ROI-scoped FFT: when ROI is active with a selected ROI, compute
@@ -2618,7 +3254,7 @@ function Show3D() {
   // -------------------------------------------------------------------------
   // Preview panel - compute aspect-ratio-aware canvas dimensions
   // -------------------------------------------------------------------------
-  const previewCanvasDims = React.useMemo(() => {
+  const previewCanvasDims = (() => {
     if (!previewCropDims) return { w: canvasW, h: canvasH };
     const { w: cropW, h: cropH } = previewCropDims;
     const aspect = cropW / cropH;
@@ -2627,7 +3263,7 @@ function Show3D() {
     } else {
       return { w: Math.max(20, Math.round(canvasH * aspect)), h: canvasH };
     }
-  }, [previewCropDims, canvasW, canvasH]);
+  })();
 
   // -------------------------------------------------------------------------
   // Preview panel - draw cached offscreen with zoom/pan (fast, no recompute)
@@ -2710,7 +3346,6 @@ function Show3D() {
     setPanStart({ x: e.clientX, y: e.clientY, pX: s.panX, pY: s.panY });
   };
   const handleWheel = (e: React.WheelEvent) => {
-    if (lockView) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -2753,31 +3388,27 @@ function Show3D() {
   };
 
   const handleDoubleClick = () => {
-    if (lockView) return;
     setLinkedState({ zoom: 1, panX: 0, panY: 0 });
     setPanelStates(arr => arr.map(() => ({ zoom: 1, panX: 0, panY: 0 })));
   };
 
-  const addROIAt = React.useCallback((row: number, col: number, shape: "circle" | "square" | "rectangle" | "annular" = newRoiShape) => {
-    if (lockRoi) return;
+  const addROIAt = (row: number, col: number, shape: "circle" | "square" | "rectangle" | "annular" = newRoiShape) => {
     const clampedRow = Math.max(0, Math.min(height - 1, Math.round(row)));
     const clampedCol = Math.max(0, Math.min(width - 1, Math.round(col)));
     const next = [...roiItems, createROI(clampedRow, clampedCol, shape, roiItems.length, width, height)];
     setRoiList(next);
     setRoiSelectedIdx(next.length - 1);
     setShowRoiResizeHint(true);
-  }, [height, width, newRoiShape, roiItems, setRoiList, setRoiSelectedIdx, lockRoi]);
+  };
 
-  const deleteSelectedROI = React.useCallback(() => {
-    if (lockRoi) return;
+  const deleteSelectedROI = () => {
     if (!roiList || roiSelectedIdx < 0 || roiSelectedIdx >= roiList.length) return;
     const next = roiList.filter((_, i) => i !== roiSelectedIdx);
     setRoiList(next);
     setRoiSelectedIdx(next.length > 0 ? Math.min(roiSelectedIdx, next.length - 1) : -1);
-  }, [roiList, roiSelectedIdx, setRoiList, setRoiSelectedIdx, lockRoi]);
+  };
 
-  const duplicateSelectedROI = React.useCallback(() => {
-    if (lockRoi) return;
+  const duplicateSelectedROI = () => {
     if (!selectedRoi) return;
     const duplicated: ROIItem = {
       ...selectedRoi,
@@ -2795,11 +3426,10 @@ function Show3D() {
     const next = [...roiItems, duplicated];
     setRoiList(next);
     setRoiSelectedIdx(next.length - 1);
-  }, [selectedRoi, height, width, roiItems, setRoiList, setRoiSelectedIdx, lockRoi]);
+  };
 
 
   const handleExportPng = async () => {
-    if (lockExport) return;
     setExportAnchor(null);
     if (!canvasRef.current) return;
     const blob = await new Promise<Blob>((resolve) =>
@@ -2809,28 +3439,24 @@ function Show3D() {
   };
 
   const handleExportPngAll = () => {
-    if (lockExport) return;
     setExportAnchor(null);
     setExporting(true);
     setZipExportRequested(true);
   };
 
   const handleExportGif = () => {
-    if (lockExport) return;
     setExportAnchor(null);
     setExporting(true);
     setGifExportRequested(true);
   };
 
   const handleExportBundle = () => {
-    if (lockExport) return;
     setExportAnchor(null);
     setExporting(true);
     setBundleExportRequested(true);
   };
 
   const handleCopy = async () => {
-    if (lockExport) return;
     if (!canvasRef.current) return;
     try {
       const blob = await new Promise<Blob | null>(resolve => canvasRef.current!.toBlob(resolve, "image/png"));
@@ -2849,7 +3475,6 @@ function Show3D() {
 
   // Export publication-quality figure
   const handleExportFigure = (withColorbar: boolean) => {
-    if (lockExport) return;
     setExportAnchor(null);
     const frameData = rawFrameDataRef.current;
     if (!frameData) return;
@@ -2892,7 +3517,7 @@ function Show3D() {
       showColorbar: withColorbar,
       showScaleBar: pixelSize > 0,
       drawAnnotations: (ctx) => {
-        if (!hideRoi && roiActive && roiItems.length > 0) {
+        if (roiActive && roiItems.length > 0) {
           for (let i = 0; i < roiItems.length; i++) {
             const roi = roiItems[i];
             const shape = (roi.shape || "circle") as "circle" | "square" | "rectangle" | "annular";
@@ -2975,25 +3600,25 @@ function Show3D() {
     return { imgCol: col, imgRow: row };
   };
 
-  const hitTestROI = React.useCallback((imgCol: number, imgRow: number): number => {
+  const hitTestROI = (imgCol: number, imgRow: number): number => {
     if (!roiActive || roiItems.length === 0) return -1;
-    for (let ri = roiItems.length - 1; ri >= 0; ri--) {
-      const roi = roiItems[ri];
+    for (let roiIdx = roiItems.length - 1; roiIdx >= 0; roiIdx--) {
+      const roi = roiItems[roiIdx];
       const shape = roi.shape || "circle";
       if (shape === "circle" || shape === "annular") {
-        if (Math.sqrt((imgCol - roi.col) ** 2 + (imgRow - roi.row) ** 2) <= roi.radius) return ri;
+        if (Math.sqrt((imgCol - roi.col) ** 2 + (imgRow - roi.row) ** 2) <= roi.radius) return roiIdx;
       } else if (shape === "square") {
-        if (Math.abs(imgCol - roi.col) <= roi.radius && Math.abs(imgRow - roi.row) <= roi.radius) return ri;
+        if (Math.abs(imgCol - roi.col) <= roi.radius && Math.abs(imgRow - roi.row) <= roi.radius) return roiIdx;
       } else if (shape === "rectangle") {
-        if (Math.abs(imgCol - roi.col) <= roi.width / 2 && Math.abs(imgRow - roi.row) <= roi.height / 2) return ri;
+        if (Math.abs(imgCol - roi.col) <= roi.width / 2 && Math.abs(imgRow - roi.row) <= roi.height / 2) return roiIdx;
       }
     }
     return -1;
-  }, [roiActive, roiItems]);
+  };
 
-  const getHitArea = React.useCallback(() => RESIZE_HIT_AREA_PX / (displayScale * zoom), [displayScale, zoom]);
+  const getHitArea = () => RESIZE_HIT_AREA_PX / (displayScale * zoom);
 
-  const isNearEdge = React.useCallback((imgCol: number, imgRow: number, roi: ROIItem): boolean => {
+  const isNearEdge = (imgCol: number, imgRow: number, roi: ROIItem): boolean => {
     const hitArea = getHitArea();
     const shape = roi.shape || "circle";
     if (shape === "circle" || shape === "annular") {
@@ -3014,24 +3639,24 @@ function Show3D() {
       return (dx <= hw + hitArea && dy <= hh + hitArea) && (Math.abs(dx - hw) < hitArea || Math.abs(dy - hh) < hitArea);
     }
     return false;
-  }, [getHitArea]);
+  };
 
-  const isNearResizeHandle = React.useCallback((imgCol: number, imgRow: number): boolean => {
+  const isNearResizeHandle = (imgCol: number, imgRow: number): boolean => {
     if (!roiActive || !selectedRoi) return false;
     return isNearEdge(imgCol, imgRow, selectedRoi);
-  }, [roiActive, selectedRoi, isNearEdge]);
+  };
 
-  const isNearAnyEdge = React.useCallback((imgCol: number, imgRow: number): boolean => {
+  const isNearAnyEdge = (imgCol: number, imgRow: number): boolean => {
     if (!roiActive || roiItems.length === 0) return false;
     return roiItems.some(roi => isNearEdge(imgCol, imgRow, roi));
-  }, [roiActive, roiItems, isNearEdge]);
+  };
 
-  const isNearResizeHandleInner = React.useCallback((imgCol: number, imgRow: number): boolean => {
+  const isNearResizeHandleInner = (imgCol: number, imgRow: number): boolean => {
     if (!roiActive || !selectedRoi || selectedRoi.shape !== "annular") return false;
     const hitArea = getHitArea();
     const dist = Math.sqrt((imgCol - selectedRoi.col) ** 2 + (imgRow - selectedRoi.row) ** 2);
     return Math.abs(dist - selectedRoi.radius_inner) < hitArea;
-  }, [roiActive, selectedRoi, getHitArea]);
+  };
 
   const updateROI = (e: React.MouseEvent) => {
     if (!selectedRoi) return;
@@ -3050,7 +3675,7 @@ function Show3D() {
     clickStartRef.current = { x: e.clientX, y: e.clientY };
     pendingRoiAddRef.current = null;
     // Check if clicking on lens inset for drag or resize
-    if (showLens && !lockDisplay) {
+    if (showLens) {
       const rect = canvasContainerRef.current?.getBoundingClientRect();
       if (rect) {
         const cssX = e.clientX - rect.left;
@@ -3074,12 +3699,6 @@ function Show3D() {
       }
     }
     if (profileActive) {
-      if (lockProfile) {
-        if (!lockView) {
-          beginPan(e);
-        }
-        return;
-      }
       const { imgCol, imgRow } = screenToImg(e);
       if (profilePoints.length === 2) {
         const p0 = profilePoints[0];
@@ -3106,18 +3725,10 @@ function Show3D() {
           return;
         }
       }
-      if (!lockView) {
-        beginPan(e);
-      }
+      beginPan(e);
       return;
     }
     if (roiActive) {
-      if (lockRoi) {
-        if (!lockView) {
-          beginPan(e);
-        }
-        return;
-      }
       const { imgCol, imgRow } = screenToImg(e);
       if (isNearResizeHandleInner(imgCol, imgRow)) {
         setIsDraggingResizeInner(true);
@@ -3130,12 +3741,12 @@ function Show3D() {
         return;
       }
       if (roiItems.length > 0) {
-        for (let ri = roiItems.length - 1; ri >= 0; ri--) {
-          const roi = roiItems[ri];
+        for (let roiIdx = roiItems.length - 1; roiIdx >= 0; roiIdx--) {
+          const roi = roiItems[roiIdx];
           if (isNearEdge(imgCol, imgRow, roi)) {
             e.preventDefault();
             resizeAspectRef.current = roi && (roi.shape === "rectangle") && roi.width > 0 && roi.height > 0 ? roi.width / roi.height : null;
-            setRoiSelectedIdx(ri);
+            setRoiSelectedIdx(roiIdx);
             setIsDraggingResize(true);
             return;
           }
@@ -3154,14 +3765,12 @@ function Show3D() {
       };
       return;
     }
-    if (!lockView) {
-      beginPan(e);
-    }
+    beginPan(e);
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent) => {
     // Fast path: during pan drag, skip all cursor/hover/lens work - just update pan
-    if (isDraggingPan && panStart && !lockView) {
+    if (isDraggingPan && panStart) {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
@@ -3188,23 +3797,23 @@ function Show3D() {
     const hoverPanelIdx = panelIdxFromEvent(e);
     if (hoverPanelIdx < 0) {
       setCursorInfo(null);
-      if (showLens && !lockDisplay) setLensPos(null);
+      if (showLens) setLensPos(null);
     } else if (canvas && rawFrameDataRef.current) {
       const { imgRow, imgCol } = screenToImg(e);
-      const imgX = Math.floor(imgCol);
-      const imgY = Math.floor(imgRow);
-      if (imgX >= 0 && imgX < width && imgY >= 0 && imgY < height) {
+      const pixelCol = Math.floor(imgCol);
+      const pixelRow = Math.floor(imgRow);
+      if (pixelCol >= 0 && pixelCol < width && pixelRow >= 0 && pixelRow < height) {
         const rawData = rawFrameDataRef.current;
-        setCursorInfo({ row: imgY, col: imgX, value: rawData[imgY * width + imgX] });
-        if (showLens && !lockDisplay) setLensPos({ row: imgY, col: imgX });
+        setCursorInfo({ row: pixelRow, col: pixelCol, value: rawData[pixelRow * width + pixelCol] });
+        if (showLens) setLensPos({ row: pixelRow, col: pixelCol });
       } else {
         setCursorInfo(null);
-        if (showLens && !lockDisplay) setLensPos(null);
+        if (showLens) setLensPos(null);
       }
     }
 
     // Lens edge hover detection
-    if (showLens && !lockDisplay) {
+    if (showLens) {
       const rect2 = canvasContainerRef.current?.getBoundingClientRect();
       if (rect2) {
         const cssX2 = e.clientX - rect2.left;
@@ -3223,7 +3832,7 @@ function Show3D() {
     }
 
     // Lens drag
-    if (!lockDisplay && isDraggingLens && lensDragStartRef.current) {
+    if (isDraggingLens && lensDragStartRef.current) {
       const dx = e.clientX - lensDragStartRef.current.mx;
       const dy = e.clientY - lensDragStartRef.current.my;
       setLensAnchor({ x: lensDragStartRef.current.ax + dx, y: lensDragStartRef.current.ay + dy });
@@ -3231,13 +3840,13 @@ function Show3D() {
     }
 
     // Lens resize drag
-    if (!lockDisplay && isResizingLens && lensResizeStartRef.current) {
+    if (isResizingLens && lensResizeStartRef.current) {
       const dy = e.clientY - lensResizeStartRef.current.my;
       setLensDisplaySize(Math.max(64, Math.min(256, lensResizeStartRef.current.startSize + dy)));
       return;
     }
 
-    if (profileActive && !lockProfile && profilePoints.length === 2) {
+    if (profileActive && profilePoints.length === 2) {
       const { imgCol, imgRow } = screenToImg(e);
       const p0 = profilePoints[0];
       const p1 = profilePoints[1];
@@ -3318,7 +3927,7 @@ function Show3D() {
     }
 
     // Hover state for resize handles
-    if (roiActive && !lockRoi && !isDraggingROI && !isDraggingPan) {
+    if (roiActive && !isDraggingROI && !isDraggingPan) {
       const { imgCol: ic, imgRow: ir } = screenToImg(e);
       const hoveringInner = isNearResizeHandleInner(ic, ir);
       const hoveringOuter = isNearAnyEdge(ic, ir);
@@ -3327,7 +3936,7 @@ function Show3D() {
       if (hoveringInner || hoveringOuter) setShowRoiResizeHint(false);
     }
 
-    if (!lockRoi && isDraggingROI) {
+    if (isDraggingROI) {
       updateROI(e);
     }
   };
@@ -3354,7 +3963,7 @@ function Show3D() {
     }
 
     // Profile click capture
-    if (profileActive && !lockProfile && clickStartRef.current) {
+    if (profileActive && clickStartRef.current) {
       const dx = e.clientX - clickStartRef.current.x;
       const dy = e.clientY - clickStartRef.current.y;
       if (Math.sqrt(dx * dx + dy * dy) < 3) {
@@ -3363,10 +3972,10 @@ function Show3D() {
           const rect = canvas.getBoundingClientRect();
           const mouseCanvasX = (e.clientX - rect.left) * (canvas.width / rect.width);
           const mouseCanvasY = (e.clientY - rect.top) * (canvas.height / rect.height);
-          const imgX = (mouseCanvasX - panX) / zoom / displayScale;
-          const imgY = (mouseCanvasY - panY) / zoom / displayScale;
-          if (imgX >= 0 && imgX < width && imgY >= 0 && imgY < height) {
-            const pt = { row: imgY, col: imgX };
+          const imgCol = (mouseCanvasX - panX) / zoom / displayScale;
+          const imgRow = (mouseCanvasY - panY) / zoom / displayScale;
+          if (imgCol >= 0 && imgCol < width && imgRow >= 0 && imgRow < height) {
+            const pt = { row: imgRow, col: imgCol };
             if (profilePoints.length === 0 || profilePoints.length === 2) {
               setProfileLine([pt]);
               setProfileData(null);
@@ -3381,7 +3990,7 @@ function Show3D() {
     }
 
     // ROI click-to-add (empty-area click)
-    if (roiActive && !lockRoi && pendingRoiAddRef.current && clickStartRef.current) {
+    if (roiActive && pendingRoiAddRef.current && clickStartRef.current) {
       const dx = e.clientX - clickStartRef.current.x;
       const dy = e.clientY - clickStartRef.current.y;
       if (Math.sqrt(dx * dx + dy * dy) < 3) {
@@ -3437,7 +4046,6 @@ function Show3D() {
   const [fftPanStart, setFftPanStart] = React.useState<{ x: number, y: number, pX: number, pY: number } | null>(null);
 
   const handleFftWheel = (e: React.WheelEvent) => {
-    if (lockView) return;
     const canvas = fftCanvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -3471,14 +4079,12 @@ function Show3D() {
   };
 
   const handleFftMouseDown = (e: React.MouseEvent) => {
-    if (lockView) return;
     fftClickStartRef.current = { x: e.clientX, y: e.clientY };
     setIsFftDragging(true);
     setFftPanStart({ x: e.clientX, y: e.clientY, pX: fftPanX, pY: fftPanY });
   };
 
   const handleFftMouseMove = (e: React.MouseEvent) => {
-    if (lockView) return;
     if (isFftDragging && fftPanStart) {
       const canvas = fftCanvasRef.current;
       if (!canvas) return;
@@ -3493,12 +4099,6 @@ function Show3D() {
   };
 
   const handleFftMouseUp = (e: React.MouseEvent) => {
-    if (lockView) {
-      fftClickStartRef.current = null;
-      setIsFftDragging(false);
-      setFftPanStart(null);
-      return;
-    }
     // Click detection for d-spacing measurement
     if (fftClickStartRef.current) {
       const dx = e.clientX - fftClickStartRef.current.x;
@@ -3547,7 +4147,6 @@ function Show3D() {
   };
 
   const handleFftReset = () => {
-    if (lockView) return;
     setFftZoom(1);
     setFftPanX(0);
     setFftPanY(0);
@@ -3558,7 +4157,6 @@ function Show3D() {
 
   // Preview panel zoom/pan handlers
   const handlePreviewWheel = (e: React.WheelEvent) => {
-    if (lockView) return;
     e.preventDefault();
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
@@ -3579,7 +4177,6 @@ function Show3D() {
   };
 
   const handlePreviewMouseDown = (e: React.MouseEvent) => {
-    if (lockView) return;
     setIsDraggingPreviewPan(true);
     setPreviewPanStart({ x: e.clientX, y: e.clientY, pX: previewZoom.panX, pY: previewZoom.panY });
   };
@@ -3597,13 +4194,11 @@ function Show3D() {
   };
 
   const handlePreviewDoubleClick = () => {
-    if (lockView) return;
     setPreviewZoom({ zoom: 1, panX: 0, panY: 0 });
   };
 
   // Resize handlers
   const handleMainResizeStart = (e: React.MouseEvent) => {
-    if (lockView) return;
     e.stopPropagation();
     e.preventDefault();
     setIsResizingMain(true);
@@ -3641,70 +4236,60 @@ function Show3D() {
   }, [isResizingMain, resizeStart]);
 
   // Keyboard
-  const handleKeyDown = React.useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (shouldIgnoreWidgetShortcut(e.target)) return;
 
     let handled = false;
 
     switch (e.key) {
         case " ":
-          if (!lockPlayback) {
-            setPlaying(!playing);
-            handled = true;
-          }
+          setPlaying(!playing);
+          handled = true;
           break;
-        case "ArrowLeft":
-          if (!lockPlayback) {
-            const lo = loop ? Math.max(0, loopStart) : 0;
-            const candidate = hiddenSet.size ? nextVisible(sliceIdx, -1, false) : sliceIdx - 1;
-            setSliceIdx(Math.max(lo, candidate));
-            handled = true;
-          }
+        case "ArrowLeft": {
+          const lo = loop ? Math.max(0, loopStart) : 0;
+          const candidate = hiddenSet.size ? nextVisible(sliceIdx, -1, false) : sliceIdx - 1;
+          setSliceIdx(Math.max(lo, candidate));
+          handled = true;
           break;
-        case "ArrowRight":
-          if (!lockPlayback) {
-            const hi = loop ? Math.min(effectiveLoopEnd, nSlices - 1) : nSlices - 1;
-            const candidate = hiddenSet.size ? nextVisible(sliceIdx, 1, false) : sliceIdx + 1;
-            setSliceIdx(Math.min(hi, candidate));
-            handled = true;
-          }
+        }
+        case "ArrowRight": {
+          const hi = loop ? Math.min(effectiveLoopEnd, nSlices - 1) : nSlices - 1;
+          const candidate = hiddenSet.size ? nextVisible(sliceIdx, 1, false) : sliceIdx + 1;
+          setSliceIdx(Math.min(hi, candidate));
+          handled = true;
           break;
+        }
         case "Home":
-          if (!lockPlayback) {
-            setSliceIdx(loop ? Math.max(0, loopStart) : 0);
-            handled = true;
-          }
+          setSliceIdx(loop ? Math.max(0, loopStart) : 0);
+          handled = true;
           break;
         case "End":
-          if (!lockPlayback) {
-            setSliceIdx(loop ? Math.min(effectiveLoopEnd, nSlices - 1) : nSlices - 1);
-            handled = true;
-          }
+          setSliceIdx(loop ? Math.min(effectiveLoopEnd, nSlices - 1) : nSlices - 1);
+          handled = true;
           break;
         case "r":
         case "R":
-          if (!lockView) {
-            handleDoubleClick();
-            handled = true;
-          }
+          handleDoubleClick();
+          handled = true;
           break;
         case "c":
         case "C":
-          if (!lockExport && cursorInfo) {
+          if (cursorInfo) {
             navigator.clipboard.writeText(`(${cursorInfo.row}, ${cursorInfo.col}, ${cursorInfo.value})`);
             handled = true;
           }
           break;
         case "Delete":
         case "Backspace":
-          if (!lockRoi && roiActive && roiSelectedIdx >= 0) {
+          if (roiActive && roiSelectedIdx >= 0) {
             deleteSelectedROI();
             handled = true;
           }
           break;
         case "d":
         case "D":
-          if (!lockRoi && roiActive && roiSelectedIdx >= 0 && (e.metaKey || e.ctrlKey || e.shiftKey)) {
+          if (roiActive && roiSelectedIdx >= 0 && (e.metaKey || e.ctrlKey || e.shiftKey)) {
             duplicateSelectedROI();
             handled = true;
           }
@@ -3718,30 +4303,27 @@ function Show3D() {
       e.preventDefault();
       e.stopPropagation();
     }
-  }, [
-    cursorInfo,
-    deleteSelectedROI,
-    duplicateSelectedROI,
-    effectiveLoopEnd,
-    effectiveShowFft,
-    handleDoubleClick,
-    lockExport,
-    lockPlayback,
-    lockRoi,
-    lockView,
-    loop,
-    loopStart,
-    nSlices,
-    playing,
-    roiActive,
-    roiSelectedIdx,
-    setPlaying,
-    setSliceIdx,
-    sliceIdx,
-  ]);
+  };
 
   // Check if view needs reset
   const needsReset = zoom !== 1 || panX !== 0 || panY !== 0;
+  const clampSlice = (idx: number) => Math.max(0, Math.min(nSlices - 1, Math.round(idx)));
+  const scrubToSlice = (idx: number) => {
+    const next = clampSlice(idx);
+    if (playing) setPlaying(false);
+    if (renderBufferedSlice(next)) return;
+    if (frameServerUrl) {
+      setDisplaySliceIdx(next);
+      void renderFetchedSlice(next);
+      prefetchServerFrames(next, false, false);
+      return;
+    }
+    setDisplaySliceIdx(next);
+    setSliceIdx(next);
+  };
+  const commitSlice = (idx: number) => {
+    setSliceIdx(clampSlice(idx));
+  };
 
   return (
     <Box
@@ -3777,117 +4359,93 @@ function Show3D() {
             </Box>} theme={themeInfo.theme} />
           </Typography>
           {/* Controls row */}
-          {(!hideDisplay || !hideProfile || !hideRoi || !hideExport || !hideView) && (
-            <Box sx={{ display: "flex", alignItems: "center", gap: "4px", mb: `${SPACING.XS}px`, height: 28 }}>
-              {!hideDisplay && (
-                <>
-                  <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
-                  <Switch checked={showFft} onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panel" }} />
-                </>
-              )}
-              {!hideProfile && (
-                <>
-                  <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Profile:</Typography>
-                  <Switch checked={profileActive} onChange={(e) => {
-                    if (lockProfile) return;
-                    const on = e.target.checked;
-                    setProfileActive(on);
-                    if (on) {
-                      if (!lockRoi) { setRoiActive(false); setRoiSelectedIdx(-1); }
-                    } else {
-                      // Toggle OFF hides overlay (gated by `profileActive` in render) but keeps
-                      // the line + sampled data so re-enable restores instantly. Use the Clear
-                      // button below to actively wipe.
-                      setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false);
-                    }
-                  }} disabled={lockProfile} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle line intensity profile tool" }} />
-                  {profileActive && (
-                    <>
-                      <Typography sx={{ ...typography.label, fontSize: 10, ml: "4px" }}>W:</Typography>
-                      <Slider value={profileWidth} min={1} max={15} step={1} onChange={(_, v) => { if (!lockProfile) setProfileWidth(v as number); }} disabled={lockProfile} size="small" valueLabelDisplay="auto" sx={{ width: 60, ml: "2px" }} aria-label={`Profile width ${profileWidth} px`} />
-                    </>
-                  )}
-                </>
-              )}
-              {!hideDisplay && (nPanels || 1) === 1 && (
-                <>
-                  <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Lens:</Typography>
-                  <Switch
-                    checked={showLens}
-                    onChange={() => {
-                      if (lockDisplay) return;
-                      if (!showLens) { setShowLens(true); setLensPos({ row: Math.floor(height / 2), col: Math.floor(width / 2) }); }
-                      else { setShowLens(false); setLensPos(null); }
-                    }}
-                    disabled={lockDisplay}
-                    size="small"
-                    sx={switchStyles.small}
-                    inputProps={{ "aria-label": "Toggle magnifier lens" }}
-                  />
-                </>
-              )}
-              {!hideRoi && (nPanels || 1) === 1 && (
-                <>
-                  <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>ROI:</Typography>
-                  <Switch checked={roiActive} onChange={(e) => {
-                    if (lockRoi) return;
-                    const on = e.target.checked;
-                    if (on) {
-                      setRoiActive(true); setShowRoiResizeHint(true);
-                      if (!lockProfile) { setProfileActive(false); setProfileLine([]); setProfileData(null); setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false); }
-                    } else {
-                      setRoiActive(false); setRoiSelectedIdx(-1); pendingRoiAddRef.current = null;
-                    }
-                  }} disabled={lockRoi} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle ROI selection tool" }} />
-                </>
-              )}
-              {(nPanels || 1) > 1 && (
-                <>
-                  <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link:</Typography>
-                  <Switch checked={linkPanels} onChange={(e) => setLinkPanels(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link zoom and pan across panels" }} />
-                  <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link contrast:</Typography>
-                  <Switch checked={linkContrast} onChange={(e) => setLinkContrast(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link contrast across panels" }} />
-                </>
-              )}
-              <Box sx={{ flex: 1 }} />
-              <Box sx={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                {!hideExport && (
-                  <>
-                    <Button size="small" sx={{ ...compactButton, color: themeColors.accent }} onClick={(e) => { if (!lockExport) setExportAnchor(e.currentTarget); }} disabled={lockExport || exporting} aria-label="Open export menu (PDF, PNG, GIF, bundle)">{exporting ? "..." : "Export"}</Button>
-                    <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} sx={{ zIndex: 9999 }}>
-                      <MenuItem disabled={lockExport} onClick={() => handleExportFigure(true)} sx={{ fontSize: 12 }}>PDF + colorbar</MenuItem>
-                      <MenuItem disabled={lockExport} onClick={() => handleExportFigure(false)} sx={{ fontSize: 12 }}>PDF</MenuItem>
-                      <MenuItem disabled={lockExport} onClick={handleExportBundle} sx={{ fontSize: 12 }}>Bundle (PNG + ROI CSV + state)</MenuItem>
-                      <MenuItem disabled={lockExport} onClick={handleExportPng} sx={{ fontSize: 12 }}>PNG (current frame)</MenuItem>
-                      <MenuItem disabled={lockExport} onClick={handleExportPngAll} sx={{ fontSize: 12 }}>PNG (all frames .zip)</MenuItem>
-                      <MenuItem disabled={lockExport} onClick={handleExportGif} sx={{ fontSize: 12 }}>GIF (fps: {fps})</MenuItem>
-                    </Menu>
-                    <Button size="small" sx={compactButton} disabled={lockExport} onClick={handleCopy} aria-label="Copy current frame to clipboard as PNG">Copy</Button>
-                  </>
-                )}
-                {!hideView && (
-                  <Button size="small" sx={compactButton} disabled={lockView || !needsReset} onClick={handleDoubleClick} aria-label="Reset zoom and pan">Reset</Button>
-                )}
-              </Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: "4px", mb: `${SPACING.XS}px`, height: 28 }}>
+            <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
+            <Switch checked={showFft} onChange={(e) => setShowFft(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panel" }} />
+            <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Profile:</Typography>
+            <Switch checked={profileActive} onChange={(e) => {
+              const on = e.target.checked;
+              setProfileActive(on);
+              if (on) {
+                setRoiActive(false); setRoiSelectedIdx(-1);
+              } else {
+                // Toggle OFF hides overlay (gated by `profileActive` in render) but keeps
+                // the line + sampled data so re-enable restores instantly. Use the Clear
+                // button below to actively wipe.
+                setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false);
+              }
+            }} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle line intensity profile tool" }} />
+            {profileActive && (
+              <>
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "4px" }}>W:</Typography>
+                <Slider value={profileWidth} min={1} max={15} step={1} onChange={(_, v) => setProfileWidth(v as number)} size="small" valueLabelDisplay="auto" sx={{ width: 60, ml: "2px" }} aria-label={`Profile width ${profileWidth} px`} />
+              </>
+            )}
+            {(nPanels || 1) === 1 && (
+              <>
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Lens:</Typography>
+                <Switch
+                  checked={showLens}
+                  onChange={() => {
+                    if (!showLens) { setShowLens(true); setLensPos({ row: Math.floor(height / 2), col: Math.floor(width / 2) }); }
+                    else { setShowLens(false); setLensPos(null); }
+                  }}
+                  size="small"
+                  sx={switchStyles.small}
+                  inputProps={{ "aria-label": "Toggle magnifier lens" }}
+                />
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>ROI:</Typography>
+                <Switch checked={roiActive} onChange={(e) => {
+                  const on = e.target.checked;
+                  if (on) {
+                    setRoiActive(true); setShowRoiResizeHint(true);
+                    setProfileActive(false); setProfileLine([]); setProfileData(null); setHoveredProfileEndpoint(null); setIsHoveringProfileLine(false);
+                  } else {
+                    setRoiActive(false); setRoiSelectedIdx(-1); pendingRoiAddRef.current = null;
+                  }
+                }} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle ROI selection tool" }} />
+              </>
+            )}
+            {(nPanels || 1) > 1 && (
+              <>
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link:</Typography>
+                <Switch checked={linkPanels} onChange={(e) => setLinkPanels(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link zoom and pan across panels" }} />
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link contrast:</Typography>
+                <Switch checked={linkContrast} onChange={(e) => setLinkContrast(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link contrast across panels" }} />
+              </>
+            )}
+            <Box sx={{ flex: 1 }} />
+            <Box sx={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <Button size="small" sx={{ ...compactButton, color: themeColors.accent }} onClick={(e) => setExportAnchor(e.currentTarget)} disabled={exporting} aria-label="Open export menu (PDF, PNG, GIF, bundle)">{exporting ? "..." : "Export"}</Button>
+              <Menu anchorEl={exportAnchor} open={Boolean(exportAnchor)} onClose={() => setExportAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }} sx={{ zIndex: 9999 }}>
+                <MenuItem onClick={() => handleExportFigure(true)} sx={{ fontSize: 12 }}>PDF + colorbar</MenuItem>
+                <MenuItem onClick={() => handleExportFigure(false)} sx={{ fontSize: 12 }}>PDF</MenuItem>
+                <MenuItem onClick={handleExportBundle} sx={{ fontSize: 12 }}>Bundle (PNG + ROI CSV + state)</MenuItem>
+                <MenuItem onClick={handleExportPng} sx={{ fontSize: 12 }}>PNG (current frame)</MenuItem>
+                <MenuItem onClick={handleExportPngAll} sx={{ fontSize: 12 }}>PNG (all frames .zip)</MenuItem>
+                <MenuItem onClick={handleExportGif} sx={{ fontSize: 12 }}>GIF (fps: {fps})</MenuItem>
+              </Menu>
+              <Button size="small" sx={compactButton} onClick={handleCopy} aria-label="Copy current frame to clipboard as PNG">Copy</Button>
+              <Button size="small" sx={compactButton} disabled={!needsReset} onClick={handleDoubleClick} aria-label="Reset zoom and pan">Reset</Button>
             </Box>
-          )}
+          </Box>
           <Box
             ref={canvasContainerRef}
             sx={{
               ...container.imageBox,
               width: canvasW,
               height: canvasH,
-              cursor: (!lockDisplay && isHoveringLensEdge)
+              cursor: isHoveringLensEdge
                 ? "nwse-resize"
-                : (!lockRoi && (isHoveringResize || isDraggingResize || isHoveringResizeInner || isDraggingResizeInner))
+                : (isHoveringResize || isDraggingResize || isHoveringResizeInner || isDraggingResizeInner)
                   ? "nwse-resize"
-                  : (!lockProfile && (draggingProfileEndpoint !== null || isDraggingProfileLine))
+                  : (draggingProfileEndpoint !== null || isDraggingProfileLine)
                     ? "grabbing"
-                    : (!lockProfile && profileActive && (hoveredProfileEndpoint !== null || isHoveringProfileLine))
+                    : (profileActive && (hoveredProfileEndpoint !== null || isHoveringProfileLine))
                       ? "grab"
-                      : ((!hideRoi && roiActive && !lockRoi) || (!hideProfile && profileActive && !lockProfile))
+                      : (roiActive || profileActive)
                         ? "crosshair"
-                        : (lockView ? "default" : "grab"),
+                        : "grab",
             }}
             onMouseDown={handleCanvasMouseDown}
             onMouseMove={handleCanvasMouseMove}
@@ -3896,10 +4454,65 @@ function Show3D() {
             onWheel={handleWheel}
             onDoubleClick={handleDoubleClick}
           >
-            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={`Slice image ${(playing ? displaySliceIdx : sliceIdx) + 1} of ${nSlices}${title ? `: ${title}` : ""} (${width} by ${height} pixels). Use arrow keys to scrub frames.`} />
+            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={`Slice image ${displaySliceIdx + 1} of ${nSlices}${title ? `: ${title}` : ""} (${width} by ${height} pixels). Use arrow keys to scrub frames.`} />
             <canvas ref={overlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             <canvas ref={uiRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             <canvas ref={lensCanvasRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
+            {/* Per-panel "best frame" stars. One gold ★ button top-right of
+                each panel. Click toggles the star on the currently displayed
+                slice for THAT panel. Programmatic API: widget.star_panel(i). */}
+            {Array.from({ length: Math.max(1, nPanels || 1) }, (_, i) => {
+              const n = Math.max(1, nPanels || 1);
+              const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+              const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
+              const panelW = (canvasW - gap * (cols - 1)) / cols;
+              const panelH = (canvasH - gap * (Math.ceil(n / cols) - 1)) / Math.ceil(n / cols);
+              const panelLeft = (i % cols) * (panelW + gap);
+              const panelTop = Math.floor(i / cols) * (panelH + gap);
+              const starredFrame = starred?.[i] ?? -1;
+              const isStarredHere = starredFrame === displaySliceIdx;
+              const starElsewhere = starredFrame >= 0 && !isStarredHere;
+              const tooltip = isStarredHere
+                ? `★ Starred. Click to unstar frame ${displaySliceIdx + 1}.`
+                : starElsewhere
+                  ? `Star is on frame ${starredFrame + 1}. Click to move it to frame ${displaySliceIdx + 1}.`
+                  : `Click to mark frame ${displaySliceIdx + 1} as best for panel ${i + 1}.`;
+              return (
+                <button
+                  key={`star-${i}`}
+                  onClick={() => {
+                    const cur = Array.from({ length: n }, (_, k) => starred?.[k] ?? -1);
+                    cur[i] = isStarredHere ? -1 : displaySliceIdx;
+                    setStarred(cur);
+                  }}
+                  title={tooltip}
+                  aria-label={tooltip}
+                  style={{
+                    position: "absolute",
+                    top: panelTop + 6,
+                    left: panelLeft + panelW - 26,
+                    width: 20, height: 20,
+                    padding: 0,
+                    border: "none",
+                    background: "transparent",
+                    cursor: "pointer",
+                    fontSize: 18,
+                    lineHeight: "20px",
+                    textAlign: "center",
+                    color: isStarredHere
+                      ? "#ffc107"  // bright gold: star IS on this frame
+                      : starElsewhere
+                        ? "rgba(255, 193, 7, 0.45)"  // faded gold: star elsewhere on this panel
+                        : "rgba(255,255,255,0.5)",   // grey: no star on this panel
+                    textShadow: "0 0 3px rgba(0,0,0,0.8)",
+                    pointerEvents: "auto",
+                    userSelect: "none",
+                  }}
+                >
+                  {isStarredHere ? "★" : "☆"}
+                </button>
+              );
+            })}
             {/* Zoom indicator now drawn on the ui canvas in the scale-bar
                 pass (Show2D-matching style: white, sans, Unicode ×). */}
             {/* Cursor readout overlay */}
@@ -3910,7 +4523,7 @@ function Show3D() {
                 </Typography>
               </Box>
             )}
-            {!hideRoi && !lockRoi && roiActive && roiItems.length > 0 && showRoiResizeHint && (
+            {roiActive && roiItems.length > 0 && showRoiResizeHint && (
               <Box sx={{ position: "absolute", left: 6, top: 6, px: 0.6, py: 0.25, bgcolor: "rgba(0,0,0,0.45)", pointerEvents: "none" }}>
                 <Typography sx={{ fontSize: 9, color: "rgba(255,255,255,0.8)", lineHeight: 1.1 }}>
                   Hover ROI edge to resize
@@ -3921,7 +4534,7 @@ function Show3D() {
                 no handle. Each handle scales the whole multi-panel canvas
                 (linked behavior). Match Show2D gallery: 16x16, grey, 0.6/1.0.
                 User trait `show_resize_handles` toggles visibility. */}
-            {!hideView && showResizeHandles !== false && (() => {
+            {showResizeHandles !== false && (() => {
               const n = Math.max(1, nPanels || 1);
               const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
               const rows = Math.ceil(n / cols);
@@ -3943,12 +4556,11 @@ function Show3D() {
                       top: slotY + outPanelH - 16,
                       width: 16,
                       height: 16,
-                      cursor: lockView ? "default" : "nwse-resize",
-                      opacity: lockView ? 0.3 : 0.6,
-                      pointerEvents: lockView ? "none" : "auto",
+                      cursor: "nwse-resize",
+                      opacity: 0.6,
                       background: `linear-gradient(135deg, transparent 50%, ${themeColors.border} 50%)`,
                       borderRadius: "0 0 4px 0",
-                      "&:hover": { opacity: lockView ? 0.3 : 1 },
+                      "&:hover": { opacity: 1 },
                     }}
                   />
                 );
@@ -3957,9 +4569,9 @@ function Show3D() {
           </Box>
           {/* Panel titles render ON canvas inside drawMain - follows grid layout. */}
           {/* Statistics bar - right below the image. Multi-panel = one row per panel. */}
-          {showStats && !hideStats && (
+          {showStats && (
             (localPanelStats && (nPanels || 1) > 1) ? (
-              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", flexDirection: "column", gap: 0.25, width: "fit-content", boxSizing: "border-box", opacity: lockStats ? 0.7 : 1, fontFamily: "ui-monospace, monospace" }}>
+              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", flexDirection: "column", gap: 0.25, width: "fit-content", boxSizing: "border-box", fontFamily: "ui-monospace, monospace" }}>
                 {localPanelStats.map((st, i) => (
                   <Box key={i} sx={{ display: "flex", gap: 2, alignItems: "center" }}>
                     <Typography sx={{ fontSize: 11, color: themeColors.textMuted, minWidth: 80, fontFamily: "ui-monospace, monospace" }}>{(panelTitles && panelTitles[i]) || `Panel ${i + 1}`}</Typography>
@@ -3971,7 +4583,7 @@ function Show3D() {
                 ))}
               </Box>
             ) : (
-              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", gap: 2, alignItems: "center", width: "fit-content", boxSizing: "border-box", opacity: lockStats ? 0.7 : 1 }}>
+              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", gap: 2, alignItems: "center", width: "fit-content", boxSizing: "border-box" }}>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(localStats ? localStats.mean : statsMean)}</Box></Typography>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(localStats ? localStats.min : statsMin)}</Box></Typography>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(localStats ? localStats.max : statsMax)}</Box></Typography>
@@ -3980,7 +4592,7 @@ function Show3D() {
             )
           )}
           {/* Line profile sparkline */}
-          {!hideProfile && profileActive && (
+          {profileActive && (
             <Box sx={{ mt: `${SPACING.XS}px`, boxSizing: "border-box" }}>
               <canvas
                 ref={profileCanvasRef}
@@ -3991,13 +4603,13 @@ function Show3D() {
                 aria-label="Line intensity profile along the drawn line"
               />
               <div
-                onMouseDown={(e) => { if (lockProfile) return; e.preventDefault(); setIsResizingProfile(true); setProfileResizeStart({ y: e.clientY, height: profileHeight }); }}
-                style={{ width: canvasW, height: 4, cursor: lockProfile ? "default" : "ns-resize", borderLeft: `1px solid ${themeColors.border}`, borderRight: `1px solid ${themeColors.border}`, borderBottom: `1px solid ${themeColors.border}`, background: `linear-gradient(to bottom, ${themeColors.border}, transparent)`, opacity: lockProfile ? 0.5 : 1, pointerEvents: lockProfile ? "none" : "auto" }}
+                onMouseDown={(e) => { e.preventDefault(); setIsResizingProfile(true); setProfileResizeStart({ y: e.clientY, height: profileHeight }); }}
+                style={{ width: canvasW, height: 4, cursor: "ns-resize", borderLeft: `1px solid ${themeColors.border}`, borderRight: `1px solid ${themeColors.border}`, borderBottom: `1px solid ${themeColors.border}`, background: `linear-gradient(to bottom, ${themeColors.border}, transparent)` }}
               />
             </Box>
           )}
           {/* ROI sparkline plot */}
-          {!hideRoi && roiActive && showRoiPlot && roiPlotData && roiPlotData.byteLength >= 4 && (
+          {roiActive && showRoiPlot && roiPlotData && roiPlotData.byteLength >= 4 && (
             <Box sx={{ mt: `${SPACING.XS}px`, boxSizing: "border-box" }}>
               <canvas
                 ref={roiPlotCanvasRef}
@@ -4009,95 +4621,93 @@ function Show3D() {
           )}
           {/* Image Controls - Display / Histogram / Playback in one row, each
               spanning two control-row heights so the three blocks line up. */}
-          {showControls && (!hideDisplay || !hideHistogram || !hidePlayback) && (
+          {showControls && (
             <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, alignItems: "stretch", width: canvasW, boxSizing: "border-box", flexWrap: "wrap" }}>
-              {!hideDisplay && (
-                <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: "0 0 auto", justifyContent: "center", opacity: lockDisplay ? 0.5 : 1, pointerEvents: lockDisplay ? "none" : "auto" }}>
-                  {/* Row 1: Scale + Auto + Color */}
-                  <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Scale:</Typography>
-                    <Select disabled={lockDisplay} value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Intensity scale (linear or logarithmic)" }}>
-                      <MenuItem value="linear">Lin</MenuItem>
-                      <MenuItem value="log">Log</MenuItem>
-                    </Select>
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
-                    <Switch checked={autoContrast} onChange={(e) => {
-                      if (lockDisplay) return;
-                      const on = e.target.checked;
-                      setAutoContrast(on);
-                      if (on && imageHistogramData) {
-                        // ON → snap slider thumbs to actual percentile clip so slider shows what's rendered.
-                        const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, percentileLow, percentileHigh);
-                        const span = dataMax - dataMin;
-                        if (span > 0) {
-                          setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
-                          setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
-                        }
-                      } else {
-                        // OFF → reset slider to full range so user sees raw data.
-                        setImageVminPct(0);
-                        setImageVmaxPct(100);
+              <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: "0 0 auto", justifyContent: "center" }}>
+                {/* Row 1: Scale + Auto + Color */}
+                <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Scale:</Typography>
+                  <Select value={logScale ? "log" : "linear"} onChange={(e) => setLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Intensity scale (linear or logarithmic)" }}>
+                    <MenuItem value="linear">Lin</MenuItem>
+                    <MenuItem value="log">Log</MenuItem>
+                  </Select>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
+	                  <Switch checked={autoContrast} onChange={(e) => {
+	                    const on = e.target.checked;
+	                    setAutoContrast(on);
+	                    if (on && imageHistogramData) {
+	                      // ON → snap slider thumbs to actual percentile clip so slider shows what's rendered.
+	                      const cached = !logScale ? ensureLocalAutoRange(displaySliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
+	                      const { vmin: pmin, vmax: pmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh);
+	                      const span = dataMax - dataMin;
+                      if (span > 0) {
+                        setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
+                        setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
                       }
-                    }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
-                    <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
-                  </Box>
-                  {/* Row 2: Color + Smooth + Diff + zoom indicator */}
-                  <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Color:</Typography>
-                    <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} inputProps={{ "aria-label": "Image colormap" }}>
-                      {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
-                    </Select>
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Smooth:</Typography>
-                    <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
-                    <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Diff:</Typography>
-                    <Select disabled={lockDisplay} value={diffMode} onChange={(e) => setDiffMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Difference mode (off, previous frame, first frame)" }}>
-                      <MenuItem value="off">Off</MenuItem>
-                      <MenuItem value="previous">Prev</MenuItem>
-                      <MenuItem value="first">First</MenuItem>
-                    </Select>
-                    {/* zoom indicator moved onto the canvas overlay */}
-                  </Box>
+                    } else {
+                      // OFF → reset slider to full range so user sees raw data.
+                      setImageVminPct(0);
+                      setImageVmaxPct(100);
+                    }
+                  }} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
+                  <Switch checked={showColorbar} onChange={(e) => setShowColorbar(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
                 </Box>
-              )}
+                {/* Row 2: Color + Smooth + Diff + zoom indicator */}
+                <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Color:</Typography>
+                  <Select size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} inputProps={{ "aria-label": "Image colormap" }}>
+                    {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
+                  </Select>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Smooth:</Typography>
+                  <Switch checked={smooth} onChange={(e) => setSmooth(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Diff:</Typography>
+                  <Select value={diffMode} onChange={(e) => setDiffMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Difference mode (off, previous frame, first frame)" }}>
+                    <MenuItem value="off">Off</MenuItem>
+                    <MenuItem value="previous">Prev</MenuItem>
+                    <MenuItem value="first">First</MenuItem>
+                  </Select>
+                  {/* zoom indicator moved onto the canvas overlay */}
+                </Box>
+              </Box>
               {/* Playback: 2 rows side-by-side with Display + Histogram. */}
-              {!hidePlayback && (() => { const activeIdx = playing ? displaySliceIdx : sliceIdx; return (
-                <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, minWidth: 320, justifyContent: "center", opacity: lockPlayback ? 0.5 : 1, pointerEvents: lockPlayback ? "none" : "auto" }}>
+              {(() => { const activeIdx = displaySliceIdx; return (
+                <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, minWidth: 320, justifyContent: "center" }}>
                   <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Stack direction="row" spacing={0} sx={{ flexShrink: 0, mr: 0.5 }}>
-                      <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
+                      <IconButton size="small" onClick={() => { setReverse(true); setPlaying(true); }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
                         <FastRewindIcon sx={{ fontSize: 18 }} />
                       </IconButton>
-                      <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: themeColors.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
+                      <IconButton size="small" onClick={() => setPlaying(!playing)} sx={{ color: themeColors.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
                         {playing ? <PauseIcon sx={{ fontSize: 18 }} /> : <PlayArrowIcon sx={{ fontSize: 18 }} />}
                       </IconButton>
-                      <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
+                      <IconButton size="small" onClick={() => { setReverse(false); setPlaying(true); }} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
                         <FastForwardIcon sx={{ fontSize: 18 }} />
                       </IconButton>
-                      <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setPlaying(false); setSliceIdx(loop ? Math.max(0, loopStart) : 0); } }} sx={{ color: themeColors.textMuted, p: 0.25 }} aria-label="Stop and rewind to start" title="Stop">
+                      <IconButton size="small" onClick={() => { setPlaying(false); setSliceIdx(loop ? Math.max(0, loopStart) : 0); }} sx={{ color: themeColors.textMuted, p: 0.25 }} aria-label="Stop and rewind to start" title="Stop">
                         <StopIcon sx={{ fontSize: 16 }} />
                       </IconButton>
                     </Stack>
                     {loop ? (
-                      <Slider value={[loopStart, activeIdx, effectiveLoopEnd]} onChange={(_, v) => { if (lockPlayback) return; const vals = v as number[]; setLoopStart(vals[0]); if (playing) setPlaying(false); setSliceIdx(vals[1]); setLoopEnd(vals[2]); }} disabled={lockPlayback} disableSwap min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Loop range and current ${dimLabel.toLowerCase()} (frame ${activeIdx + 1} of ${nSlices}, loop ${loopStart + 1} to ${effectiveLoopEnd + 1})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-thumb[data-index='0']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-thumb[data-index='1']": { width: 12, height: 12 }, "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" }, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
+                      <Slider value={[loopStart, activeIdx, effectiveLoopEnd]} onChange={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); scrubToSlice(vals[1]); setLoopEnd(vals[2]); }} onChangeCommitted={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); commitSlice(vals[1]); setLoopEnd(vals[2]); }} disableSwap min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Loop range and current ${dimLabel.toLowerCase()} (frame ${activeIdx + 1} of ${nSlices}, loop ${loopStart + 1} to ${effectiveLoopEnd + 1})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-thumb[data-index='0']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-thumb[data-index='1']": { width: 12, height: 12 }, "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" }, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
                     ) : (
-                      <Slider value={activeIdx} onChange={(_, v) => { if (lockPlayback) return; if (playing) setPlaying(false); setSliceIdx(v as number); }} disabled={lockPlayback} min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Current ${dimLabel.toLowerCase()} (${activeIdx + 1} of ${nSlices})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" } }} />
+                      <Slider value={activeIdx} onChange={(_, v) => scrubToSlice(v as number)} onChangeCommitted={(_, v) => commitSlice(v as number)} min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Current ${dimLabel.toLowerCase()} (${activeIdx + 1} of ${nSlices})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" } }} />
                     )}
                     <Typography sx={{ ...typography.value, color: themeColors.textMuted, minWidth: `${String(nSlices).length * 2 + 2}ch`, textAlign: "right", flexShrink: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{hiddenSet.size ? `${activeIdx + 1}/${visibleCount} (${nSlices})` : `${activeIdx + 1}/${nSlices}`}</Typography>
                   </Box>
                   <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>fps</Typography>
-                    <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => { if (!lockPlayback) setFps(v as number); }} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
+                    <Slider value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Loop</Typography>
-                    <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
+                    <Switch size="small" checked={loop} onChange={() => setLoop(!loop)} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Bounce</Typography>
-                    <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce playback" }} />
+                    <Switch size="small" checked={boomerang} onChange={() => setBoomerang(!boomerang)} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce playback" }} />
                     <Box sx={{ flex: 1 }} />
                   </Box>
                 </Box>
               ); })()}
-              {!hideHistogram && (() => {
+              {(() => {
                 // Global stack range from Python (data_min/data_max trait), not per-frame.
                 // Log mode: log1p the range so bins line up with the log-scaled frame data.
                 const { min: histMin, max: histMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
@@ -4108,14 +4718,13 @@ function Show3D() {
                   // inner Slider thumbs from overflowing onto the canvas, which was
                   // the source of the "2.8 tooltip overlaps bars" overlap bug.
                   display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start", gap: 0.5,
-                  opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto",
                 }}>
                   <Histogram
                     data={imageHistogramData}
+                    bins={imageHistogramBins}
                     vminPct={imageVminPct}
                     vmaxPct={imageVmaxPct}
                     onRangeChange={(min, max) => {
-                      if (lockHistogram) return;
                       setImageVminPct(min);
                       setImageVmaxPct(max);
                       if (autoContrast) setAutoContrast(false);
@@ -4132,20 +4741,20 @@ function Show3D() {
             </Box>
           )}
           {/* Lens settings row (when Lens is active) */}
-          {!hideDisplay && showLens && (
+          {showLens && (
             <Box sx={{ mt: `${SPACING.XS}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, width: "fit-content" }}>
-              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, opacity: lockDisplay ? 0.5 : 1, pointerEvents: lockDisplay ? "none" : "auto" }}>
+              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                 <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Lens {lensMag}×</Typography>
-                <Slider disabled={lockDisplay} value={lensMag} min={2} max={8} step={1} onChange={(_, v) => setLensMag(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens magnification" valueLabelDisplay="auto" />
+                <Slider value={lensMag} min={2} max={8} step={1} onChange={(_, v) => setLensMag(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens magnification" valueLabelDisplay="auto" />
                 <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>{lensDisplaySize}px</Typography>
-                <Slider disabled={lockDisplay} value={lensDisplaySize} min={64} max={256} step={16} onChange={(_, v) => setLensDisplaySize(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens display size in pixels" valueLabelDisplay="auto" />
+                <Slider value={lensDisplaySize} min={64} max={256} step={16} onChange={(_, v) => setLensDisplaySize(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35 }} aria-label="Lens display size in pixels" valueLabelDisplay="auto" />
               </Box>
             </Box>
           )}
           {/* ROI settings row (when ROI is active) */}
-          {!hideRoi && roiActive && (
+          {roiActive && (
             <Box sx={{ mt: `${SPACING.XS}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, width: "fit-content" }}>
-              <Box sx={{ border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, px: 1, py: 0.5, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, opacity: lockRoi ? 0.5 : 1, pointerEvents: lockRoi ? "none" : "auto" }}>
+              <Box sx={{ border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg, px: 1, py: 0.5, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px` }}>
                 {/* ROI: shape + add/duplicate + plot + dim */}
                 <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>ROI:</Typography>
@@ -4258,28 +4867,24 @@ function Show3D() {
               <Typography sx={{ ...typography.label, color: themeColors.accentGreen }}>
                 Preview{previewCropDims ? ` (${previewCropDims.w}\u00d7${previewCropDims.h})` : ""}
               </Typography>
-              {!hideView && (
-                <Button size="small" sx={compactButton} disabled={lockView || (previewZoom.zoom === 1 && previewZoom.panX === 0 && previewZoom.panY === 0)} onClick={handlePreviewDoubleClick} aria-label="Reset preview zoom and pan">Reset</Button>
-              )}
+              <Button size="small" sx={compactButton} disabled={previewZoom.zoom === 1 && previewZoom.panX === 0 && previewZoom.panY === 0} onClick={handlePreviewDoubleClick} aria-label="Reset preview zoom and pan">Reset</Button>
             </Stack>
             <Box
               ref={previewContainerRef}
-              sx={{ position: "relative", bgcolor: "#000", border: `1px solid ${themeColors.border}`, cursor: lockView ? "default" : "grab", width: previewCanvasDims.w, height: previewCanvasDims.h }}
-              onWheel={lockView ? undefined : handlePreviewWheel}
-              onDoubleClick={lockView ? undefined : handlePreviewDoubleClick}
-              onMouseDown={lockView ? undefined : handlePreviewMouseDown}
-              onMouseMove={lockView ? undefined : handlePreviewMouseMove}
+              sx={{ position: "relative", bgcolor: "#000", border: `1px solid ${themeColors.border}`, cursor: "grab", width: previewCanvasDims.w, height: previewCanvasDims.h }}
+              onWheel={handlePreviewWheel}
+              onDoubleClick={handlePreviewDoubleClick}
+              onMouseDown={handlePreviewMouseDown}
+              onMouseMove={handlePreviewMouseMove}
               onMouseUp={handlePreviewMouseUp}
               onMouseLeave={handlePreviewMouseUp}
             >
               <canvas ref={previewCanvasRef} width={previewCanvasDims.w} height={previewCanvasDims.h} style={{ width: previewCanvasDims.w, height: previewCanvasDims.h, imageRendering: "pixelated" }} role="img" aria-label={`ROI preview crop${previewCropDims ? ` (${previewCropDims.w} by ${previewCropDims.h} pixels)` : ""}`} />
               <canvas ref={previewOverlayRef} width={Math.round(previewCanvasDims.w * DPR)} height={Math.round(previewCanvasDims.h * DPR)} style={{ position: "absolute", top: 0, left: 0, width: previewCanvasDims.w, height: previewCanvasDims.h, pointerEvents: "none" }} aria-hidden="true" />
-              {!hideView && (
-                <Box onMouseDown={handleMainResizeStart} sx={{ position: "absolute", bottom: 0, right: 0, width: 28, height: 28, cursor: lockView ? "default" : "nwse-resize", opacity: lockView ? 0.4 : 0.95, pointerEvents: lockView ? "none" : "auto", background: `linear-gradient(135deg, transparent 50%, ${themeColors.border} 50%)`, "&:hover": { opacity: lockView ? 0.4 : 1 } }} />
-              )}
+              <Box onMouseDown={handleMainResizeStart} sx={{ position: "absolute", bottom: 0, right: 0, width: 28, height: 28, cursor: "nwse-resize", opacity: 0.95, background: `linear-gradient(135deg, transparent 50%, ${themeColors.border} 50%)`, "&:hover": { opacity: 1 } }} />
             </Box>
             {/* All-ROI Stats - one row per ROI, same style as main stats bar */}
-            {!hideStats && showStats && allRoiStats.length > 0 && (
+            {showStats && allRoiStats.length > 0 && (
               <Box sx={{ mt: `${SPACING.XS}px`, display: "flex", flexDirection: "column", gap: 0.5, width: previewCanvasDims.w }}>
                 {allRoiStats.map((stats, i) => {
                   if (!stats) return null;
@@ -4312,27 +4917,25 @@ function Show3D() {
                   ROI FFT ({fftCropDims.cropWidth}&times;{fftCropDims.cropHeight})
                 </Typography>
               ) : <Box />}
-              {!hideView && (
-                <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsReset} onClick={handleFftReset} aria-label="Reset FFT zoom and pan">Reset</Button>
-              )}
+              <Button size="small" sx={compactButton} disabled={!fftNeedsReset} onClick={handleFftReset} aria-label="Reset FFT zoom and pan">Reset</Button>
             </Stack>
             {/* FFT Canvas - same size as main image */}
             <Box
               ref={fftContainerRef}
-              sx={{ ...container.imageBox, width: canvasW, height: canvasH, cursor: lockView ? "default" : "grab" }}
-              onMouseDown={lockView ? undefined : handleFftMouseDown}
-              onMouseMove={lockView ? undefined : handleFftMouseMove}
-              onMouseUp={lockView ? undefined : handleFftMouseUp}
+              sx={{ ...container.imageBox, width: canvasW, height: canvasH, cursor: "grab" }}
+              onMouseDown={handleFftMouseDown}
+              onMouseMove={handleFftMouseMove}
+              onMouseUp={handleFftMouseUp}
               onMouseLeave={() => { fftClickStartRef.current = null; setIsFftDragging(false); setFftPanStart(null); }}
-              onWheel={lockView ? undefined : handleFftWheel}
-              onDoubleClick={lockView ? undefined : handleFftReset}
+              onWheel={handleFftWheel}
+              onDoubleClick={handleFftReset}
             >
               <canvas ref={fftCanvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={roiFftActive && fftCropDims ? `FFT power spectrum of ROI crop (${fftCropDims.cropWidth} by ${fftCropDims.cropHeight} pixels)` : "FFT power spectrum of current frame"} />
               <canvas ref={fftOverlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             </Box>
             {/* FFT Statistics bar */}
-            {showStats && !hideStats && (
-              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", gap: 2, flexWrap: "wrap", opacity: lockStats ? 0.7 : 1 }}>
+            {showStats && (
+              <Box sx={{ mt: 0.5, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, display: "flex", gap: 2, flexWrap: "wrap" }}>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(fftStats.mean)}</Box></Typography>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(fftStats.min)}</Box></Typography>
                 <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatNumber(fftStats.max)}</Box></Typography>
@@ -4354,49 +4957,47 @@ function Show3D() {
             {/* FFT Controls - two rows with histogram on right (like Show4DSTEM) */}
             {showControls && <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, width: canvasW, boxSizing: "border-box" }}>
               {/* Left: two rows of controls */}
-              <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center", opacity: lockDisplay ? 0.5 : 1, pointerEvents: lockDisplay ? "none" : "auto" }}>
+              <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
                 {/* Row 1: Scale + Auto */}
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Scale:</Typography>
-                  <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
+                  <Select value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
                     <MenuItem value="linear">Lin</MenuItem>
                     <MenuItem value="log">Log</MenuItem>
                   </Select>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
-                  <Switch checked={fftAuto} onChange={(e) => { if (!lockDisplay) setFftAuto(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
+                  <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
                   {roiFftActive && fftCropDims && (
                     <>
                       <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Win:</Typography>
-                      <Switch checked={fftWindow} onChange={(e) => { if (!lockDisplay) setFftWindow(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle Hann windowing before FFT" }} />
+                      <Switch checked={fftWindow} onChange={(e) => setFftWindow(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle Hann windowing before FFT" }} />
                     </>
                   )}
                 </Box>
                 {/* Row 2: Color + Colorbar */}
                 <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Color:</Typography>
-                  <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
+                  <Select value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
                     {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                   </Select>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
-                  <Switch checked={fftShowColorbar} onChange={(e) => { if (!lockDisplay) setFftShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT colorbar overlay" }} />
+                  <Switch checked={fftShowColorbar} onChange={(e) => setFftShowColorbar(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT colorbar overlay" }} />
                 </Box>
               </Box>
               {/* Right: Histogram spanning both rows */}
-              {!hideHistogram && (
-                <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto" }}>
-                  <Histogram
-                    data={fftHistogramData}
-                    vminPct={fftVminPct}
-                    vmaxPct={fftVmaxPct}
-                    onRangeChange={(min, max) => { if (!lockHistogram) { setFftVminPct(min); setFftVmaxPct(max); } }}
-                    width={110}
-                    height={58}
-                    theme={themeInfo.theme}
-                    dataMin={fftDataRange.min}
-                    dataMax={fftDataRange.max}
-                  />
-                </Box>
-              )}
+              <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
+                <Histogram
+                  data={fftHistogramData}
+                  vminPct={fftVminPct}
+                  vmaxPct={fftVmaxPct}
+                  onRangeChange={(min, max) => { setFftVminPct(min); setFftVmaxPct(max); }}
+                  width={110}
+                  height={58}
+                  theme={themeInfo.theme}
+                  dataMin={fftDataRange.min}
+                  dataMax={fftDataRange.max}
+                />
+              </Box>
             </Box>}
           </Box>
         )}

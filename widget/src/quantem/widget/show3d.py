@@ -5,10 +5,21 @@ For viewing a stack of 2D images (e.g., defocus sweep, time series, z-stack, mov
 Includes playback controls, statistics, ROI selection, FFT, and more.
 """
 
+import csv
 import gc
+import http.server
+import io
 import json
+import math
 import pathlib
+import secrets
 import sys
+import threading
+import time
+import urllib.parse
+import warnings
+import weakref
+import zipfile
 from enum import Enum
 from typing import Self
 
@@ -72,22 +83,53 @@ _VALID_CMAPS = frozenset({
     "cividis", "RdBu", "RdBu_r", "seismic", "twilight", "twilight_shifted",
 })
 
+# Keep a single synced playback chunk small enough for the Jupyter/AnyWidget
+# Comm path to survive. The data is still exact float32; large stacks move as
+# sliding windows instead of browser-hostile 256 MB+ messages.
+_MAX_PLAYBACK_CHUNK_BYTES = 128 * 1024 * 1024
+
+
+class _Show3DFrameHTTPServer(http.server.ThreadingHTTPServer):
+    """Tiny localhost server for exact float32 frame reads."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
 
 class Show3D(anywidget.AnyWidget):
     """
-    Interactive 3D stack viewer with advanced features for electron microscopy.
+    Interactive 3D stack viewer for sequential 2D images.
 
-    View a stack of 2D images along a specific dimension (e.g., defocus sweep,
-    time series, depth stack, in-situ movies). Includes playback controls,
-    statistics panel, ROI selection, FFT view, and more.
+    Renders an (N, H, W) stack through a WebGPU canvas (CPU fallback when WebGPU
+    is unavailable) with a sliding prefetch buffer for smooth playback. The full
+    stack is held once on the Python side; scrubbing and playback ship individual
+    frames or chunks over the Jupyter Comm channel. Common use cases: defocus
+    sweep, time series, depth stack, in-situ movie, side-by-side trial comparison.
+
+    Features
+    --------
+    - Interactive scrubber + ``play`` / ``pause`` / ``stop`` / ``goto`` with bookmark and loop range
+    - Per-frame statistics, log scale, percentile auto-contrast, manual vmin/vmax
+    - Diff mode (vs first frame or vs previous frame) for delta visualization
+    - ROI tools (circle / square / rectangle / annular) with per-frame timeseries
+    - Line profiles sampled across the full stack
+    - FFT panel with optional Hann window
+    - Side-by-side multi-panel mode with linked or independent zoom / pan / contrast
+    - Frame hiding (``hide``, ``show``, ``set_hidden``, ``show_all``) without rebuilding
+    - PNG / PDF / TIFF single-frame export, GIF and ZIP stack export
+    - JSON state save/load via ``state_dict`` / ``load_state_dict`` / ``save``
+    - Explicit ``free`` to release VRAM/RAM held by traitlets observers
 
     Parameters
     ----------
     data : array_like
         3D array of shape (N, height, width) where N is the stack dimension.
-    labels : list of str, optional
-        Labels for each slice (e.g., ["C10=-500nm", "C10=-400nm", ...]).
-        If None, uses slice indices.
+        Also accepts a 2D array (treated as a single-frame stack), a torch
+        tensor (CPU or GPU, any dtype), or a quantem ``Dataset3d``. Complex
+        input is rejected; cast to magnitude or phase first.
+    labels : list[str] | None, optional
+        Labels for each slice (e.g., ``["C10=-500nm", "C10=-400nm", ...]``).
+        If ``None``, uses string slice indices.
     title : str, optional
         Title to display above the image.
     cmap : str or Colormap, default Colormap.MAGMA
@@ -143,7 +185,6 @@ class Show3D(anywidget.AnyWidget):
         Draw the ``1.0×`` zoom readout at the bottom-left of every panel.
         Set ``False`` for clean static layouts or when the scale bar alone
         is enough to communicate scale.
-
     Attributes
     ----------
     render_total_ms : int or None
@@ -158,21 +199,31 @@ class Show3D(anywidget.AnyWidget):
         Subset covering everything after Python returns: Comm transfer, JS
         decode, colormap, and canvas paint.
 
-    Examples
-    --------
+    Example
+    -------
+    Instantiate Show3D with a stack of 2D images, drive playback, and persist
+    the display state to disk:
+
     >>> import numpy as np
     >>> from quantem.widget import Show3D
-    >>>
-    >>> # View defocus sweep
-    >>> labels = [f"C10={c10:.0f}nm" for c10 in np.linspace(-500, -200, 12)]
-    >>> Show3D(stack, labels=labels, title="Defocus Sweep")
-    >>>
-    >>> # View in-situ movie with timestamps
-    >>> times = np.arange(100) * 0.1  # 100 frames at 10 fps
-    >>> Show3D(movie, timestamps=times, timestamp_unit="s", fps=30)
-    >>>
-    >>> # With scale bar
-    >>> Show3D(data, pixel_size=0.5, title="HRTEM")
+    >>> stack = np.random.rand(12, 256, 256).astype(np.float32)
+    >>> labels = [f"C10={c:.0f}nm" for c in np.linspace(-500, -200, 12)]
+    >>> w = Show3D(stack, labels=labels, title="Defocus Sweep", pixel_size=0.5)
+    >>> w.play()  # doctest: +SKIP
+    >>> w.goto(3)  # doctest: +SKIP
+    >>> w.save("show3d_state.json")  # doctest: +SKIP
+
+    Notes
+    -----
+    - The stack is loaded once into ``self._data`` (``float32``); ``set_image``
+      replaces the data without rebuilding the widget.
+    - When the stack is large (>32 MB per frame), an internal display copy is
+      binned for faster scrubbing; full-resolution data is kept for stats,
+      ROIs, FFT, profiles, and image export.
+    - Multi-panel mode is auto-detected from input shape and configured via
+      ``n_panels``, ``panel_titles``, and the ``link_*`` traits.
+    - Call ``free()`` before discarding the widget; ``del`` alone will not
+      release VRAM because traitlets observers pin the refcount.
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "show3d.js"
@@ -206,7 +257,12 @@ class Show3D(anywidget.AnyWidget):
     # Multi-Panel (side-by-side stacks, independent zoom by default with optional link)
     n_panels = traitlets.Int(1).tag(sync=True)
     panel_titles = traitlets.List(traitlets.Unicode()).tag(sync=True)
-    panel_width_px = traitlets.Int(0)  # Python-only: JS infers panel width from frame width / n_panels
+    panel_width_px = traitlets.Int(0).tag(sync=True)
+    shared_panel_source = traitlets.Bool(False).tag(sync=True)
+    # Per-panel "best frame" marker. One int per panel; -1 = unset. Used to flag
+    # the user's preferred iteration / trial / focal slice without losing the
+    # full stack. JS draws a gold star top-right of each panel when set.
+    starred = traitlets.List(traitlets.Int()).tag(sync=True)
     # Real frame count per panel for stack comparison: stacks of different
     # lengths get auto-padded to the longest; this trait lets JS mark
     # "end-of-stack" frames (frame idx >= real[panel]). Empty = all real.
@@ -270,6 +326,8 @@ class Show3D(anywidget.AnyWidget):
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
     data_min = traitlets.Float(0.0).tag(sync=True)
     data_max = traitlets.Float(0.0).tag(sync=True)
+    auto_vmins = traitlets.List(traitlets.Float()).tag(sync=True)
+    auto_vmaxs = traitlets.List(traitlets.Float()).tag(sync=True)
 
     # =========================================================================
     # Scale Bar
@@ -296,7 +354,9 @@ class Show3D(anywidget.AnyWidget):
     roi_active = traitlets.Bool(False).tag(sync=True)
     roi_list = traitlets.List([]).tag(sync=True)
     roi_selected_idx = traitlets.Int(-1).tag(sync=True)
-    roi_stats = traitlets.Dict({}).tag(sync=True)
+    # roi_stats: Python-only readout. JS computes its own ROI stats locally
+    # (allRoiStats useMemo in index.tsx), so don't ship over Comm every ROI move.
+    roi_stats = traitlets.Dict({})
     roi_plot_data = traitlets.Bytes(b"").tag(sync=True)
     # =========================================================================
     # Sizing
@@ -339,6 +399,8 @@ class Show3D(anywidget.AnyWidget):
     _buffer_start = traitlets.Int(0).tag(sync=True)
     _buffer_count = traitlets.Int(0).tag(sync=True)
     _prefetch_request = traitlets.Int(-1).tag(sync=True)
+    frame_server_url = traitlets.Unicode("").tag(sync=True)
+    frame_server_version = traitlets.Int(0).tag(sync=True)
 
     # Render-time telemetry (set after first browser paint; docstring promises these).
     render_total_ms = traitlets.Int(allow_none=True, default_value=None)
@@ -348,7 +410,8 @@ class Show3D(anywidget.AnyWidget):
     _VALID_DIFF_MODES = {"off", "previous", "first"}
 
     @traitlets.validate("diff_mode")
-    def _validate_diff_mode(self, proposal):
+    def _validate_diff_mode(self, proposal: dict) -> str:
+        """Reject unknown diff modes; only off/previous/first are renderable."""
         val = proposal["value"]
         if val not in self._VALID_DIFF_MODES:
             raise traitlets.TraitError(
@@ -357,16 +420,16 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("playback_path")
-    def _validate_playback_path(self, proposal):
+    def _validate_playback_path(self, proposal: dict) -> list:
+        """Wrap indices into [0, n_slices) to keep JS in bounds."""
         # Wrap indices to [0, n_slices) so JS never indexes out of bounds.
-        # Direct trait assignment was raw; wrap here so JS never indexes OOB.
         val = list(proposal["value"])
         n = max(1, int(self.n_slices))
         return [int(i) % n for i in val]
 
     @traitlets.validate("vmax")
-    def _validate_vmax_ge_vmin(self, proposal):
-        import math
+    def _validate_vmax_ge_vmin(self, proposal: dict) -> float | None:
+        """Reject non-finite vmax and enforce vmax >= vmin."""
         new_vmax = proposal["value"]
         if new_vmax is not None:
             if not math.isfinite(new_vmax):
@@ -378,8 +441,8 @@ class Show3D(anywidget.AnyWidget):
         return new_vmax
 
     @traitlets.validate("vmin")
-    def _validate_vmin_le_vmax(self, proposal):
-        import math
+    def _validate_vmin_le_vmax(self, proposal: dict) -> float | None:
+        """Reject non-finite vmin and enforce vmin <= vmax."""
         new_vmin = proposal["value"]
         if new_vmin is not None:
             if not math.isfinite(new_vmin):
@@ -391,7 +454,8 @@ class Show3D(anywidget.AnyWidget):
         return new_vmin
 
     @traitlets.validate("cmap")
-    def _validate_cmap(self, proposal):
+    def _validate_cmap(self, proposal: dict) -> str:
+        """Reject unknown colormap names."""
         val = str(proposal["value"])
         if val not in _VALID_CMAPS:
             raise traitlets.TraitError(
@@ -400,14 +464,16 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("bookmarked_frames")
-    def _validate_bookmarks(self, proposal):
+    def _validate_bookmarks(self, proposal: dict) -> list:
+        """Drop bookmark indices outside [0, n_slices) so markers stay onscreen."""
         # Drop indices outside [0, n_slices). JS draws bookmark markers and
         # raw out-of-range values caused offscreen / negative positions.
         n = max(1, int(self.n_slices))
         return [int(i) for i in proposal["value"] if 0 <= int(i) < n]
 
     @traitlets.validate("loop_end")
-    def _validate_loop_end(self, proposal):
+    def _validate_loop_end(self, proposal: dict) -> int:
+        """Clamp to [0, n_slices) and enforce loop_end >= loop_start (-1 = last)."""
         # -1 sentinel = "last frame". Otherwise must be >= loop_start.
         val = int(proposal["value"])
         if val < 0:
@@ -421,7 +487,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("loop_start")
-    def _validate_loop_start(self, proposal):
+    def _validate_loop_start(self, proposal: dict) -> int:
+        """Clamp to [0, n_slices) and enforce loop_start <= loop_end."""
         val = int(proposal["value"])
         n = max(1, int(self.n_slices))
         val = max(0, min(val, n - 1))
@@ -433,9 +500,9 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("pixel_size")
-    def _validate_pixel_size(self, proposal):
+    def _validate_pixel_size(self, proposal: dict) -> float:
+        """Reject non-finite or negative pixel sizes."""
         val = float(proposal["value"])
-        import math
         if math.isnan(val) or math.isinf(val):
             raise traitlets.TraitError(f"pixel_size must be finite, got {val}")
         if val < 0:
@@ -443,7 +510,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("labels")
-    def _validate_labels(self, proposal):
+    def _validate_labels(self, proposal: dict) -> list:
+        """Require labels length to match n_slices or be empty."""
         # Length must match n_slices; mismatch caused IndexError in ZIP export.
         val = list(proposal["value"])
         if val and len(val) != int(self.n_slices):
@@ -453,7 +521,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("timestamps")
-    def _validate_timestamps(self, proposal):
+    def _validate_timestamps(self, proposal: dict) -> list:
+        """Require timestamps length to match n_slices or be empty."""
         # Empty list = no timestamps. Otherwise length must match n_slices.
         val = list(proposal["value"])
         if val and len(val) != int(self.n_slices):
@@ -463,7 +532,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("panel_titles")
-    def _validate_panel_titles(self, proposal):
+    def _validate_panel_titles(self, proposal: dict) -> list:
+        """Require panel_titles length to match n_panels or be empty."""
         # Empty list = default per-panel labels. Otherwise must match n_panels.
         val = list(proposal["value"])
         if val and len(val) != int(self.n_panels):
@@ -472,9 +542,29 @@ class Show3D(anywidget.AnyWidget):
             )
         return val
 
+    @traitlets.validate("starred")
+    def _validate_starred(self, proposal: dict) -> list:
+        """Require `starred` length to match n_panels. Each entry is a frame
+        index in [-1, n_slices); -1 means no star on that panel."""
+        val = list(proposal["value"])
+        n_pan = int(self.n_panels)
+        if not val:
+            return [-1] * n_pan
+        if len(val) != n_pan:
+            raise traitlets.TraitError(
+                f"starred length ({len(val)}) must equal n_panels ({n_pan})"
+            )
+        n_sl = int(self.n_slices)
+        for i, v in enumerate(val):
+            if v != -1 and not (0 <= v < n_sl):
+                raise traitlets.TraitError(
+                    f"starred[{i}] = {v} out of range [-1, {n_sl})"
+                )
+        return val
+
     @traitlets.validate("fps")
-    def _validate_fps(self, proposal):
-        import math
+    def _validate_fps(self, proposal: dict) -> float:
+        """Reject non-finite or non-positive fps."""
         val = float(proposal["value"])
         if not math.isfinite(val):
             raise traitlets.TraitError(f"fps must be finite, got {val}")
@@ -483,7 +573,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("slice_idx")
-    def _validate_slice_idx(self, proposal):
+    def _validate_slice_idx(self, proposal: dict) -> int:
+        """Clamp to [0, n_slices) so stale indices don't IndexError on reload."""
         # Clamp to [0, n_slices). State load with stale index used to crash
         # _update_all → _data[idx] with IndexError on a smaller new stack.
         val = int(proposal["value"])
@@ -491,14 +582,16 @@ class Show3D(anywidget.AnyWidget):
         return max(0, min(val, n - 1))
 
     @traitlets.validate("profile_width")
-    def _validate_profile_width(self, proposal):
+    def _validate_profile_width(self, proposal: dict) -> int:
+        """Reject profile widths < 1."""
         val = int(proposal["value"])
         if val < 1:
             raise traitlets.TraitError(f"profile_width must be >= 1, got {val}")
         return val
 
     @traitlets.validate("percentile_low")
-    def _validate_percentile_low(self, proposal):
+    def _validate_percentile_low(self, proposal: dict) -> float:
+        """Require percentile_low in [0, 100] and strictly < percentile_high."""
         val = float(proposal["value"])
         if not 0 <= val <= 100:
             raise traitlets.TraitError(f"percentile_low must be in [0, 100], got {val}")
@@ -509,7 +602,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("percentile_high")
-    def _validate_percentile_high(self, proposal):
+    def _validate_percentile_high(self, proposal: dict) -> float:
+        """Require percentile_high in [0, 100] and strictly > percentile_low."""
         val = float(proposal["value"])
         if not 0 <= val <= 100:
             raise traitlets.TraitError(f"percentile_high must be in [0, 100], got {val}")
@@ -520,7 +614,8 @@ class Show3D(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("roi_selected_idx")
-    def _validate_roi_selected_idx(self, proposal):
+    def _validate_roi_selected_idx(self, proposal: dict) -> int:
+        """Clamp to [0, len(roi_list)) or -1 for nothing selected."""
         # -1 = nothing selected. Otherwise clamp to [0, len(roi_list))
         # so JS doesn't index OOB and Python stats don't silently return {}.
         val = int(proposal["value"])
@@ -531,7 +626,8 @@ class Show3D(anywidget.AnyWidget):
     _VALID_ROI_SHAPES = {"circle", "square", "rectangle", "annular"}
 
     @traitlets.validate("roi_list")
-    def _validate_roi_list(self, proposal):
+    def _validate_roi_list(self, proposal: dict) -> list:
+        """Reject unknown ROI shapes and non-numeric or negative geometry fields."""
         # Reject unknown shapes (used to silently fall back to circle).
         # Clamp negative radii / dims to 1 so stats reflect what user sees.
         val = list(proposal["value"])
@@ -545,13 +641,18 @@ class Show3D(anywidget.AnyWidget):
             for k in ("radius", "radius_inner", "width", "height"):
                 if k in r and r[k] is not None:
                     try:
-                        if float(r[k]) < 0:
-                            raise traitlets.TraitError(
-                                f"ROI {i}: {k} must be >= 0, got {r[k]}"
-                            )
+                        v = float(r[k])
                     except (TypeError, ValueError):
-                        pass
+                        raise traitlets.TraitError(
+                            f"ROI {i}: {k}={r[k]!r} is not a number"
+                        )
+                    if v < 0:
+                        raise traitlets.TraitError(
+                            f"ROI {i}: {k} must be >= 0, got {r[k]}"
+                        )
         return val
+
+    # === Construction ===
 
     def __init__(
         self,
@@ -607,7 +708,6 @@ class Show3D(anywidget.AnyWidget):
             kwargs["show_resize_handles"] = bool(show_resize_handles)
         if show_zoom_indicator is not None:
             kwargs["show_zoom_indicator"] = bool(show_zoom_indicator)
-        import time
         _t0 = time.perf_counter()
         # Reject unknown kwargs so typos raise instead of being silently ignored.
         _reject_unknown_kwargs(type(self), kwargs)
@@ -632,17 +732,29 @@ class Show3D(anywidget.AnyWidget):
                             size=size,
                             diff_mode=diff_mode, buffer_size=buffer_size,
                             dim_label=dim_label, use_torch=use_torch, device=device,
-                            display_bin=display_bin, state=state, _t0=_t0)
+                            display_bin=display_bin,
+                            state=state, _t0=_t0)
 
-    def _init_sync(self, data_args, *, labels, panel_titles, title, cmap, vmin, vmax,
-                   pixel_size, pixel_unit, smooth, image_rotation,
-                   log_scale, auto_contrast, percentile_low, percentile_high,
-                   fps, timestamps, timestamp_unit, show_fft, fft_window, show_playback,
-                   show_stats, show_controls, size,
-                   diff_mode, buffer_size, dim_label, use_torch, device, display_bin,
-                   state, _t0):
-        import time
+    def _init_sync(self, data_args: tuple, *, labels: list[str] | None,
+                   panel_titles: list[str] | None, title: str,
+                   cmap: str | Colormap, vmin: float | None, vmax: float | None,
+                   pixel_size: float, pixel_unit: str, smooth: bool, image_rotation: int,
+                   log_scale: bool, auto_contrast: bool, percentile_low: float,
+                   percentile_high: float, fps: float, timestamps: list[float] | None,
+                   timestamp_unit: str, show_fft: bool, fft_window: bool,
+                   show_playback: bool, show_stats: bool, show_controls: bool,
+                   size: int, diff_mode: str, buffer_size: int, dim_label: str,
+                   use_torch: bool | None, device: str | None,
+                   display_bin: int | str,
+                   state: dict | str | pathlib.Path | None, _t0: float) -> None:
+        """Heavy setup called synchronously by `__init__` inside `hold_sync()`.
+        Validates panels, allocates frame_bytes, wires observers, and applies
+        optional `state`. Split out from `__init__` so the construction surface
+        reads as a clean kwargs list while the heavy work has its own scope."""
         self.widget_version = resolve_widget_version()
+        self._frame_server = None
+        self._frame_server_thread = None
+        self._frame_server_token = secrets.token_urlsafe(18)
 
         # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
         # merely because CUDA/MPS exists: real multi-panel ptycho stacks can be
@@ -726,8 +838,18 @@ class Show3D(anywidget.AnyWidget):
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
             )
 
-        # Multi-panel: convert remaining args, validate shapes, concatenate
+        # Multi-panel: convert remaining args, validate shapes, concatenate.
+        # If the caller repeats the same stack object across panels, keep the
+        # data once and let JS draw that exact frame into multiple panel slots.
+        # This is the "36 full-res frames across 9 panels" stress case: no
+        # pre-binning, no 9x Python copy, no 604 MB synthetic browser frame.
         if len(data_args) > 1:
+            def _raw_array_obj(obj):
+                return obj.array if hasattr(obj, "array") else obj
+
+            first_source_obj = _raw_array_obj(data_args[0])
+            shared_source = all(_raw_array_obj(extra) is first_source_obj for extra in data_args[1:])
+
             def _sample_is_finite(arr: np.ndarray) -> bool:
                 return _all_finite(arr)
 
@@ -746,83 +868,104 @@ class Show3D(anywidget.AnyWidget):
                     )
                 return arr32
 
-            # copy=False avoids a redundant 120 MB+ allocation per panel when
-            # the user already passed float32 (the common case for ptycho recons).
-            panels = [_as_valid_panel(data, "Panel 0")]
-            for i, extra in enumerate(data_args[1:], 1):
-                if hasattr(extra, "array"):
-                    extra = extra.array
-                arr = to_numpy(extra)
-                if arr.ndim == 2:
-                    arr = arr[None, ...]
-                if arr.ndim != 3:
-                    raise ValueError(f"Panel {i}: expected 3D array, got {arr.ndim}D")
-                if 0 in arr.shape:
-                    raise ValueError(f"Panel {i}: empty stack shape {arr.shape}. All dims must be >= 1.")
-                if np.iscomplexobj(arr):
-                    raise TypeError(
-                        f"Panel {i}: complex data not accepted. Convert first: "
-                        "np.abs(arr) for magnitude or np.angle(arr) for phase."
-                    )
-                # Image (H,W) must match across panels - viewer cannot composite
-                # different image sizes into one canvas.
-                if arr.shape[1:] != panels[0].shape[1:]:
-                    raise ValueError(
-                        f"Panel {i} image shape {arr.shape[1:]} must match panel 0 image shape {panels[0].shape[1:]}."
-                    )
-                # Slice counts can differ - caller compares trials with different
-                # iteration counts. We auto-pad shorter stacks below.
-                panels.append(_as_valid_panel(arr, f"Panel {i}"))
-            self.n_panels = len(panels)
+            self.n_panels = len(data_args)
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
             else:
-                self.panel_titles = [f"Panel {i+1}" for i in range(len(panels))]
-            # Auto-pad short stacks to longest, auto-fill panel_real_frames so
-            # JS marks end-of-stack frames. Pad by repeating each panel's last
-            # frame - visually obvious vs zeros and keeps colormap range stable.
-            real_n = [p.shape[0] for p in panels]
-            max_n = max(real_n)
-            if any(n != max_n for n in real_n):
-                padded = []
-                for p, n in zip(panels, real_n):
-                    if n == max_n:
-                        padded.append(p)
-                    else:
-                        last = p[-1:]
-                        pad = np.broadcast_to(last, (max_n - n, *p.shape[1:]))
-                        padded.append(np.concatenate([p, pad], axis=0))
-                panels = padded
-                if not self.panel_real_frames:
-                    self.panel_real_frames = real_n
-            # NEVER BIN (CLAUDE.md rule). Operator wants full source resolution
-            # on every multi-panel surface - pixel-exact for microscopy.
-            # Memory: bumped JS-side buffer cap (see _buffer_size logic) so
-            # 10 panels × 1366² × 4B fits.
-            panel_bin = 1
-            orig_h = panels[0].shape[1]
-            normalized = []
-            for p in panels:
-                if p.size > 10_000_000:
-                    sample = p.flat[::max(1, p.size // 1_000_000)]
-                    p2, p98 = np.percentile(sample, [2, 98])
-                else:
-                    p2, p98 = np.percentile(p, [2, 98])
-                rng_inv = np.float32(1.0 / max(p98 - p2, 1e-10))
-                normalized.append((p - np.float32(p2)) * rng_inv)
+                self.panel_titles = [f"Panel {i+1}" for i in range(self.n_panels)]
+            self.starred = [-1] * self.n_panels
 
-            # Concatenate panels back-to-back. JS paints clean bg-color gaps
-            # between them at render time (so the gap matches the page theme
-            # instead of becoming colormap[0]).
-            data = np.concatenate(normalized, axis=2)
-            self._panel_width = panels[0].shape[2]
-            self.panel_width_px = self._panel_width
-            self._multi_panel_bin = panel_bin
+            if shared_source:
+                _as_valid_panel(data, "Panel 0")
+                self.shared_panel_source = True
+                self.panel_width_px = int(data.shape[2])
+                self._panel_width = self.panel_width_px
+                self._multi_panel_bin = 0
+                if not self.panel_real_frames:
+                    self.panel_real_frames = [int(data.shape[0])] * self.n_panels
+            else:
+                self.shared_panel_source = False
+                # copy=False avoids a redundant 120 MB+ allocation per panel when
+                # the user already passed float32 (the common case for ptycho recons).
+                panels = [_as_valid_panel(data, "Panel 0")]
+                for i, extra in enumerate(data_args[1:], 1):
+                    if hasattr(extra, "array"):
+                        extra = extra.array
+                    arr = to_numpy(extra)
+                    if arr.ndim == 2:
+                        arr = arr[None, ...]
+                    if arr.ndim != 3:
+                        raise ValueError(f"Panel {i}: expected 3D array, got {arr.ndim}D")
+                    if 0 in arr.shape:
+                        raise ValueError(f"Panel {i}: empty stack shape {arr.shape}. All dims must be >= 1.")
+                    if np.iscomplexobj(arr):
+                        raise TypeError(
+                            f"Panel {i}: complex data not accepted. Convert first: "
+                            "np.abs(arr) for magnitude or np.angle(arr) for phase."
+                        )
+                    # Image (H,W) must match across panels - viewer cannot composite
+                    # different image sizes into one canvas.
+                    if arr.shape[1:] != panels[0].shape[1:]:
+                        raise ValueError(
+                            f"Panel {i} image shape {arr.shape[1:]} must match panel 0 image shape {panels[0].shape[1:]}."
+                        )
+                    # Slice counts can differ - caller compares trials with different
+                    # iteration counts. We auto-pad shorter stacks below.
+                    panels.append(_as_valid_panel(arr, f"Panel {i}"))
+                self.n_panels = len(panels)
+                # Auto-pad short stacks to longest, auto-fill panel_real_frames so
+                # JS marks end-of-stack frames. Pad by repeating each panel's last
+                # frame - visually obvious vs zeros and keeps colormap range stable.
+                real_n = [p.shape[0] for p in panels]
+                max_n = max(real_n)
+                if any(n != max_n for n in real_n):
+                    padded = []
+                    for p, n in zip(panels, real_n):
+                        if n == max_n:
+                            padded.append(p)
+                        else:
+                            last = p[-1:]
+                            pad = np.broadcast_to(last, (max_n - n, *p.shape[1:]))
+                            padded.append(np.concatenate([p, pad], axis=0))
+                    panels = padded
+                    if not self.panel_real_frames:
+                        self.panel_real_frames = real_n
+                # For large multi-panel stress tests, apply an explicit display_bin
+                # before concatenating panels. Binning after concat would first
+                # materialize a 4096 x (4096 * panels) slab; nine 4k panels is a
+                # 604 MB frame. The full source panels remain referenced here.
+                orig_h = panels[0].shape[1]
+                orig_w = panels[0].shape[2]
+                panel_bin = display_bin if isinstance(display_bin, int) and display_bin > 1 else 1
+                if panel_bin > 1:
+                    from quantem.widget.array_utils import bin2d
+
+                    self._source_panels = panels
+                    panels = [
+                        np.asarray(bin2d(p, factor=panel_bin, mode="mean"), dtype=np.float32)
+                        for p in panels
+                    ]
+                    if pixel_size > 0:
+                        pixel_size = pixel_size * panel_bin
+                    display_bin = 1
+                    print(
+                        f"  Multi-panel display bin {panel_bin}x before concat: "
+                        f"{orig_h}x{orig_w} -> {panels[0].shape[1]}x{panels[0].shape[2]} per panel"
+                    )
+                # Concatenate raw float32 panels back-to-back. Do not normalize:
+                # copied-panel stress tests use this path specifically to verify
+                # that full-resolution source values survive unchanged.
+                data = np.concatenate(panels, axis=2)
+                self._panel_width = panels[0].shape[2]
+                self.panel_width_px = self._panel_width
+                self._multi_panel_bin = panel_bin
         else:
             self.n_panels = 1
+            self.shared_panel_source = False
             self._multi_panel_bin = 0
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
+            self.starred = [-1]
 
         # Reject complex input - silently dropping the imaginary part on
         # ptychography probes was a real data-loss footgun. User should
@@ -874,20 +1017,25 @@ class Show3D(anywidget.AnyWidget):
             self.height = orig_h
             self.width = orig_w
             self._display_bin_factor = 1
+        if self.shared_panel_source:
+            self.panel_width_px = self.width
 
         # Color range (global across all frames)
         self._vmin_user = vmin
         self._vmax_user = vmax
+        # Compute global min/max ONCE - each scan is bandwidth-bound (~150 ms
+        # per pass on 1.34 GB float32), so eliminating the duplicate scans
+        # saves ~300 ms on a 20x4k stack.
         if self._use_torch:
-            self._vmin = vmin if vmin is not None else float(self._data_torch.min().item())
-            self._vmax = vmax if vmax is not None else float(self._data_torch.max().item())
-            self.data_min = float(self._data_torch.min().item())
-            self.data_max = float(self._data_torch.max().item())
+            stack_min = float(self._data_torch.min().item())
+            stack_max = float(self._data_torch.max().item())
         else:
-            self._vmin = vmin if vmin is not None else float(self._data.min())
-            self._vmax = vmax if vmax is not None else float(self._data.max())
-            self.data_min = float(self._data.min())
-            self.data_max = float(self._data.max())
+            stack_min = float(self._data.min())
+            stack_max = float(self._data.max())
+        self._vmin = vmin if vmin is not None else stack_min
+        self._vmax = vmax if vmax is not None else stack_max
+        self.data_min = stack_min
+        self.data_max = stack_max
         # Cache the diff_mode='off' range so toggling Off→Previous→Off restores exact value.
         self._data_min_off = self.data_min
         self._data_max_off = self.data_max
@@ -928,6 +1076,7 @@ class Show3D(anywidget.AnyWidget):
         self.timestamp_unit = timestamp_unit
         self.dim_label = dim_label
         self.diff_mode = diff_mode
+        self._refresh_auto_contrast_ranges()
         self.show_fft = show_fft
         self.fft_window = fft_window
         self.show_playback = show_playback
@@ -935,12 +1084,9 @@ class Show3D(anywidget.AnyWidget):
         self.show_controls = show_controls
         self.size = size
         frame_bytes = self.height * self.width * 4  # float32
-        # 256 MB buffer cap. Holds 16 frames at 16 MB/frame (4K binned) so
-        # scrubbing within window is paint-limited (no Comm round-trip).
-        # Sliding window prefetches outside the cached zone.
-        max_buffer_bytes = 4 * 1024 * 1024 * 1024  # 4 GB cap, NEVER BIN
-        min_buffer_frames = 8
-        max_frames = max(min_buffer_frames, max_buffer_bytes // frame_bytes)
+        # Exact float32 sliding window. Do not ship the whole stack when it
+        # would cross the browser/Jupyter ~2 GB Comm cliff (36×4k×4k is 2.4 GB).
+        max_frames = max(1, _MAX_PLAYBACK_CHUNK_BYTES // max(1, frame_bytes))
         self._buffer_size = min(buffer_size, self.n_slices, max_frames)
 
         # Initial position at middle
@@ -959,6 +1105,8 @@ class Show3D(anywidget.AnyWidget):
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_prefetch, names=["_prefetch_request"])
         self.observe(self._on_diff_mode_change, names=["diff_mode"])
+
+        self._start_frame_server()
 
         # Initial update
         self._update_all()
@@ -981,31 +1129,52 @@ class Show3D(anywidget.AnyWidget):
         self._init_py_elapsed_ms = (time.perf_counter() - _t0) * 1000
         self.observe(self._on_first_render, names=["_js_rendered"])
 
-    def _on_first_render(self, change):
-        import time
-        if not change.get("new"):
-            return
-        total_ms = (time.perf_counter() - self._init_t0) * 1000
-        py_ms = self._init_py_elapsed_ms
-        shape = f"{self.n_slices}×{self.height}×{self.width}"
-        mem = self._data.nbytes
-        mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
-        self.render_total_ms = int(total_ms)
-        self.render_python_build_ms = int(py_ms)
-        self.render_wire_js_ms = int(total_ms - py_ms)
-        print(
-            f"Show3D: {shape} {mem_str} - "
-            f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
-            f"wire+JS {total_ms - py_ms:.0f} ms)",
-            flush=True,
-        )
-        try:
-            self.unobserve(self._on_first_render, names=["_js_rendered"])
-        except (ValueError, KeyError):
-            pass  # observer already removed
 
-    def set_image(self, data, labels=None):
-        """Replace the stack data. Preserves all display settings."""
+    # === Public API ===
+
+    def set_image(self, data, labels: list[str] | None = None) -> None:
+        """Replace the stack data in place without rebuilding the widget.
+
+        Swaps in a new stack while preserving display settings (cmap, contrast,
+        log scale, pixel size, FFT toggle, playback config) so the operator can
+        cycle through datasets in one widget cell. Resets state that is tied to
+        the previous frame dimensions: ROIs and the line profile are cleared if
+        ``(height, width)`` changes; bookmarks and the loop range are clamped
+        to the new ``n_slices``; the playback prefetch buffer is invalidated;
+        cached display data and any in-flight ROI debounce timer are dropped.
+
+        Parameters
+        ----------
+        data : array_like
+            3D stack ``(N, H, W)``, a 2D image (promoted to a single-frame
+            stack), a torch tensor, or a quantem ``Dataset3d``. Complex data
+            is rejected (cast to magnitude or phase first); non-finite data
+            is rejected with a hint to ``np.nan_to_num``.
+        labels : list[str] | None, optional
+            New per-frame labels. If ``None``, string indices ``"0"..."N-1"``
+            are used.
+
+        Returns
+        -------
+        None
+            Mutates the widget in place. The browser canvas re-renders
+            automatically via traitlet sync.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack_a, title="A")  # doctest: +SKIP
+        >>> w.set_image(stack_b, labels=[f"frame {i}" for i in range(len(stack_b))])  # doctest: +SKIP
+
+        Notes
+        -----
+        - Prefer ``set_image`` over constructing a new ``Show3D`` when iterating
+          through datasets in the same cell: it avoids re-creating the canvas
+          and preserves the operator's contrast / zoom / cmap state.
+        - The new stack is cast to ``float32``. If float64 input contains values
+          outside ``float32`` range, an error is raised (silent overflow to
+          ``inf`` would corrupt stats).
+        """
         if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
             data = data.array
         data = to_numpy(data)
@@ -1025,8 +1194,6 @@ class Show3D(anywidget.AnyWidget):
         # Cancel any pending ROI plot timer so it doesn't fire mid-swap with
         # stale _display_data dims (race observed by audit).
         if getattr(self, "_roi_plot_timer", None) is not None:
-            # threading.Timer.cancel() is documented not to raise; guard kept
-            # for defensive paranoia only.
             self._roi_plot_timer.cancel()
             self._roi_plot_timer = None
         self.playing = False
@@ -1057,29 +1224,17 @@ class Show3D(anywidget.AnyWidget):
         self._panel_width = int(data.shape[2])
         self.n_slices = int(data.shape[0])
 
-        # Auto-bin display data
+        # Keep display dims = source dims. Constructor's auto-bin path was
+        # silently down-sampling large frames + leaving pixel_size unscaled,
+        # which gave wrong scale bars + ROI coords after set_image(). The
+        # caller can re-instantiate with explicit display_bin if they need
+        # the lower-memory rendering path.
         orig_h, orig_w = data.shape[1], data.shape[2]
-        frame_mb = orig_h * orig_w * 4 / (1024 * 1024)
         self._display_bin = 1
-        if frame_mb > 32:
-            for bf in [2, 4, 8]:
-                if frame_mb / (bf * bf) <= 32:
-                    self._display_bin = bf
-                    break
-            else:
-                self._display_bin = 8
-
-        if self._display_bin > 1:
-            from quantem.widget.array_utils import bin2d
-            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
-            self.height = int(self._display_data.shape[1])
-            self.width = int(self._display_data.shape[2])
-            self._display_bin_factor = self._display_bin
-        else:
-            self._display_data = self._data
-            self.height = orig_h
-            self.width = orig_w
-            self._display_bin_factor = 1
+        self._display_data = self._data
+        self.height = orig_h
+        self.width = orig_w
+        self._display_bin_factor = 1
 
         if self._use_torch:
             self.data_min = float(self._data_torch.min().item())
@@ -1114,13 +1269,11 @@ class Show3D(anywidget.AnyWidget):
         # Recompute buffer_size against new frame size, then invalidate JS-side
         # buffer (otherwise JS would slice the new H×W out of the old buffer).
         frame_bytes_n = self.height * self.width * 4
-        max_buffer_bytes = 4 * 1024 * 1024 * 1024  # 4 GB cap, NEVER BIN
-        max_frames = max(8, max_buffer_bytes // max(1, frame_bytes_n))
+        max_frames = max(1, _MAX_PLAYBACK_CHUNK_BYTES // max(1, frame_bytes_n))
         self._buffer_size = min(self._buffer_size, self.n_slices, max_frames)
-        with self.hold_sync():
-            self._buffer_bytes = b""
-            self._buffer_count = 0
-            self._buffer_start = 0
+        self._buffer_bytes = b""
+        self._bump_frame_server_version()
+        self._refresh_auto_contrast_ranges()
         self._update_all()
 
     def __repr__(self) -> str:
@@ -1130,8 +1283,46 @@ class Show3D(anywidget.AnyWidget):
         parts += ")"
         return parts
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
+        """Return a JSON-serializable snapshot of every user-tunable trait.
+
+        Captures display config (cmap, contrast, log scale, FFT, diff mode),
+        playback config (fps, loop, range, bookmarks, playback path), per-frame
+        labels and timestamps, scale-bar settings, and any active ROIs and line
+        profile. The raw stack data is NOT included; pair the snapshot with the
+        original ``data`` argument (or re-attach via ``set_image``) on restore.
+
+        Key order in the returned dict is deliberate: cross-validating pairs
+        (``percentile_high`` before ``percentile_low``, ``loop_end`` before
+        ``loop_start``) are emitted in the order the validators expect so a
+        round-trip through ``load_state_dict`` cannot wedge in an intermediate
+        state.
+
+        Returns
+        -------
+        dict
+            Mapping of trait name -> serializable value. Suitable for
+            ``json.dump`` or use with ``save`` / ``load_state_dict``.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> state = w.state_dict()  # doctest: +SKIP
+        >>> w2 = Show3D(stack)  # doctest: +SKIP
+        >>> w2.load_state_dict(state)  # doctest: +SKIP
+
+        Notes
+        -----
+        - Schema versioning is handled inside ``save``; the dict returned here
+          is the unversioned inner payload.
+        - To save directly to disk in one step, use ``save(path)`` instead.
+        """
         return {
+            # Widget discriminator: lets load_state_dict reject cross-widget
+            # loads (e.g. Show3DSlices.load_state_dict(show3d.state_dict()))
+            # cleanly instead of partially applying overlapping keys.
+            "_widget": "Show3D",
             "title": self.title,
             "cmap": self.cmap,
             "log_scale": self.log_scale,
@@ -1162,6 +1353,7 @@ class Show3D(anywidget.AnyWidget):
             "loop_end": self.loop_end,
             "loop_start": self.loop_start,
             "bookmarked_frames": self.bookmarked_frames,
+            "starred": list(self.starred),
             "playback_path": self.playback_path,
             "slice_idx": self.slice_idx,
             "roi_active": self.roi_active,
@@ -1178,29 +1370,112 @@ class Show3D(anywidget.AnyWidget):
         }
 
     def save(self, path: str):
+        """Write the current widget state to a versioned JSON file.
+
+        Wraps ``state_dict`` in a small envelope that records the widget type
+        (``"Show3D"``) and a schema version so ``load_state_dict`` can refuse
+        states that belong to a different widget. The raw stack data is NOT
+        written; only the display / playback / ROI / profile configuration.
+
+        Parameters
+        ----------
+        path : str
+            Destination JSON file path. Parent directories must already exist.
+
+        Returns
+        -------
+        None
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack, cmap="viridis", pixel_size=0.5)  # doctest: +SKIP
+        >>> w.save("show3d_state.json")  # doctest: +SKIP
+
+        Notes
+        -----
+        - To restore, instantiate ``Show3D`` with the (possibly different) data
+          and call ``w.load_state_dict(json.loads(open(path).read()))``.
+        - Use ``state_dict`` directly if you want to embed widget state in a
+          larger document instead of a standalone file.
+        """
         save_state_file(path, "Show3D", self.state_dict())
 
-    def load_state_dict(self, state):
-        import warnings
+    def load_state_dict(self, state: dict) -> None:
+        """Apply a saved ``state_dict`` snapshot to this widget.
+
+        Restores display, playback, ROI, and profile configuration from a dict
+        produced by ``state_dict``. Unknown keys (typically from a newer widget
+        version or a different widget type) are dropped with a ``UserWarning``
+        instead of raising, so partial / forward-compatible loads succeed.
+        Cross-validated trait pairs are applied atomically:
+
+        - ``percentile_low`` / ``percentile_high`` are validated together and
+          applied in whichever order keeps the invariant ``low < high``.
+        - ``vmin`` / ``vmax`` are cleared first so either bound can be set
+          regardless of the current contrast limits.
+        - ``loop_start`` / ``loop_end`` are clamped to ``[0, n_slices)`` and
+          applied in safe order via the ``-1`` sentinel.
+
+        Parameters
+        ----------
+        state : dict
+            Mapping previously returned by ``state_dict`` (or its on-disk
+            equivalent). Old ``canvas_size`` aliases are migrated to ``size``;
+            the constructor-derived ``display_bin`` key is ignored.
+
+        Returns
+        -------
+        None
+            Mutates the widget in place.
+
+        Example
+        -------
+        >>> import json
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.load_state_dict(json.load(open("show3d_state.json")))  # doctest: +SKIP
+
+        Notes
+        -----
+        - Unknown keys raise ``warnings.warn`` rather than an exception so
+          forward-compatible files from a future widget still load.
+        - The new contrast (``vmin`` / ``vmax``) is also stored on the private
+          user-override slots so subsequent ``set_image`` calls keep the
+          loaded contrast pinned.
+        """
         state = dict(state)
-        allowed = {
-            "title", "cmap", "log_scale", "auto_contrast",
-            "percentile_high", "percentile_low", "vmin", "vmax",
-            "show_stats", "show_controls", "show_fft", "fft_window",
-            "show_playback", "pixel_size", "pixel_unit", "smooth",
-            "image_rotation", "scale_bar_visible", "size", "fps",
-            "loop", "reverse", "boomerang", "loop_end", "loop_start",
-            "bookmarked_frames", "playback_path", "slice_idx",
-            "roi_active", "roi_list", "roi_selected_idx", "profile_line",
-            "profile_width", "diff_mode", "dim_label", "labels",
-            "panel_titles", "timestamps", "timestamp_unit",
-        }
+        # Reject cross-widget loads up front. Without this check, loading a
+        # Show3DSlices state_dict() into Show3D would partially apply the
+        # overlapping keys (cmap, log_scale, etc.) and leave the widget in a
+        # plausible-but-wrong state.
+        marker = state.pop("_widget", None)
+        if marker is not None and marker != "Show3D":
+            raise ValueError(
+                f"load_state_dict: state was saved from {marker!r}, not Show3D. "
+                f"Use the matching widget class to load it."
+            )
+        # Derive allowed keys from state_dict() so the two stay in lockstep -
+        # adding a trait to state_dict() automatically lets load_state_dict()
+        # accept it. Matches the Show4DSTEM pattern.
+        allowed = set(self.state_dict().keys())
         unknown = []
         if "canvas_size" in state:
             state["size"] = state.pop("canvas_size")
         # `display_bin` is constructor/data dependent. Loading only the private
         # integer leaves display_data/height/width stale, so ignore saved values.
         state.pop("display_bin", None)
+        # Drop length-coupled traits when stack size differs from saved state.
+        # Otherwise the labels/timestamps validators raise, breaking the common
+        # workflow of saving a state from one trial and loading into another.
+        n_cur = int(self.n_slices)
+        for key in ("labels", "timestamps"):
+            if key in state and isinstance(state[key], list) and 0 < len(state[key]) != n_cur:
+                state.pop(key)
+        # Drop `starred` if its length doesn't match current n_panels (e.g.
+        # saved from a 4-panel widget, loading into a single-panel one).
+        if "starred" in state and isinstance(state["starred"], list) and len(state["starred"]) != int(self.n_panels):
+            state.pop("starred")
         for key in list(state):
             if key not in allowed:
                 unknown.append(key)
@@ -1272,69 +1547,32 @@ class Show3D(anywidget.AnyWidget):
                 stacklevel=2,
             )
 
-    def free(self):
-        """Release VRAM and RAM held by this widget. `del widget` won't
-        free memory because traitlets observers pin the refcount."""
-        if self._data is None:
-            return
-        # Cancel pending ROI debounce so its callback can't fire post-free.
-        if self._roi_plot_timer is not None:
-            self._roi_plot_timer.cancel()
-            self._roi_plot_timer = None
-        device = str(self._device) if self._device is not None else ""
-        self._data = None
-        self._data_torch = None
-        self._display_data = None
-        for trait in ("frame_bytes", "roi_plot_data", "_gif_data", "_zip_data", "_bundle_data", "_buffer_bytes"):
-            setattr(self, trait, b"")
-        gc.collect()
-        # Flush cupy pool: _data may have been a torch view into cupy memory.
-        if "cupy" in sys.modules:
-            import cupy
-            cupy.get_default_memory_pool().free_all_blocks()
-            cupy.fft.config.get_plan_cache().clear()
-        if device == "mps":
-            torch.mps.empty_cache()
-        elif device.startswith("cuda"):
-            torch.cuda.empty_cache()
+    def summary(self) -> None:
+        """Print a one-screen status report for the current widget.
 
-    @property
-    def visible_indices(self) -> list[int]:
-        """Live list of frame indices NOT in hidden_indices. Read-only;
-        mutate via set_hidden() / show_all() / hide()."""
-        hidden = set(self.hidden_indices)
-        return [i for i in range(self.n_slices) if i not in hidden]
+        Sections include: title and stack shape (with pixel-size readout when
+        set), current frame index and label, raw data min/max/mean, display
+        config (cmap, contrast, log/linear, FFT, diff mode), playback config
+        (fps, loop, reverse, boomerang) and loop range, active ROI count, line
+        profile endpoints if set, and render timing once the first browser
+        paint has fired. Useful for notebook reproducibility and bug reports.
 
-    def hide(self, *indices: int) -> "Show3D":
-        """Hide one or more frames from the scrubber. Idempotent."""
-        keep = set(self.hidden_indices) | {int(i) for i in indices}
-        # Always keep at least one frame visible.
-        if len(keep) >= self.n_slices:
-            return self
-        self.hidden_indices = sorted(keep)
-        return self
+        Returns
+        -------
+        None
+            Prints to stdout.
 
-    def show(self, *indices: int) -> "Show3D":
-        """Restore frames previously hidden. Idempotent."""
-        drop = {int(i) for i in indices}
-        self.hidden_indices = sorted(set(self.hidden_indices) - drop)
-        return self
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack, title="defocus")  # doctest: +SKIP
+        >>> w.summary()  # doctest: +SKIP
 
-    def set_hidden(self, indices: list[int]) -> "Show3D":
-        """Replace the hidden set wholesale."""
-        clean = sorted({int(i) for i in indices if 0 <= int(i) < self.n_slices})
-        # Always keep at least one frame visible.
-        if len(clean) >= self.n_slices:
-            clean = clean[:-1]
-        self.hidden_indices = clean
-        return self
-
-    def show_all(self) -> "Show3D":
-        """Restore every frame."""
-        self.hidden_indices = []
-        return self
-
-    def summary(self):
+        Notes
+        -----
+        - ``Rendered:`` reads ``(pending first browser paint)`` until the JS
+          side has round-tripped its first paint timestamp.
+        """
         lines = [self.title or "Show3D", "═" * 32]
         lines.append(f"Stack:    {self.n_slices}×{self.height}×{self.width}")
         if self.pixel_size > 0:
@@ -1383,314 +1621,269 @@ class Show3D(anywidget.AnyWidget):
             lines.append("Rendered: (pending first browser paint)")
         print("\n".join(lines))
 
-    def _get_color_range(self, frame: np.ndarray) -> tuple[float, float]:
-        """Get vmin/vmax based on current settings."""
-        if self.vmin is not None or self.vmax is not None:
-            vmin = float(self.vmin if self.vmin is not None else self._vmin)
-            vmax = float(self.vmax if self.vmax is not None else self._vmax)
-            if self.log_scale:
-                # Signed log so negative vmin (e.g. diff_mode) doesn't collapse to 0.
-                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
-                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
-        elif self.auto_contrast:
-            vmin = float(np.percentile(frame, self.percentile_low))
-            vmax = float(np.percentile(frame, self.percentile_high))
-        else:
-            vmin = self._vmin
-            vmax = self._vmax
-        return vmin, vmax
-
-    def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Normalize frame to uint8 with current display settings."""
-        # Signed log so negatives don't collapse to zero. Matches JS `slog` so
-        # GIF/PNG exports look identical to live render for signed data
-        # (diff_mode, phase, residuals, anything that can go negative).
-        if self.log_scale:
-            frame = np.sign(frame) * np.log1p(np.abs(frame))
-
-        vmin, vmax = self._get_color_range(frame)
-
-        if vmax > vmin:
-            normalized = np.clip((frame - vmin) / (vmax - vmin) * 255, 0, 255)
-            return normalized.astype(np.uint8)
-        return np.zeros(frame.shape, dtype=np.uint8)
-
-    def _get_display_frame(self, idx=None):
-        if idx is None:
-            idx = self.slice_idx
-        data = self._display_data
-        frame = data[idx]
-        if self.diff_mode == "previous":
-            if idx == 0:
-                return np.zeros_like(frame)
-            return frame - data[idx - 1]
-        if self.diff_mode == "first":
-            return frame - data[0]
-        return frame
-
-    def _on_diff_mode_change(self, change=None):
-        data = self._display_data
-        if self.diff_mode == "off":
-            # Restore the constructor's full-resolution data range so toggling
-            # Off→Previous→Off is idempotent (computing from binned data drifts).
-            self.data_min = float(getattr(self, "_data_min_off", data.min()))
-            self.data_max = float(getattr(self, "_data_max_off", data.max()))
-        elif self.diff_mode == "previous":
-            # Vectorized diff: data[1:] - data[:-1]
-            # Symmetric clamp around 0 so the all-zero baseline frame at idx=0
-            # stays inside the displayed range whether diffs are positive or negative.
-            if self.n_slices < 2:
-                self.data_min = 0.0
-                self.data_max = 0.0
-            else:
-                diffs = data[1:] - data[:-1]
-                self.data_min = min(0.0, float(diffs.min()))
-                self.data_max = max(0.0, float(diffs.max()))
-        elif self.diff_mode == "first":
-            if self.n_slices < 2:
-                self.data_min = 0.0
-                self.data_max = 0.0
-            else:
-                diffs = data[1:] - data[0:1]
-                self.data_min = min(0.0, float(diffs.min()))
-                self.data_max = max(0.0, float(diffs.max()))
-        else:
-            self.data_min = float(data.min())
-            self.data_max = float(data.max())
-        self._update_all()
-
-    def _update_all(self):
-        """Update frame, stats, and all derived data. Uses hold_sync for batched transfer."""
-        display_frame = self._get_display_frame()
-        with self.hold_sync():
-            # Stats from display_frame (binned). Full-res stats on 4K cost ~50ms/scrub.
-            # Binned stats on 2K cost ~12ms = scrub FPS jumps 17 → 60+.
-            self.stats_mean = float(display_frame.mean())
-            self.stats_min = float(display_frame.min())
-            self.stats_max = float(display_frame.max())
-            self.stats_std = float(display_frame.std())
-            if self.roi_active:
-                self._update_roi_stats(display_frame)
-            else:
-                self.roi_stats = {}
-            self.frame_bytes = display_frame.tobytes()
-            self.frame_seq = self.frame_seq + 1
-
-    def _roi_mask(self, roi: dict):
-        r, c = np.ogrid[0 : self.height, 0 : self.width]
-        shape = roi.get("shape", "circle")
-        row = float(roi.get("row", 0))
-        col = float(roi.get("col", 0))
-        radius = max(1.0, float(roi.get("radius", 10)))
-        if shape == "circle":
-            return (c - col) ** 2 + (r - row) ** 2 <= radius**2
-        if shape == "square":
-            # Strict < to match JS strokeRect width = 2*radius (exclusive).
-            return (np.abs(c - col) < radius) & (np.abs(r - row) < radius)
-        if shape == "rectangle":
-            half_w = max(1.0, float(roi.get("width", 20)) / 2.0)
-            half_h = max(1.0, float(roi.get("height", 20)) / 2.0)
-            # Strict < to match JS strokeRect (width=width, exclusive at edge).
-            return (np.abs(c - col) < half_w) & (np.abs(r - row) < half_h)
-        if shape == "annular":
-            inner = max(0.0, float(roi.get("radius_inner", 5)))
-            dist2 = (c - col) ** 2 + (r - row) ** 2
-            return (dist2 >= inner**2) & (dist2 <= radius**2)
-        return (c - col) ** 2 + (r - row) ** 2 <= radius**2
-
-    def _update_roi_stats(self, frame: np.ndarray):
-        idx = self.roi_selected_idx
-        if idx < 0 or idx >= len(self.roi_list):
-            self.roi_stats = {}
-            return
-        roi = self.roi_list[idx]
-        mask = self._roi_mask(roi)
-        # Mask is built at display (binned) dims, matching `frame`. The torch path
-        # used to index raw _data_torch[slice_idx] which is full-res → shape mismatch.
-        # Stats on 16 MB binned numpy frame are <5 ms; no torch round-trip needed.
-        region = frame[mask]
-        if region.size > 0:
-            self.roi_stats = {
-                "mean": float(region.mean()),
-                "min": float(region.min()),
-                "max": float(region.max()),
-                "std": float(region.std()),
-            }
-        else:
-            self.roi_stats = {}
-
-    def _send_buffer(self, start_idx: int):
-        end_idx = start_idx + self._buffer_size
-        if self.diff_mode == "off":
-            data = self._display_data
-            if end_idx <= self.n_slices:
-                chunk = data[start_idx:end_idx]
-            else:
-                chunk = np.concatenate(
-                    [data[start_idx:], data[: end_idx - self.n_slices]]
-                )
-        else:
-            frames = []
-            for j in range(self._buffer_size):
-                idx = (start_idx + j) % self.n_slices
-                frames.append(self._get_display_frame(idx))
-            chunk = np.stack(frames)
-        with self.hold_sync():
-            self._buffer_start = int(start_idx)
-            self._buffer_count = int(chunk.shape[0])
-            self._buffer_bytes = chunk.tobytes()
-
-    def _on_playing_change(self, change=None):
-        if self.playing:
-            self._send_buffer(self.slice_idx)
-        else:
-            # Playback stopped - refresh stats for the current frame
-            self._update_all()
-
-    def _on_prefetch(self, change=None):
-        if self._prefetch_request >= 0 and self.playing:
-            self._send_buffer(self._prefetch_request % self.n_slices)
-
-    def _on_slice_change(self, change=None):
-        if self.playing:
-            return
-        self._update_all()
-
-    def _on_roi_change(self, change=None):
-        """Handle ROI change. Stats for current frame are instant.
-        Full-stack ROI plot is debounced (500ms) to avoid UI freeze during drag."""
-        # Auto-select first ROI if the user added one programmatically and
-        # roi_selected_idx is still -1 (otherwise stats stay empty silently).
-        if self.roi_active and self.roi_list and self.roi_selected_idx < 0:
-            self.roi_selected_idx = 0
-        if self.roi_active:
-            self._update_roi_stats(self._get_display_frame())
-            # Debounce the expensive all-frame ROI plot
-            if self._roi_plot_timer is not None:
-                self._roi_plot_timer.cancel()
-            import threading
-            self._roi_plot_timer = threading.Timer(0.5, self._compute_roi_plot)
-            self._roi_plot_timer.start()
-        else:
-            self.roi_stats = {}
-            self.roi_plot_data = b""
-
-    def _compute_roi_plot(self):
-        """Compute selected ROI mean for all frames. Uses display data (binned) for speed."""
-        idx = self.roi_selected_idx
-        if idx < 0 or idx >= len(self.roi_list):
-            self.roi_plot_data = b""
-            return
-        mask = self._roi_mask(self.roi_list[idx])
-        if mask.sum() == 0:
-            self.roi_plot_data = b""
-            return
-        # Use _display_data (binned) - 4-16× less data than _data, same ROI result.
-        # Cache torch view of _display_data on the instance so every drag doesn't
-        # reallocate VRAM (was leaking ~4 GB/drag on large stacks).
-        # Apply diff_mode so plot matches what the stats panel shows.
-        data = self._display_data
-        if self.diff_mode == "previous":
-            diff = np.zeros_like(data)
-            diff[1:] = data[1:] - data[:-1]
-            data = diff
-        elif self.diff_mode == "first":
-            data = data - data[0:1]
-        if self._use_torch and self.diff_mode == "off":
-            if getattr(self, "_display_torch", None) is None:
-                self._display_torch = torch.from_numpy(self._display_data).to(self._device)
-            mask_t = torch.from_numpy(mask).to(self._device)
-            masked = self._display_torch[:, mask_t]
-            means = masked.mean(dim=1).cpu().numpy().astype(np.float32)
-        else:
-            means = np.array([float(data[i][mask].mean()) for i in range(self.n_slices)], dtype=np.float32)
-        self.roi_plot_data = means.tobytes()
-
-    # =========================================================================
-    # Public Methods
-    # =========================================================================
-
     def play(self) -> Self:
-        """Start playback."""
+        """Start playback from the current frame.
+
+        Sets the ``playing`` trait to ``True``, which triggers the JS
+        playback loop and the Python-side sliding-prefetch buffer that
+        ships chunks of frames ahead of the scrubber position.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining (``w.play().goto(0)``).
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack, fps=10)  # doctest: +SKIP
+        >>> w.play()  # doctest: +SKIP
+        """
         self.playing = True
         return self
 
     def pause(self) -> Self:
-        """Pause playback."""
+        """Pause playback at the current frame.
+
+        Sets ``playing`` to ``False`` without resetting ``slice_idx``.
+        Per-frame statistics are refreshed for the current frame on pause.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.play().pause()  # doctest: +SKIP
+        """
         self.playing = False
         return self
 
     def stop(self) -> Self:
-        """Stop playback and reset to beginning."""
+        """Stop playback and jump back to frame 0.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.play().stop()  # doctest: +SKIP
+
+        Notes
+        -----
+        - Unlike ``pause``, ``stop`` resets ``slice_idx`` to 0. Use ``pause``
+          to keep the current frame visible.
+        """
         self.playing = False
         self.slice_idx = 0
         return self
 
     def goto(self, index: int) -> Self:
-        """Jump to a specific frame index."""
-        self.slice_idx = int(index) % self.n_slices
-        return self
+        """Jump to a specific frame index.
 
-    def profile_all_frames(self, start: tuple | None = None, end: tuple | None = None) -> np.ndarray:
-        """Extract the line profile from every frame, returning (n_slices, n_points).
-
-        Uses the current profile_line unless start/end are provided.
-        Always samples raw data (ignores diff_mode).
+        The index is taken modulo ``n_slices``, so negative or out-of-range
+        values wrap rather than raise.
 
         Parameters
         ----------
-        start : tuple of (row, col), optional
-            Start point. Overrides current profile_line.
-        end : tuple of (row, col), optional
-            End point. Overrides current profile_line.
+        index : int
+            Target frame index. Wrapped into ``[0, n_slices)``.
 
         Returns
         -------
-        np.ndarray
-            Shape (n_slices, n_points) float32 array.
-        """
-        if start is not None and end is not None:
-            row0, col0 = float(start[0]), float(start[1])
-            row1, col1 = float(end[0]), float(end[1])
-        elif len(self.profile_line) >= 2:
-            p0, p1 = self.profile_line[0], self.profile_line[1]
-            row0, col0 = p0["row"], p0["col"]
-            row1, col1 = p1["row"], p1["col"]
-        else:
-            raise ValueError(
-                "No profile line set. Call set_profile() first or pass start/end."
-            )
-        rows = []
-        for i in range(self.n_slices):
-            rows.append(self._sample_profile_on(self._data[i], row0, col0, row1, col1))
-        return np.stack(rows)
+        Self
+            The widget, for chaining.
 
-    def _upsert_selected_roi(self, updates: dict):
-        rois = list(self.roi_list)
-        color_cycle = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#ef5350", "#ffd54f", "#90a4ae", "#a1887f"]
-        defaults = {
-            "shape": "circle",
-            "row": int(self.height // 2),
-            "col": int(self.width // 2),
-            "radius": 10,
-            "radius_inner": 5,
-            "width": 20,
-            "height": 20,
-            "line_width": 2,
-            "highlight": False,
-            "visible": True,
-            "locked": False,
-        }
-        if self.roi_selected_idx >= 0 and self.roi_selected_idx < len(rois):
-            current = {**defaults, **rois[self.roi_selected_idx]}
-            if not current.get("color"):
-                current["color"] = color_cycle[self.roi_selected_idx % len(color_cycle)]
-            rois[self.roi_selected_idx] = {**current, **updates}
-        else:
-            rois.append({**defaults, "color": color_cycle[len(rois) % len(color_cycle)], **updates})
-            self.roi_selected_idx = len(rois) - 1
-        self.roi_list = rois
-        self.roi_active = True
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.goto(5)  # doctest: +SKIP
+        >>> w.goto(-1)  # last frame  # doctest: +SKIP
+        """
+        self.slice_idx = int(index) % self.n_slices
+        return self
+
+    def star_panel(self, panel: int = 0, frame: int | None = None) -> Self:
+        """Mark a "best frame" star on a panel.
+
+        Parameters
+        ----------
+        panel : int, default 0
+            Panel index (0-based). For single-panel widgets, panel=0 is the
+            only valid value.
+        frame : int | None, default None
+            Frame index to star. ``None`` stars the currently displayed frame
+            (``slice_idx``).
+
+        Returns
+        -------
+        Self
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack_a, stack_b)  # doctest: +SKIP
+        >>> w.goto(50)  # doctest: +SKIP
+        >>> w.star_panel(0)            # mark frame 50 as best on panel 0
+        >>> w.star_panel(1, frame=80)  # mark frame 80 as best on panel 1
+        >>> w.starred_frames           # → {0: 50, 1: 80}  # doctest: +SKIP
+        """
+        if not (0 <= panel < self.n_panels):
+            raise ValueError(f"panel {panel} out of range [0, {self.n_panels})")
+        if frame is None:
+            frame = int(self.slice_idx)
+        starred = list(self.starred)
+        if len(starred) != self.n_panels:
+            starred = [-1] * self.n_panels
+        starred[panel] = int(frame)
+        self.starred = starred
+        return self
+
+    def unstar_panel(self, panel: int) -> Self:
+        """Clear the star on a panel (sets `starred[panel] = -1`)."""
+        if not (0 <= panel < self.n_panels):
+            raise ValueError(f"panel {panel} out of range [0, {self.n_panels})")
+        starred = list(self.starred)
+        if len(starred) != self.n_panels:
+            starred = [-1] * self.n_panels
+        starred[panel] = -1
+        self.starred = starred
+        return self
+
+    @property
+    def starred_frames(self) -> dict[int, int]:
+        """Mapping of panel index → starred frame index, only for panels that
+        have a star set. Returns ``{}`` if no panel is starred. Useful for
+        downstream code like ``best_iters = {trial: w.starred_frames.get(i)}``."""
+        return {i: f for i, f in enumerate(self.starred) if f >= 0}
+
+    @property
+    def visible_indices(self) -> list[int]:
+        """Live list of frame indices NOT in hidden_indices. Read-only;
+        mutate via set_hidden() / show_all() / hide()."""
+        hidden = set(self.hidden_indices)
+        return [i for i in range(self.n_slices) if i not in hidden]
+
+    def hide(self, *indices: int) -> Self:
+        """Mark one or more frames as hidden from the scrubber.
+
+        Hidden frames are excluded from the scrubber UI and from playback but
+        kept in memory; restore them with ``show`` or ``show_all``. Idempotent:
+        hiding an already-hidden index is a no-op. At least one frame always
+        stays visible, so a call that would hide every frame is silently
+        rejected.
+
+        Parameters
+        ----------
+        *indices : int
+            One or more frame indices to hide. Values outside ``[0, n_slices)``
+            are accepted but never become visible-or-hidden in the UI.
+
+        Returns
+        -------
+        Show3D
+            The widget, for chaining (``w.hide(0, 1).hide(5)``).
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.hide(0, 1, 2)  # doctest: +SKIP
+
+        Notes
+        -----
+        - The ``hideable`` trait must be ``True`` for the JS scrubber to show
+          the hide overlay; the underlying ``hidden_indices`` trait is always
+          honored regardless.
+        """
+        keep = set(self.hidden_indices) | {int(i) for i in indices}
+        # Always keep at least one frame visible.
+        if len(keep) >= self.n_slices:
+            return self
+        self.hidden_indices = sorted(keep)
+        return self
+
+    def show(self, *indices: int) -> Self:
+        """Restore one or more previously hidden frames.
+
+        Idempotent: indices that are not currently hidden are silently ignored.
+
+        Parameters
+        ----------
+        *indices : int
+            Frame indices to make visible again.
+
+        Returns
+        -------
+        Show3D
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.hide(2).show(2)  # doctest: +SKIP
+        """
+        drop = {int(i) for i in indices}
+        self.hidden_indices = sorted(set(self.hidden_indices) - drop)
+        return self
+
+    def set_hidden(self, indices: list[int]) -> Self:
+        """Replace the hidden set wholesale.
+
+        Discards any current ``hidden_indices`` and installs ``indices``
+        clamped to ``[0, n_slices)``. At least one frame is always visible;
+        if the input would hide every frame, the largest index is dropped.
+
+        Parameters
+        ----------
+        indices : list[int]
+            Full replacement set of hidden frame indices. Order and duplicates
+            are normalized internally.
+
+        Returns
+        -------
+        Show3D
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.set_hidden([0, 1, 2, 7])  # doctest: +SKIP
+        """
+        clean = sorted({int(i) for i in indices if 0 <= int(i) < self.n_slices})
+        # Always keep at least one frame visible.
+        if len(clean) >= self.n_slices:
+            clean = clean[:-1]
+        self.hidden_indices = clean
+        return self
+
+    def show_all(self) -> Self:
+        """Clear the hidden set so every frame is visible.
+
+        Returns
+        -------
+        Show3D
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.hide(0, 1, 2).show_all()  # doctest: +SKIP
+        """
+        self.hidden_indices = []
+        return self
 
     @property
     def roi(self) -> dict:
@@ -1761,74 +1954,6 @@ class Show3D(anywidget.AnyWidget):
             self._upsert_selected_roi({"shape": "annular", "radius_inner": int(inner), "radius": int(outer)})
         return self
 
-    def _sample_line(self, img, row0, col0, row1, col1):
-        h, w = img.shape
-        dc, dr = col1 - col0, row1 - row0
-        length = (dc**2 + dr**2) ** 0.5
-        n = max(2, int(np.ceil(length)))
-        t = np.linspace(0, 1, n)
-        cs = col0 + t * dc
-        rs = row0 + t * dr
-        ci = np.floor(cs).astype(int)
-        ri = np.floor(rs).astype(int)
-        cf = cs - ci
-        rf = rs - ri
-        c0c = np.clip(ci, 0, w - 1)
-        c1c = np.clip(ci + 1, 0, w - 1)
-        r0c = np.clip(ri, 0, h - 1)
-        r1c = np.clip(ri + 1, 0, h - 1)
-        return (img[r0c, c0c] * (1 - cf) * (1 - rf) +
-                img[r0c, c1c] * cf * (1 - rf) +
-                img[r1c, c0c] * (1 - cf) * rf +
-                img[r1c, c1c] * cf * rf)
-
-    def _sample_profile_on(self, img, row0, col0, row1, col1):
-        pw = self.profile_width
-        if pw <= 1:
-            return self._sample_line(img, row0, col0, row1, col1).astype(np.float32)
-        dc, dr = col1 - col0, row1 - row0
-        length = (dc**2 + dr**2) ** 0.5
-        if length < 1e-8:
-            return self._sample_line(img, row0, col0, row1, col1).astype(np.float32)
-        perp_r, perp_c = -dc / length, dr / length
-        half = (pw - 1) / 2.0
-        offsets = np.linspace(-half, half, pw)
-        accumulated = None
-        for off in offsets:
-            vals = self._sample_line(img, row0 + off * perp_r, col0 + off * perp_c,
-                                     row1 + off * perp_r, col1 + off * perp_c)
-            if accumulated is None:
-                accumulated = vals.copy()
-            else:
-                accumulated += vals
-        return (accumulated / pw).astype(np.float32)
-
-    def _sample_profile(self, row0, col0, row1, col1):
-        return self._sample_profile_on(self._get_display_frame(), row0, col0, row1, col1)
-
-    def set_profile(self, start: tuple, end: tuple) -> Self:
-        """Set a line profile between two points (image pixel coordinates).
-
-        Parameters
-        ----------
-        start : tuple of (row, col)
-            Start point in pixel coordinates.
-        end : tuple of (row, col)
-            End point in pixel coordinates.
-        """
-        row0, col0 = start
-        row1, col1 = end
-        self.profile_line = [
-            {"row": float(row0), "col": float(col0)},
-            {"row": float(row1), "col": float(col1)},
-        ]
-        return self
-
-    def clear_profile(self) -> Self:
-        """Clear the current line profile."""
-        self.profile_line = []
-        return self
-
     @property
     def profile(self):
         """Get profile line endpoints as [(row0, col0), (row1, col1)] or []."""
@@ -1855,7 +1980,309 @@ class Show3D(anywidget.AnyWidget):
             return dist_px * self.pixel_size
         return dist_px
 
-    def _on_gif_export(self, change=None):
+    def set_profile(self, start: tuple[float, float], end: tuple[float, float]) -> Self:
+        """Set a line profile between two points (image pixel coordinates).
+
+        Parameters
+        ----------
+        start : tuple of (row, col)
+            Start point in pixel coordinates.
+        end : tuple of (row, col)
+            End point in pixel coordinates.
+        """
+        row0, col0 = start
+        row1, col1 = end
+        self.profile_line = [
+            {"row": float(row0), "col": float(col0)},
+            {"row": float(row1), "col": float(col1)},
+        ]
+        return self
+
+    def clear_profile(self) -> Self:
+        """Clear the current line profile."""
+        self.profile_line = []
+        return self
+
+    def profile_all_frames(self, start: tuple[float, float] | None = None, end: tuple[float, float] | None = None) -> np.ndarray:
+        """Extract the line profile from every frame, returning (n_slices, n_points).
+
+        Uses the current profile_line unless start/end are provided.
+        Always samples raw data (ignores diff_mode).
+
+        Parameters
+        ----------
+        start : tuple of (row, col), optional
+            Start point. Overrides current profile_line.
+        end : tuple of (row, col), optional
+            End point. Overrides current profile_line.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (n_slices, n_points) float32 array.
+        """
+        if start is not None and end is not None:
+            row0, col0 = float(start[0]), float(start[1])
+            row1, col1 = float(end[0]), float(end[1])
+        elif len(self.profile_line) >= 2:
+            p0, p1 = self.profile_line[0], self.profile_line[1]
+            row0, col0 = p0["row"], p0["col"]
+            row1, col1 = p1["row"], p1["col"]
+        else:
+            raise ValueError(
+                "No profile line set. Call set_profile() first or pass start/end."
+            )
+        rows = []
+        for i in range(self.n_slices):
+            rows.append(self._sample_profile_on(self._data[i], row0, col0, row1, col1))
+        return np.stack(rows)
+
+    def save_image(self, path: str | pathlib.Path, *, frame_idx: int | None = None,
+                   format: str | None = None, dpi: int = 150) -> pathlib.Path:
+        """Save a single frame as a PNG, PDF, or TIFF file.
+
+        The exported image is colorized with the current ``cmap`` and contrast
+        (``vmin`` / ``vmax`` or percentile auto-contrast), so the saved file
+        matches what the browser shows for that frame. ``diff_mode`` is
+        respected: ``"previous"`` saves ``frame - frame[idx-1]`` and ``"first"``
+        saves ``frame - frame[0]``.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Output file path. Parent directories are created if needed.
+        frame_idx : int | None, optional
+            Frame index to export. Defaults to the current ``slice_idx``.
+        format : str | None, optional
+            One of ``"png"``, ``"pdf"``, ``"tiff"``. If omitted, inferred
+            from the file extension; defaults to ``"png"`` if no extension.
+        dpi : int, default 150
+            DPI metadata written into the file.
+
+        Returns
+        -------
+        pathlib.Path
+            The written file path.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack, cmap="viridis")  # doctest: +SKIP
+        >>> w.save_image("frame_5.png", frame_idx=5)  # doctest: +SKIP
+        >>> w.save_image("frame.pdf", dpi=300)  # doctest: +SKIP
+
+        Notes
+        -----
+        - PDF output is converted to RGB internally (no alpha channel).
+        - Frame indices outside ``[0, n_slices)`` raise ``IndexError``;
+          unsupported extensions raise ``ValueError``.
+        - For multi-frame export, use the widget's GIF / ZIP export buttons
+          or call ``save_image`` in a loop.
+        """
+        from matplotlib import colormaps
+        from PIL import Image
+
+        path = pathlib.Path(path)
+        fmt = (format or path.suffix.lstrip(".").lower() or "png").lower()
+        if fmt not in ("png", "pdf", "tiff", "tif"):
+            raise ValueError(f"Unsupported format: {fmt!r}. Use 'png', 'pdf', or 'tiff'.")
+
+        idx = frame_idx if frame_idx is not None else self.slice_idx
+        if idx < 0 or idx >= self.n_slices:
+            raise IndexError(f"Frame index {idx} out of range [0, {self.n_slices})")
+
+        # Respect diff_mode so saved frame matches what user sees.
+        frame = self._data[idx]
+        if self.diff_mode == "previous":
+            frame = frame - self._data[idx - 1] if idx > 0 else np.zeros_like(frame)
+        elif self.diff_mode == "first":
+            frame = frame - self._data[0]
+        normalized = self._normalize_frame(frame)
+        cmap_fn = colormaps.get_cmap(self.cmap)
+        rgba = (cmap_fn(normalized / 255.0) * 255).astype(np.uint8)
+
+        img = Image.fromarray(rgba)
+        if fmt == "pdf":
+            Image.init()
+            img = img.convert("RGB")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(str(path), dpi=(dpi, dpi))
+        return path
+
+    def free(self) -> None:
+        """Release VRAM and RAM held by this widget.
+
+        Drops the numpy stack, the torch view (if any), the binned display
+        copy, every sync'd bytes trait (frame, ROI plot, GIF, ZIP, bundle,
+        prefetch buffer), and cancels any in-flight ROI debounce timer.
+        When applicable, also flushes the CuPy memory pool and the FFT plan
+        cache (in case a torch tensor was a view into CuPy memory), and
+        releases the active torch device cache (``mps`` or ``cuda``).
+
+        ``del widget`` alone does NOT free memory: traitlets installs strong
+        observer references that pin the widget's refcount until ``free`` is
+        called.
+
+        Returns
+        -------
+        None
+            Mutates the widget in place. After this call, frame data is gone
+            and rendering will be blank; rebuild a new widget for further use.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3D
+        >>> w = Show3D(stack)  # doctest: +SKIP
+        >>> w.free()  # doctest: +SKIP
+
+        Notes
+        -----
+        - Idempotent: calling ``free`` twice is a no-op.
+        - After ``free``, ``set_image`` cannot restore the widget (the
+          observers are still pinned but ``_data`` is ``None``); construct a
+          new ``Show3D`` if you need to re-display something.
+        """
+        self._stop_frame_server()
+        if self._data is None:
+            return
+        # Stop frontend playback FIRST so JS rAF loop tears down before we
+        # null out the byte buffers it's reading from. Without this, free()
+        # mid-play leaves the JS rAF rendering from a stale Float32Array
+        # view into freed memory.
+        self.playing = False
+        # Cancel pending ROI debounce so its callback can't fire post-free.
+        if self._roi_plot_timer is not None:
+            self._roi_plot_timer.cancel()
+            self._roi_plot_timer = None
+        device = str(self._device) if self._device is not None else ""
+        self._data = None
+        self._data_torch = None
+        self._display_data = None
+        for trait in ("frame_bytes", "roi_plot_data", "_gif_data", "_zip_data", "_bundle_data", "_buffer_bytes"):
+            setattr(self, trait, b"")
+        gc.collect()
+        # Flush cupy pool: _data may have been a torch view into cupy memory.
+        if "cupy" in sys.modules:
+            import cupy
+            cupy.get_default_memory_pool().free_all_blocks()
+            cupy.fft.config.get_plan_cache().clear()
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+
+    # === Observers ===
+
+    def _on_first_render(self, change):
+        """Observer for `_js_rendered=True`: prints true end-to-end construction
+        timing telemetry (Python + comm + JS paint) and unobserves itself."""
+        if not change.get("new"):
+            return
+        total_ms = (time.perf_counter() - self._init_t0) * 1000
+        py_ms = self._init_py_elapsed_ms
+        shape = f"{self.n_slices}×{self.height}×{self.width}"
+        mem = self._data.nbytes
+        mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
+        self.render_total_ms = int(total_ms)
+        self.render_python_build_ms = int(py_ms)
+        self.render_wire_js_ms = int(total_ms - py_ms)
+        print(
+            f"Show3D: {shape} {mem_str} - "
+            f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
+            f"wire+JS {total_ms - py_ms:.0f} ms)",
+            flush=True,
+        )
+        try:
+            self.unobserve(self._on_first_render, names=["_js_rendered"])
+        except (ValueError, KeyError):
+            pass  # observer already removed
+
+    def _on_diff_mode_change(self, change: dict | None = None) -> None:
+        """Observer: `diff_mode` flipped. Recomputes the symmetric-around-zero
+        data range so the colormap pins black at 0 (positive vs negative diff
+        signal stays balanced)."""
+        data = self._display_data
+        if self.diff_mode == "off":
+            # Restore the constructor's full-resolution data range so toggling
+            # Off→Previous→Off is idempotent (computing from binned data drifts).
+            self.data_min = float(getattr(self, "_data_min_off", data.min()))
+            self.data_max = float(getattr(self, "_data_max_off", data.max()))
+        elif self.diff_mode == "previous":
+            # Vectorized diff: data[1:] - data[:-1]
+            # Symmetric clamp around 0 so the all-zero baseline frame at idx=0
+            # stays inside the displayed range whether diffs are positive or negative.
+            if self.n_slices < 2:
+                self.data_min = 0.0
+                self.data_max = 0.0
+            else:
+                diffs = data[1:] - data[:-1]
+                self.data_min = min(0.0, float(diffs.min()))
+                self.data_max = max(0.0, float(diffs.max()))
+        elif self.diff_mode == "first":
+            if self.n_slices < 2:
+                self.data_min = 0.0
+                self.data_max = 0.0
+            else:
+                diffs = data[1:] - data[0:1]
+                self.data_min = min(0.0, float(diffs.min()))
+                self.data_max = max(0.0, float(diffs.max()))
+        else:
+            self.data_min = float(data.min())
+            self.data_max = float(data.max())
+        self._bump_frame_server_version()
+        self._refresh_auto_contrast_ranges()
+        self._update_all()
+
+    def _on_slice_change(self, change: dict | None = None) -> None:
+        """Observer: `slice_idx` changed via scrub. Skipped during playback
+        (playback drives frames from the JS-side prefetch buffer). Stats are
+        computed JS-side from frame_bytes; Python only ships the raw bytes."""
+        if self.playing:
+            return
+        self._update_all()
+
+    def _on_playing_change(self, change: dict | None = None) -> None:
+        """Observer: `playing` toggled. Starts the JS animation via a sliding
+        buffer chunk, or refreshes stats on the held frame on stop."""
+        if self.playing:
+            if self.frame_server_url:
+                with self.hold_sync():
+                    self._buffer_start = int(self.slice_idx)
+                    self._buffer_count = 0
+                    self._buffer_bytes = b""
+            else:
+                self._send_buffer(self.slice_idx)
+        else:
+            self._update_all()
+
+    def _on_prefetch(self, change: dict | None = None) -> None:
+        """Observer: JS requested the next playback chunk. Re-sends the sliding
+        window so playback never starves."""
+        if self.frame_server_url:
+            return
+        if self._prefetch_request >= 0 and self.playing:
+            self._send_buffer(self._prefetch_request % self.n_slices)
+
+    def _on_roi_change(self, change: dict | None = None) -> None:
+        """Handle ROI change. Stats for current frame are instant.
+        Full-stack ROI plot is debounced (500ms) to avoid UI freeze during drag."""
+        # Auto-select first ROI if the user added one programmatically and
+        # roi_selected_idx is still -1 (otherwise stats stay empty silently).
+        if self.roi_active and self.roi_list and self.roi_selected_idx < 0:
+            self.roi_selected_idx = 0
+        if self.roi_active:
+            self._update_roi_stats(self._get_display_frame())
+            # Debounce the expensive all-frame ROI plot
+            if self._roi_plot_timer is not None:
+                self._roi_plot_timer.cancel()
+            self._roi_plot_timer = threading.Timer(0.5, self._compute_roi_plot)
+            self._roi_plot_timer.start()
+        else:
+            self.roi_stats = {}
+            self.roi_plot_data = b""
+
+    def _on_gif_export(self, change: dict | None = None) -> None:
         if not self._gif_export_requested:
             return
         self._gif_export_requested = False
@@ -1864,9 +2291,251 @@ class Show3D(anywidget.AnyWidget):
         except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
             # On error: clear _gif_data + bump frame_seq so JS observer fires
             # and resets exporting=False. Without this the UI shows "..." forever.
-            import warnings
             warnings.warn(f"GIF export failed: {type(e).__name__}: {e}")
             self._gif_data = b""
+
+    def _on_zip_export(self, change: dict | None = None) -> None:
+        if not self._zip_export_requested:
+            return
+        self._zip_export_requested = False
+        try:
+            self._generate_zip()
+        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
+            warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
+            self._zip_data = b""
+
+    def _on_bundle_export(self, change: dict | None = None) -> None:
+        if not self._bundle_export_requested:
+            return
+        self._bundle_export_requested = False
+        self._generate_bundle()
+
+
+    # === Internal primitives ===
+
+    def _start_frame_server(self) -> None:
+        """Start the localhost exact-frame endpoint used by browser playback."""
+        if getattr(self, "_frame_server", None) is not None:
+            return
+
+        widget_ref = weakref.ref(self)
+        token = self._frame_server_token
+
+        class FrameHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt: str, *args) -> None:  # noqa: D401
+                return
+
+            def _cors(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+                self.send_header("Cache-Control", "no-store")
+
+            def _text(self, status: int, message: str) -> None:
+                body = message.encode("utf-8")
+                self.send_response(status)
+                self._cors()
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self._cors()
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlsplit(self.path)
+                if parsed.path != "/frame":
+                    self._text(404, "not found")
+                    return
+                params = urllib.parse.parse_qs(parsed.query)
+                if params.get("token", [""])[0] != token:
+                    self._text(403, "forbidden")
+                    return
+                try:
+                    idx = int(params.get("idx", [""])[0])
+                except ValueError:
+                    self._text(400, "idx must be an integer")
+                    return
+                version_param = params.get("version", [None])[0]
+                try:
+                    version = int(version_param) if version_param is not None else None
+                except ValueError:
+                    self._text(400, "version must be an integer")
+                    return
+
+                widget = widget_ref()
+                if widget is None:
+                    self._text(410, "widget is gone")
+                    return
+                status, frame_or_message = widget._frame_for_http(idx, version)
+                if status != 200:
+                    self._text(status, str(frame_or_message))
+                    return
+
+                frame = frame_or_message
+                view = memoryview(frame).cast("B")
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(view)))
+                self.send_header("X-Frame-Index", str(idx))
+                self.send_header("X-Frame-Shape", f"{frame.shape[0]},{frame.shape[1]}")
+                self.end_headers()
+                try:
+                    self.wfile.write(view)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        try:
+            server = _Show3DFrameHTTPServer(("127.0.0.1", 0), FrameHandler)
+        except OSError as exc:
+            warnings.warn(f"Show3D frame server disabled: {exc}", RuntimeWarning, stacklevel=2)
+            self.frame_server_url = ""
+            return
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"Show3DFrameServer-{id(self):x}",
+            daemon=True,
+        )
+        thread.start()
+        self._frame_server = server
+        self._frame_server_thread = thread
+        host, port = server.server_address[:2]
+        quoted_token = urllib.parse.quote(self._frame_server_token, safe="")
+        self.frame_server_url = f"http://{host}:{port}/frame?token={quoted_token}"
+        self._bump_frame_server_version()
+
+    def _stop_frame_server(self) -> None:
+        """Stop the localhost frame endpoint."""
+        server = getattr(self, "_frame_server", None)
+        thread = getattr(self, "_frame_server_thread", None)
+        self._frame_server = None
+        self._frame_server_thread = None
+        if self.frame_server_url:
+            self.frame_server_url = ""
+            self._bump_frame_server_version()
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def _bump_frame_server_version(self) -> None:
+        self.frame_server_version = int(self.frame_server_version) + 1
+
+    def _frame_for_http(self, idx: int, version: int | None) -> tuple[int, np.ndarray | str]:
+        if version is not None and version != self.frame_server_version:
+            return 409, "stale frame server version"
+        data = self._display_data
+        if data is None:
+            return 410, "frame data has been released"
+        if idx < 0 or idx >= int(self.n_slices):
+            return 416, f"frame index {idx} out of range [0, {self.n_slices})"
+        frame = np.asarray(self._get_display_frame(idx), dtype=np.float32)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+        return 200, frame
+
+    def _get_display_frame(self, idx: int | None = None) -> np.ndarray:
+        """Return the (binned, possibly diff-mode) frame for display. idx=None uses
+        current slice_idx. Applies `diff_mode` subtraction so the FFT / stats
+        observers see the same data the browser renders."""
+        if idx is None:
+            idx = self.slice_idx
+        data = self._display_data
+        frame = data[idx]
+        if self.diff_mode == "previous":
+            if idx == 0:
+                return np.zeros_like(frame)
+            return frame - data[idx - 1]
+        if self.diff_mode == "first":
+            return frame - data[0]
+        return frame
+
+    def _refresh_auto_contrast_ranges(self) -> None:
+        """Precompute per-frame auto-contrast ranges for JS playback.
+
+        The browser must not spend a 30 fps frame budget scanning 16M pixels for
+        percentile bounds. This mirrors the frontend's 1024-bin percentileClip
+        approximation using the full-resolution float32 frames.
+        """
+        if self.n_slices <= 0:
+            self.auto_vmins = []
+            self.auto_vmaxs = []
+            return
+
+        vmins: list[float] = []
+        vmaxs: list[float] = []
+        low_target = self.percentile_low / 100.0
+        high_target = self.percentile_high / 100.0
+        bins = 1024
+        denom = bins - 1
+        for i in range(self.n_slices):
+            frame = self._get_display_frame(i)
+            mn = float(np.min(frame))
+            mx = float(np.max(frame))
+            if mn == mx:
+                vmins.append(mn)
+                vmaxs.append(mx)
+                continue
+            hist, _ = np.histogram(frame, bins=bins, range=(mn, mx))
+            csum = np.cumsum(hist)
+            low_count = int(frame.size * low_target)
+            high_count = int(np.ceil(frame.size * high_target))
+            lo = int(np.searchsorted(csum, low_count, side="left"))
+            hi = int(np.searchsorted(csum, high_count, side="left"))
+            lo = max(0, min(denom, lo))
+            hi = max(0, min(denom, hi))
+            span = mx - mn
+            vmins.append(float(mn + (lo / denom) * span))
+            vmaxs.append(float(mn + (hi / denom) * span))
+
+        with self.hold_sync():
+            self.auto_vmins = vmins
+            self.auto_vmaxs = vmaxs
+
+    def _get_color_range(self, frame: np.ndarray) -> tuple[float, float]:
+        """Get vmin/vmax based on current settings."""
+        if self.vmin is not None or self.vmax is not None:
+            vmin = float(self.vmin if self.vmin is not None else self._vmin)
+            vmax = float(self.vmax if self.vmax is not None else self._vmax)
+            if self.log_scale:
+                # Signed log so negative vmin (e.g. diff_mode) doesn't collapse to 0.
+                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
+                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
+        elif self.auto_contrast:
+            vmin = float(np.percentile(frame, self.percentile_low))
+            vmax = float(np.percentile(frame, self.percentile_high))
+        else:
+            vmin = self._vmin
+            vmax = self._vmax
+        return vmin, vmax
+
+    def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Normalize frame to uint8 with current display settings."""
+        # Signed log so negatives don't collapse to zero. Matches JS `slog` so
+        # GIF/PNG exports look identical to live render for signed data
+        # (diff_mode, phase, residuals, anything that can go negative).
+        if self.log_scale:
+            frame = np.sign(frame) * np.log1p(np.abs(frame))
+
+        vmin, vmax = self._get_color_range(frame)
+
+        if vmax > vmin:
+            normalized = np.clip((frame - vmin) / (vmax - vmin) * 255, 0, 255)
+            return normalized.astype(np.uint8)
+        return np.zeros(frame.shape, dtype=np.uint8)
 
     def _normalize_frames_torch(self, start: int, end: int) -> np.ndarray:
         """Batch-normalize frames [start, end] on GPU. Returns (N, H, W) uint8 numpy."""
@@ -1899,8 +2568,248 @@ class Show3D(anywidget.AnyWidget):
             normalized = torch.zeros_like(frames, dtype=torch.uint8)
         return normalized.cpu().numpy()
 
-    def _generate_gif(self):
-        import io
+    def _update_all(self) -> None:
+        """Ship frame_bytes to JS. Stats (mean/min/max/std/histogram) are
+        recomputed entirely on the JS side from the float32 bytes - Python
+        doing the same reductions wastes ~50 ms per scrub at 4k full-res.
+        ROI stats stay on Python because the mask logic + per-ROI bookkeeping
+        lives here."""
+        display_frame = self._get_display_frame()
+        with self.hold_sync():
+            if self.roi_active:
+                self._update_roi_stats(display_frame)
+            else:
+                self.roi_stats = {}
+            self.frame_bytes = display_frame.tobytes()
+            self.frame_seq = self.frame_seq + 1
+
+    def _update_roi_stats(self, frame: np.ndarray) -> None:
+        """Compute mean/min/max/std/area of the currently-selected ROI on `frame`
+        and write to the `roi_stats` trait so the JS panel can render. Skipped
+        when no ROI selected (cheap fast-path for the common scrub case)."""
+        idx = self.roi_selected_idx
+        if idx < 0 or idx >= len(self.roi_list):
+            self.roi_stats = {}
+            return
+        roi = self.roi_list[idx]
+        mask = self._roi_mask(roi)
+        # Mask is built at display (binned) dims, matching `frame`. The torch path
+        # used to index raw _data_torch[slice_idx] which is full-res → shape mismatch.
+        # Stats on 16 MB binned numpy frame are <5 ms; no torch round-trip needed.
+        region = frame[mask]
+        if region.size > 0:
+            self.roi_stats = {
+                "mean": float(region.mean()),
+                "min": float(region.min()),
+                "max": float(region.max()),
+                "std": float(region.std()),
+            }
+        else:
+            self.roi_stats = {}
+
+    def _compute_roi_plot(self) -> None:
+        """Compute selected ROI mean for all frames. Uses display data (binned) for speed."""
+        idx = self.roi_selected_idx
+        if idx < 0 or idx >= len(self.roi_list):
+            self.roi_plot_data = b""
+            return
+        mask = self._roi_mask(self.roi_list[idx])
+        if mask.sum() == 0:
+            self.roi_plot_data = b""
+            return
+        # Use _display_data (binned) - 4-16× less data than _data, same ROI result.
+        # Cache torch view of _display_data on the instance so every drag doesn't
+        # reallocate VRAM (was leaking ~4 GB/drag on large stacks).
+        # Apply diff_mode so plot matches what the stats panel shows.
+        data = self._display_data
+        if self.diff_mode == "previous":
+            diff = np.zeros_like(data)
+            diff[1:] = data[1:] - data[:-1]
+            data = diff
+        elif self.diff_mode == "first":
+            data = data - data[0:1]
+        if self._use_torch and self.diff_mode == "off":
+            if getattr(self, "_display_torch", None) is None:
+                self._display_torch = torch.from_numpy(self._display_data).to(self._device)
+            mask_t = torch.from_numpy(mask).to(self._device)
+            masked = self._display_torch[:, mask_t]
+            means = masked.mean(dim=1).cpu().numpy().astype(np.float32)
+        else:
+            means = np.array([float(data[i][mask].mean()) for i in range(self.n_slices)], dtype=np.float32)
+        self.roi_plot_data = means.tobytes()
+
+    def _roi_mask(self, roi: dict) -> np.ndarray:
+        """Return a boolean mask of the ROI over the current frame. Supports
+        circle / square / rectangle / annular shapes. Strict-< edge match the
+        JS strokeRect drawing so Python stats agree with what the user sees."""
+        r, c = np.ogrid[0 : self.height, 0 : self.width]
+        shape = roi.get("shape", "circle")
+        row = float(roi.get("row", 0))
+        col = float(roi.get("col", 0))
+        radius = max(1.0, float(roi.get("radius", 10)))
+        if shape == "circle":
+            return (c - col) ** 2 + (r - row) ** 2 <= radius**2
+        if shape == "square":
+            # Strict < to match JS strokeRect width = 2*radius (exclusive).
+            return (np.abs(c - col) < radius) & (np.abs(r - row) < radius)
+        if shape == "rectangle":
+            half_w = max(1.0, float(roi.get("width", 20)) / 2.0)
+            half_h = max(1.0, float(roi.get("height", 20)) / 2.0)
+            # Strict < to match JS strokeRect (width=width, exclusive at edge).
+            return (np.abs(c - col) < half_w) & (np.abs(r - row) < half_h)
+        if shape == "annular":
+            inner = max(0.0, float(roi.get("radius_inner", 5)))
+            dist2 = (c - col) ** 2 + (r - row) ** 2
+            return (dist2 >= inner**2) & (dist2 <= radius**2)
+        return (c - col) ** 2 + (r - row) ** 2 <= radius**2
+
+    def _upsert_selected_roi(self, updates: dict) -> None:
+        """Merge `updates` into the currently-selected ROI, or append a new ROI
+        if none is selected. Fills defaults + cyclic color so single-field edits
+        (e.g. `radius=20`) don't strip unspecified fields."""
+        rois = list(self.roi_list)
+        color_cycle = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#ef5350", "#ffd54f", "#90a4ae", "#a1887f"]
+        defaults = {
+            "shape": "circle",
+            "row": int(self.height // 2),
+            "col": int(self.width // 2),
+            "radius": 10,
+            "radius_inner": 5,
+            "width": 20,
+            "height": 20,
+            "line_width": 2,
+            "highlight": False,
+            "visible": True,
+            "locked": False,
+        }
+        if self.roi_selected_idx >= 0 and self.roi_selected_idx < len(rois):
+            current = {**defaults, **rois[self.roi_selected_idx]}
+            if not current.get("color"):
+                current["color"] = color_cycle[self.roi_selected_idx % len(color_cycle)]
+            rois[self.roi_selected_idx] = {**current, **updates}
+        else:
+            rois.append({**defaults, "color": color_cycle[len(rois) % len(color_cycle)], **updates})
+            self.roi_selected_idx = len(rois) - 1
+        self.roi_list = rois
+        self.roi_active = True
+
+    def _send_buffer(self, start_idx: int) -> None:
+        end_idx = start_idx + self._buffer_size
+        if self.diff_mode == "off":
+            data = self._display_data
+            if end_idx <= self.n_slices:
+                chunk = data[start_idx:end_idx]
+            else:
+                chunk = np.concatenate(
+                    [data[start_idx:], data[: end_idx - self.n_slices]]
+                )
+        else:
+            frames = []
+            for j in range(self._buffer_size):
+                idx = (start_idx + j) % self.n_slices
+                frames.append(self._get_display_frame(idx))
+            chunk = np.stack(frames)
+        with self.hold_sync():
+            self._buffer_start = int(start_idx)
+            self._buffer_count = int(chunk.shape[0])
+            self._buffer_bytes = chunk.tobytes()
+
+    def _sample_line(self, img: np.ndarray, row0: float, col0: float, row1: float, col1: float) -> np.ndarray:
+        """Sample one pixel line between two endpoints via bilinear interpolation.
+        N samples = ceil(line length). Used as the building block for line
+        profiles; without bilinear the profile aliases on diagonal lines."""
+        h, w = img.shape
+        dc, dr = col1 - col0, row1 - row0
+        length = (dc**2 + dr**2) ** 0.5
+        n = max(2, int(np.ceil(length)))
+        t = np.linspace(0, 1, n)
+        cs = col0 + t * dc
+        rs = row0 + t * dr
+        ci = np.floor(cs).astype(int)
+        ri = np.floor(rs).astype(int)
+        cf = cs - ci
+        rf = rs - ri
+        c0c = np.clip(ci, 0, w - 1)
+        c1c = np.clip(ci + 1, 0, w - 1)
+        r0c = np.clip(ri, 0, h - 1)
+        r1c = np.clip(ri + 1, 0, h - 1)
+        return (img[r0c, c0c] * (1 - cf) * (1 - rf) +
+                img[r0c, c1c] * cf * (1 - rf) +
+                img[r1c, c0c] * (1 - cf) * rf +
+                img[r1c, c1c] * cf * rf)
+
+    def _sample_profile_on(self, img: np.ndarray, row0: float, col0: float, row1: float, col1: float) -> np.ndarray:
+        """Sample a width-`profile_width` strip averaged perpendicular to the line.
+        Averaging across the strip reduces shot noise on thin line profiles -
+        a single-pixel sample is too noisy for atomic-resolution data."""
+        pw = self.profile_width
+        if pw <= 1:
+            return self._sample_line(img, row0, col0, row1, col1).astype(np.float32)
+        dc, dr = col1 - col0, row1 - row0
+        length = (dc**2 + dr**2) ** 0.5
+        if length < 1e-8:
+            return self._sample_line(img, row0, col0, row1, col1).astype(np.float32)
+        perp_r, perp_c = -dc / length, dr / length
+        half = (pw - 1) / 2.0
+        offsets = np.linspace(-half, half, pw)
+        accumulated = None
+        for off in offsets:
+            vals = self._sample_line(img, row0 + off * perp_r, col0 + off * perp_c,
+                                     row1 + off * perp_r, col1 + off * perp_c)
+            if accumulated is None:
+                accumulated = vals.copy()
+            else:
+                accumulated += vals
+        return (accumulated / pw).astype(np.float32)
+
+    def _sample_profile(self, row0: float, col0: float, row1: float, col1: float) -> np.ndarray:
+        """Sample the line profile on the current display frame (binned, diff-aware)
+        so the returned profile matches what the user sees."""
+        return self._sample_profile_on(self._get_display_frame(), row0, col0, row1, col1)
+
+    def _roi_timeseries_csv(self) -> str:
+
+        rois = list(self.roi_list)
+        masks = [self._roi_mask(roi) for roi in rois]
+        out = io.StringIO()
+        writer = csv.writer(out)
+        header = ["frame_index", "label"]
+        if self.timestamps and len(self.timestamps) >= self.n_slices:
+            header.append(f"timestamp_{self.timestamp_unit or 'value'}")
+        header.extend([f"roi_{i + 1}_mean" for i in range(len(rois))])
+        writer.writerow(header)
+
+        if self._use_torch:
+            # Vectorized per-ROI means across all frames
+            masks_t = [torch.from_numpy(m).to(self._device) for m in masks]
+            roi_means = []
+            for mask_t in masks_t:
+                masked = self._data_torch[:, mask_t]  # (n_slices, n_pixels)
+                if masked.shape[1] > 0:
+                    roi_means.append(masked.mean(dim=1).cpu().numpy())
+                else:
+                    roi_means.append(np.full(self.n_slices, np.nan))
+            for i in range(self.n_slices):
+                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
+                if self.timestamps and len(self.timestamps) >= self.n_slices:
+                    row.append(float(self.timestamps[i]))
+                for rm in roi_means:
+                    val = rm[i]
+                    row.append(float(val) if not np.isnan(val) else "")
+                writer.writerow(row)
+        else:
+            for i in range(self.n_slices):
+                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
+                if self.timestamps and len(self.timestamps) >= self.n_slices:
+                    row.append(float(self.timestamps[i]))
+                frame = self._data[i]
+                for mask in masks:
+                    region = frame[mask]
+                    row.append(float(region.mean()) if region.size > 0 else "")
+                writer.writerow(row)
+        return out.getvalue()
+
+    def _generate_gif(self) -> None:
 
         from matplotlib import colormaps
         from PIL import Image
@@ -1969,20 +2878,7 @@ class Show3D(anywidget.AnyWidget):
             self._gif_metadata_json = json.dumps(metadata, indent=2)
             self._gif_data = gif_bytes
 
-    def _on_zip_export(self, change=None):
-        if not self._zip_export_requested:
-            return
-        self._zip_export_requested = False
-        try:
-            self._generate_zip()
-        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
-            import warnings
-            warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
-            self._zip_data = b""
-
-    def _generate_zip(self):
-        import io
-        import zipfile
+    def _generate_zip(self) -> None:
 
         from matplotlib import colormaps
         from PIL import Image
@@ -2030,59 +2926,7 @@ class Show3D(anywidget.AnyWidget):
         self._zip_data = b""
         self._zip_data = zip_bytes
 
-    def _on_bundle_export(self, change=None):
-        if not self._bundle_export_requested:
-            return
-        self._bundle_export_requested = False
-        self._generate_bundle()
-
-    def _roi_timeseries_csv(self) -> str:
-        import csv
-        import io
-
-        rois = list(self.roi_list)
-        masks = [self._roi_mask(roi) for roi in rois]
-        out = io.StringIO()
-        writer = csv.writer(out)
-        header = ["frame_index", "label"]
-        if self.timestamps and len(self.timestamps) >= self.n_slices:
-            header.append(f"timestamp_{self.timestamp_unit or 'value'}")
-        header.extend([f"roi_{i + 1}_mean" for i in range(len(rois))])
-        writer.writerow(header)
-
-        if self._use_torch:
-            # Vectorized per-ROI means across all frames
-            masks_t = [torch.from_numpy(m).to(self._device) for m in masks]
-            roi_means = []
-            for mask_t in masks_t:
-                masked = self._data_torch[:, mask_t]  # (n_slices, n_pixels)
-                if masked.shape[1] > 0:
-                    roi_means.append(masked.mean(dim=1).cpu().numpy())
-                else:
-                    roi_means.append(np.full(self.n_slices, np.nan))
-            for i in range(self.n_slices):
-                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
-                if self.timestamps and len(self.timestamps) >= self.n_slices:
-                    row.append(float(self.timestamps[i]))
-                for rm in roi_means:
-                    val = rm[i]
-                    row.append(float(val) if not np.isnan(val) else "")
-                writer.writerow(row)
-        else:
-            for i in range(self.n_slices):
-                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
-                if self.timestamps and len(self.timestamps) >= self.n_slices:
-                    row.append(float(self.timestamps[i]))
-                frame = self._data[i]
-                for mask in masks:
-                    region = frame[mask]
-                    row.append(float(region.mean()) if region.size > 0 else "")
-                writer.writerow(row)
-        return out.getvalue()
-
-    def _generate_bundle(self):
-        import io
-        import zipfile
+    def _generate_bundle(self) -> None:
 
         from matplotlib import colormaps
         from PIL import Image
@@ -2115,54 +2959,3 @@ class Show3D(anywidget.AnyWidget):
         bundle_bytes = buf.getvalue()
         self._bundle_data = b""
         self._bundle_data = bundle_bytes
-
-
-    def save_image(self, path: str | pathlib.Path, *, frame_idx: int | None = None,
-                   format: str | None = None, dpi: int = 150) -> pathlib.Path:
-        """Save a single frame as PNG, PDF, or TIFF.
-
-        Parameters
-        ----------
-        path : str or pathlib.Path
-            Output file path.
-        frame_idx : int, optional
-            Frame index to export. Defaults to current slice_idx.
-        format : str, optional
-            'png', 'pdf', or 'tiff'. If omitted, inferred from file extension.
-        dpi : int, default 150
-            Output DPI metadata.
-
-        Returns
-        -------
-        pathlib.Path
-            The written file path.
-        """
-        from matplotlib import colormaps
-        from PIL import Image
-
-        path = pathlib.Path(path)
-        fmt = (format or path.suffix.lstrip(".").lower() or "png").lower()
-        if fmt not in ("png", "pdf", "tiff", "tif"):
-            raise ValueError(f"Unsupported format: {fmt!r}. Use 'png', 'pdf', or 'tiff'.")
-
-        idx = frame_idx if frame_idx is not None else self.slice_idx
-        if idx < 0 or idx >= self.n_slices:
-            raise IndexError(f"Frame index {idx} out of range [0, {self.n_slices})")
-
-        # Respect diff_mode so saved frame matches what user sees.
-        frame = self._data[idx]
-        if self.diff_mode == "previous":
-            frame = frame - self._data[idx - 1] if idx > 0 else np.zeros_like(frame)
-        elif self.diff_mode == "first":
-            frame = frame - self._data[0]
-        normalized = self._normalize_frame(frame)
-        cmap_fn = colormaps.get_cmap(self.cmap)
-        rgba = (cmap_fn(normalized / 255.0) * 255).astype(np.uint8)
-
-        img = Image.fromarray(rgba)
-        if fmt == "pdf":
-            Image.init()
-            img = img.convert("RGB")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(str(path), dpi=(dpi, dpi))
-        return path

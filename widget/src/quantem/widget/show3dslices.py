@@ -7,11 +7,15 @@ response. This widget is intentionally focused on single-object iterative
 ptychography volumes; comparison and tomography-specific workflows belong in
 Show3DVolume.
 """
+import gc
+import io
 import json
 import math
 import pathlib
+import warnings
 from numbers import Real
-from typing import Self, Sequence
+from collections.abc import Sequence
+from typing import Self
 
 import anywidget
 import numpy as np
@@ -35,16 +39,41 @@ _VALID_CMAPS = frozenset({
 
 
 class Show3DSlices(anywidget.AnyWidget):
-    """Ptycho multislice viewer with three orthogonal slice planes.
+    """
+    Three-panel orthogonal slice viewer for a single 3D volume.
+
+    Renders XY / XZ / YZ slice planes of a ``(nz, ny, nx)`` volume in three
+    linked canvases with synchronized crosshair, per-plane contrast, optional
+    FFT, and per-axis playback. Designed for multislice ptychography
+    reconstructions and other small-to-medium 3D volumes where the operator
+    wants to scrub through depth (axis 0) while seeing the orthogonal context.
+    The raw volume is sent once over the Jupyter Comm channel and re-sliced
+    in JS for each scrubber update.
+
+    Features
+    --------
+    - Three linked XY / XZ / YZ slice canvases with crosshair guides
+    - Per-axis playback (Z, Y, X, or cycle all) with loop / reverse / boomerang
+    - Independent scrub of each plane via ``slice_z``, ``slice_y``, ``slice_x``
+    - Log scale, percentile auto-contrast, manual ``vmin`` / ``vmax``
+    - Per-plane statistics (opt-in via ``show_stats``)
+    - Anisotropic scale bars via ``pixel_size_axes`` (e.g. nz << nxy multislice)
+    - Depth-axis ``z_stretch`` for non-cubic volumes (CSS scaling, zero memory)
+    - FFT panel with optional Hann window for the active plane
+    - PNG / PDF / TIFF single-slice export with plane and index selection
+    - JSON state save/load via ``state_dict`` / ``load_state_dict`` / ``save``
+    - Explicit ``free`` to release RAM held by traitlets observers
 
     Parameters
     ----------
     data : array_like
-        3D array of shape (nz, ny, nx).
+        3D array of shape ``(nz, ny, nx)``. Also accepts a quantem ``Dataset3d``
+        (uses ``.array`` and ``.sampling`` automatically).
     title : str, optional
         Title displayed above the viewer.
     cmap : str, default "inferno"
-        Colormap name. One of {valid set above}.
+        Colormap name. One of the project's valid colormaps (``"inferno"``,
+        ``"viridis"``, ``"magma"``, ``"gray"``, ``"plasma"``, ...).
     pixel_size : float or sequence of 3 floats, optional
         Voxel sampling in angstroms. Pass a scalar for isotropic data, or a
         3-tuple `(pz, py, px)` for anisotropic data (e.g. multislice ptycho
@@ -83,20 +112,36 @@ class Show3DSlices(anywidget.AnyWidget):
         matches the project-wide detector-plane convention (axis 0 = multislice
         depth, axis 1 = row, axis 2 = col). Pass any 3-string list to override.
 
-    Examples
-    --------
+    Example
+    -------
+    Instantiate Show3DSlices on a multislice ptycho object, scrub through
+    depth, and export a slice to PNG:
+
     >>> import numpy as np
     >>> from quantem.widget import Show3DSlices
-    >>> volume = np.random.rand(64, 64, 64).astype(np.float32)
-    >>> Show3DSlices(volume, title="My Volume", cmap="viridis")
+    >>> volume = np.random.rand(14, 256, 256).astype(np.float32)
+    >>> w = Show3DSlices(volume, title="multislice object", cmap="viridis",
+    ...                  pixel_size=(2.0, 0.2, 0.2), z_stretch=8)
+    >>> w.play()  # doctest: +SKIP
+    >>> w.save_image("xy_slice7.png", plane="xy", slice_idx=7)  # doctest: +SKIP
+
+    Notes
+    -----
+    - The raw volume is sent once over the Comm channel; subsequent slice
+      moves only ship trait updates, not the data.
+    - For comparing two volumes side-by-side, use ``Show3DVolume`` (or two
+      separate ``Show3DSlices`` cells). This widget intentionally rejects
+      saved states that include ``dual_mode`` / ``show_diff`` keys.
+    - Call ``free()`` before discarding the widget to release RAM pinned by
+      traitlets observers.
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "show3dslices.js"
     _widget_name = "Show3DSlices"
     _viewer_kind = "slices"
 
-    widget_version = traitlets.Unicode("unknown").tag(sync=True)
-    viewer_kind = traitlets.Unicode("slices").tag(sync=True)
+    widget_version = traitlets.Unicode("unknown")  # Python-only: telemetry readout
+    viewer_kind = traitlets.Unicode("slices")       # Python-only: introspection / state save
 
     # Volume dimensions
     nx = traitlets.Int(1).tag(sync=True)
@@ -129,14 +174,14 @@ class Show3DSlices(anywidget.AnyWidget):
     z_stretch = traitlets.Float(1.0).tag(sync=True)
     # UI
     show_controls = traitlets.Bool(True).tag(sync=True)
-    show_stats = traitlets.Bool(False).tag(sync=True)
+    show_stats = traitlets.Bool(False)  # Python-only: gates _compute_stats reductions, no JS bar
     show_crosshair = traitlets.Bool(True).tag(sync=True)
     show_fft = traitlets.Bool(False).tag(sync=True)
     fft_window = traitlets.Bool(False).tag(sync=True)
     orthographic = traitlets.Bool(False).tag(sync=True)
     smooth = traitlets.Bool(False).tag(sync=True)
     # Deprecated compatibility no-op. The JS widget always renders the compact layout.
-    compact = traitlets.Bool(True).tag(sync=True)
+    compact = traitlets.Bool(True)
     flip = traitlets.Bool(False).tag(sync=True)
     # Axis labels (dim 0, 1, 2). Use detector-plane convention: axis 0 = slice
     # (multislice depth), axis 1 = row, axis 2 = col. Panel headers display as
@@ -158,7 +203,8 @@ class Show3DSlices(anywidget.AnyWidget):
     # Validators (consistent with Show3D)
 
     @traitlets.validate("cmap")
-    def _validate_cmap(self, proposal):
+    def _validate_cmap(self, proposal: dict) -> str:
+        """Reject unknown colormap names. Keeps JS LUT lookup safe."""
         val = str(proposal["value"])
         if val not in _VALID_CMAPS:
             raise traitlets.TraitError(
@@ -167,7 +213,8 @@ class Show3DSlices(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("fps")
-    def _validate_fps(self, proposal):
+    def _validate_fps(self, proposal: dict) -> float:
+        """Reject non-finite or non-positive playback speed."""
         val = float(proposal["value"])
         if not math.isfinite(val):
             raise traitlets.TraitError(f"fps must be finite, got {val}")
@@ -176,7 +223,8 @@ class Show3DSlices(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("pixel_size")
-    def _validate_pixel_size(self, proposal):
+    def _validate_pixel_size(self, proposal: dict) -> float:
+        """Reject NaN/inf/negative pixel size to keep scale bar math sane."""
         val = float(proposal["value"])
         if math.isnan(val) or math.isinf(val):
             raise traitlets.TraitError(f"pixel_size must be finite, got {val}")
@@ -185,7 +233,8 @@ class Show3DSlices(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("pixel_size_axes")
-    def _validate_pixel_size_axes(self, proposal):
+    def _validate_pixel_size_axes(self, proposal: dict) -> list[float]:
+        """Enforce 3-element finite non-negative [pz, py, px] tuple."""
         val = [float(v) for v in proposal["value"]]
         if len(val) != 3:
             raise traitlets.TraitError(
@@ -199,42 +248,61 @@ class Show3DSlices(anywidget.AnyWidget):
         return val
 
     @traitlets.validate("play_axis")
-    def _validate_play_axis(self, proposal):
+    def _validate_play_axis(self, proposal: dict) -> int:
+        """Restrict play axis to 0/1/2 (Z/Y/X) or 3 (all)."""
         val = int(proposal["value"])
         if val not in (0, 1, 2, 3):
             raise traitlets.TraitError(f"play_axis must be 0/1/2/3, got {val}")
         return val
 
     @traitlets.validate("z_stretch")
-    def _validate_z_stretch(self, proposal):
+    def _validate_z_stretch(self, proposal: dict) -> float:
+        """Clamp z stretch to [1, 30] so the 3D view stays usable."""
         val = float(proposal["value"])
         if math.isnan(val) or math.isinf(val):
             raise traitlets.TraitError(f"z_stretch must be finite, got {val}")
         return max(1.0, min(val, 30.0))
 
     @traitlets.validate("dim_labels")
-    def _validate_dim_labels(self, proposal):
-        val = list(proposal["value"])
+    def _validate_dim_labels(self, proposal: dict) -> list[str]:
+        """Enforce exactly 3 axis labels for Z/Y/X. Reject bare strings up
+        front since `list("zyx")` would silently produce single-character
+        labels in saved state and panel headers (typo footgun)."""
+        raw = proposal["value"]
+        if isinstance(raw, (str, bytes)):
+            raise traitlets.TraitError(
+                f"dim_labels must be a list of 3 strings, got bare {type(raw).__name__}: {raw!r}"
+            )
+        val = list(raw)
         if len(val) != 3:
             raise traitlets.TraitError(
                 f"dim_labels must have length 3, got {len(val)}"
             )
+        for i, label in enumerate(val):
+            if not isinstance(label, str):
+                raise traitlets.TraitError(
+                    f"dim_labels[{i}] must be a string, got {type(label).__name__}: {label!r}"
+                )
         return val
 
     @traitlets.validate("slice_z")
-    def _validate_slice_z(self, proposal):
+    def _validate_slice_z(self, proposal: dict) -> int:
+        """Clamp slice_z to [0, nz-1]."""
         return max(0, min(int(proposal["value"]), max(0, int(self.nz) - 1)))
 
     @traitlets.validate("slice_y")
-    def _validate_slice_y(self, proposal):
+    def _validate_slice_y(self, proposal: dict) -> int:
+        """Clamp slice_y to [0, ny-1]."""
         return max(0, min(int(proposal["value"]), max(0, int(self.ny) - 1)))
 
     @traitlets.validate("slice_x")
-    def _validate_slice_x(self, proposal):
+    def _validate_slice_x(self, proposal: dict) -> int:
+        """Clamp slice_x to [0, nx-1]."""
         return max(0, min(int(proposal["value"]), max(0, int(self.nx) - 1)))
 
     @traitlets.validate("vmax")
-    def _validate_vmax_ge_vmin(self, proposal):
+    def _validate_vmax_ge_vmin(self, proposal: dict) -> float | None:
+        """Reject vmax < vmin and non-finite values."""
         new_vmax = proposal["value"]
         if new_vmax is not None:
             if not math.isfinite(new_vmax):
@@ -246,7 +314,8 @@ class Show3DSlices(anywidget.AnyWidget):
         return new_vmax
 
     @traitlets.validate("vmin")
-    def _validate_vmin_le_vmax(self, proposal):
+    def _validate_vmin_le_vmax(self, proposal: dict) -> float | None:
+        """Reject vmin > vmax and non-finite values."""
         new_vmin = proposal["value"]
         if new_vmin is not None:
             if not math.isfinite(new_vmin):
@@ -256,6 +325,10 @@ class Show3DSlices(anywidget.AnyWidget):
                     f"vmin ({new_vmin}) must be <= vmax ({self.vmax})"
                 )
         return new_vmin
+
+    # =========================================================================
+    # === Construction ===
+    # =========================================================================
 
     def __init__(
         self,
@@ -338,10 +411,10 @@ class Show3DSlices(anywidget.AnyWidget):
                     def unit_scale(unit):
                         if not unit:
                             return 1.0
-                        u = str(unit).strip().lower()
-                        if u == "nm":
+                        unit_str = str(unit).strip().lower()
+                        if unit_str == "nm":
                             return 10.0
-                        if u in ("a", "å", "angstrom", "angstroms"):
+                        if unit_str in ("a", "å", "angstrom", "angstroms"):
                             return 1.0
                         raise ValueError(f"unsupported Dataset3d unit: {unit!r}")
 
@@ -472,6 +545,10 @@ class Show3DSlices(anywidget.AnyWidget):
                 state = unwrap_state_payload(state, expected_widget=self._widget_name)
             self.load_state_dict(state)
 
+    # =========================================================================
+    # === Public API ===
+    # =========================================================================
+
     def __repr__(self) -> str:
         return (
             f"{self._widget_name}({self.nz}×{self.ny}×{self.nx}, "
@@ -479,7 +556,38 @@ class Show3DSlices(anywidget.AnyWidget):
         )
 
     def state_dict(self) -> dict:
+        """Return a JSON-serializable snapshot of every user-tunable trait.
+
+        Captures display config (cmap, log scale, contrast, FFT, orthographic,
+        smooth, flip, crosshair), scale-bar settings (``pixel_size``,
+        ``pixel_size_axes``, ``z_stretch``), playback config (fps, loop,
+        reverse, boomerang, play axis), the three slice positions, and the
+        dimension labels. The raw volume data is NOT included; pair the
+        snapshot with the original ``data`` argument on restore.
+
+        Returns
+        -------
+        dict
+            Mapping of trait name -> serializable value. Suitable for
+            ``json.dump`` or use with ``save`` / ``load_state_dict``.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume, cmap="viridis")  # doctest: +SKIP
+        >>> state = w.state_dict()  # doctest: +SKIP
+        >>> w2 = Show3DSlices(volume)  # doctest: +SKIP
+        >>> w2.load_state_dict(state)  # doctest: +SKIP
+
+        Notes
+        -----
+        - Schema versioning is handled inside ``save``; the dict returned
+          here is the unversioned inner payload.
+        """
         return {
+            # Widget discriminator: lets load_state_dict reject cross-widget
+            # loads (e.g. Show3D.state_dict() into Show3DSlices) cleanly.
+            "_widget": "Show3DSlices",
             "title": self.title,
             "viewer_kind": self.viewer_kind,
             "cmap": self.cmap,
@@ -511,27 +619,99 @@ class Show3DSlices(anywidget.AnyWidget):
         }
 
     def save(self, path: str) -> None:
+        """Write the current widget state to a versioned JSON file.
+
+        Wraps ``state_dict`` in a small envelope that records the widget type
+        (``"Show3DSlices"``) and a schema version so ``load_state_dict`` can
+        refuse states that belong to a different widget. The raw volume data
+        is NOT written; only the display / playback / slice configuration.
+
+        Parameters
+        ----------
+        path : str
+            Destination JSON file path. Parent directories must already exist.
+
+        Returns
+        -------
+        None
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume, cmap="viridis", pixel_size=(2.0, 0.2, 0.2))  # doctest: +SKIP
+        >>> w.save("slices_state.json")  # doctest: +SKIP
+
+        Notes
+        -----
+        - To restore, instantiate ``Show3DSlices`` with the (possibly different)
+          volume and call ``w.load_state_dict(json.loads(open(path).read()))``.
+        """
         save_state_file(path, self._widget_name, self.state_dict())
 
     def load_state_dict(self, state: dict) -> None:
+        """Apply a saved ``state_dict`` snapshot to this widget.
+
+        Restores display, playback, slice, and labeling configuration from a
+        dict produced by ``state_dict``. States that include the deprecated
+        ``dual_mode`` / ``show_diff`` keys are rejected with a hint to use
+        ``Show3DVolume`` for two-volume comparisons. Unknown keys (typically
+        from a newer widget version or a typo) emit a ``UserWarning`` and are
+        dropped. Deprecated keys (``title_b``, ``linked_contrast``, ``compact``)
+        are silently ignored.
+
+        ``vmin`` / ``vmax`` are cleared first so either bound can be set
+        regardless of the current contrast limits. Forward-compat: a saved
+        state with only the scalar ``pixel_size`` (no ``pixel_size_axes``)
+        mirrors the scalar across all three axes so depth scale bars stay
+        in sync with the lateral one.
+
+        Parameters
+        ----------
+        state : dict
+            Mapping previously returned by ``state_dict`` (or its on-disk
+            equivalent).
+
+        Returns
+        -------
+        None
+            Mutates the widget in place.
+
+        Example
+        -------
+        >>> import json
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume)  # doctest: +SKIP
+        >>> w.load_state_dict(json.load(open("slices_state.json")))  # doctest: +SKIP
+
+        Notes
+        -----
+        - Saved files from a different widget type are caught earlier in the
+          ``save`` envelope check, not here.
+        """
+        # Reject cross-widget loads up front. Without this check, loading a
+        # Show3D state_dict() into Show3DSlices would partially apply the
+        # overlapping keys (cmap, log_scale, etc.) and leave the widget in a
+        # plausible-but-wrong state.
+        state = dict(state)
+        marker = state.pop("_widget", None)
+        if marker is not None and marker != "Show3DSlices":
+            raise ValueError(
+                f"load_state_dict: state was saved from {marker!r}, not Show3DSlices. "
+                f"Use the matching widget class to load it."
+            )
         # Surface validator errors. Warn on unknown keys (typo / wrong widget version).
         if state.get("dual_mode") or state.get("show_diff"):
             raise ValueError(
                 "Show3DSlices only supports a single 3D object. "
                 "Use Show3DVolume for saved dual/diff comparison states."
             )
-        allowed = {
-            "title", "cmap", "log_scale", "auto_contrast", "vmin", "vmax",
-            "viewer_kind",
-            "show_stats", "show_controls", "show_crosshair", "show_fft",
-            "fft_window", "orthographic", "smooth", "flip", "pixel_size", "pixel_size_axes",
-            "scale_bar_visible", "z_stretch", "compact", "slice_x",
-            "slice_y", "slice_z", "fps", "loop", "reverse", "boomerang",
-            "play_axis", "dim_labels",
-        }
-        unknown = [k for k in state if k not in allowed and k not in {"dual_mode", "show_diff", "title_b", "linked_contrast"}]
+        # Derive allowed keys from state_dict() so the two stay in lockstep -
+        # adding a trait to state_dict() automatically lets load_state_dict()
+        # accept it. Plus deprecated/back-compat keys that get popped below.
+        allowed = set(self.state_dict().keys())
+        deprecated = {"dual_mode", "show_diff", "title_b", "linked_contrast", "compact"}
+        unknown = [k for k in state if k not in allowed and k not in deprecated]
         if unknown:
-            import warnings
             warnings.warn(
                 f"load_state_dict ignored unknown keys: {unknown}. "
                 "Likely typo or saved by a different widget version.",
@@ -570,17 +750,58 @@ class Show3DSlices(anywidget.AnyWidget):
             self.pixel_size_axes = [ps, ps, ps]
 
     def free(self) -> None:
-        """Release RAM held by this widget. `del widget` won't free
-        memory because traitlets observers pin the refcount."""
+        """Release RAM held by this widget.
+
+        Drops the numpy volume and clears the ``volume_bytes`` sync trait, then
+        triggers a ``gc.collect()``. ``del widget`` alone does NOT free memory:
+        traitlets installs strong observer references that pin the widget's
+        refcount until ``free`` is called.
+
+        Returns
+        -------
+        None
+            Mutates the widget in place. After this call, the volume is gone
+            and rendering will be blank; rebuild a new widget for further use.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume)  # doctest: +SKIP
+        >>> w.free()  # doctest: +SKIP
+
+        Notes
+        -----
+        - Idempotent: calling ``free`` twice is a no-op.
+        """
         if self._data is None:
             return
+        # Stop frontend playback FIRST so JS rAF loop tears down before we null
+        # out the byte buffers it's reading from.
+        self.playing = False
         self._data = None
-        for trait in ("volume_bytes",):
-            setattr(self, trait, b"")
-        import gc
+        self.volume_bytes = b""
         gc.collect()
 
     def summary(self) -> None:
+        """Print a one-screen status report for the current widget.
+
+        Sections include: title and volume shape (with pixel-size readout
+        when set), current slice positions per axis with the user's
+        ``dim_labels``, raw data min/max/mean, and display config (cmap,
+        contrast, log/linear, FFT, Hann window). Useful for notebook
+        reproducibility and bug reports.
+
+        Returns
+        -------
+        None
+            Prints to stdout.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume, title="multislice")  # doctest: +SKIP
+        >>> w.summary()  # doctest: +SKIP
+        """
         lines = [self.title or self._widget_name, "═" * 32]
         lines.append(f"Volume:   {self.nz}×{self.ny}×{self.nx}")
         if self.pixel_size > 0:
@@ -611,79 +832,71 @@ class Show3DSlices(anywidget.AnyWidget):
         lines.append(f"Display:  {display}")
         print("\n".join(lines))
 
-    def _compute_stats(self) -> None:
-        """Compute statistics for the 3 current slices.
-
-        Skipped when show_stats is False to avoid 12 reductions
-        per slice movement on multi-MB volumes (JS does not render a stats bar; this
-        is for programmatic access only when the caller has opted in).
-        """
-        if not self.show_stats or self._data is None:
-            return
-        slices = [
-            self._data[self.slice_z, :, :],
-            self._data[:, self.slice_y, :],
-            self._data[:, :, self.slice_x],
-        ]
-        with self.hold_sync():
-            self.stats_mean = [float(np.mean(s, dtype=np.float64)) for s in slices]
-            self.stats_min = [float(np.min(s)) for s in slices]
-            self.stats_max = [float(np.max(s)) for s in slices]
-            self.stats_std = [float(np.std(s, dtype=np.float64)) for s in slices]
-
-    def _on_slice_change(self, change) -> None:
-        if self.playing:
-            return
-        self._compute_stats()
-
-    def _on_playing_change(self, change) -> None:
-        if not self.playing:
-            self._compute_stats()
-
-    def _on_show_stats_change(self, change) -> None:
-        if change.get("new"):
-            self._compute_stats()
-
     def play(self) -> Self:
+        """Start slice playback along the current ``play_axis``.
+
+        Sets the ``playing`` trait to ``True``. The JS animation loop scrubs
+        the axis selected by ``play_axis`` (``0=Z``, ``1=Y``, ``2=X``,
+        ``3=cycle all``) at ``fps`` frames per second.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining (``w.play()``).
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume, fps=10, play_axis=0)  # doctest: +SKIP
+        >>> w.play()  # doctest: +SKIP
+        """
         self.playing = True
         return self
 
     def pause(self) -> Self:
+        """Pause playback at the current slice indices.
+
+        Sets ``playing`` to ``False`` without resetting ``slice_z`` /
+        ``slice_y`` / ``slice_x``. Per-slice statistics (if ``show_stats``
+        is on) are refreshed for the current slice on pause.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume)  # doctest: +SKIP
+        >>> w.play().pause()  # doctest: +SKIP
+        """
         self.playing = False
         return self
 
     def stop(self) -> Self:
+        """Stop playback and recenter all three slice indices.
+
+        Sets ``playing`` to ``False`` and resets ``slice_z`` / ``slice_y`` /
+        ``slice_x`` to the geometric center of the volume (``nz // 2`` etc.).
+        Use ``pause`` to keep the current slice indices.
+
+        Returns
+        -------
+        Self
+            The widget, for chaining.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume)  # doctest: +SKIP
+        >>> w.play().stop()  # doctest: +SKIP
+        """
         self.playing = False
         self.slice_z = self.nz // 2
         self.slice_y = self.ny // 2
         self.slice_x = self.nx // 2
         return self
-
-    def _normalize_slice(self, slc: np.ndarray) -> np.ndarray:
-        if self.log_scale:
-            slc = np.sign(slc) * np.log1p(np.abs(slc))
-        # Mirror JS path: when flip=True the on-screen renderer negates the data
-        # and flips the contrast range (min<->max with sign). Python-side saved
-        # images should match what the user sees on screen.
-        if self.flip:
-            slc = -slc
-        if self.vmin is not None and self.vmax is not None:
-            vmin = float(self.vmin)
-            vmax = float(self.vmax)
-            if self.log_scale:
-                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
-                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
-            if self.flip:
-                vmin, vmax = -vmax, -vmin
-        elif self.auto_contrast:
-            vmin = float(np.percentile(slc, 2))
-            vmax = float(np.percentile(slc, 98))
-        else:
-            vmin = float(slc.min())
-            vmax = float(slc.max())
-        if vmax > vmin:
-            return np.clip((slc - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-        return np.zeros(slc.shape, dtype=np.uint8)
 
     def save_image(
         self,
@@ -694,25 +907,57 @@ class Show3DSlices(anywidget.AnyWidget):
         format: str | None = None,
         dpi: int = 150,
     ) -> pathlib.Path:
-        """Save a volume slice as PNG, PDF, or TIFF.
+        """Save a single 2D slice of the volume as PNG, PDF, or TIFF.
+
+        Extracts the requested orthogonal slice, colorizes it with the current
+        ``cmap`` and contrast (``vmin`` / ``vmax`` or 2-98 percentile
+        auto-contrast), and writes it to ``path``. ``log_scale`` and ``flip``
+        are honored so the saved file matches what the browser shows for that
+        plane.
+
+        Plane / index mapping:
+
+        - ``"xy"``: slice along Z, ``slice_idx`` indexes into ``nz``; defaults
+          to current ``slice_z``.
+        - ``"xz"``: slice along Y, ``slice_idx`` indexes into ``ny``; defaults
+          to current ``slice_y``.
+        - ``"yz"``: slice along X, ``slice_idx`` indexes into ``nx``; defaults
+          to current ``slice_x``.
 
         Parameters
         ----------
         path : str or pathlib.Path
-            Output file path.
-        plane : str, optional
-            One of 'xy', 'xz', 'yz'. Defaults to 'xy'.
-        slice_idx : int, optional
-            Slice index along the chosen axis. Defaults to current position.
-        format : str, optional
-            'png', 'pdf', or 'tiff'. If omitted, inferred from extension.
+            Output file path. Parent directories are created if needed.
+        plane : str | None, optional
+            One of ``"xy"``, ``"xz"``, ``"yz"``. Defaults to ``"xy"``.
+        slice_idx : int | None, optional
+            Slice index along the chosen axis. Defaults to the current
+            position for that plane.
+        format : str | None, optional
+            One of ``"png"``, ``"pdf"``, ``"tiff"``. If omitted, inferred
+            from the file extension; defaults to ``"png"`` if no extension.
+            Mismatched extension and explicit ``format`` is allowed: the
+            container written follows ``format``.
         dpi : int, default 150
-            Output DPI metadata.
+            DPI metadata written into the file.
 
         Returns
         -------
         pathlib.Path
             The written file path.
+
+        Example
+        -------
+        >>> from quantem.widget import Show3DSlices
+        >>> w = Show3DSlices(volume, cmap="viridis")  # doctest: +SKIP
+        >>> w.save_image("xy_top.png", plane="xy", slice_idx=0)  # doctest: +SKIP
+        >>> w.save_image("xz_mid.pdf", plane="xz")  # doctest: +SKIP
+
+        Notes
+        -----
+        - PDF output is converted to RGB internally (no alpha channel).
+        - Slice indices outside the valid range for the chosen plane raise
+          ``IndexError``; unsupported planes or extensions raise ``ValueError``.
         """
         from matplotlib import colormaps
         from PIL import Image
@@ -760,3 +1005,78 @@ class Show3DSlices(anywidget.AnyWidget):
         pil_format = {"png": "PNG", "pdf": "PDF", "tiff": "TIFF", "tif": "TIFF"}[fmt]
         img.save(str(path), format=pil_format, dpi=(dpi, dpi))
         return path
+
+    # =========================================================================
+    # === Observers ===
+    # =========================================================================
+
+    def _on_slice_change(self, change: dict) -> None:
+        """Recompute slice stats when the user scrubs sliders; skip during playback
+        to avoid 12 reductions per frame."""
+        if self.playing:
+            return
+        self._compute_stats()
+
+    def _on_playing_change(self, change: dict) -> None:
+        """Refresh stats once playback stops so the displayed values match the
+        final slice indices."""
+        if not self.playing:
+            self._compute_stats()
+
+    def _on_show_stats_change(self, change: dict) -> None:
+        """Lazily populate stats traits the first time the caller opts in."""
+        if change.get("new"):
+            self._compute_stats()
+
+    # =========================================================================
+    # === Internal primitives ===
+    # =========================================================================
+
+    def _compute_stats(self) -> None:
+        """Compute statistics for the 3 current slices.
+
+        Skipped when show_stats is False to avoid 12 reductions
+        per slice movement on multi-MB volumes (JS does not render a stats bar; this
+        is for programmatic access only when the caller has opted in).
+        """
+        if not self.show_stats or self._data is None:
+            return
+        slices = [
+            self._data[self.slice_z, :, :],
+            self._data[:, self.slice_y, :],
+            self._data[:, :, self.slice_x],
+        ]
+        with self.hold_sync():
+            self.stats_mean = [float(np.mean(s, dtype=np.float64)) for s in slices]
+            self.stats_min = [float(np.min(s)) for s in slices]
+            self.stats_max = [float(np.max(s)) for s in slices]
+            self.stats_std = [float(np.std(s, dtype=np.float64)) for s in slices]
+
+    def _normalize_slice(self, slc: np.ndarray) -> np.ndarray:
+        """Map a 2D slice into a uint8 buffer matching what JS renders. Mirrors
+        log_scale, flip, vmin/vmax, and auto_contrast so saved images stay
+        pixel-faithful to the on-screen view."""
+        if self.log_scale:
+            slc = np.sign(slc) * np.log1p(np.abs(slc))
+        # Mirror JS path: when flip=True the on-screen renderer negates the data
+        # and flips the contrast range (min<->max with sign). Python-side saved
+        # images should match what the user sees on screen.
+        if self.flip:
+            slc = -slc
+        if self.vmin is not None and self.vmax is not None:
+            vmin = float(self.vmin)
+            vmax = float(self.vmax)
+            if self.log_scale:
+                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
+                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
+            if self.flip:
+                vmin, vmax = -vmax, -vmin
+        elif self.auto_contrast:
+            vmin = float(np.percentile(slc, 2))
+            vmax = float(np.percentile(slc, 98))
+        else:
+            vmin = float(slc.min())
+            vmax = float(slc.max())
+        if vmax > vmin:
+            return np.clip((slc - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+        return np.zeros(slc.shape, dtype=np.uint8)

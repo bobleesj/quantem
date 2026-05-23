@@ -240,18 +240,12 @@ function Histogram({
   dataMin = 0, dataMax = 1, pinBinsToRange = true, ariaHidden = false,
 }: HistogramProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const bins = React.useMemo(
-    () => pinBinsToRange
-      ? computeHistogramFromBytes(data, 256, dataMin, dataMax)
-      : computeHistogramFromBytes(data),
-    [data, dataMin, dataMax, pinBinsToRange],
-  );
-  const colors = React.useMemo(
-    () => theme === "dark"
-      ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" }
-      : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" },
-    [theme],
-  );
+  const bins = pinBinsToRange
+    ? computeHistogramFromBytes(data, 256, dataMin, dataMax)
+    : computeHistogramFromBytes(data);
+  const colors = theme === "dark"
+    ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" }
+    : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" };
   React.useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -428,18 +422,6 @@ function Show3DSlices() {
   const [scaleBarVisible] = useModelState<boolean>("scale_bar_visible");
   const [zStretch, setZStretch] = useModelState<number>("z_stretch");
 
-  // No tool-parity in new monorepo. Everything visible + unlocked.
-  const hideDisplay = false;
-  const hideHistogram = false;
-  const hidePlayback = false;
-  const hideView = false;
-  const hideVolume = false;
-  const lockDisplay = false;
-  const lockHistogram = false;
-  const lockPlayback = false;
-  const lockView = false;
-  const lockVolume = false;
-
   // Initialize WebGPU FFT
   React.useEffect(() => {
     getWebGPUFFT().then(fft => {
@@ -546,7 +528,7 @@ function Show3DSlices() {
 
   // Show3DSlices always uses the compact widget layout. The old Python
   // `compact` trait is kept only as a compatibility no-op.
-  const effectiveShowFft = showFft && !hideDisplay;
+  const effectiveShowFft = showFft;
 
   // Cursor readout state
   const [cursorInfo, setCursorInfo] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
@@ -555,7 +537,7 @@ function Show3DSlices() {
   const allFloats = React.useMemo(() => extractFloat32(volumeBytes), [volumeBytes]);
 
   // Slice dimensions: [xy: ny x nx], [xz: nz x nx], [yz: nz x ny]
-  const sliceDims: [number, number][] = React.useMemo(() => [[ny, nx], [nz, nx], [nz, ny]], [nx, ny, nz]);
+  const sliceDims: [number, number][] = [[ny, nx], [nz, nx], [nz, ny]];
 
   // Canvas sizes. For depth panels (XZ=1, YZ=2) when nz << nxy, multiply
   // display height by z_stretch so the depth axis is readable. The internal
@@ -564,17 +546,15 @@ function Show3DSlices() {
   // smooth=true → CSS bilinear (auto); smooth=false → nearest-neighbor (pixelated).
   // Overlay canvases (crosshair, scale bar, colorbar, FFT scale bar) use displayH
   // for their pixel buffer to avoid distortion under CSS stretch.
-  const canvasSizes = React.useMemo(() => {
-    return sliceDims.map(([h, w], a) => {
-      const isDepth = a > 0;
-      const target = isDepth ? sideCanvasTarget : canvasTarget;
-      const scale = target / Math.max(w, h);
-      const baseW = Math.round(w * scale);
-      const baseH = Math.round(h * scale);
-      const displayH = isDepth ? Math.min(target, Math.round(baseH * Math.max(1, zStretch))) : baseH;
-      return { w: baseW, h: baseH, displayH, scale };
-    });
-  }, [sliceDims, canvasTarget, sideCanvasTarget, zStretch]);
+  const canvasSizes = sliceDims.map(([h, w], a) => {
+    const isDepth = a > 0;
+    const target = isDepth ? sideCanvasTarget : canvasTarget;
+    const scale = target / Math.max(w, h);
+    const baseW = Math.round(w * scale);
+    const baseH = Math.round(h * scale);
+    const displayH = isDepth ? Math.min(target, Math.round(baseH * Math.max(1, zStretch))) : baseH;
+    return { w: baseW, h: baseH, displayH, scale };
+  });
 
   // Pre-allocate reusable offscreen canvases + ImageData per axis (avoids GC churn)
   React.useEffect(() => {
@@ -590,18 +570,6 @@ function Show3DSlices() {
       }
     }
   }, [sliceDims]);
-
-  React.useEffect(() => {
-    if (hideDisplay && showFft) {
-      setShowFft(false);
-    }
-  }, [hideDisplay, showFft, setShowFft]);
-
-  React.useEffect(() => {
-    if (lockPlayback && playing) {
-      setPlaying(false);
-    }
-  }, [lockPlayback, playing, setPlaying]);
 
   // Prevent page scroll on canvases
   React.useEffect(() => {
@@ -692,7 +660,7 @@ function Show3DSlices() {
   // so absolute traitVmin/Vmax must be converted to that normalized space before
   // being passed to the WGSL remap. Without this, slice panels honor traitVmin/Vmax
   // but the ray-cast view ignores it - giving inconsistent contrast.
-  const volTexRange = React.useMemo(() => {
+  const volTexRange = (() => {
     const span = imageDataRange.max - imageDataRange.min;
     const hasTrait = (traitVmin != null || traitVmax != null) && span > 0;
     let baseMin: number, baseMax: number;
@@ -707,7 +675,7 @@ function Show3DSlices() {
     const subMin = baseMin + (baseMax - baseMin) * (imageVminPct / 100);
     const subMax = baseMin + (baseMax - baseMin) * (imageVmaxPct / 100);
     return { vmin: subMin, vmax: subMax };
-  }, [traitVmin, traitVmax, imageDataRange, imageVminPct, imageVmaxPct, logScale]);
+  })();
   // Keep render params in ref for direct rAF rendering (bypasses React during drag)
   const volumeRenderParamsRef = React.useRef({
     sliceX, sliceY, sliceZ, nx, ny, nz,
@@ -1299,13 +1267,10 @@ function Show3DSlices() {
   // -------------------------------------------------------------------------
   const sliceSettersRef = React.useRef<((v: number) => void)[]>([setSliceZ, setSliceY, setSliceX]);
   sliceSettersRef.current = [setSliceZ, setSliceY, setSliceX];
-  const effectiveLoopEnds = React.useMemo(
-    () => loopEnds.map((end, i) => {
-      const max = [nz - 1, ny - 1, nx - 1][i];
-      return end < 0 ? max : Math.min(end, max);
-    }),
-    [loopEnds, nx, ny, nz],
-  );
+  const effectiveLoopEnds = loopEnds.map((end, i) => {
+    const max = [nz - 1, ny - 1, nx - 1][i];
+    return end < 0 ? max : Math.min(end, max);
+  });
   React.useEffect(() => {
     if (!playing) return;
     const intervalMs = 1000 / fps;
@@ -1532,27 +1497,27 @@ function Show3DSlices() {
     const { w: cw, h: ch, scale } = canvasSizes[axis];
     const zs = liveZoomsRef.current[axis];
     const cx = cw / 2, cy = ch / 2;
-    let imgX: number, imgY: number;
+    let imgCol: number, imgRow: number;
     if (zs.zoom !== 1 || zs.panX !== 0 || zs.panY !== 0) {
-      imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
-      imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
+      imgCol = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
+      imgRow = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
     } else {
-      imgX = canvasX / scale;
-      imgY = canvasY / scale;
+      imgCol = canvasX / scale;
+      imgRow = canvasY / scale;
     }
-    const px = Math.floor(imgX);
-    const py = Math.floor(imgY);
+    const pixelCol = Math.floor(imgCol);
+    const pixelRow = Math.floor(imgRow);
     const [sliceH, sliceW] = sliceDims[axis];
-    if (px < 0 || px >= sliceW || py < 0 || py >= sliceH) {
+    if (pixelCol < 0 || pixelCol >= sliceW || pixelRow < 0 || pixelRow >= sliceH) {
       setCursorInfo(null);
       return;
     }
     // 3D voxel lookup. XY: slice along Z. XZ: slice along Y. YZ: slice along X.
     let value: number;
-    if (axis === 0)       value = allFloats[sliceZ * ny * nx + py * nx + px];
-    else if (axis === 1)  value = allFloats[py * ny * nx + sliceY * nx + px];
-    else                  value = allFloats[py * ny * nx + px * nx + sliceX];
-    setCursorInfo({ row: py, col: px, value, view: ["XY", "XZ", "YZ"][axis] });
+    if (axis === 0)       value = allFloats[sliceZ * ny * nx + pixelRow * nx + pixelCol];
+    else if (axis === 1)  value = allFloats[pixelRow * ny * nx + sliceY * nx + pixelCol];
+    else                  value = allFloats[pixelRow * ny * nx + pixelCol * nx + sliceX];
+    setCursorInfo({ row: pixelRow, col: pixelCol, value, view: ["XY", "XZ", "YZ"][axis] });
   };
 
   // Stationary click on a slice panel = jump-to-voxel. Convert the click's
@@ -1563,7 +1528,7 @@ function Show3DSlices() {
     if (zoomRafRef.current) { cancelAnimationFrame(zoomRafRef.current); zoomRafRef.current = 0; }
     setZooms(liveZoomsRef.current);
     const click = clickStartRef.current;
-    if (e && axis !== undefined && refs && click && click.axis === axis && !lockPlayback) {
+    if (e && axis !== undefined && refs && click && click.axis === axis) {
       const moved = Math.abs(e.clientX - click.x) + Math.abs(e.clientY - click.y);
       if (moved < 4) {
         const canvas = refs.current?.[axis];
@@ -1574,18 +1539,18 @@ function Show3DSlices() {
           const { w: cw, h: ch, scale } = canvasSizes[axis];
           const zs = liveZoomsRef.current[axis];
           const cx = cw / 2, cy = ch / 2;
-          const imgX = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
-          const imgY = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
-          const px = Math.floor(imgX), py = Math.floor(imgY);
+          const imgCol = ((canvasX - cx - zs.panX) / zs.zoom + cx) / scale;
+          const imgRow = ((canvasY - cy - zs.panY) / zs.zoom + cy) / scale;
+          const pixelCol = Math.floor(imgCol), pixelRow = Math.floor(imgRow);
           const [sliceH, sliceW] = sliceDims[axis];
-          if (px >= 0 && px < sliceW && py >= 0 && py < sliceH) {
+          if (pixelCol >= 0 && pixelCol < sliceW && pixelRow >= 0 && pixelRow < sliceH) {
             if (clickJumpTimerRef.current !== null) {
               window.clearTimeout(clickJumpTimerRef.current);
             }
             clickJumpTimerRef.current = window.setTimeout(() => {
-              if (axis === 0) { setSliceY(py); setSliceX(px); }
-              else if (axis === 1) { setSliceZ(py); setSliceX(px); }
-              else { setSliceZ(py); setSliceY(px); }
+              if (axis === 0) { setSliceY(pixelRow); setSliceX(pixelCol); }
+              else if (axis === 1) { setSliceZ(pixelRow); setSliceX(pixelCol); }
+              else { setSliceZ(pixelRow); setSliceY(pixelCol); }
               clickJumpTimerRef.current = null;
             }, 220);
           }
@@ -1619,11 +1584,9 @@ function Show3DSlices() {
   }, [dragAxis, fftDragAxis]);
 
   const handleResetSlices = () => {
-    if (!lockView) {
-      setZooms([DEFAULT_ZOOM, DEFAULT_ZOOM, DEFAULT_ZOOM]);
-      setFftZooms([DEFAULT_FFT_ZOOM, DEFAULT_FFT_ZOOM, DEFAULT_FFT_ZOOM]);
-      setFftClickInfo(null);
-    }
+    setZooms([DEFAULT_ZOOM, DEFAULT_ZOOM, DEFAULT_ZOOM]);
+    setFftZooms([DEFAULT_FFT_ZOOM, DEFAULT_FFT_ZOOM, DEFAULT_FFT_ZOOM]);
+    setFftClickInfo(null);
   };
 
   // -------------------------------------------------------------------------
@@ -1643,16 +1606,13 @@ function Show3DSlices() {
     const axisMaxes = [nz - 1, ny - 1, nx - 1];
     const activeAxis = playAxis < 3 ? playAxis : 0;
     const advance = (axis: number, delta: number) => {
-      if (lockPlayback) return;
       e.preventDefault();
       axisSetters[axis](Math.max(0, Math.min(axisMaxes[axis], axisValues[axis] + delta)));
     };
     switch (e.key) {
       case " ":
-        if (!lockPlayback) {
-          e.preventDefault();
-          setPlaying(!playing);
-        }
+        e.preventDefault();
+        setPlaying(!playing);
         break;
       case "ArrowLeft":
         // ← / →  scrub the ACTIVE axis (matches the popup help + Space/Home/End
@@ -1671,16 +1631,12 @@ function Show3DSlices() {
         advance(1, 1);
         break;
       case "Home":
-        if (!lockPlayback) {
-          e.preventDefault();
-          axisSetters[activeAxis](0);
-        }
+        e.preventDefault();
+        axisSetters[activeAxis](0);
         break;
       case "End":
-        if (!lockPlayback) {
-          e.preventDefault();
-          axisSetters[activeAxis](axisMaxes[activeAxis]);
-        }
+        e.preventDefault();
+        axisSetters[activeAxis](axisMaxes[activeAxis]);
         break;
       case "r":
       case "R":
@@ -1864,9 +1820,10 @@ function Show3DSlices() {
   // -------------------------------------------------------------------------
   // Labels and setters
   // -------------------------------------------------------------------------
-  // Default mirrors Python's dim_labels default ["Z", "Y", "X"]: axis 0 is the slice
-  // dim. Fallback fires only when the trait is briefly undefined (initial mount race).
-  const dl = dimLabels || ["Z", "Y", "X"];
+  // Default mirrors Python's dim_labels default ["slice", "row", "col"]: axis
+  // 0 is the slice (multislice depth), axis 1 is row, axis 2 is col. Fallback
+  // fires only when the trait is briefly undefined (initial mount race).
+  const dl = dimLabels || ["slice", "row", "col"];
   const sliceValues = [sliceZ, sliceY, sliceX];
   // Mirror of slice values for playback intervals to read between renders.
   // The interval's `sliceValuesRef.current[a] = next` writes are load-bearing
@@ -1898,14 +1855,14 @@ function Show3DSlices() {
     if (!imageHistogramData || imageHistogramData.length === 0) return null;
     return percentileClip(imageHistogramData, 1, 99);
   }, [imageHistogramData]);
-  const isOverClipped = React.useMemo(() => {
+  const isOverClipped = (() => {
     if (!imageClipBounds) return false;
     const span = imageDataRange.max - imageDataRange.min;
     if (span <= 0) return false;
     const vmin = imageDataRange.min + (imageVminPct / 100) * span;
     const vmax = imageDataRange.min + (imageVmaxPct / 100) * span;
     return vmin >= imageClipBounds.vmax || vmax <= imageClipBounds.vmin;
-  }, [imageClipBounds, imageDataRange, imageVminPct, imageVmaxPct]);
+  })();
 
   // Thin-Z layout: depth axis much smaller than lateral. Stack YZ/XZ panels vertically beside XY.
   const thinZ = nz < Math.min(nx, ny) / 4;
@@ -1955,7 +1912,6 @@ function Show3DSlices() {
           Side-by-side layout keeps the whole widget within a 13" laptop viewport. */}
       <Box sx={{ display: "flex", flexDirection: "row", alignItems: "flex-start", gap: `${SPACING.SM}px` }}>
       {/* 3D Volume Renderer (left column) */}
-      {!hideVolume && (
       <Box sx={{ mb: 0, flexShrink: 0 }}>
         {/* Title row */}
         <Typography variant="caption" sx={{ ...typography.label, color: tc.accent, mb: `${SPACING.XS}px`, display: "block", height: 16, lineHeight: "16px", overflow: "hidden" }}>
@@ -1978,17 +1934,17 @@ function Show3DSlices() {
             <Box>
               <Box sx={{ ...inlineVolumeControlRow, mb: `${SPACING.XS}px` }}>
                 <Typography sx={{ ...controlLabel }}>Planes</Typography>
-                <Switch checked={showSlicePlanes} onChange={(e) => setShowSlicePlanes(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle slice planes in 3D volume" }} />
+                <Switch checked={showSlicePlanes} onChange={(e) => setShowSlicePlanes(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle slice planes in 3D volume" }} />
                 <Typography sx={{ ...controlLabel }}>Ortho</Typography>
-                <Switch checked={orthographic} onChange={(e) => setOrthographic(e.target.checked)} disabled={lockVolume} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle orthographic 3D projection" }} />
+                <Switch checked={orthographic} onChange={(e) => setOrthographic(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle orthographic 3D projection" }} />
                 {showSlicePlanes && (
                   <>
                     <Typography sx={{ ...controlLabel }}>Opacity</Typography>
-                    <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Slice plane opacity" valueLabelDisplay="auto" />
+                    <Slider value={slicePlaneOpacity} min={0.05} max={1} step={0.05} onChange={(_, v) => setSlicePlaneOpacity(v as number)} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Slice plane opacity" valueLabelDisplay="auto" />
                   </>
                 )}
                 <Typography sx={{ ...controlLabel }}>Vol Strength</Typography>
-                <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} disabled={lockVolume} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Volume strength" valueLabelDisplay="auto" />
+                <Slider value={opacityA} min={0} max={1} step={0.05} onChange={(_, v) => setOpacityA(v as number)} size="small" sx={{ ...sliderStyles.small, width: 50 }} aria-label="Volume strength" valueLabelDisplay="auto" />
               </Box>
               <Box
                 sx={{
@@ -1996,11 +1952,11 @@ function Show3DSlices() {
                   border: `1px solid ${tc.border}`,
                   width: volumeCanvasSize,
                   height: volumeCanvasSize,
-                  cursor: lockVolume ? "default" : (volumeDrag ? "grabbing" : "grab"),
+                  cursor: volumeDrag ? "grabbing" : "grab",
                 }}
-                onMouseDown={(e) => { if (!lockVolume) handleVolumeMouseDown(e); }}
-                onWheel={(e) => { if (!lockVolume) handleVolumeWheel(e); }}
-                onDoubleClick={() => { if (!lockVolume && !lockView) handleVolumeDoubleClick(); }}
+                onMouseDown={handleVolumeMouseDown}
+                onWheel={handleVolumeWheel}
+                onDoubleClick={handleVolumeDoubleClick}
                 onContextMenu={(e) => e.preventDefault()}
               >
                 <canvas
@@ -2013,8 +1969,7 @@ function Show3DSlices() {
                   <Button
                     size="small"
                     sx={{ ...compactButton, position: "absolute", top: 4, right: 4, minWidth: 0, px: 0.75, bgcolor: "rgba(255,255,255,0.75)", "&:hover": { bgcolor: "rgba(255,255,255,0.9)" } }}
-                    onClick={(e) => { e.stopPropagation(); if (!lockVolume) setCamera(SHOW3DSLICES_DEFAULT_CAMERA); }}
-                    disabled={lockVolume}
+                    onClick={(e) => { e.stopPropagation(); setCamera(SHOW3DSLICES_DEFAULT_CAMERA); }}
                     aria-label="Reset 3D camera view"
                     title="Reset 3D camera view"
                   >
@@ -2022,10 +1977,10 @@ function Show3DSlices() {
                   </Button>
                 )}
                 <Box
-                  onMouseDown={(e) => { if (!lockVolume) handleVolumeResizeStart(e); }}
+                  onMouseDown={handleVolumeResizeStart}
                   sx={{
                     position: "absolute", bottom: 2, right: 2, width: 12, height: 12,
-                    cursor: lockVolume ? "default" : "nwse-resize", opacity: lockVolume ? 0.2 : 0.4,
+                    cursor: "nwse-resize", opacity: 0.4,
                     background: `linear-gradient(135deg, transparent 50%, ${tc.textMuted} 50%)`,
                     "&:hover": { opacity: 1 },
                   }}
@@ -2038,7 +1993,6 @@ function Show3DSlices() {
                     key={value}
                     size="small"
                     sx={{ ...compactButton, minWidth: label === "Top" ? 28 : 30, px: 0.5 }}
-                    disabled={lockVolume}
                     onClick={() => setVolumeView(value)}
                     aria-label={`Set 3D view to ${description}`}
                     title={`Set 3D view to ${description}`}
@@ -2049,7 +2003,6 @@ function Show3DSlices() {
                 <Button
                   size="small"
                   sx={{ ...compactButton, minWidth: 28, px: 0.5, fontSize: 13 }}
-                  disabled={lockVolume}
                   onClick={() => rollVolumeView(1)}
                   aria-label="Roll 3D camera view counterclockwise 90 degrees"
                   title="Roll view counterclockwise 90 degrees"
@@ -2059,7 +2012,6 @@ function Show3DSlices() {
                 <Button
                   size="small"
                   sx={{ ...compactButton, minWidth: 28, px: 0.5, fontSize: 13 }}
-                  disabled={lockVolume}
                   onClick={() => rollVolumeView(-1)}
                   aria-label="Roll 3D camera view clockwise 90 degrees"
                   title="Roll view clockwise 90 degrees"
@@ -2080,30 +2032,23 @@ function Show3DSlices() {
           </Box>
         )}
       </Box>
-      )}
       {/* Right column: slice toolbar + projected slice panels (grouped so they
           sit beside the 3D volume rather than below it). */}
       <Box sx={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
       {/* Slice toolbar: compact row above the side column. */}
       <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px`, mt: 0, mb: 0, minHeight: 18, justifyContent: "flex-end", width: panelTotalW, maxWidth: panelTotalW, boxSizing: "border-box" }}>
-        {!hideDisplay && (
-          <>
-            <Typography sx={{ ...controlLabel }}>FFT</Typography>
-            <Switch checked={showFft} onChange={(e) => { if (!lockDisplay) setShowFft(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panels" }} />
-          </>
-        )}
-        {(!hideView || !hideDisplay) && (
-          <Button
-            size="small"
-            sx={compactButton}
-            disabled={lockView || !anyZoomDirty}
-            onClick={() => { if (!lockView) handleResetSlices(); }}
-            title="Reset slice and FFT zoom/pan only"
-            aria-label="Reset slice and FFT zoom/pan"
-          >
-            Reset Zoom
-          </Button>
-        )}
+        <Typography sx={{ ...controlLabel }}>FFT</Typography>
+        <Switch checked={showFft} onChange={(e) => setShowFft(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle FFT power spectrum panels" }} />
+        <Button
+          size="small"
+          sx={compactButton}
+          disabled={!anyZoomDirty}
+          onClick={handleResetSlices}
+          title="Reset slice and FFT zoom/pan only"
+          aria-label="Reset slice and FFT zoom/pan"
+        >
+          Reset Zoom
+        </Button>
       </Box>
       {(() => {
         const panels = AXES.map((_, a) => {
@@ -2116,12 +2061,12 @@ function Show3DSlices() {
               {/* Canvas with plane-colored border. dh = displayH (stretched for depth panels). */}
               <Box
                 sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
-                onMouseDown={(e) => { if (!lockView) handleMouseDown(e, a); }}
+                onMouseDown={(e) => handleMouseDown(e, a)}
                 onMouseMove={(e) => handleMouseMove(e, a)}
                 onMouseUp={(e) => handleMouseUp(e, a, canvasRefs)}
                 onMouseLeave={handleMouseLeave}
-                onWheel={(e) => { if (!lockView) handleWheel(e, a); }}
-                onDoubleClick={() => { if (!lockView) handleDoubleClick(a); }}
+                onWheel={(e) => handleWheel(e, a)}
+                onDoubleClick={() => handleDoubleClick(a)}
               >
                 <canvas
                   ref={(el) => { canvasRefs.current[a] = el; }}
@@ -2162,10 +2107,10 @@ function Show3DSlices() {
                 )}
                 {/* Resize handle */}
                 <Box
-                  onMouseDown={(e) => { if (!lockView) handleResizeStart(e, a); }}
+                  onMouseDown={(e) => handleResizeStart(e, a)}
                   sx={{
                     position: "absolute", bottom: 2, right: 2, width: 12, height: 12,
-                    cursor: lockView ? "default" : "nwse-resize", opacity: lockView ? 0.2 : 0.4,
+                    cursor: "nwse-resize", opacity: 0.4,
                     background: `linear-gradient(135deg, transparent 50%, ${tc.textMuted} 50%)`,
                     "&:hover": { opacity: 1 },
                   }}
@@ -2189,16 +2134,16 @@ function Show3DSlices() {
                         </Typography>
                       )}
                     </Stack>
-                    <Button size="small" sx={compactButton} disabled={lockView || !fftNeedsResetAxis(a)} onClick={() => handleFftResetAxis(a)} aria-label={`Reset ${["XY", "XZ", "YZ"][a]} FFT zoom and pan`}>Reset</Button>
+                    <Button size="small" sx={compactButton} disabled={!fftNeedsResetAxis(a)} onClick={() => handleFftResetAxis(a)} aria-label={`Reset ${["XY", "XZ", "YZ"][a]} FFT zoom and pan`}>Reset</Button>
                   </Stack>
                   <Box
                     sx={{ ...container.imageBox, width: cw, height: dh, cursor: "grab", borderColor: ["#4d80ff", "#4dff66", "#ff4d4d"][a] }}
-                    onMouseDown={(e) => { if (!lockView) handleFftMouseDown(e, a); }}
-                    onMouseMove={(e) => { if (!lockView) handleFftMouseMove(e, a); }}
-                    onMouseUp={(e) => { if (!lockView) handleFftMouseUp(e, a); }}
-                    onMouseLeave={() => { if (!lockView) { fftClickStartRef.current = null; setFftDragAxis(null); setFftDragStart(null); } }}
-                    onWheel={(e) => { if (!lockView) handleFftWheel(e, a); }}
-                    onDoubleClick={() => { if (!lockView) handleFftDoubleClick(a); }}
+                    onMouseDown={(e) => handleFftMouseDown(e, a)}
+                    onMouseMove={(e) => handleFftMouseMove(e, a)}
+                    onMouseUp={(e) => handleFftMouseUp(e, a)}
+                    onMouseLeave={() => { fftClickStartRef.current = null; setFftDragAxis(null); setFftDragStart(null); }}
+                    onWheel={(e) => handleFftWheel(e, a)}
+                    onDoubleClick={() => handleFftDoubleClick(a)}
                   >
                     <canvas
                       ref={(el) => { fftCanvasRefs.current[a] = el; }}
@@ -2218,7 +2163,6 @@ function Show3DSlices() {
                   </Box>
                 </Box>
               )}
-              {!hidePlayback && (
               <Box sx={{ ...controlRow, mt: `${SPACING.SM}px`, border: `1px solid ${tc.border}`, bgcolor: tc.controlBg, width: cw, maxWidth: cw, boxSizing: "border-box" }}>
                 <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>{dl[a]}</Typography>
                 {loop ? (
@@ -2230,7 +2174,6 @@ function Show3DSlices() {
                     disableSwap
                     min={0}
                     max={sliceMaxes[a]}
-                    disabled={lockPlayback}
                     size="small"
                     valueLabelDisplay="auto"
                     sx={{
@@ -2251,7 +2194,6 @@ function Show3DSlices() {
                     min={0}
                     max={sliceMaxes[a]}
                     onChange={sliceSetters[a]}
-                    disabled={lockPlayback}
                     size="small"
                     sx={{ ...sliderStyles.small, flex: 1, minWidth: 40 }}
                     aria-label={`${dl[a]} slice ${sliceValues[a] + 1} of ${sliceMaxes[a] + 1}`}
@@ -2263,7 +2205,6 @@ function Show3DSlices() {
                   {sliceValues[a]}/{sliceMaxes[a]}
                 </Typography>
               </Box>
-              )}
             </Box>
           );
         });
@@ -2287,22 +2228,22 @@ function Show3DSlices() {
       {effectiveShowFft && (
         <Box sx={{ ...panelControlRow, mt: `${SPACING.SM}px`, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
           <Typography sx={{ ...controlLabel }}>FFT Scale</Typography>
-          <Select disabled={lockDisplay} value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...denseSelect, minWidth: 45 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
+          <Select value={fftLogScale ? "log" : "linear"} onChange={(e) => setFftLogScale(e.target.value === "log")} size="small" sx={{ ...denseSelect, minWidth: 45 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT intensity scale (linear or logarithmic)" }}>
             <MenuItem value="linear">Lin</MenuItem>
             <MenuItem value="log">Log</MenuItem>
           </Select>
           <Typography sx={{ ...controlLabel }}>FFT Color</Typography>
-          <Select disabled={lockDisplay} value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...denseSelect, minWidth: 60 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
+          <Select value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...denseSelect, minWidth: 60 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "FFT colormap" }}>
             {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
           </Select>
           <Typography sx={{ ...controlLabel }}>FFT Auto</Typography>
-          <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
+          <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic FFT contrast" }} />
           <Typography sx={{ ...controlLabel }} title="Apply a Hann window before zero-padding each slice FFT to reduce edge leakage.">Window</Typography>
-          <Switch checked={!!fftWindow} onChange={(e) => setFftWindow(e.target.checked)} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle Hann window before FFT" }} />
+          <Switch checked={!!fftWindow} onChange={(e) => setFftWindow(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle Hann window before FFT" }} />
         </Box>
       )}
       {/* Controls row with histogram anchored to the slice panel columns. */}
-      {showControls && (!hideDisplay || !hideHistogram) && (() => {
+      {showControls && (() => {
         const histogramW = 110;
         const histogramH = controlRowHeight * 2 + SPACING.XS;
         return (
@@ -2315,88 +2256,78 @@ function Show3DSlices() {
           maxWidth: panelTotalW,
           boxSizing: "border-box",
         }}>
-          {!hideDisplay && (
-            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "flex-start", minWidth: 0 }}>
-              <Box sx={{ ...panelControlRow, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
-                <Typography sx={{ ...controlLabel }}>Color</Typography>
-                <Select disabled={lockDisplay} size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...denseSelect, minWidth: 60 }} inputProps={{ "aria-label": "Image colormap" }}>
-                  {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
-                </Select>
-                <Typography sx={{ ...controlLabel }}>Colorbar</Typography>
-                <Switch checked={showColorbar} onChange={(e) => { if (!lockDisplay) setShowColorbar(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
-                <Typography sx={{ ...controlLabel }} title="CSS bilinear interpolation on image canvas. Off = pixelated.">Smooth</Typography>
-                <Switch checked={smooth} onChange={(e) => { if (!lockDisplay) setSmooth(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
-              </Box>
-              <Box sx={{ ...panelControlRow, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
-                {thinZ && (
-                  <>
-                    <Typography sx={{ ...controlLabel }} title="Depth-axis display height multiplier (1-30x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch</Typography>
-                    <Slider value={zStretch} min={1} max={30} step={0.5} onChange={(_, v) => { if (!lockDisplay) setZStretch(v as number); }} disabled={lockDisplay} size="small" valueLabelDisplay="auto" sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} aria-label="Depth axis display stretch multiplier" />
-                  </>
-                )}
-                <Typography sx={{ ...controlLabel }} title="Show slice intersection guides across orthogonal panels.">Cross</Typography>
-                <Switch checked={showCrosshair} onChange={(e) => { if (!lockDisplay) setShowCrosshair(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle crosshair overlay on slice panels" }} />
-                <Typography sx={{ ...controlLabel }} title="Negate displayed values. Useful when phase sign is inverted.">Flip</Typography>
-                <Switch checked={flip} onChange={(e) => { if (!lockDisplay) setFlip(e.target.checked); }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Flip (negate) displayed values" }} />
-                <Typography sx={{ ...controlLabel }}>Auto</Typography>
-                <Switch checked={autoContrast} onChange={(e) => {
-                  if (lockDisplay) return;
-                  const on = e.target.checked;
-                  setAutoContrast(on);
-                  if (on && imageHistogramData) {
-                    // ON → snap to 2/98 percentile.
-                    const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, 2, 98);
-                    const span = imageDataRange.max - imageDataRange.min;
-                    if (span > 0) {
-                      setImageVminPct(Math.max(0, Math.min(100, ((pmin - imageDataRange.min) / span) * 100)));
-                      setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - imageDataRange.min) / span) * 100)));
-                    }
-                  } else {
-                    // OFF → reset slider(s) to full range 0/100 so user gets default contrast back.
-                    setImageVminPct(0);
-                    setImageVmaxPct(100);
+          <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, justifyContent: "flex-start", minWidth: 0 }}>
+            <Box sx={{ ...panelControlRow, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
+              <Typography sx={{ ...controlLabel }}>Color</Typography>
+              <Select size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...denseSelect, minWidth: 60 }} inputProps={{ "aria-label": "Image colormap" }}>
+                {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
+              </Select>
+              <Typography sx={{ ...controlLabel }}>Colorbar</Typography>
+              <Switch checked={showColorbar} onChange={(e) => setShowColorbar(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
+              <Typography sx={{ ...controlLabel }} title="CSS bilinear interpolation on image canvas. Off = pixelated.">Smooth</Typography>
+              <Switch checked={smooth} onChange={(e) => setSmooth(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
+            </Box>
+            <Box sx={{ ...panelControlRow, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "wrap" }}>
+              {thinZ && (
+                <>
+                  <Typography sx={{ ...controlLabel }} title="Depth-axis display height multiplier (1-30x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch</Typography>
+                  <Slider value={zStretch} min={1} max={30} step={0.5} onChange={(_, v) => setZStretch(v as number)} size="small" valueLabelDisplay="auto" sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} aria-label="Depth axis display stretch multiplier" />
+                </>
+              )}
+              <Typography sx={{ ...controlLabel }} title="Show slice intersection guides across orthogonal panels.">Cross</Typography>
+              <Switch checked={showCrosshair} onChange={(e) => setShowCrosshair(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle crosshair overlay on slice panels" }} />
+              <Typography sx={{ ...controlLabel }} title="Negate displayed values. Useful when phase sign is inverted.">Flip</Typography>
+              <Switch checked={flip} onChange={(e) => setFlip(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Flip (negate) displayed values" }} />
+              <Typography sx={{ ...controlLabel }}>Auto</Typography>
+              <Switch checked={autoContrast} onChange={(e) => {
+                const on = e.target.checked;
+                setAutoContrast(on);
+                if (on && imageHistogramData) {
+                  // ON → snap to 2/98 percentile.
+                  const { vmin: pmin, vmax: pmax } = percentileClip(imageHistogramData, 2, 98);
+                  const span = imageDataRange.max - imageDataRange.min;
+                  if (span > 0) {
+                    setImageVminPct(Math.max(0, Math.min(100, ((pmin - imageDataRange.min) / span) * 100)));
+                    setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - imageDataRange.min) / span) * 100)));
                   }
-                }} disabled={lockDisplay} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
-              </Box>
+                } else {
+                  // OFF → reset slider(s) to full range 0/100 so user gets default contrast back.
+                  setImageVminPct(0);
+                  setImageVmaxPct(100);
+                }
+              }} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
             </Box>
-          )}
-          {!hideHistogram && (
-            <Box sx={{ display: "flex", flexDirection: "row", gap: `${SPACING.SM}px`, alignItems: "flex-start", justifyContent: "flex-start", opacity: lockHistogram ? 0.5 : 1, pointerEvents: lockHistogram ? "none" : "auto" }}>
-              <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start" }}>
-                <Histogram
-                  data={imageHistogramData}
-                  vminPct={imageVminPct}
-                  vmaxPct={imageVmaxPct}
-                  onRangeChange={(min, max) => {
-                    if (!lockHistogram) {
-                      // User drag overrides Auto - Auto would otherwise win and ignore slider.
-                      if (autoContrast) setAutoContrast(false);
-                      setImageVminPct(min);
-                      setImageVmaxPct(max);
-                    }
-                  }}
-                  width={histogramW}
-                  height={histogramH}
-                  theme={themeInfo.theme === "dark" ? "dark" : "light"}
-                  dataMin={flip ? -imageDataRange.max : imageDataRange.min}
-                  dataMax={flip ? -imageDataRange.min : imageDataRange.max}
-                  pinBinsToRange={false}
-                  ariaHidden
-                />
-              </Box>
+          </Box>
+          <Box sx={{ display: "flex", flexDirection: "row", gap: `${SPACING.SM}px`, alignItems: "flex-start", justifyContent: "flex-start" }}>
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start" }}>
+              <Histogram
+                data={imageHistogramData}
+                vminPct={imageVminPct}
+                vmaxPct={imageVmaxPct}
+                onRangeChange={(min, max) => {
+                  // User drag overrides Auto - Auto would otherwise win and ignore slider.
+                  if (autoContrast) setAutoContrast(false);
+                  setImageVminPct(min);
+                  setImageVmaxPct(max);
+                }}
+                width={histogramW}
+                height={histogramH}
+                theme={themeInfo.theme === "dark" ? "dark" : "light"}
+                dataMin={flip ? -imageDataRange.max : imageDataRange.min}
+                dataMax={flip ? -imageDataRange.min : imageDataRange.max}
+                pinBinsToRange={false}
+                ariaHidden
+              />
             </Box>
-          )}
+          </Box>
         </Box>
         );
       })()}
       {/* Playback: transport + axis selector + fps + loop + bounce */}
-      {!hidePlayback && (() => {
-        return (
       <Box sx={{ ...panelControlRow, mt: `${SPACING.SM}px`, width: primaryPanelW, maxWidth: primaryPanelW, flexWrap: "nowrap" }}>
         <Select
           value={playAxis}
-          onChange={(e) => { if (!lockPlayback) { setPlaying(false); setPlayAxis(Number(e.target.value)); } }}
-          disabled={lockPlayback}
+          onChange={(e) => { setPlaying(false); setPlayAxis(Number(e.target.value)); }}
           size="small"
           sx={{ ...denseSelect, minWidth: 40 }}
           MenuProps={themedMenuProps}
@@ -2408,37 +2339,33 @@ function Show3DSlices() {
           <MenuItem value={3}>All</MenuItem>
         </Select>
         <Stack direction="row" spacing={0} sx={{ flexShrink: 0 }}>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(true); setPlaying(true); } }} sx={{ color: reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
+          <IconButton size="small" onClick={() => { setReverse(true); setPlaying(true); }} sx={{ color: reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
             <FastRewindIcon sx={{ fontSize: 18 }} />
           </IconButton>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) setPlaying(!playing); }} sx={{ color: tc.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
+          <IconButton size="small" onClick={() => setPlaying(!playing)} sx={{ color: tc.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
             {playing ? <PauseIcon sx={{ fontSize: 18 }} /> : <PlayArrowIcon sx={{ fontSize: 18 }} />}
           </IconButton>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => { if (!lockPlayback) { setReverse(false); setPlaying(true); } }} sx={{ color: !reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
+          <IconButton size="small" onClick={() => { setReverse(false); setPlaying(true); }} sx={{ color: !reverse && playing ? tc.accent : tc.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
             <FastForwardIcon sx={{ fontSize: 18 }} />
           </IconButton>
-          <IconButton size="small" disabled={lockPlayback} onClick={() => {
-            if (!lockPlayback) {
-              setPlaying(false);
-              if (playAxis === 3) {
-                for (let a = 0; a < 3; a++) sliceSettersRef.current[a](loopStarts[a]);
-              } else {
-                sliceSettersRef.current[playAxis](loopStarts[playAxis]);
-              }
+          <IconButton size="small" onClick={() => {
+            setPlaying(false);
+            if (playAxis === 3) {
+              for (let a = 0; a < 3; a++) sliceSettersRef.current[a](loopStarts[a]);
+            } else {
+              sliceSettersRef.current[playAxis](loopStarts[playAxis]);
             }
           }} sx={{ color: tc.textMuted, p: 0.25 }} aria-label="Stop and rewind to loop start" title="Stop">
             <StopIcon sx={{ fontSize: 16 }} />
           </IconButton>
         </Stack>
         <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>fps</Typography>
-        <Slider disabled={lockPlayback} value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label={`Playback frames per second (${Math.round(fps)})`} valueLabelDisplay="auto" />
+        <Slider value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label={`Playback frames per second (${Math.round(fps)})`} valueLabelDisplay="auto" />
         <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>Loop</Typography>
-        <Switch size="small" checked={loop} onChange={() => { if (!lockPlayback) setLoop(!loop); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
+        <Switch size="small" checked={loop} onChange={() => setLoop(!loop)} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
         <Typography sx={{ ...controlLabel, color: tc.textMuted, flexShrink: 0 }}>Bounce</Typography>
-        <Switch size="small" checked={boomerang} onChange={() => { if (!lockPlayback) setBoomerang(!boomerang); }} disabled={lockPlayback} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce (ping-pong) playback" }} />
+        <Switch size="small" checked={boomerang} onChange={() => setBoomerang(!boomerang)} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle bounce (ping-pong) playback" }} />
       </Box>
-        );
-      })()}
     </Box>
   );
 }
