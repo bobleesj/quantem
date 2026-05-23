@@ -54,3 +54,18 @@ def test_star_state_round_trip():
     w2.load_state_dict(state)
     assert w2.starred == [2, -1, 8]
     assert w2.starred_frames == {0: 2, 2: 8}
+
+
+def test_identical_panel_dedupe_keeps_full_res_source():
+    base = np.arange(3 * 8 * 8, dtype=np.float32).reshape(3, 8, 8)
+    panels = [base.copy() for _ in range(3)]
+
+    w = Show3D(*panels, display_bin=1, dedupe_identical_panels=True)
+
+    assert w.n_panels == 3
+    assert w.shared_panel_source is True
+    assert w.height == 8
+    assert w.width == 8
+    assert w.panel_width_px == 8
+    assert w._display_bin_factor == 1
+    np.testing.assert_array_equal(w._data, panels[0])

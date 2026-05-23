@@ -709,6 +709,87 @@ export class GPUColormapEngine {
   }
 
   /**
+   * GPU colormap one slot, then blit the full-resolution RGBA buffer into a
+   * smaller OffscreenCanvas. The fragment shader samples the source buffer by
+   * UV, so values stay full-precision through the colormap step while playback
+   * avoids creating a 4096x4096 ImageBitmap when the visible canvas is smaller.
+   */
+  renderSlotScaledToImageBitmap(
+    idx: number,
+    range: { vmin: number; vmax: number },
+    logScale: boolean,
+    outW: number,
+    outH: number,
+  ): ImageBitmap | null {
+    if (!this.pipeline || !this.lutBuffer) return null;
+    const slot = this.slots[idx];
+    if (!slot) return null;
+    const w = Math.max(1, Math.round(outW));
+    const h = Math.max(1, Math.round(outH));
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureBlitPipeline(fmt);
+    if (!this.blitPipeline) return null;
+
+    const encoder = this.device.createCommandEncoder();
+    const params = new ArrayBuffer(24);
+
+    this._writeParams(params, slot.width, slot.height, range.vmin, range.vmax, logScale);
+    this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+    const computeGroup = this.device.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: slot.paramsBuffer } },
+        { binding: 1, resource: { buffer: slot.dataBuffer } },
+        { binding: 2, resource: { buffer: this.lutBuffer } },
+        { binding: 3, resource: { buffer: slot.rgbaBuffer } },
+      ],
+    });
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(this.pipeline);
+    computePass.setBindGroup(0, computeGroup);
+    computePass.dispatchWorkgroups(Math.ceil(slot.width / 16), Math.ceil(slot.height / 16));
+    computePass.end();
+
+    const oc = new OffscreenCanvas(w, h);
+    const ctx = oc.getContext("webgpu") as GPUCanvasContext | null;
+    if (!ctx) return null;
+    ctx.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+
+    const blitParamsBuffer = this.device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([slot.width, slot.height]));
+
+    const blitGroup = this.device.createBindGroup({
+      layout: this.blitPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: blitParamsBuffer } },
+        { binding: 1, resource: { buffer: slot.rgbaBuffer } },
+      ],
+    });
+
+    const texture = ctx.getCurrentTexture();
+    const renderPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    renderPass.setPipeline(this.blitPipeline);
+    renderPass.setBindGroup(0, blitGroup);
+    renderPass.draw(3);
+    renderPass.end();
+
+    this.device.queue.submit([encoder.finish()]);
+    blitParamsBuffer.destroy();
+    return oc.transferToImageBitmap();
+  }
+
+  /**
    * Configure a canvas for WebGPU zero-copy rendering.
    * Returns the GPUCanvasContext, or null if WebGPU canvas is not supported.
    */

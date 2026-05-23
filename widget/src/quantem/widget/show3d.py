@@ -702,6 +702,7 @@ class Show3D(anywidget.AnyWidget):
         panel_title_font_size: int | None = None,
         show_resize_handles: bool | None = None,
         show_zoom_indicator: bool | None = None,
+        dedupe_identical_panels: bool = False,
         **kwargs,
     ):
         if hideable:
@@ -741,7 +742,8 @@ class Show3D(anywidget.AnyWidget):
                             diff_mode=diff_mode, buffer_size=buffer_size,
                             dim_label=dim_label, use_torch=use_torch, device=device,
                             display_bin=display_bin, offline=offline,
-                            state=state, _t0=_t0)
+                            state=state, dedupe_identical_panels=dedupe_identical_panels,
+                            _t0=_t0)
 
     def _init_sync(self, data_args: tuple, *, labels: list[str] | None,
                    panel_titles: list[str] | None, title: str,
@@ -754,7 +756,8 @@ class Show3D(anywidget.AnyWidget):
                    size: int, diff_mode: str, buffer_size: int, dim_label: str,
                    use_torch: bool | None, device: str | None,
                    display_bin: int | str, offline: bool,
-                   state: dict | str | pathlib.Path | None, _t0: float) -> None:
+                   state: dict | str | pathlib.Path | None,
+                   dedupe_identical_panels: bool, _t0: float) -> None:
         """Heavy setup called synchronously by `__init__` inside `hold_sync()`.
         Validates panels, allocates frame_bytes, wires observers, and applies
         optional `state`. Split out from `__init__` so the construction surface
@@ -938,35 +941,55 @@ class Show3D(anywidget.AnyWidget):
                     panels = padded
                     if not self.panel_real_frames:
                         self.panel_real_frames = real_n
-                # For large multi-panel stress tests, apply an explicit display_bin
-                # before concatenating panels. Binning after concat would first
-                # materialize a 4096 x (4096 * panels) slab; nine 4k panels is a
-                # 604 MB frame. The full source panels remain referenced here.
                 orig_h = panels[0].shape[1]
                 orig_w = panels[0].shape[2]
-                panel_bin = display_bin if isinstance(display_bin, int) and display_bin > 1 else 1
-                if panel_bin > 1:
-                    from quantem.widget.array_utils import bin2d
-
-                    self._source_panels = panels
-                    panels = [
-                        np.asarray(bin2d(p, factor=panel_bin, mode="mean"), dtype=np.float32)
-                        for p in panels
-                    ]
-                    if pixel_size > 0:
-                        pixel_size = pixel_size * panel_bin
-                    display_bin = 1
-                    print(
-                        f"  Multi-panel display bin {panel_bin}x before concat: "
-                        f"{orig_h}x{orig_w} -> {panels[0].shape[1]}x{panels[0].shape[2]} per panel"
+                identical_panels = False
+                if dedupe_identical_panels and len(panels) > 1:
+                    identical_panels = all(
+                        p.shape == panels[0].shape and np.array_equal(p, panels[0])
+                        for p in panels[1:]
                     )
-                # Concatenate raw float32 panels back-to-back. Do not normalize:
-                # copied-panel stress tests use this path specifically to verify
-                # that full-resolution source values survive unchanged.
-                data = np.concatenate(panels, axis=2)
-                self._panel_width = panels[0].shape[2]
-                self.panel_width_px = self._panel_width
-                self._multi_panel_bin = panel_bin
+
+                if identical_panels:
+                    data = panels[0]
+                    self.shared_panel_source = True
+                    self.panel_width_px = int(orig_w)
+                    self._panel_width = self.panel_width_px
+                    self._multi_panel_bin = 0
+                    if not self.panel_real_frames:
+                        self.panel_real_frames = real_n
+                    print(
+                        "  Exact duplicate panels deduped for display: "
+                        f"{self.n_panels} panels share one {orig_h}x{orig_w} source frame"
+                    )
+                else:
+                    # For large multi-panel stress tests, apply an explicit display_bin
+                    # before concatenating panels. Binning after concat would first
+                    # materialize a 4096 x (4096 * panels) slab; nine 4k panels is a
+                    # 604 MB frame. The full source panels remain referenced here.
+                    panel_bin = display_bin if isinstance(display_bin, int) and display_bin > 1 else 1
+                    if panel_bin > 1:
+                        from quantem.widget.array_utils import bin2d
+
+                        self._source_panels = panels
+                        panels = [
+                            np.asarray(bin2d(p, factor=panel_bin, mode="mean"), dtype=np.float32)
+                            for p in panels
+                        ]
+                        if pixel_size > 0:
+                            pixel_size = pixel_size * panel_bin
+                        display_bin = 1
+                        print(
+                            f"  Multi-panel display bin {panel_bin}x before concat: "
+                            f"{orig_h}x{orig_w} -> {panels[0].shape[1]}x{panels[0].shape[2]} per panel"
+                        )
+                    # Concatenate raw float32 panels back-to-back. Do not normalize:
+                    # copied-panel stress tests use this path specifically to verify
+                    # that full-resolution source values survive unchanged.
+                    data = np.concatenate(panels, axis=2)
+                    self._panel_width = panels[0].shape[2]
+                    self.panel_width_px = self._panel_width
+                    self._multi_panel_bin = panel_bin
         else:
             self.n_panels = 1
             self.shared_panel_source = False
