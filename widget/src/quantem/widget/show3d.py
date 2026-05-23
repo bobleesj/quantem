@@ -245,6 +245,13 @@ class Show3D(anywidget.AnyWidget):
     # to this counter as a guaranteed-changing dep so render effects always
     # re-fire on slice scrubs / playback ticks.
     frame_seq = traitlets.Int(0).tag(sync=True)
+    # Offline mode: when True at __init__, the full (N, H, W) float32 stack
+    # is packed into _offline_stack so JS can slice client-side without a
+    # Python kernel. Use for nbconvert HTML exports where the kernel is dead
+    # after Save Widget State + Export. Slider still fires slice_idx change;
+    # JS reads from _offline_stack instead of waiting on a Comm round-trip.
+    offline = traitlets.Bool(False).tag(sync=True)
+    _offline_stack = traitlets.Bytes(b"").tag(sync=True)
     _display_bin_factor = traitlets.Int(1)  # Python-only: JS doesn't read
     # Flipped True by JS after the first colormap pass has painted to canvas.
     # Drives the truthful timing print (end-to-end, not __init__-only).
@@ -688,6 +695,7 @@ class Show3D(anywidget.AnyWidget):
         device: str | None = None,
         display_bin: int | str = "auto",
         hideable: bool = False,
+        offline: bool = False,
         state=None,
         max_cols: int | None = None,
         panel_gap: int | None = None,
@@ -732,7 +740,7 @@ class Show3D(anywidget.AnyWidget):
                             size=size,
                             diff_mode=diff_mode, buffer_size=buffer_size,
                             dim_label=dim_label, use_torch=use_torch, device=device,
-                            display_bin=display_bin,
+                            display_bin=display_bin, offline=offline,
                             state=state, _t0=_t0)
 
     def _init_sync(self, data_args: tuple, *, labels: list[str] | None,
@@ -745,7 +753,7 @@ class Show3D(anywidget.AnyWidget):
                    show_playback: bool, show_stats: bool, show_controls: bool,
                    size: int, diff_mode: str, buffer_size: int, dim_label: str,
                    use_torch: bool | None, device: str | None,
-                   display_bin: int | str,
+                   display_bin: int | str, offline: bool,
                    state: dict | str | pathlib.Path | None, _t0: float) -> None:
         """Heavy setup called synchronously by `__init__` inside `hold_sync()`.
         Validates panels, allocates frame_bytes, wires observers, and applies
@@ -1092,6 +1100,17 @@ class Show3D(anywidget.AnyWidget):
         # Initial position at middle
         self.slice_idx = int(self.n_slices // 2)
         self._roi_plot_timer = None
+
+        # Offline mode: pack the entire display stack so JS can slice
+        # client-side. Required for nbconvert HTML exports - once the kernel
+        # dies, slice_idx changes can no longer trigger _on_slice_change /
+        # frame_bytes refresh. With offline=True the stack lives in widget
+        # state and JS handles scrub locally. Cost: full N*H*W*4 in HTML.
+        if offline:
+            self.offline = True
+            self._offline_stack = np.ascontiguousarray(
+                self._display_data, dtype=np.float32
+            ).tobytes()
 
         # Observers
         self.observe(self._on_slice_change, names=["slice_idx"])

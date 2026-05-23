@@ -764,11 +764,28 @@ function Show3D() {
   const [nSlices] = useModelState<number>("n_slices");
   const [width] = useModelState<number>("width");
   const [height] = useModelState<number>("height");
-  const [frameBytes] = useModelState<DataView>("frame_bytes");
+  const [rawFrameBytes] = useModelState<DataView>("frame_bytes");
   // Defensive: traitlets.Bytes can identity-suppress trait events when content
   // and length are similar. frame_seq is incremented Python-side on every write
   // so JS effects always see a change. Use it in dep arrays alongside frameBytes.
   const [frameSeq] = useModelState<number>("frame_seq");
+  // Offline mode (nbconvert HTML export): when True at __init__, the full
+  // (N, H, W) float32 stack is shipped in _offline_stack and JS slices it on
+  // every sliceIdx change — no kernel round-trip needed. Use case: ship a
+  // Show3D widget embedded in an HTML page that a colleague can scrub without
+  // a Python environment running.
+  const [offline] = useModelState<boolean>("offline");
+  const [offlineStack] = useModelState<DataView>("_offline_stack");
+  const frameBytes = React.useMemo<DataView>(() => {
+    if (offline && offlineStack && offlineStack.byteLength > 0 && width > 0 && height > 0) {
+      const frameSize = width * height * 4;
+      const start = sliceIdx * frameSize;
+      if (start + frameSize <= offlineStack.byteLength) {
+        return new DataView(offlineStack.buffer, offlineStack.byteOffset + start, frameSize);
+      }
+    }
+    return rawFrameBytes;
+  }, [offline, offlineStack, rawFrameBytes, sliceIdx, width, height]);
 
   // Truthful first-render signal: flipped ONCE after the first frame_bytes
   // arrives and the browser has had time to composite two frames.  Python side
