@@ -69,3 +69,36 @@ def test_identical_panel_dedupe_keeps_full_res_source():
     assert w.panel_width_px == 8
     assert w._display_bin_factor == 1
     np.testing.assert_array_equal(w._data, panels[0])
+
+
+def test_nonidentical_panels_stay_separate_full_res():
+    panels = [
+        (np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6) + offset)
+        for offset in (0, 1000, 2000)
+    ]
+
+    w = Show3D(*panels, display_bin=1, dedupe_identical_panels=True)
+    try:
+        assert w.n_panels == 3
+        assert w.shared_panel_source is False
+        assert w.separate_panel_frames is True
+        assert w.height == 5
+        assert w.width == 18
+        assert w.panel_width_px == 6
+        assert w._display_bin_factor == 1
+
+        for panel_idx, panel in enumerate(panels):
+            np.testing.assert_array_equal(w._get_display_panel_frame(panel_idx, 2), panel[2])
+
+        expected_joined = np.concatenate([panel[2] for panel in panels], axis=1)
+        np.testing.assert_array_equal(w._get_display_frame(2), expected_joined)
+
+        status, frame = w._frame_for_http(2, w.frame_server_version, panel=1)
+        assert status == 200
+        assert frame.flags.c_contiguous
+        np.testing.assert_array_equal(frame, panels[1][2])
+
+        w.goto(3)
+        assert w.frame_bytes == b""
+    finally:
+        w.free()

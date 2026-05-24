@@ -245,13 +245,21 @@ class Show3D(anywidget.AnyWidget):
     # to this counter as a guaranteed-changing dep so render effects always
     # re-fire on slice scrubs / playback ticks.
     frame_seq = traitlets.Int(0).tag(sync=True)
-    # Offline mode: when True at __init__, the full (N, H, W) float32 stack
-    # is packed into _offline_stack so JS can slice client-side without a
-    # Python kernel. Use for nbconvert HTML exports where the kernel is dead
-    # after Save Widget State + Export. Slider still fires slice_idx change;
-    # JS reads from _offline_stack instead of waiting on a Comm round-trip.
+    # Offline mode: when True at __init__, the full (N, H, W) stack is packed
+    # into _offline_stack so JS can slice client-side without a Python kernel.
+    # Use for nbconvert HTML exports where the kernel is dead after Save Widget
+    # State + Export. Slider still fires slice_idx change; JS reads from
+    # _offline_stack instead of waiting on a Comm round-trip.
+    #
+    # The packed stack is uint8-quantized against the global (min, max) of the
+    # display data. uint8 = 4x smaller than float32, sidesteps V8's ~512 MB
+    # JSON.parse limit on the widget-state script that nbconvert inlines.
+    # Eye can't tell uint8 from float32 once colormap reduces to 256 levels.
+    # JS dequantizes per-slice: f32 = u8 * (max - min) / 255 + min.
     offline = traitlets.Bool(False).tag(sync=True)
     _offline_stack = traitlets.Bytes(b"").tag(sync=True)
+    _offline_min = traitlets.Float(0.0).tag(sync=True)
+    _offline_max = traitlets.Float(1.0).tag(sync=True)
     _display_bin_factor = traitlets.Int(1)  # Python-only: JS doesn't read
     # Flipped True by JS after the first colormap pass has painted to canvas.
     # Drives the truthful timing print (end-to-end, not __init__-only).
@@ -266,6 +274,7 @@ class Show3D(anywidget.AnyWidget):
     panel_titles = traitlets.List(traitlets.Unicode()).tag(sync=True)
     panel_width_px = traitlets.Int(0).tag(sync=True)
     shared_panel_source = traitlets.Bool(False).tag(sync=True)
+    separate_panel_frames = traitlets.Bool(False).tag(sync=True)
     # Per-panel "best frame" marker. One int per panel; -1 = unset. Used to flag
     # the user's preferred iteration / trial / focal slice without losing the
     # full stack. JS draws a gold star top-right of each panel when set.
@@ -331,6 +340,8 @@ class Show3D(anywidget.AnyWidget):
     percentile_high = traitlets.Float(99.5).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
+    vmin_per_panel = traitlets.List(traitlets.Float(None, allow_none=True), default_value=[]).tag(sync=True)
+    vmax_per_panel = traitlets.List(traitlets.Float(None, allow_none=True), default_value=[]).tag(sync=True)
     data_min = traitlets.Float(0.0).tag(sync=True)
     data_max = traitlets.Float(0.0).tag(sync=True)
     auto_vmins = traitlets.List(traitlets.Float()).tag(sync=True)
@@ -408,6 +419,12 @@ class Show3D(anywidget.AnyWidget):
     _prefetch_request = traitlets.Int(-1).tag(sync=True)
     frame_server_url = traitlets.Unicode("").tag(sync=True)
     frame_server_version = traitlets.Int(0).tag(sync=True)
+
+    # Browser-side benchmark hook. Setting benchmark_request from Python starts
+    # an in-widget measurement in the visible frontend; benchmark_result is
+    # written back by JS when sampling finishes.
+    benchmark_request = traitlets.Dict({}).tag(sync=True)
+    benchmark_result = traitlets.Dict({}).tag(sync=True)
 
     # Render-time telemetry (set after first browser paint; docstring promises these).
     render_total_ms = traitlets.Int(allow_none=True, default_value=None)
@@ -569,6 +586,46 @@ class Show3D(anywidget.AnyWidget):
                 )
         return val
 
+    def _validate_panel_list_length(self, name: str, value: list) -> list:
+        """Require per-panel list traits to have exactly one entry per panel."""
+        n_pan = int(self.n_panels)
+        if len(value) != n_pan:
+            raise traitlets.TraitError(
+                f"{name} length ({len(value)}) must equal n_panels ({n_pan})"
+            )
+        return value
+
+    @traitlets.validate("vmin_per_panel", "vmax_per_panel")
+    def _validate_panel_bounds(self, proposal: dict) -> list:
+        """Require per-panel vmin/vmax lists to match n_panels and be finite."""
+        name = proposal["trait"].name
+        val = self._validate_panel_list_length(name, list(proposal["value"]))
+        for i, bound in enumerate(val):
+            if bound is not None and not math.isfinite(float(bound)):
+                raise traitlets.TraitError(f"{name}[{i}] must be finite or None, got {bound}")
+        other_name = "vmax_per_panel" if name == "vmin_per_panel" else "vmin_per_panel"
+        other = list(getattr(self, other_name))
+        if len(other) == len(val):
+            for i, bound in enumerate(val):
+                other_bound = other[i]
+                if bound is None or other_bound is None:
+                    continue
+                if name == "vmin_per_panel" and float(bound) > float(other_bound):
+                    raise traitlets.TraitError(
+                        f"vmin_per_panel[{i}] ({bound}) must be <= vmax_per_panel[{i}] ({other_bound})"
+                    )
+                if name == "vmax_per_panel" and float(bound) < float(other_bound):
+                    raise traitlets.TraitError(
+                        f"vmax_per_panel[{i}] ({bound}) must be >= vmin_per_panel[{i}] ({other_bound})"
+                    )
+        return val
+
+    def _reset_panel_contrast_traits(self) -> None:
+        """Initialize per-panel contrast traits from the shared contrast defaults."""
+        n_pan = int(self.n_panels)
+        self.vmin_per_panel = [None] * n_pan
+        self.vmax_per_panel = [None] * n_pan
+
     @traitlets.validate("fps")
     def _validate_fps(self, proposal: dict) -> float:
         """Reject non-finite or non-positive fps."""
@@ -695,7 +752,7 @@ class Show3D(anywidget.AnyWidget):
         device: str | None = None,
         display_bin: int | str = "auto",
         hideable: bool = False,
-        offline: bool = False,
+        offline: bool | None = None,
         state=None,
         max_cols: int | None = None,
         panel_gap: int | None = None,
@@ -755,7 +812,7 @@ class Show3D(anywidget.AnyWidget):
                    show_playback: bool, show_stats: bool, show_controls: bool,
                    size: int, diff_mode: str, buffer_size: int, dim_label: str,
                    use_torch: bool | None, device: str | None,
-                   display_bin: int | str, offline: bool,
+                   display_bin: int | str, offline: bool | None,
                    state: dict | str | pathlib.Path | None,
                    dedupe_identical_panels: bool, _t0: float) -> None:
         """Heavy setup called synchronously by `__init__` inside `hold_sync()`.
@@ -766,6 +823,7 @@ class Show3D(anywidget.AnyWidget):
         self._frame_server = None
         self._frame_server_thread = None
         self._frame_server_token = secrets.token_urlsafe(18)
+        self._separate_panel_data = None
 
         # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
         # merely because CUDA/MPS exists: real multi-panel ptycho stacks can be
@@ -983,10 +1041,20 @@ class Show3D(anywidget.AnyWidget):
                             f"  Multi-panel display bin {panel_bin}x before concat: "
                             f"{orig_h}x{orig_w} -> {panels[0].shape[1]}x{panels[0].shape[2]} per panel"
                         )
-                    # Concatenate raw float32 panels back-to-back. Do not normalize:
-                    # copied-panel stress tests use this path specifically to verify
-                    # that full-resolution source values survive unchanged.
-                    data = np.concatenate(panels, axis=2)
+                    if panel_bin == 1:
+                        # Keep non-identical 4k panels separate. Concatenating
+                        # nine panels makes each playback frame 4096 x 36864
+                        # (~604 MB) and exceeds practical WebGPU storage-buffer
+                        # binding limits. The frame server exposes exact
+                        # float32 panel frames, and the frontend renders one
+                        # GPU buffer per panel without binning or quantization.
+                        self.separate_panel_frames = True
+                        self._separate_panel_data = panels
+                        data = panels[0]
+                    else:
+                        # Explicitly binned panels are small enough for the
+                        # legacy concatenated-frame path.
+                        data = np.concatenate(panels, axis=2)
                     self._panel_width = panels[0].shape[2]
                     self.panel_width_px = self._panel_width
                     self._multi_panel_bin = panel_bin
@@ -1034,7 +1102,12 @@ class Show3D(anywidget.AnyWidget):
         if isinstance(display_bin, int) and display_bin > 1:
             self._display_bin = display_bin
 
-        if self._display_bin > 1:
+        if self.separate_panel_frames:
+            self._display_data = self._data
+            self.height = orig_h
+            self.width = int(self.panel_width_px) * int(self.n_panels)
+            self._display_bin_factor = 1
+        elif self._display_bin > 1:
             from quantem.widget.array_utils import bin2d
             self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
             self.height = int(self._display_data.shape[1])
@@ -1057,7 +1130,10 @@ class Show3D(anywidget.AnyWidget):
         # Compute global min/max ONCE - each scan is bandwidth-bound (~150 ms
         # per pass on 1.34 GB float32), so eliminating the duplicate scans
         # saves ~300 ms on a 20x4k stack.
-        if self._use_torch:
+        if self.separate_panel_frames and self._separate_panel_data is not None:
+            stack_min = min(float(p.min()) for p in self._separate_panel_data)
+            stack_max = max(float(p.max()) for p in self._separate_panel_data)
+        elif self._use_torch:
             stack_min = float(self._data_torch.min().item())
             stack_max = float(self._data_torch.max().item())
         else:
@@ -1097,6 +1173,7 @@ class Show3D(anywidget.AnyWidget):
         self.percentile_high = percentile_high
         self.vmin = vmin
         self.vmax = vmax
+        self._reset_panel_contrast_traits()
         self.fps = fps
 
         # Timestamps
@@ -1128,12 +1205,39 @@ class Show3D(anywidget.AnyWidget):
         # client-side. Required for nbconvert HTML exports - once the kernel
         # dies, slice_idx changes can no longer trigger _on_slice_change /
         # frame_bytes refresh. With offline=True the stack lives in widget
-        # state and JS handles scrub locally. Cost: full N*H*W*4 in HTML.
+        # state and JS handles scrub locally.
+        # Stored as uint8 against global (min, max) - 4x smaller than float32
+        # and stays under V8's ~512 MB JSON.parse limit on the widget-state
+        # script. Eye can't tell uint8 from float32 after viridis colormap.
+        # Default (offline=None): auto-enable when the packed uint8 stack fits
+        # a 1 GB budget; opt-out with offline=False for absurdly huge stacks.
+        # Pick the right stack source for offline packing. separate_panel_frames
+        # keeps each panel as its own array in self._separate_panel_data; the
+        # offline path needs every panel, concatenated horizontally so JS
+        # indexes by (sliceIdx * width * height) where `width` is the trait
+        # value (= total concat width). Otherwise `_display_data` already holds
+        # the concatenated or single-panel stack.
+        if self.separate_panel_frames and self._separate_panel_data is not None:
+            offline_source = np.concatenate(self._separate_panel_data, axis=2)
+        else:
+            offline_source = self._display_data
+        stack_bytes = int(np.prod(offline_source.shape))  # uint8 = 1 B/px
+        if offline is None:
+            offline = stack_bytes <= 1 * 1024 * 1024 * 1024
         if offline:
             self.offline = True
-            self._offline_stack = np.ascontiguousarray(
-                self._display_data, dtype=np.float32
-            ).tobytes()
+            arr = np.ascontiguousarray(offline_source, dtype=np.float32)
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                lo, hi = 0.0, 1.0
+            else:
+                lo = float(finite.min())
+                hi = float(finite.max())
+            rng = hi - lo if hi > lo else 1.0
+            quantized = np.clip((arr - lo) * (255.0 / rng), 0, 255).astype(np.uint8)
+            self._offline_min = lo
+            self._offline_max = hi
+            self._offline_stack = quantized.tobytes()
 
         # Observers
         self.observe(self._on_slice_change, names=["slice_idx"])
@@ -1262,6 +1366,8 @@ class Show3D(anywidget.AnyWidget):
             self._data_torch = torch.from_numpy(self._data).to(self._device)
         self.n_panels = 1
         self.panel_titles = []
+        self.starred = [-1]
+        self._reset_panel_contrast_traits()
         self._multi_panel_bin = 0
         self._panel_width = int(data.shape[2])
         self.n_slices = int(data.shape[0])
@@ -1374,6 +1480,9 @@ class Show3D(anywidget.AnyWidget):
             "percentile_low": self.percentile_low,
             "vmin": self.vmin,
             "vmax": self.vmax,
+            "link_contrast": self.link_contrast,
+            "vmin_per_panel": list(self.vmin_per_panel),
+            "vmax_per_panel": list(self.vmax_per_panel),
             "show_stats": self.show_stats,
             "show_controls": self.show_controls,
             "show_fft": self.show_fft,
@@ -1518,6 +1627,19 @@ class Show3D(anywidget.AnyWidget):
         # saved from a 4-panel widget, loading into a single-panel one).
         if "starred" in state and isinstance(state["starred"], list) and len(state["starred"]) != int(self.n_panels):
             state.pop("starred")
+        # These were briefly present in the development branch. Contrast auto,
+        # percentile, and log scale now stay global to match Show2D.
+        for key in (
+            "auto_contrast_per_panel",
+            "percentile_low_per_panel",
+            "percentile_high_per_panel",
+            "log_scale_per_panel",
+        ):
+            state.pop(key, None)
+        panel_len_keys = ("vmin_per_panel", "vmax_per_panel")
+        for key in panel_len_keys:
+            if key in state and isinstance(state[key], list) and len(state[key]) != int(self.n_panels):
+                state.pop(key)
         for key in list(state):
             if key not in allowed:
                 unknown.append(key)
@@ -2200,6 +2322,7 @@ class Show3D(anywidget.AnyWidget):
         self._data = None
         self._data_torch = None
         self._display_data = None
+        self._separate_panel_data = None
         for trait in ("frame_bytes", "roi_plot_data", "_gif_data", "_zip_data", "_bundle_data", "_buffer_bytes"):
             setattr(self, trait, b"")
         gc.collect()
@@ -2224,7 +2347,10 @@ class Show3D(anywidget.AnyWidget):
         total_ms = (time.perf_counter() - self._init_t0) * 1000
         py_ms = self._init_py_elapsed_ms
         shape = f"{self.n_slices}×{self.height}×{self.width}"
-        mem = self._data.nbytes
+        if self.separate_panel_frames and getattr(self, "_separate_panel_data", None) is not None:
+            mem = sum(int(p.nbytes) for p in self._separate_panel_data)
+        else:
+            mem = self._data.nbytes
         mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
         self.render_total_ms = int(total_ms)
         self.render_python_build_ms = int(py_ms)
@@ -2405,6 +2531,12 @@ class Show3D(anywidget.AnyWidget):
                 except ValueError:
                     self._text(400, "idx must be an integer")
                     return
+                panel_param = params.get("panel", [None])[0]
+                try:
+                    panel = int(panel_param) if panel_param is not None else None
+                except ValueError:
+                    self._text(400, "panel must be an integer")
+                    return
                 version_param = params.get("version", [None])[0]
                 try:
                     version = int(version_param) if version_param is not None else None
@@ -2416,7 +2548,7 @@ class Show3D(anywidget.AnyWidget):
                 if widget is None:
                     self._text(410, "widget is gone")
                     return
-                status, frame_or_message = widget._frame_for_http(idx, version)
+                status, frame_or_message = widget._frame_for_http(idx, version, panel)
                 if status != 200:
                     self._text(status, str(frame_or_message))
                     return
@@ -2476,7 +2608,7 @@ class Show3D(anywidget.AnyWidget):
     def _bump_frame_server_version(self) -> None:
         self.frame_server_version = int(self.frame_server_version) + 1
 
-    def _frame_for_http(self, idx: int, version: int | None) -> tuple[int, np.ndarray | str]:
+    def _frame_for_http(self, idx: int, version: int | None, panel: int | None = None) -> tuple[int, np.ndarray | str]:
         if version is not None and version != self.frame_server_version:
             return 409, "stale frame server version"
         data = self._display_data
@@ -2484,10 +2616,32 @@ class Show3D(anywidget.AnyWidget):
             return 410, "frame data has been released"
         if idx < 0 or idx >= int(self.n_slices):
             return 416, f"frame index {idx} out of range [0, {self.n_slices})"
-        frame = np.asarray(self._get_display_frame(idx), dtype=np.float32)
+        if panel is not None:
+            if not self.separate_panel_frames:
+                return 400, "panel query is only valid for separate-panel frames"
+            if panel < 0 or panel >= int(self.n_panels):
+                return 416, f"panel index {panel} out of range [0, {self.n_panels})"
+            frame = np.asarray(self._get_display_panel_frame(panel, idx), dtype=np.float32)
+        else:
+            frame = np.asarray(self._get_display_frame(idx), dtype=np.float32)
         if not frame.flags.c_contiguous:
             frame = np.ascontiguousarray(frame)
         return 200, frame
+
+    def _get_display_panel_frame(self, panel: int, idx: int) -> np.ndarray:
+        panels = getattr(self, "_separate_panel_data", None)
+        if not self.separate_panel_frames or panels is None:
+            frame = self._get_display_frame(idx)
+            pw = int(self.panel_width_px) or frame.shape[1] // max(1, int(self.n_panels))
+            return frame[:, panel * pw : (panel + 1) * pw]
+        frame = panels[panel][idx]
+        if self.diff_mode == "previous":
+            if idx == 0:
+                return np.zeros_like(frame)
+            return frame - panels[panel][idx - 1]
+        if self.diff_mode == "first":
+            return frame - panels[panel][0]
+        return frame
 
     def _get_display_frame(self, idx: int | None = None) -> np.ndarray:
         """Return the (binned, possibly diff-mode) frame for display. idx=None uses
@@ -2495,6 +2649,11 @@ class Show3D(anywidget.AnyWidget):
         observers see the same data the browser renders."""
         if idx is None:
             idx = self.slice_idx
+        if self.separate_panel_frames and getattr(self, "_separate_panel_data", None) is not None:
+            return np.concatenate(
+                [self._get_display_panel_frame(panel, idx) for panel in range(int(self.n_panels))],
+                axis=1,
+            )
         data = self._display_data
         frame = data[idx]
         if self.diff_mode == "previous":
@@ -2506,42 +2665,74 @@ class Show3D(anywidget.AnyWidget):
         return frame
 
     def _refresh_auto_contrast_ranges(self) -> None:
-        """Precompute per-frame auto-contrast ranges for JS playback.
+        """Precompute one stack-level auto-contrast range for JS playback.
 
-        The browser must not spend a 30 fps frame budget scanning 16M pixels for
-        percentile bounds. This mirrors the frontend's 1024-bin percentileClip
-        approximation using the full-resolution float32 frames.
+        Show3D is a scrubber, so Auto should give a stable intensity mapping
+        across frames and panels. The synced lists still have one entry per
+        slice for the existing JS cache contract, but every entry carries the
+        same stack percentile range.
         """
         if self.n_slices <= 0:
             self.auto_vmins = []
             self.auto_vmaxs = []
             return
+        if not self.auto_contrast:
+            self.auto_vmins = []
+            self.auto_vmaxs = []
+            return
 
-        vmins: list[float] = []
-        vmaxs: list[float] = []
         low_target = self.percentile_low / 100.0
         high_target = self.percentile_high / 100.0
         bins = 1024
         denom = bins - 1
+        separate_panels = self.separate_panel_frames and getattr(self, "_separate_panel_data", None) is not None
+        mn = float("inf")
+        mx = float("-inf")
+        total_size = 0
         for i in range(self.n_slices):
-            frame = self._get_display_frame(i)
-            mn = float(np.min(frame))
-            mx = float(np.max(frame))
-            if mn == mx:
-                vmins.append(mn)
-                vmaxs.append(mx)
-                continue
-            hist, _ = np.histogram(frame, bins=bins, range=(mn, mx))
-            csum = np.cumsum(hist)
-            low_count = int(frame.size * low_target)
-            high_count = int(np.ceil(frame.size * high_target))
-            lo = int(np.searchsorted(csum, low_count, side="left"))
-            hi = int(np.searchsorted(csum, high_count, side="left"))
-            lo = max(0, min(denom, lo))
-            hi = max(0, min(denom, hi))
-            span = mx - mn
-            vmins.append(float(mn + (lo / denom) * span))
-            vmaxs.append(float(mn + (hi / denom) * span))
+            if separate_panels:
+                panel_frames = [self._get_display_panel_frame(panel, i) for panel in range(int(self.n_panels))]
+                mn = min(mn, min(float(np.min(frame)) for frame in panel_frames))
+                mx = max(mx, max(float(np.max(frame)) for frame in panel_frames))
+                total_size += sum(int(frame.size) for frame in panel_frames)
+            else:
+                frame = self._get_display_frame(i)
+                mn = min(mn, float(np.min(frame)))
+                mx = max(mx, float(np.max(frame)))
+                total_size += int(frame.size)
+        if total_size <= 0 or not math.isfinite(mn) or not math.isfinite(mx):
+            self.auto_vmins = []
+            self.auto_vmaxs = []
+            return
+        if mn == mx:
+            self.auto_vmins = [mn] * int(self.n_slices)
+            self.auto_vmaxs = [mx] * int(self.n_slices)
+            return
+
+        hist = np.zeros(bins, dtype=np.int64)
+        for i in range(self.n_slices):
+            if separate_panels:
+                for panel in range(int(self.n_panels)):
+                    frame = self._get_display_panel_frame(panel, i)
+                    panel_hist, _ = np.histogram(frame, bins=bins, range=(mn, mx))
+                    hist += panel_hist
+            else:
+                frame = self._get_display_frame(i)
+                frame_hist, _ = np.histogram(frame, bins=bins, range=(mn, mx))
+                hist += frame_hist
+
+        csum = np.cumsum(hist)
+        low_count = int(total_size * low_target)
+        high_count = int(np.ceil(total_size * high_target))
+        lo = int(np.searchsorted(csum, low_count, side="left"))
+        hi = int(np.searchsorted(csum, high_count, side="left"))
+        lo = max(0, min(denom, lo))
+        hi = max(0, min(denom, hi))
+        span = mx - mn
+        vmin = float(mn + (lo / denom) * span)
+        vmax = float(mn + (hi / denom) * span)
+        vmins = [vmin] * int(self.n_slices)
+        vmaxs = [vmax] * int(self.n_slices)
 
         with self.hold_sync():
             self.auto_vmins = vmins
@@ -2615,14 +2806,18 @@ class Show3D(anywidget.AnyWidget):
         recomputed entirely on the JS side from the float32 bytes - Python
         doing the same reductions wastes ~50 ms per scrub at 4k full-res.
         ROI stats stay on Python because the mask logic + per-ROI bookkeeping
-        lives here."""
-        display_frame = self._get_display_frame()
+        lives here. In offline mode JS slices from _offline_stack directly,
+        so frame_bytes is dead weight in the HTML state - skip the write."""
+        display_frame = None
+        if self.roi_active or not self.separate_panel_frames:
+            display_frame = self._get_display_frame()
         with self.hold_sync():
-            if self.roi_active:
+            if self.roi_active and display_frame is not None:
                 self._update_roi_stats(display_frame)
             else:
                 self.roi_stats = {}
-            self.frame_bytes = display_frame.tobytes()
+            if not self.offline and not self.separate_panel_frames:
+                self.frame_bytes = display_frame.tobytes()
             self.frame_seq = self.frame_seq + 1
 
     def _update_roi_stats(self, frame: np.ndarray) -> None:

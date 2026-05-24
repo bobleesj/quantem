@@ -456,7 +456,16 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
         gpuInfo = info.description || `${info.vendor} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
       }
     } catch (_e) { /* adapter info not available */ }
-    gpuDevice = await adapter.requestDevice({ requiredFeatures: [] });
+    const requiredLimits: Record<string, number> = {};
+    const maxBufferSize = adapter.limits.maxBufferSize || 0;
+    const maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize || 0;
+    if (maxBufferSize > 0) {
+      requiredLimits.maxBufferSize = maxBufferSize;
+    }
+    if (maxStorageBufferBindingSize > 0) {
+      requiredLimits.maxStorageBufferBindingSize = maxStorageBufferBindingSize;
+    }
+    gpuDevice = await adapter.requestDevice({ requiredFeatures: [], requiredLimits });
     // Re-acquire if GPU process crashes (Linux NVIDIA hiccups, Electron tab suspend).
     gpuDevice.lost.then(() => { gpuDevice = null; gpuFFT = null; });
     return gpuDevice;

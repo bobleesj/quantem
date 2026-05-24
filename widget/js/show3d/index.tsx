@@ -79,6 +79,12 @@ const typography = {
 // Inlined utilities (matches Show2D/Show4DSTEM single-file convention)
 // ============================================================================
 const signedLog1p = (x: number): number => x >= 0 ? Math.log1p(x) : -Math.log1p(-x);
+const clampPct = (x: number): number => Math.max(0, Math.min(100, x));
+const valueToPct = (value: number | null | undefined, min: number, max: number, fallback: number): number => {
+  if (value == null || !Number.isFinite(value) || max <= min) return fallback;
+  return clampPct(((value - min) / (max - min)) * 100);
+};
+const pctToValue = (pct: number, min: number, max: number): number => min + (max - min) * (clampPct(pct) / 100);
 
 function shouldIgnoreWidgetShortcut(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -151,6 +157,18 @@ function cachedAutoRange(
   return Number.isFinite(vmin) && Number.isFinite(vmax) && vmax > vmin ? { vmin, vmax } : null;
 }
 
+function cachedAutoDisplayRange(
+  vmins: number[] | null | undefined,
+  vmaxs: number[] | null | undefined,
+  idx: number,
+  logScale: boolean,
+): { vmin: number; vmax: number } | null {
+  const range = cachedAutoRange(vmins, vmaxs, idx);
+  if (!range) return null;
+  if (!logScale) return range;
+  return { vmin: signedLog1p(range.vmin), vmax: signedLog1p(range.vmax) };
+}
+
 function show3dPerfDebug(): Record<string, unknown> | null {
   if (typeof window === "undefined") return null;
   const host = window as unknown as { __quantemShow3DPerf?: Record<string, unknown> };
@@ -158,8 +176,80 @@ function show3dPerfDebug(): Record<string, unknown> | null {
   return host.__quantemShow3DPerf;
 }
 
-const FRAME_SERVER_STREAM_CACHE_BYTES = 1024 * 1024 * 1024;
-const FRAME_SERVER_FULL_STACK_CACHE_BYTES = 3 * 1024 * 1024 * 1024;
+const FRAME_INTERVAL_HISTORY = 512;
+
+function resetFramePacingDebug(dbg: Record<string, unknown>, targetMs: number): void {
+  dbg.frameIntervalTargetMs = Number(targetMs.toFixed(2));
+  dbg.frameIntervalCount = 0;
+  dbg.frameIntervalSumMs = 0;
+  dbg.frameIntervalAvgMs = 0;
+  dbg.lastFrameIntervalMs = null;
+  dbg.maxFrameIntervalMs = 0;
+  dbg.overBudgetFrames = 0;
+  dbg.frameIntervalHistory = [];
+  dbg.lastRenderedAt = null;
+}
+
+function recordFramePacingDebug(dbg: Record<string, unknown>, now: number, targetMs: number): void {
+  const lastRenderedAt = Number(dbg.lastRenderedAt ?? 0);
+  if (lastRenderedAt > 0) {
+    const interval = Math.max(0, now - lastRenderedAt);
+    const count = Number(dbg.frameIntervalCount ?? 0) + 1;
+    const sum = Number(dbg.frameIntervalSumMs ?? 0) + interval;
+    const longFrameBudgetMs = Math.max(targetMs * 1.5, targetMs + 8);
+    const history = Array.isArray(dbg.frameIntervalHistory)
+      ? (dbg.frameIntervalHistory as number[])
+      : [];
+    history.push(Number(interval.toFixed(2)));
+    if (history.length > FRAME_INTERVAL_HISTORY) history.splice(0, history.length - FRAME_INTERVAL_HISTORY);
+
+    dbg.frameIntervalCount = count;
+    dbg.frameIntervalSumMs = Number(sum.toFixed(2));
+    dbg.frameIntervalAvgMs = Number((sum / count).toFixed(2));
+    dbg.lastFrameIntervalMs = Number(interval.toFixed(2));
+    dbg.maxFrameIntervalMs = Number(Math.max(Number(dbg.maxFrameIntervalMs ?? 0), interval).toFixed(2));
+    dbg.overBudgetFrames = Number(dbg.overBudgetFrames ?? 0) + (interval > longFrameBudgetMs ? 1 : 0);
+    dbg.frameIntervalHistory = history;
+  }
+  dbg.lastRenderedAt = now;
+}
+
+function percentileFromHistory(values: unknown, percentile: number): number | null {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const nums = values
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v))
+    .sort((a, b) => a - b);
+  if (nums.length === 0) return null;
+  const idx = Math.min(nums.length - 1, Math.max(0, Math.ceil((percentile / 100) * nums.length) - 1));
+  return Number(nums[idx].toFixed(2));
+}
+
+function estimateRafFps(sampleMs: number): Promise<number | null> {
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    return Promise.resolve(null);
+  }
+  return new Promise(resolve => {
+    let first = 0;
+    let last = 0;
+    let frames = 0;
+    const tick = (ts: number) => {
+      if (first === 0) first = ts;
+      last = ts;
+      frames++;
+      if (ts - first >= sampleMs) {
+        const elapsed = Math.max(1, last - first);
+        resolve(frames > 1 ? (frames - 1) * 1000 / elapsed : null);
+        return;
+      }
+      window.requestAnimationFrame(tick);
+    };
+    window.requestAnimationFrame(tick);
+  });
+}
+
+const FRAME_SERVER_STREAM_CACHE_BYTES = 4 * 1024 * 1024 * 1024;
+const FRAME_SERVER_FULL_STACK_CACHE_BYTES = 24 * 1024 * 1024 * 1024;
+const FRAME_SERVER_JS_FULL_STACK_CACHE_BYTES = 8 * 1024 * 1024 * 1024;
 const FRAME_SERVER_MIN_CACHE_FRAMES = 6;
 const FRAME_SERVER_PREFETCH_FRAMES = 8;
 
@@ -340,10 +430,21 @@ const upwardMenuProps = {
   sx: { zIndex: 9999 },
 };
 
-import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse, getGPUColormapEngine, GPUColormapEngine } from "../colormaps";
+import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse, createGPUColormapEngine, GPUColormapEngine } from "../colormaps";
 
 const DPR = window.devicePixelRatio || 1;
 const RESIZE_HIT_AREA_PX = 10;
+const ENABLE_GPU_CANVAS_DISPLAY = true;
+
+function packedRgbFromHex(color: string): number {
+  const raw = (color.startsWith("#") ? color.slice(1) : color).trim();
+  const expanded = raw.length === 3
+    ? raw.split("").map(ch => ch + ch).join("")
+    : raw.slice(0, 6);
+  const parsed = Number.parseInt(expanded, 16);
+  return Number.isFinite(parsed) ? parsed & 0xFFFFFF : 0;
+}
+
 // ROI drawing
 function drawROI(
   ctx: CanvasRenderingContext2D,
@@ -770,22 +871,65 @@ function Show3D() {
   // so JS effects always see a change. Use it in dep arrays alongside frameBytes.
   const [frameSeq] = useModelState<number>("frame_seq");
   // Offline mode (nbconvert HTML export): when True at __init__, the full
-  // (N, H, W) float32 stack is shipped in _offline_stack and JS slices it on
-  // every sliceIdx change — no kernel round-trip needed. Use case: ship a
-  // Show3D widget embedded in an HTML page that a colleague can scrub without
-  // a Python environment running.
+  // (N, H, W) uint8-quantized stack is shipped in _offline_stack plus the
+  // global (min, max). JS dequantizes the requested slice on every sliceIdx
+  // change — no kernel round-trip needed. Use case: ship a Show3D widget
+  // embedded in an HTML page that a colleague can scrub without a Python
+  // environment running. uint8 keeps the widget-state JSON under V8's
+  // ~512 MB JSON.parse limit on multi-widget reports.
   const [offline] = useModelState<boolean>("offline");
   const [offlineStack] = useModelState<DataView>("_offline_stack");
+  const [offlineMin] = useModelState<number>("_offline_min");
+  const [offlineMax] = useModelState<number>("_offline_max");
+  // Reused scratch Float32Array sized to one frame so per-scrub dequant
+  // doesn't re-allocate. Indexed by (width, height) since reshape resets it.
+  const offlineScratch = React.useRef<Float32Array | null>(null);
+  const offlineScratchKey = React.useRef<number>(-1);
+  // Local live index used by the offline frameBytes useMemo. During MUI Slider
+  // drag, `setSliceIdx` (anywidget useModelState) goes through model.set +
+  // save_changes which appears to batch under rapid mousemove ticks - useMemo
+  // doesn't see sliceIdx change until the user releases the slider, so the
+  // canvas stays on the old frame the whole drag. Local React state updates
+  // synchronously per tick. scrubToSlice writes both; the model trait is still
+  // updated for state.dict round-trips and observers.
+  const [liveSliceIdx, setLiveSliceIdx] = React.useState<number>(sliceIdx);
+  React.useEffect(() => { setLiveSliceIdx(sliceIdx); }, [sliceIdx]);
   const frameBytes = React.useMemo<DataView>(() => {
     if (offline && offlineStack && offlineStack.byteLength > 0 && width > 0 && height > 0) {
-      const frameSize = width * height * 4;
-      const start = sliceIdx * frameSize;
-      if (start + frameSize <= offlineStack.byteLength) {
-        return new DataView(offlineStack.buffer, offlineStack.byteOffset + start, frameSize);
+      const pixelCount = width * height;
+      const start = liveSliceIdx * pixelCount;
+      if (start + pixelCount <= offlineStack.byteLength) {
+        const u8 = new Uint8Array(offlineStack.buffer, offlineStack.byteOffset + start, pixelCount);
+        const key = (width << 16) | height;
+        if (offlineScratchKey.current !== key || offlineScratch.current === null) {
+          offlineScratch.current = new Float32Array(pixelCount);
+          offlineScratchKey.current = key;
+        }
+        const f32 = offlineScratch.current;
+        const scale = (offlineMax - offlineMin) / 255.0;
+        for (let i = 0; i < pixelCount; i++) f32[i] = u8[i] * scale + offlineMin;
+        return new DataView(f32.buffer);
       }
     }
     return rawFrameBytes;
-  }, [offline, offlineStack, rawFrameBytes, sliceIdx, width, height]);
+  }, [offline, offlineStack, offlineMin, offlineMax, rawFrameBytes, liveSliceIdx, width, height]);
+  const getOfflineFrame = (idx: number): Float32Array | null => {
+    // Allocate a FRESH Float32Array per call so the GPU upload path's
+    // pointer-equality cache can't short-circuit the upload and leave
+    // the canvas painted with a stale frame. Previously reused a single
+    // scratch buffer in place; engine.uploadData saw identical reference
+    // every tick and skipped the texture refresh — autoplay frame counter
+    // advanced but canvas stayed on initial frame. Verified 2026-05-24.
+    if (!offline || !offlineStack || offlineStack.byteLength === 0 || width <= 0 || height <= 0) return null;
+    const pixelCount = width * height;
+    const start = idx * pixelCount;
+    if (start < 0 || start + pixelCount > offlineStack.byteLength) return null;
+    const u8 = new Uint8Array(offlineStack.buffer, offlineStack.byteOffset + start, pixelCount);
+    const f32 = new Float32Array(pixelCount);
+    const scale = (offlineMax - offlineMin) / 255.0;
+    for (let i = 0; i < pixelCount; i++) f32[i] = u8[i] * scale + offlineMin;
+    return f32;
+  };
 
   // Truthful first-render signal: flipped ONCE after the first frame_bytes
   // arrives and the browser has had time to composite two frames.  Python side
@@ -807,6 +951,7 @@ function Show3D() {
   const [panelTitles] = useModelState<string[]>("panel_titles");
   const [panelWidthPx] = useModelState<number>("panel_width_px");
   const [sharedPanelSource] = useModelState<boolean>("shared_panel_source");
+  const [separatePanelFrames] = useModelState<boolean>("separate_panel_frames");
   const [panelRealFrames] = useModelState<number[]>("panel_real_frames");
   const [starred, setStarred] = useModelState<number[]>("starred");
   const [hiddenIndices] = useModelState<number[]>("hidden_indices");
@@ -875,6 +1020,8 @@ function Show3D() {
   const [percentileHigh] = useModelState<number>("percentile_high");
   const [traitVmin] = useModelState<number | null>("vmin");
   const [traitVmax] = useModelState<number | null>("vmax");
+  const [vminPerPanel, setVminPerPanel] = useModelState<(number | null)[]>("vmin_per_panel");
+  const [vmaxPerPanel, setVmaxPerPanel] = useModelState<(number | null)[]>("vmax_per_panel");
   const [dataMin] = useModelState<number>("data_min");
   const [dataMax] = useModelState<number>("data_max");
   const [autoVmins] = useModelState<number[]>("auto_vmins");
@@ -922,10 +1069,15 @@ function Show3D() {
   const [, setPrefetchRequest] = useModelState<number>("_prefetch_request");
   const [frameServerUrl] = useModelState<string>("frame_server_url");
   const [frameServerVersion] = useModelState<number>("frame_server_version");
+  const [benchmarkRequest] = useModelState<Record<string, unknown>>("benchmark_request");
+  const [, setBenchmarkResult] = useModelState<Record<string, unknown>>("benchmark_result");
 
   // Canvas refs
   const rootRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const gpuCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  const gpuCanvasCtxRef = React.useRef<GPUCanvasContext | null>(null);
+  const gpuCanvasSizeRef = React.useRef<{ w: number; h: number } | null>(null);
   const overlayRef = React.useRef<HTMLCanvasElement>(null);
   const uiRef = React.useRef<HTMLCanvasElement>(null);
   const canvasContainerRef = React.useRef<HTMLDivElement>(null);
@@ -964,10 +1116,22 @@ function Show3D() {
   // Per-panel zoom/pan: index 0 is also used as the SHARED state for
   // single-panel widgets, and as the linked state when link_zoom or
   // link_pan are on. Each panel keeps its own state when unlinked.
-  type ZoomState = { zoom: number; panX: number; panY: number };
-  const initialState: ZoomState = { zoom: 1, panX: 0, panY: 0 };
-  const [linkedState, setLinkedState] = React.useState<ZoomState>(initialState);
-  const [panelStates, setPanelStates] = React.useState<ZoomState[]>([initialState]);
+  type PanelState = {
+    zoom: number;
+    panX: number;
+    panY: number;
+    imageVminPct: number;
+    imageVmaxPct: number;
+  };
+  const initialState: PanelState = {
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    imageVminPct: 0,
+    imageVmaxPct: 100,
+  };
+  const [linkedState, setLinkedState] = React.useState<PanelState>(initialState);
+  const [panelStates, setPanelStates] = React.useState<PanelState[]>([initialState]);
   React.useEffect(() => {
     const n = Math.max(1, nPanels || 1);
     setPanelStates(prev => {
@@ -984,19 +1148,20 @@ function Show3D() {
     if (prevLinkRef.current && !linkPanels) {
       // Linked → unlinked: distribute linkedState to all panels
       const s = linkedState;
-      setPanelStates(arr => arr.map(() => ({ zoom: s.zoom, panX: s.panX, panY: s.panY })));
+      setPanelStates(arr => arr.map(() => ({ ...s })));
     } else if (!prevLinkRef.current && linkPanels) {
       // Unlinked → linked: adopt panel 0's state as the shared linked state
       const s0 = panelStates[0] || initialState;
-      setLinkedState({ zoom: s0.zoom, panX: s0.panX, panY: s0.panY });
+      setLinkedState({ ...s0 });
     }
     prevLinkRef.current = linkPanels;
   }, [linkPanels]);
-  const getState = (panelIdx: number, axis: "zoom" | "pan"): ZoomState => {
+  const getState = (panelIdx: number, axis: "zoom" | "pan"): PanelState => {
     const linked = axis === "zoom" ? linkZoom : linkPan;
     return linked ? linkedState : (panelStates[panelIdx] || initialState);
   };
-  const stateFor = (panelIdx: number): ZoomState => ({
+  const stateFor = (panelIdx: number): PanelState => ({
+    ...(panelStates[panelIdx] || initialState),
     zoom: getState(panelIdx, "zoom").zoom,
     panX: getState(panelIdx, "pan").panX,
     panY: getState(panelIdx, "pan").panY,
@@ -1058,6 +1223,7 @@ function Show3D() {
   const playbackIdxRef = React.useRef(0);
   const frameFetchCacheRef = React.useRef<Map<number, Float32Array>>(new Map());
   const frameFetchPendingRef = React.useRef<Map<number, Promise<Float32Array | null>>>(new Map());
+  const panelGpuFramePendingRef = React.useRef<Map<number, Promise<boolean>>>(new Map());
   const frameFetchSerialRef = React.useRef(0);
   const localAutoVminsRef = React.useRef<number[]>([]);
   const localAutoVmaxsRef = React.useRef<number[]>([]);
@@ -1083,6 +1249,39 @@ function Show3D() {
     logScale: boolean;
   } | null>(null);
   const gpuRenderSerialRef = React.useRef(0);
+  const gpuDisplayVisibleRef = React.useRef<boolean | null>(null);
+  const [gpuDisplayVisible, setGpuDisplayVisibleState] = React.useState(false);
+
+  const setGpuDisplayVisible = React.useCallback((visible: boolean) => {
+    if (gpuDisplayVisibleRef.current === visible) return;
+    gpuDisplayVisibleRef.current = visible;
+    const gpuCanvas = gpuCanvasRef.current;
+    const canvas = canvasRef.current;
+    const gpuVisible = ENABLE_GPU_CANVAS_DISPLAY && visible;
+    setGpuDisplayVisibleState(gpuVisible);
+    if (gpuCanvas) gpuCanvas.style.opacity = gpuVisible ? "1" : "0";
+    if (canvas) {
+      canvas.style.opacity = gpuVisible ? "0" : "1";
+      canvas.style.display = gpuVisible ? "none" : "block";
+    }
+  }, []);
+
+  const ensureGpuDisplayContext = React.useCallback((
+    engine: GPUColormapEngine,
+    w: number,
+    h: number,
+  ): GPUCanvasContext | null => {
+    const canvas = gpuCanvasRef.current;
+    if (!canvas) return null;
+    const widthPx = Math.max(1, Math.round(w));
+    const heightPx = Math.max(1, Math.round(h));
+    const size = gpuCanvasSizeRef.current;
+    if (!gpuCanvasCtxRef.current || !size || size.w !== widthPx || size.h !== heightPx) {
+      gpuCanvasCtxRef.current = engine.configureCanvas(canvas, widthPx, heightPx);
+      gpuCanvasSizeRef.current = { w: widthPx, h: heightPx };
+    }
+    return gpuCanvasCtxRef.current;
+  }, []);
 
   const ensureLocalAutoRange = React.useCallback((
     idx: number,
@@ -1113,21 +1312,39 @@ function Show3D() {
   }, [percentileLow, percentileHigh, nSlices, width, height]);
 
   React.useEffect(() => {
+    let disposed = false;
     getWebGPUFFT().then(fft => {
-      if (fft) { gpuFFTRef.current = fft; setGpuReady(true); }
+      if (!disposed && fft) { gpuFFTRef.current = fft; setGpuReady(true); }
     });
-    getGPUColormapEngine().then(engine => {
+    createGPUColormapEngine().then(engine => {
+      if (disposed) {
+        engine?.destroy();
+        return;
+      }
       if (engine) {
         gpuCmapRef.current = engine;
         gpuCmapReadyRef.current = true;
       }
     });
+    return () => {
+      disposed = true;
+      gpuCmapRef.current?.destroy();
+      gpuCmapRef.current = null;
+      gpuCmapReadyRef.current = false;
+      gpuCanvasCtxRef.current = null;
+      gpuCanvasSizeRef.current = null;
+      frameFetchSerialRef.current++;
+      frameFetchCacheRef.current.clear();
+      frameFetchPendingRef.current.clear();
+      panelGpuFramePendingRef.current.clear();
+      gpuFrameCacheUploadedRef.current.clear();
+    };
   }, []);
 
   const getFrameServerCacheLimit = React.useCallback(() => {
     const frameByteLength = Math.max(1, width * height * 4);
     const stackByteLength = frameByteLength * Math.max(1, nSlices);
-    const cacheBudget = stackByteLength <= FRAME_SERVER_FULL_STACK_CACHE_BYTES
+    const cacheBudget = stackByteLength <= FRAME_SERVER_JS_FULL_STACK_CACHE_BYTES
       ? stackByteLength
       : FRAME_SERVER_STREAM_CACHE_BYTES;
     const budgetFrames = Math.floor(cacheBudget / frameByteLength);
@@ -1162,7 +1379,9 @@ function Show3D() {
     frameFetchSerialRef.current++;
     frameFetchCacheRef.current.clear();
     frameFetchPendingRef.current.clear();
+    panelGpuFramePendingRef.current.clear();
     gpuFrameCacheUploadedRef.current.clear();
+    gpuCmapRef.current?.destroy();
     const dbg = show3dPerfDebug();
     if (dbg) {
       dbg.frameServerUrl = frameServerUrl || "";
@@ -1239,6 +1458,100 @@ function Show3D() {
     return promise;
   }, [frameServerUrl, frameServerVersion, width, height, nSlices, getCachedServerFrame, putCachedServerFrame]);
 
+  const ensurePanelFrameGpu = React.useCallback(async (
+    idx: number,
+    rgbaCapacityHint?: number,
+  ): Promise<boolean> => {
+    if (!separatePanelFrames || !frameServerUrl || width <= 0 || height <= 0 || nSlices <= 0) return false;
+    const normalized = ((Math.round(idx) % nSlices) + nSlices) % nSlices;
+    if (gpuFrameCacheUploadedRef.current.has(normalized)) return true;
+    const pending = panelGpuFramePendingRef.current.get(normalized);
+    if (pending) return pending;
+
+    const promise = (async () => {
+      while (!gpuCmapReadyRef.current || !gpuCmapRef.current) {
+        await new Promise<void>(resolve => setTimeout(resolve, 25));
+      }
+      const engine = gpuCmapRef.current;
+      if (!engine) return false;
+      const frame = await fetchFrameFromServer(normalized);
+      if (!frame) {
+        const dbg = show3dPerfDebug();
+        if (dbg) {
+          dbg.lastPanelGpuMissFrame = normalized;
+        }
+        return false;
+      }
+      try {
+        engine.uploadData(normalized, frame, width, height, rgbaCapacityHint, true);
+        frameFetchCacheRef.current.delete(normalized);
+      } catch (err) {
+        const dbg = show3dPerfDebug();
+        if (dbg) {
+          dbg.lastPanelGpuUploadFrame = normalized;
+          dbg.lastPanelGpuUploadError = err instanceof Error ? err.message : String(err);
+        }
+        return false;
+      }
+      gpuFrameCacheUploadedRef.current.add(normalized);
+      const dbg = show3dPerfDebug();
+      if (dbg) {
+        dbg.gpuPreloadDone = gpuFrameCacheUploadedRef.current.size;
+        dbg.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+        dbg.gpuPanelCacheLayout = "combined-frame";
+        dbg.lastFrameSource = "gpu-panel-cache-combined";
+      }
+      return true;
+    })().finally(() => {
+      if (panelGpuFramePendingRef.current.get(normalized) === promise) {
+        panelGpuFramePendingRef.current.delete(normalized);
+      }
+    });
+    panelGpuFramePendingRef.current.set(normalized, promise);
+    return promise;
+  }, [
+    separatePanelFrames,
+    frameServerUrl,
+    width,
+    height,
+    nSlices,
+    fetchFrameFromServer,
+  ]);
+
+  React.useEffect(() => {
+    if (!frameServerUrl || width <= 0 || height <= 0 || nSlices <= 0) return;
+    if (separatePanelFrames) return;
+    const frameByteLength = Math.max(1, width * height * 4);
+    const stackByteLength = frameByteLength * Math.max(1, nSlices);
+    if (stackByteLength > FRAME_SERVER_JS_FULL_STACK_CACHE_BYTES) return;
+    let cancelled = false;
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.frameFetchPreloadTarget = nSlices;
+      dbg.frameFetchPreloadDone = 0;
+      dbg.frameFetchPreloadActive = true;
+    }
+    void (async () => {
+      for (let i = 0; i < nSlices; i++) {
+        if (cancelled) break;
+        await fetchFrameFromServer(i);
+        const d = show3dPerfDebug();
+        if (d) {
+          d.frameFetchPreloadDone = i + 1;
+          d.frameFetchCacheSize = frameFetchCacheRef.current.size;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
+      const d = show3dPerfDebug();
+      if (d) d.frameFetchPreloadActive = false;
+    })();
+    return () => {
+      cancelled = true;
+      const d = show3dPerfDebug();
+      if (d) d.frameFetchPreloadActive = false;
+    };
+  }, [frameServerUrl, frameServerVersion, width, height, nSlices, fetchFrameFromServer, separatePanelFrames]);
+
   const prefetchServerFrames = React.useCallback((
     startIdx: number,
     reversePlayback = false,
@@ -1247,6 +1560,7 @@ function Show3D() {
     loopEndIdx = -1,
   ) => {
     if (!frameServerUrl || nSlices <= 0) return;
+    if (separatePanelFrames) return;
     const dir = reversePlayback ? -1 : 1;
     const rangeStart = loopPlayback ? Math.max(0, Math.min(loopStartIdx, nSlices - 1)) : 0;
     const rangeEnd = loopPlayback
@@ -1263,7 +1577,7 @@ function Show3D() {
       }
       void fetchFrameFromServer(next);
     }
-  }, [frameServerUrl, nSlices, fetchFrameFromServer]);
+  }, [frameServerUrl, nSlices, fetchFrameFromServer, separatePanelFrames]);
 
   // Parse incoming playback buffer (double-buffer to avoid overwrite stalls)
   React.useEffect(() => {
@@ -1321,8 +1635,11 @@ function Show3D() {
 
   // Sync displaySliceIdx with model when not playing
   React.useEffect(() => {
-    if (!playing) setDisplaySliceIdx(sliceIdx);
-  }, [sliceIdx, playing]);
+    if (!playing) {
+      setGpuDisplayVisible(false);
+      setDisplaySliceIdx(sliceIdx);
+    }
+  }, [sliceIdx, playing, setGpuDisplayVisible]);
 
   // Histogram state for main image
   const [imageVminPct, setImageVminPct] = React.useState(0);
@@ -1332,6 +1649,129 @@ function Show3D() {
   // uses these bins directly and skips its CPU bin-scan fallback.
   const [imageHistogramBins, setImageHistogramBins] = React.useState<number[] | null>(null);
   const [imageDataRange, setImageDataRange] = React.useState<{ min: number; max: number }>({ min: 0, max: 1 });
+  const [panelHistogramData, setPanelHistogramData] = React.useState<(Float32Array | null)[]>([]);
+  const [panelDataRanges, setPanelDataRanges] = React.useState<{ min: number; max: number }[]>([]);
+  const perPanelHistogramEnabled = (nPanels || 1) > 1 && !linkContrast;
+
+  const updatePanelState = (panel: number, patch: Partial<PanelState>) => {
+    setPanelStates(prev => prev.map((state, i) => i === panel ? { ...state, ...patch } : state));
+  };
+  const setPanelListValue = <T,>(values: T[], setter: (next: T[]) => void, panel: number, value: T, fallback: T) => {
+    const n = Math.max(1, nPanels || 1);
+    const next = Array.from({ length: n }, (_, i) => values[i] ?? fallback);
+    next[panel] = value;
+    setter(next);
+  };
+  const setPanelRangeValues = (panel: number, minValue: number | null, maxValue: number | null) => {
+    setPanelListValue<number | null>(vminPerPanel, setVminPerPanel, panel, minValue, null);
+    setPanelListValue<number | null>(vmaxPerPanel, setVmaxPerPanel, panel, maxValue, null);
+  };
+  const setAllPanelClipPcts = (minPct: number, maxPct: number) => {
+    const n = Math.max(1, nPanels || 1);
+    setPanelStates(prev => Array.from({ length: n }, (_, i) => ({
+      ...(prev[i] || initialState),
+      imageVminPct: minPct,
+      imageVmaxPct: maxPct,
+    })));
+  };
+  const resetPerPanelClips = () => {
+    const n = Math.max(1, nPanels || 1);
+    setAllPanelClipPcts(0, 100);
+    setImageVminPct(0);
+    setImageVmaxPct(100);
+    setVminPerPanel(Array.from({ length: n }, () => null));
+    setVmaxPerPanel(Array.from({ length: n }, () => null));
+  };
+
+  const extractPanelSlice = (
+    raw: Float32Array,
+    panel: number,
+    panelLogScale: boolean,
+  ): Float32Array | null => {
+    const n = Math.max(1, nPanels || 1);
+    if (height <= 0 || raw.length === 0) return null;
+    const panelW = Math.max(1, sourcePanelWidth);
+    const fullW = raw.length === height * panelW ? panelW : width;
+    const srcPanel = sharedPanelSource ? 0 : panel;
+    const x0 = Math.min(Math.max(0, srcPanel * panelW), Math.max(0, fullW - panelW));
+    if (raw.length < height * fullW || x0 + panelW > fullW || panel >= n) return null;
+    const out = new Float32Array(height * panelW);
+    for (let r = 0; r < height; r++) {
+      out.set(raw.subarray(r * fullW + x0, r * fullW + x0 + panelW), r * panelW);
+    }
+    return panelLogScale ? applyLogScale(out) : out;
+  };
+
+  const resolvePanelRange = (
+    panel: number,
+    range: { min: number; max: number },
+    sharedAutoRange?: { vmin: number; vmax: number } | null,
+  ): { vmin: number; vmax: number; logScale: boolean } => {
+    const state = panelStates[panel] || initialState;
+    if (sharedAutoRange) {
+      return { ...sharedAutoRange, logScale };
+    }
+    const storedMin = vminPerPanel[panel];
+    const storedMax = vmaxPerPanel[panel];
+    if (storedMin != null || storedMax != null) {
+      const lo = storedMin ?? range.min;
+      const hi = storedMax ?? range.max;
+      return { vmin: lo, vmax: Math.max(lo, hi), logScale };
+    }
+    const slider = sliderRange(range.min, range.max, state.imageVminPct, state.imageVmaxPct);
+    return { ...slider, logScale };
+  };
+
+  const resolveCurrentSharedAutoRange = (requireAuto = true): { vmin: number; vmax: number } | null => {
+    if (requireAuto && !autoContrast) return null;
+    const raw = rawFrameDataRef.current;
+    if (raw && raw.length > 0) {
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
+      if (cached) return cached;
+      const processed = logScale ? applyLogScale(raw) : raw;
+      return percentileClip(processed, percentileLow, percentileHigh);
+    }
+    return resolveDisplayRange(dataMin, dataMax, traitVmin, traitVmax, logScale, imageVminPct, imageVmaxPct);
+  };
+  const snapPerPanelClipsToStackAuto = () => {
+    const bounds = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+    if (bounds.max <= bounds.min) return;
+    const clipped = resolveCurrentSharedAutoRange(false);
+    if (!clipped) return;
+    const minPct = valueToPct(clipped.vmin, bounds.min, bounds.max, 0);
+    const maxPct = valueToPct(clipped.vmax, bounds.min, bounds.max, 100);
+    setAllPanelClipPcts(minPct, maxPct);
+    setImageVminPct(minPct);
+    setImageVmaxPct(maxPct);
+  };
+  const handleAutoContrastChange = (on: boolean) => {
+    setAutoContrast(on);
+    if (perPanelHistogramEnabled) {
+      if (on) {
+        snapPerPanelClipsToStackAuto();
+      } else {
+        resetPerPanelClips();
+      }
+      return;
+    }
+    if (on && imageHistogramData) {
+      // ON -> snap slider thumbs to actual percentile clip so slider shows what's rendered.
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
+      const { vmin: pmin, vmax: pmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh);
+      const { min: autoMin, max: autoMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+      const span = autoMax - autoMin;
+      if (span > 0) {
+        setImageVminPct(Math.max(0, Math.min(100, ((pmin - autoMin) / span) * 100)));
+        setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - autoMin) / span) * 100)));
+      }
+    } else {
+      // OFF -> reset slider to full range so user sees raw data.
+      setImageVminPct(0);
+      setImageVmaxPct(100);
+    }
+  };
 
   // Histogram state for FFT
   const [fftVminPct, setFftVminPct] = React.useState(0);
@@ -1349,6 +1789,143 @@ function Show3D() {
     const target = e.target as HTMLElement | null;
     if (target?.closest("canvas")) rootRef.current?.focus();
   };
+
+  const lastBenchmarkTokenRef = React.useRef<unknown>(null);
+  const benchmarkPlaybackFpsRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    const req = benchmarkRequest ?? {};
+    const token = req.token;
+    const mode = typeof req.mode === "string" ? req.mode : "playback";
+    if ((typeof token !== "string" && typeof token !== "number") || mode === "renderBurst" || lastBenchmarkTokenRef.current === token) return;
+    lastBenchmarkTokenRef.current = token;
+
+    let cancelled = false;
+    const sleep = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
+    const numberFromReq = (key: string, fallback: number) => {
+      const value = req[key];
+      return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+    };
+    const warmupMs = Math.max(0, numberFromReq("warmupMs", 3000));
+    const sampleMs = Math.max(250, numberFromReq("sampleMs", 10000));
+    const targetFps = Math.max(1, numberFromReq("targetFps", fps));
+    const expectedFrames = Math.max(0, Math.floor(numberFromReq("expectedFrames", nSlices)));
+    const waitForGpuPreload = req.waitForGpuPreload === true;
+    const reportUrl = typeof req.reportUrl === "string" ? req.reportUrl : "";
+    const label = typeof req.label === "string" ? req.label : "show3d benchmark";
+
+    void (async () => {
+      const startedAt = performance.now();
+      const setStatus = (status: string, extra: Record<string, unknown> = {}) => {
+        if (!cancelled) {
+          setBenchmarkResult({ token, label, status, targetFps, ...extra });
+        }
+      };
+
+      try {
+        setStatus("warming");
+        const estimatedRefresh = await estimateRafFps(Math.max(300, numberFromReq("refreshProbeMs", 750)));
+        if (estimatedRefresh !== null) {
+          setStatus("warming", { displayRefreshFps: Number(estimatedRefresh.toFixed(2)) });
+        }
+        benchmarkPlaybackFpsRef.current = targetFps;
+        setFps(targetFps);
+        setPlaying(true);
+
+        if (waitForGpuPreload && expectedFrames > 0) {
+          const preloadDeadline = performance.now() + Math.max(5000, numberFromReq("preloadTimeoutMs", 120000));
+          let preloadReady = false;
+          while (!cancelled && performance.now() < preloadDeadline) {
+            const dbg = show3dPerfDebug() ?? {};
+            const gpuDone = Number(dbg.gpuPreloadDone ?? dbg.gpuFrameCacheUploaded ?? 0);
+            const fetchDone = Number(dbg.frameFetchPreloadDone ?? 0);
+            preloadReady = separatePanelFrames
+              ? gpuDone >= expectedFrames
+              : gpuDone >= expectedFrames || fetchDone >= expectedFrames;
+            if (preloadReady) break;
+            setStatus("preloading", { gpuPreloadDone: gpuDone, frameFetchPreloadDone: fetchDone });
+            await sleep(250);
+          }
+          if (!preloadReady) {
+            const dbg = show3dPerfDebug() ?? {};
+            const gpuDone = Number(dbg.gpuPreloadDone ?? dbg.gpuFrameCacheUploaded ?? 0);
+            const fetchDone = Number(dbg.frameFetchPreloadDone ?? 0);
+            setStatus("error", {
+              error: "GPU preload incomplete",
+              gpuPreloadDone: gpuDone,
+              frameFetchPreloadDone: fetchDone,
+              gpuPreloadTarget: expectedFrames,
+              gpuPreloadError: dbg.gpuPreloadError ?? null,
+              gpuPreloadLastMiss: dbg.gpuPreloadLastMiss ?? null,
+            });
+            return;
+          }
+        }
+
+        await sleep(warmupMs);
+        if (cancelled) return;
+
+        const dbgStart = show3dPerfDebug() ?? {};
+        resetFramePacingDebug(dbgStart, 1000 / targetFps);
+        const startFrames = Number(dbgStart.renderedFrames ?? 0);
+        const sampleStart = performance.now();
+        setStatus("sampling");
+        await sleep(sampleMs);
+        if (cancelled) return;
+
+        const dbgEnd = show3dPerfDebug() ?? {};
+        const elapsedSeconds = Math.max(0.001, (performance.now() - sampleStart) / 1000);
+        const endFrames = Number(dbgEnd.renderedFrames ?? 0);
+        const frames = Math.max(0, endFrames - startFrames);
+        const measuredFps = frames / elapsedSeconds;
+        const frameIntervalCount = Number(dbgEnd.frameIntervalCount ?? 0);
+        const overBudgetFrames = Number(dbgEnd.overBudgetFrames ?? 0);
+        const passTarget = measuredFps >= targetFps * 0.98;
+        const displayRefreshFps = estimatedRefresh !== null ? Number(estimatedRefresh.toFixed(2)) : null;
+        const refreshLimited = displayRefreshFps !== null && targetFps > displayRefreshFps * 1.03;
+        const result = {
+          token,
+          label,
+          status: "done",
+          targetFps,
+          displayRefreshFps,
+          refreshLimited,
+          measuredFps: Number(measuredFps.toFixed(2)),
+          frames,
+          elapsedSeconds: Number(elapsedSeconds.toFixed(2)),
+          passTarget,
+          pass60: measuredFps >= 60 * 0.98,
+          frameIntervalAvgMs: dbgEnd.frameIntervalAvgMs ?? null,
+          frameIntervalP95Ms: percentileFromHistory(dbgEnd.frameIntervalHistory, 95),
+          maxFrameIntervalMs: dbgEnd.maxFrameIntervalMs ?? null,
+          overBudgetFrames,
+          overBudgetPct: frameIntervalCount > 0 ? Number(((overBudgetFrames / frameIntervalCount) * 100).toFixed(2)) : null,
+          lastRenderPath: dbgEnd.lastRenderPath ?? null,
+          lastRenderMs: dbgEnd.lastRenderMs ?? null,
+          lastFrameSource: dbgEnd.lastFrameSource ?? null,
+          frameFetchCacheSize: dbgEnd.frameFetchCacheSize ?? null,
+          gpuFrameCacheUploaded: dbgEnd.gpuFrameCacheUploaded ?? null,
+          gpuPreloadDone: dbgEnd.gpuPreloadDone ?? null,
+          frameFetchPreloadDone: dbgEnd.frameFetchPreloadDone ?? null,
+          missingFrame: dbgEnd.missingFrame ?? null,
+          totalMs: Number((performance.now() - startedAt).toFixed(1)),
+        };
+        setBenchmarkResult(result);
+        if (reportUrl) {
+          void fetch(reportUrl, { method: "POST", mode: "no-cors", body: JSON.stringify(result) }).catch(() => {});
+        }
+      } catch (err) {
+        setStatus("error", { error: err instanceof Error ? err.message : String(err) });
+      } finally {
+        if (!cancelled) setPlaying(false);
+        benchmarkPlaybackFpsRef.current = null;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      benchmarkPlaybackFpsRef.current = null;
+    };
+  }, [benchmarkRequest, fps, nSlices, separatePanelFrames, setBenchmarkResult, setFps, setPlaying]);
 
   // FFT d-spacing measurement
   const [fftClickInfo, setFftClickInfo] = React.useState<{
@@ -1428,6 +2005,105 @@ function Show3D() {
     : _canvasHSingleRow;
   const effectiveLoopEnd = loopEnd < 0 ? nSlices - 1 : loopEnd;
 
+  React.useEffect(() => {
+    if (!frameServerUrl || width <= 0 || height <= 0 || nSlices <= 0 || canvasW <= 0 || canvasH <= 0) return;
+    const n = Math.max(1, nPanels || 1);
+    if (n <= 1) return;
+    if (separatePanelFrames) {
+      let cancelled = false;
+      const dbg = show3dPerfDebug();
+      if (dbg) {
+        dbg.gpuPreloadTarget = nSlices;
+        dbg.gpuPreloadDone = gpuFrameCacheUploadedRef.current.size;
+        dbg.gpuPreloadActive = true;
+        dbg.gpuPreloadMode = "separate-panel-direct-grid";
+      }
+      void (async () => {
+        const rgbaCapacity = Math.max(1, Math.round(canvasW * canvasH));
+        for (let i = 0; i < nSlices; i++) {
+          if (cancelled) break;
+          try {
+            const ready = await ensurePanelFrameGpu(i, rgbaCapacity);
+            if (!ready) {
+              const d = show3dPerfDebug();
+              if (d) {
+                d.gpuPreloadMisses = ((d.gpuPreloadMisses as number | undefined) ?? 0) + 1;
+                d.gpuPreloadLastMiss = i;
+              }
+              break;
+            }
+          } catch (err) {
+            const d = show3dPerfDebug();
+            if (d) d.gpuPreloadError = err instanceof Error ? err.message : String(err);
+            break;
+          }
+          const d = show3dPerfDebug();
+          if (d) {
+            d.gpuPreloadDone = gpuFrameCacheUploadedRef.current.size;
+            d.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+          }
+          await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+        const d = show3dPerfDebug();
+        if (d) d.gpuPreloadActive = false;
+      })();
+      return () => {
+        cancelled = true;
+        const d = show3dPerfDebug();
+        if (d) d.gpuPreloadActive = false;
+      };
+    }
+    const stackByteLength = Math.max(1, width * height * 4) * Math.max(1, nSlices);
+    if (stackByteLength <= FRAME_SERVER_JS_FULL_STACK_CACHE_BYTES || stackByteLength > FRAME_SERVER_FULL_STACK_CACHE_BYTES) return;
+    let cancelled = false;
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.gpuPreloadTarget = nSlices;
+      dbg.gpuPreloadDone = 0;
+      dbg.gpuPreloadActive = true;
+      dbg.gpuPreloadMode = "direct-grid";
+    }
+    void (async () => {
+      while (!cancelled && (!gpuCmapReadyRef.current || !gpuCmapRef.current)) {
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
+      }
+      const engine = gpuCmapRef.current;
+      if (!engine || cancelled) return;
+      const rgbaCapacity = Math.max(1, Math.round(canvasW * canvasH));
+      for (let i = 0; i < nSlices; i++) {
+        if (cancelled) break;
+        const frame = await fetchFrameFromServer(i);
+        if (cancelled) break;
+        const d = show3dPerfDebug();
+        if (!frame) {
+          if (d) d.gpuPreloadMisses = ((d.gpuPreloadMisses as number | undefined) ?? 0) + 1;
+          continue;
+        }
+        try {
+          engine.uploadData(i, frame, width, height, rgbaCapacity);
+          gpuFrameCacheUploadedRef.current.add(i);
+          frameFetchCacheRef.current.delete(i);
+          if (d) {
+            d.gpuPreloadDone = gpuFrameCacheUploadedRef.current.size;
+            d.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+            d.frameFetchCacheSize = frameFetchCacheRef.current.size;
+          }
+        } catch (err) {
+          if (d) d.gpuPreloadError = err instanceof Error ? err.message : String(err);
+          break;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
+      const d = show3dPerfDebug();
+      if (d) d.gpuPreloadActive = false;
+    })();
+    return () => {
+      cancelled = true;
+      const d = show3dPerfDebug();
+      if (d) d.gpuPreloadActive = false;
+    };
+  }, [frameServerUrl, frameServerVersion, width, height, nSlices, nPanels, canvasW, canvasH, fetchFrameFromServer, separatePanelFrames, ensurePanelFrameGpu]);
+
   // ROI FFT active: both ROI and FFT on, with a selected ROI
   const roiFftActive = effectiveShowFft && roiActive && roiSelectedIdx >= 0 && roiSelectedIdx < (roiList?.length ?? 0);
 
@@ -1491,6 +2167,8 @@ function Show3D() {
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     autoVmins, autoVmaxs,
+    linkContrast,
+    panelStates, vminPerPanel, vmaxPerPanel,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
     traitVmin, traitVmax, smooth, imageRotation, showStats,
@@ -1502,6 +2180,8 @@ function Show3D() {
       logScale, autoContrast, percentileLow, percentileHigh,
       dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
       autoVmins, autoVmaxs,
+      linkContrast,
+      panelStates, vminPerPanel, vmaxPerPanel,
       zoom, panX, panY, playbackPath,
       profileActive, profilePoints, profileWidth,
       traitVmin, traitVmax, smooth, imageRotation, showStats,
@@ -1510,16 +2190,390 @@ function Show3D() {
     nSlices, width, height, displayScale, canvasW, canvasH,
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
-    autoVmins, autoVmaxs,
+    autoVmins, autoVmaxs, linkContrast, panelStates, vminPerPanel, vmaxPerPanel,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
     traitVmin, traitVmax, smooth, imageRotation, showStats]);
+
+  const renderGpuPanelSlice = (idx: number, updateDisplayState = true): boolean => {
+    const normalized = ((Math.round(idx) % Math.max(1, nSlices)) + Math.max(1, nSlices)) % Math.max(1, nSlices);
+    if (!separatePanelFrames || !gpuFrameCacheUploadedRef.current.has(normalized)) return false;
+    const engine = gpuCmapRef.current;
+    if (!engine || !gpuCmapReadyRef.current) return false;
+    const c = playRef.current;
+    if (c.imageRotation % 4 !== 0 || c.zoom !== 1 || c.panX !== 0 || c.panY !== 0) return false;
+    const n = Math.max(1, nPanels || 1);
+    const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+    const rows = Math.ceil(n / cols);
+    const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
+
+    const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
+    engine.uploadLUT(c.cmap, lut);
+    let renderRanges: { vmin: number; vmax: number } | { vmin: number; vmax: number }[];
+    let renderLogScale: boolean | boolean[];
+    if (n > 1 && !c.linkContrast) {
+      let sharedAutoRange: { vmin: number; vmax: number } | null = null;
+      if (c.autoContrast) {
+        sharedAutoRange = cachedAutoDisplayRange(c.autoVmins, c.autoVmaxs, normalized, c.logScale)
+          || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, normalized, c.logScale);
+        if (!sharedAutoRange) {
+          sharedAutoRange = resolveDisplayRange(
+            c.dataMin,
+            c.dataMax,
+            c.traitVmin,
+            c.traitVmax,
+            c.logScale,
+            c.imageVminPct,
+            c.imageVmaxPct,
+          );
+        }
+      }
+      renderRanges = Array.from({ length: n }, (_, panel) => {
+        const bounds = resolveDisplayBounds(c.dataMin, c.dataMax, c.traitVmin, c.traitVmax, c.logScale);
+        return resolvePanelRange(panel, bounds, sharedAutoRange);
+      });
+      renderLogScale = c.logScale;
+    } else {
+      let vmin: number, vmax: number;
+      if (c.autoContrast) {
+        const cached = cachedAutoDisplayRange(c.autoVmins, c.autoVmaxs, normalized, c.logScale)
+          || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, normalized, c.logScale);
+        if (cached) {
+          ({ vmin, vmax } = cached);
+        } else {
+          ({ vmin, vmax } = resolveDisplayRange(
+            c.dataMin,
+            c.dataMax,
+            c.traitVmin,
+            c.traitVmax,
+            c.logScale,
+            c.imageVminPct,
+            c.imageVmaxPct,
+          ));
+        }
+      } else {
+        ({ vmin, vmax } = resolveDisplayRange(
+          c.dataMin,
+          c.dataMax,
+          c.traitVmin,
+          c.traitVmax,
+          c.logScale,
+          c.imageVminPct,
+          c.imageVmaxPct,
+        ));
+      }
+      renderRanges = { vmin, vmax };
+      renderLogScale = c.logScale;
+    }
+
+    const renderStartMs = performance.now();
+    const sourcePanelWidthForGrid = Math.max(1, panelWidthPx || Math.round(c.width / n));
+    if (n > 1 && !c.linkContrast) {
+      const ranges = Array.isArray(renderRanges)
+        ? renderRanges
+        : Array.from({ length: n }, () => renderRanges);
+      const gpuCtx = ensureGpuDisplayContext(engine, c.canvasW, c.canvasH);
+      if (!gpuCtx) return false;
+      const rendered = engine.renderCombinedGridRangesDirectToCanvas(
+        normalized,
+        ranges,
+        renderLogScale,
+        gpuCtx,
+        {
+          width: c.canvasW,
+          height: c.canvasH,
+          panelCount: n,
+          cols,
+          rows,
+          gap,
+          bgRgb: packedRgbFromHex(themeColors.bg),
+          sourcePanelWidth: sourcePanelWidthForGrid,
+        },
+      );
+      if (!rendered) return false;
+      setGpuDisplayVisible(true);
+      playbackIdxRef.current = normalized;
+      if (updateDisplayState) setDisplaySliceIdx(normalized);
+      const dbg = show3dPerfDebug();
+      if (dbg) {
+        dbg.missingFrame = null;
+        dbg.lastFrame = normalized;
+        dbg.lastFrameSource = "gpu-panel-cache-combined";
+        dbg.lastRenderPath = "webgpu-grid-separate-panels-combined-direct-grid-ranges";
+        dbg.lastRenderMs = Number((performance.now() - renderStartMs).toFixed(2));
+      }
+      return true;
+    }
+
+    const gpuCtx = ensureGpuDisplayContext(engine, c.canvasW, c.canvasH);
+    if (!gpuCtx) return false;
+    const range = Array.isArray(renderRanges)
+      ? (renderRanges[0] ?? { vmin: 0, vmax: 1 })
+      : renderRanges;
+    const log = Array.isArray(renderLogScale)
+      ? !!renderLogScale[0]
+      : renderLogScale;
+    const rendered = engine.renderSharedGridDirectToCanvas(
+      normalized,
+      range,
+      log,
+      gpuCtx,
+      {
+        width: c.canvasW,
+        height: c.canvasH,
+        panelCount: n,
+        cols,
+        rows,
+        gap,
+        bgRgb: packedRgbFromHex(themeColors.bg),
+        sourcePanelWidth: sourcePanelWidthForGrid,
+        sharedSource: false,
+      },
+    );
+    if (!rendered) return false;
+    setGpuDisplayVisible(true);
+    playbackIdxRef.current = normalized;
+    if (updateDisplayState) setDisplaySliceIdx(normalized);
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.missingFrame = null;
+      dbg.lastFrame = normalized;
+      dbg.lastFrameSource = "gpu-panel-cache-combined";
+      dbg.lastRenderPath = "webgpu-grid-separate-panels-combined-direct-fragment";
+      dbg.lastRenderMs = Number((performance.now() - renderStartMs).toFixed(2));
+    }
+    return true;
+  };
+
+  const renderGpuCachedSliceDirect = (idx: number, updateDisplayState = true): boolean => {
+    if (separatePanelFrames) return renderGpuPanelSlice(idx, updateDisplayState);
+    const normalized = ((Math.round(idx) % Math.max(1, nSlices)) + Math.max(1, nSlices)) % Math.max(1, nSlices);
+    if (!gpuFrameCacheUploadedRef.current.has(normalized)) return false;
+    const engine = gpuCmapRef.current;
+    if (!engine || !gpuCmapReadyRef.current) return false;
+    const c = playRef.current;
+    if (c.imageRotation % 4 !== 0 || c.zoom !== 1 || c.panX !== 0 || c.panY !== 0) return false;
+    const gpuCtx = ensureGpuDisplayContext(engine, c.canvasW, c.canvasH);
+    if (!gpuCtx) return false;
+
+    const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
+    engine.uploadLUT(c.cmap, lut);
+    let vmin: number, vmax: number;
+    if (c.autoContrast) {
+      const cached = cachedAutoDisplayRange(c.autoVmins, c.autoVmaxs, normalized, c.logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, normalized, c.logScale);
+      if (cached) {
+        ({ vmin, vmax } = cached);
+      } else {
+        ({ vmin, vmax } = resolveDisplayRange(
+          c.dataMin,
+          c.dataMax,
+          c.traitVmin,
+          c.traitVmax,
+          c.logScale,
+          c.imageVminPct,
+          c.imageVmaxPct,
+        ));
+      }
+    } else {
+      ({ vmin, vmax } = resolveDisplayRange(
+        c.dataMin,
+        c.dataMax,
+        c.traitVmin,
+        c.traitVmax,
+        c.logScale,
+        c.imageVminPct,
+        c.imageVmaxPct,
+      ));
+    }
+
+    const n = Math.max(1, nPanels || 1);
+    const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+    const rows = Math.ceil(n / cols);
+    const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
+    const renderStartMs = performance.now();
+    if (n > 1 && !c.linkContrast && !sharedPanelSource) {
+      const panelW = Math.max(1, panelWidthPx || Math.round(c.width / n));
+      const regions = Array.from({ length: n }, (_, panel) => ({
+        x: panel * panelW, y: 0, width: panelW, height: c.height,
+      }));
+      const sharedAutoRange = c.autoContrast ? { vmin, vmax } : null;
+      const ranges = Array.from({ length: n }, (_, panel) => {
+        const bounds = resolveDisplayBounds(c.dataMin, c.dataMax, c.traitVmin, c.traitVmax, c.logScale);
+        return resolvePanelRange(panel, bounds, sharedAutoRange);
+      });
+      const logs = c.logScale;
+      const bitmaps = engine.renderPerPanelGpuExplicit(normalized, regions, ranges, logs);
+      const offCtx = mainOffscreenRef.current?.getContext("2d");
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (!bitmaps || !offCtx || !ctx || !mainOffscreenRef.current) return false;
+      offCtx.clearRect(0, 0, c.width, c.height);
+      for (let panel = 0; panel < n; panel++) {
+        if (bitmaps[panel]) {
+          offCtx.drawImage(bitmaps[panel], panel * panelW, 0);
+          bitmaps[panel].close();
+        }
+      }
+      setGpuDisplayVisible(false);
+      drawMain(ctx, mainOffscreenRef.current);
+      playbackIdxRef.current = normalized;
+      if (updateDisplayState) setDisplaySliceIdx(normalized);
+      const dbg = show3dPerfDebug();
+      if (dbg) {
+        dbg.missingFrame = null;
+        dbg.lastFrame = normalized;
+        dbg.lastFrameSource = "gpu-cache";
+        dbg.lastRenderPath = "webgpu-grid-panels-explicit-ranges";
+        dbg.lastRenderMs = Number((performance.now() - renderStartMs).toFixed(2));
+      }
+      return true;
+    }
+    const sourcePanelWidthForGrid = sharedPanelSource
+      ? Math.max(1, panelWidthPx || c.width)
+      : Math.max(1, panelWidthPx || Math.round(c.width / n));
+    const rendered = engine.renderSharedGridDirectToCanvas(
+      normalized,
+      { vmin, vmax },
+      c.logScale,
+      gpuCtx,
+      {
+        width: c.canvasW,
+        height: c.canvasH,
+        panelCount: n,
+        cols,
+        rows,
+        gap,
+        bgRgb: packedRgbFromHex(themeColors.bg),
+        sourcePanelWidth: sourcePanelWidthForGrid,
+        sharedSource: !!sharedPanelSource,
+      },
+    );
+    if (!rendered) return false;
+    setGpuDisplayVisible(true);
+    playbackIdxRef.current = normalized;
+    if (updateDisplayState) setDisplaySliceIdx(normalized);
+    const dbg = show3dPerfDebug();
+    if (dbg) {
+      dbg.missingFrame = null;
+      dbg.lastFrame = normalized;
+      dbg.lastFrameSource = "gpu-cache";
+      dbg.lastRenderPath = n === 1
+        ? "webgpu-grid-single-panel-direct-fragment"
+        : (sharedPanelSource ? "webgpu-grid-shared-panels-direct-fragment" : "webgpu-grid-panels-direct-fragment");
+      dbg.lastRenderMs = Number((performance.now() - renderStartMs).toFixed(2));
+    }
+    return true;
+  };
+
+  const lastRenderBurstBenchmarkTokenRef = React.useRef<unknown>(null);
+  React.useEffect(() => {
+    const req = benchmarkRequest ?? {};
+    const token = req.token;
+    const mode = typeof req.mode === "string" ? req.mode : "playback";
+    if ((typeof token !== "string" && typeof token !== "number") || mode !== "renderBurst" || lastRenderBurstBenchmarkTokenRef.current === token) return;
+    lastRenderBurstBenchmarkTokenRef.current = token;
+
+    let cancelled = false;
+    const sleep = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
+    const numberFromReq = (key: string, fallback: number) => {
+      const value = req[key];
+      return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+    };
+    const sampleMs = Math.max(250, numberFromReq("sampleMs", 3000));
+    const expectedFrames = Math.max(0, Math.floor(numberFromReq("expectedFrames", nSlices)));
+    const syncEvery = Math.max(0, Math.floor(numberFromReq("syncEvery", 1)));
+    const reportUrl = typeof req.reportUrl === "string" ? req.reportUrl : "";
+    const label = typeof req.label === "string" ? req.label : "show3d render burst";
+
+    void (async () => {
+      const startedAt = performance.now();
+      const setStatus = (status: string, extra: Record<string, unknown> = {}) => {
+        if (!cancelled) setBenchmarkResult({ token, label, status, targetFps: 0, mode, ...extra });
+      };
+      try {
+        setStatus("preloading");
+        const engine = gpuCmapRef.current;
+        if (!engine || !gpuCmapReadyRef.current) throw new Error("WebGPU colormap engine is not ready");
+        const rgbaCapacity = Math.max(1, Math.round(canvasW * canvasH));
+        const framesToPrepare = expectedFrames > 0 ? Math.min(expectedFrames, nSlices) : nSlices;
+        for (let i = 0; i < framesToPrepare; i++) {
+          if (cancelled) return;
+          if (separatePanelFrames) {
+            const ready = await ensurePanelFrameGpu(i, rgbaCapacity);
+            if (!ready) throw new Error(`panel frame ${i} was not available for GPU upload`);
+          } else if (!gpuFrameCacheUploadedRef.current.has(i)) {
+            const frame = await fetchFrameFromServer(i);
+            if (!frame) throw new Error(`frame ${i} was not available for GPU upload`);
+            engine.uploadData(i, frame, width, height, rgbaCapacity);
+            gpuFrameCacheUploadedRef.current.add(i);
+          }
+          if (i % 4 === 0) {
+            setStatus("preloading", { preparedFrames: i + 1, expectedFrames: framesToPrepare });
+            await sleep(0);
+          }
+        }
+        await engine.waitForSubmittedWork();
+
+        setStatus("sampling", { preparedFrames: framesToPrepare, syncEvery });
+        const sampleStart = performance.now();
+        let frames = 0;
+        let misses = 0;
+        while (!cancelled && performance.now() - sampleStart < sampleMs) {
+          const idx = frames % Math.max(1, framesToPrepare);
+          const ok = renderGpuCachedSliceDirect(idx, false);
+          if (!ok) {
+            misses++;
+            await sleep(0);
+            continue;
+          }
+          frames++;
+          if (syncEvery > 0 && frames % syncEvery === 0) {
+            await engine.waitForSubmittedWork();
+          } else if (frames % 32 === 0) {
+            await sleep(0);
+          }
+        }
+        await engine.waitForSubmittedWork();
+        const elapsedSeconds = Math.max(0.001, (performance.now() - sampleStart) / 1000);
+        const measuredFps = frames / elapsedSeconds;
+        const dbgEnd = show3dPerfDebug() ?? {};
+        const result = {
+          token,
+          label,
+          status: "done",
+          mode,
+          syncEvery,
+          measuredFps: Number(measuredFps.toFixed(2)),
+          frames,
+          misses,
+          elapsedSeconds: Number(elapsedSeconds.toFixed(2)),
+          preparedFrames: framesToPrepare,
+          lastRenderPath: dbgEnd.lastRenderPath ?? null,
+          lastRenderMs: dbgEnd.lastRenderMs ?? null,
+          totalMs: Number((performance.now() - startedAt).toFixed(1)),
+        };
+        setBenchmarkResult(result);
+        if (reportUrl) {
+          void fetch(reportUrl, { method: "POST", mode: "no-cors", body: JSON.stringify(result) }).catch(() => {});
+        }
+      } catch (err) {
+        setStatus("error", { error: err instanceof Error ? err.message : String(err) });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [benchmarkRequest, nSlices, separatePanelFrames, canvasW, canvasH, width, height]);
 
   // Playback logic - rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
     if (!playing) {
       // Playback stopped - sync final position to Python
-      if (playbackIdxRef.current !== sliceIdx && bufferRef.current) {
+      if (playbackIdxRef.current !== sliceIdx && (bufferRef.current || separatePanelFrames || offline)) {
+        setLiveSliceIdx(playbackIdxRef.current);
         setSliceIdx(playbackIdxRef.current);
       }
       if (!playRef.current.showStats) setLocalStats(null);
@@ -1539,20 +2593,30 @@ function Show3D() {
     const pathLen = playRef.current.playbackPath?.length ?? 0;
     pathIdxRef.current = pathLen > 0 ? (playRef.current.reverse ? pathLen : -1) : 0;
     bounceDirRef.current = playRef.current.reverse ? -1 : 1;
-    if (frameServerUrl) {
+    if (frameServerUrl && gpuFrameCacheUploadedRef.current.size < playRef.current.nSlices) {
       const c0 = playRef.current;
       prefetchServerFrames(playbackIdxRef.current, c0.reverse, c0.loop, c0.loopStart, c0.loopEnd);
     }
     let lastFrameTime = 0;
     let lastUIUpdate = 0;
-    let animId: number;
+    let animId = 0;
+    let tick: (now: number) => void = () => {};
+    const scheduleTick = () => {
+      animId = requestAnimationFrame(tick);
+    };
+    const startDbg = show3dPerfDebug();
+    const startFps = benchmarkPlaybackFpsRef.current ?? playRef.current.fps;
+    if (startDbg) resetFramePacingDebug(startDbg, 1000 / Math.max(1, startFps));
 
-    const tick = (now: number) => {
+    tick = (now: number) => {
       const c = playRef.current;
-      const intervalMs = 1000 / c.fps;
+      const effectiveFps = benchmarkPlaybackFpsRef.current ?? c.fps;
+      const intervalMs = 1000 / effectiveFps;
+      const uiUpdateIntervalMs = effectiveFps >= 90 ? 1000 : (effectiveFps >= 60 ? 250 : 100);
       const dbg = show3dPerfDebug();
       if (dbg) {
         dbg.playing = true;
+        dbg.effectiveFps = effectiveFps;
         dbg.lastTickAt = now;
         dbg.currentBufferFloatLength = bufferRef.current?.length ?? 0;
         dbg.currentBufferStart = bufferStartRef.current;
@@ -1572,7 +2636,7 @@ function Show3D() {
       const elapsed = now - lastFrameTime;
       const framePacingToleranceMs = Math.min(6, intervalMs * 0.2);
       if (elapsed + framePacingToleranceMs < intervalMs) {
-        animId = requestAnimationFrame(tick);
+        scheduleTick();
         return;
       }
       lastFrameTime = now - Math.max(0, elapsed - intervalMs);
@@ -1616,64 +2680,122 @@ function Show3D() {
         }
       }
 
-      // Try buffer path (zero round-trip) with double-buffer swap
+      // OFFLINE mode (nbconvert HTML export with packed stack in widget state):
+      // bypass ALL the kernel-fed buffer paths — bufferRef/nextBufferRef/
+      // gpuFrameCacheUploadedRef are stale from prior pause+resume cycles and
+      // can pin the canvas to a single frame. Always re-derive from the
+      // offline stack so play→pause→play repaints correctly. Verified bug
+      // 2026-05-24: 2nd autoplay cycle painted same frame from buffer cache.
       const frameSize = c.width * c.height;
+      let frame: Float32Array | null = null;
       let frameSource = "buffer";
-      let frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
-      if (!frame && nextBufferRef.current) {
-        // Current buffer doesn't have this frame - swap to next buffer
-        bufferRef.current = nextBufferRef.current;
-        bufferStartRef.current = nextBufferStartRef.current;
-        bufferCountRef.current = nextBufferCountRef.current;
-        nextBufferRef.current = null;
-        nextBufferCountRef.current = 0;
+      const gpuCachedFrameReady = offline ? false : gpuFrameCacheUploadedRef.current.has(next);
+      const gpuPanelFrameReady = separatePanelFrames && gpuCachedFrameReady;
+      if (offline) {
+        frame = getOfflineFrame(next);
+        if (frame) frameSource = "offline";
+      } else if (gpuPanelFrameReady) {
+        frameSource = "gpu-panel-cache";
+      } else if (!gpuCachedFrameReady) {
         frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
-      }
-      if (!frame && frameServerUrl) {
-        frame = getCachedServerFrame(next);
-        if (frame) {
-          frameSource = "server";
-        } else {
-          prefetchServerFrames(next, c.reverse, c.loop, c.loopStart, c.loopEnd);
+        if (!frame && nextBufferRef.current) {
+          // Current buffer doesn't have this frame - swap to next buffer
+          bufferRef.current = nextBufferRef.current;
+          bufferStartRef.current = nextBufferStartRef.current;
+          bufferCountRef.current = nextBufferCountRef.current;
+          nextBufferRef.current = null;
+          nextBufferCountRef.current = 0;
+          frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
+        }
+        if (!frame && frameServerUrl) {
+          frame = getCachedServerFrame(next);
+          if (frame) {
+            frameSource = "server";
+          } else {
+            prefetchServerFrames(next, c.reverse, c.loop, c.loopStart, c.loopEnd);
+          }
+        }
+        if (!frame) {
+          frame = getOfflineFrame(next);
+          if (frame) frameSource = "offline";
         }
       }
-      if (!frame) {
+      if (!frame && !gpuCachedFrameReady) {
         // Buffer not ready yet - keep requesting frames
         if (dbg) {
           dbg.missingFrame = next;
           dbg.missingFrameAt = now;
         }
-        animId = requestAnimationFrame(tick);
+        scheduleTick();
         return;
       }
       if (dbg) {
         dbg.missingFrame = null;
         dbg.lastFrame = next;
         dbg.lastFrameSource = frameSource;
-        dbg.renderedFrames = ((dbg.renderedFrames as number | undefined) ?? 0) + 1;
       }
 
       playbackIdxRef.current = next;
-      rawFrameDataRef.current = frame;
+      if (frame) rawFrameDataRef.current = frame;
+      if (gpuPanelFrameReady) {
+        if (!renderGpuPanelSlice(next, false)) {
+          if (dbg) {
+            dbg.missingFrame = next;
+            dbg.lastRenderError = "separate panel GPU render failed";
+          }
+          scheduleTick();
+          return;
+        }
+        const d = show3dPerfDebug();
+        if (d) {
+          recordFramePacingDebug(d, performance.now(), intervalMs);
+          d.renderedFrames = ((d.renderedFrames as number | undefined) ?? 0) + 1;
+        }
+        if (now - lastUIUpdate > uiUpdateIntervalMs) {
+          lastUIUpdate = now;
+          setDisplaySliceIdx(next);
+          // Keep liveSliceIdx in sync so the static offline-frame useMemo
+          // re-fires per tick. Without this, the rAF playback path advances
+          // the slider thumb but the React-driven canvas paint sees a stale
+          // liveSliceIdx and re-paints the initial frame on every unrelated
+          // re-render, freezing the canvas during play (verified bug 2026-05-24,
+          // samsung_logic_013_trial190.html: slider counts 0→14→0, canvas frozen).
+          setLiveSliceIdx(next);
+        }
+        scheduleTick();
+        return;
+      }
 
       // Render frame. The 4k playback hot path must stay off the JS CPU:
       // one 4096^2 colormap loop alone is ~37 ms, before auto-contrast/canvas.
+      const renderStartMs = performance.now();
       const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
       if (mainOffscreenRef.current && mainImgDataRef.current) {
         let vmin: number, vmax: number;
-        let cpuData: Float32Array = frame;
+        let cpuData: Float32Array | null = frame;
         let cpuDataAlreadyLogged = false;
         if (c.autoContrast) {
-          const cached = !c.logScale ? ensureLocalAutoRange(next, frame, c.percentileLow, c.percentileHigh) : null;
+          const cached = cachedAutoDisplayRange(c.autoVmins, c.autoVmaxs, next, c.logScale)
+            || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, next, c.logScale);
           if (cached) {
             ({ vmin, vmax } = cached);
-          } else if (c.logScale && logBufferRef.current) {
+          } else if (frame && c.logScale && logBufferRef.current) {
             applyLogScaleInPlace(frame, logBufferRef.current);
             ({ vmin, vmax } = percentileClip(logBufferRef.current, c.percentileLow, c.percentileHigh));
             cpuData = logBufferRef.current;
             cpuDataAlreadyLogged = true;
-          } else {
+          } else if (frame) {
             ({ vmin, vmax } = percentileClip(frame, c.percentileLow, c.percentileHigh));
+          } else {
+            ({ vmin, vmax } = resolveDisplayRange(
+              c.dataMin,
+              c.dataMax,
+              c.traitVmin,
+              c.traitVmax,
+              c.logScale,
+              c.imageVminPct,
+              c.imageVmaxPct,
+            ));
           }
         } else {
           ({ vmin, vmax } = resolveDisplayRange(
@@ -1691,13 +2813,16 @@ function Show3D() {
         let drewDisplayDirect = false;
         const dw = Math.max(1, Math.round(c.width * c.displayScale));
         const dh = Math.max(1, Math.round(c.height * c.displayScale));
-        const canSharedPanelScaledDirect =
-          !!sharedPanelSource &&
-          (nPanels || 1) > 1 &&
+        const panelCountForGrid = Math.max(1, nPanels || 1);
+        const canDirectGridCanvas =
           c.imageRotation % 4 === 0 &&
           c.zoom === 1 &&
           c.panX === 0 &&
           c.panY === 0;
+        const canSharedPanelScaledDirect =
+          !!sharedPanelSource &&
+          canDirectGridCanvas &&
+          panelCountForGrid > 1;
         const canScaledDirect =
           (nPanels === 1 || canSharedPanelScaledDirect) &&
           c.imageRotation % 4 === 0 &&
@@ -1725,7 +2850,9 @@ function Show3D() {
             ctx.drawImage(bitmap, slotX, slotY, outPanelW, outPanelH);
           }
         };
-        if (canScaledDirect && !canSharedPanelScaledDirect && !c.smooth) {
+        const engine = gpuCmapRef.current;
+        const preferGpuScaledPlayback = !!engine && gpuCmapReadyRef.current;
+        if (frame && canScaledDirect && !canSharedPanelScaledDirect && !c.smooth && !preferGpuScaledPlayback) {
           const canvas = canvasRef.current;
           const ctx = canvas?.getContext("2d");
           if (ctx) {
@@ -1749,6 +2876,7 @@ function Show3D() {
             }
             renderFrameScaledPlayback(frame, cached.imageData.data, map.xMap, map.yMap, dw, dh, lut, vmin, vmax, c.logScale);
             ctx.imageSmoothingEnabled = false;
+            setGpuDisplayVisible(false);
             ctx.clearRect(0, 0, c.canvasW, c.canvasH);
             ctx.putImageData(cached.imageData, 0, 0);
             rendered = true;
@@ -1756,33 +2884,106 @@ function Show3D() {
             if (dbg) dbg.lastRenderPath = "scaled-cpu";
           }
         }
-        const engine = gpuCmapRef.current;
         if (!rendered && engine && gpuCmapReadyRef.current) {
           try {
             engine.uploadLUT(c.cmap, lut);
             const stackByteLength = c.width * c.height * 4 * c.nSlices;
+            const hasGpuSlot = gpuFrameCacheUploadedRef.current.has(next);
             const canGpuFrameCache =
               !!frameServerUrl &&
-              frameFetchCacheRef.current.size >= c.nSlices &&
-              stackByteLength <= FRAME_SERVER_FULL_STACK_CACHE_BYTES;
+              stackByteLength <= FRAME_SERVER_FULL_STACK_CACHE_BYTES &&
+              (hasGpuSlot || frameFetchCacheRef.current.size >= c.nSlices);
             const slotIdx = canGpuFrameCache ? next : 0;
+            const gpuRgbaCapacityHint = canDirectGridCanvas
+              ? c.canvasW * c.canvasH
+              : (canScaledDirect ? dw * dh : undefined);
             if (canGpuFrameCache) {
               if (!gpuFrameCacheUploadedRef.current.has(slotIdx)) {
-                engine.uploadData(slotIdx, frame, c.width, c.height);
-                gpuFrameCacheUploadedRef.current.add(slotIdx);
-                if (dbg) dbg.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+                if (frame) {
+                  engine.uploadData(slotIdx, frame, c.width, c.height, gpuRgbaCapacityHint);
+                  gpuFrameCacheUploadedRef.current.add(slotIdx);
+                  if (dbg) dbg.gpuFrameCacheUploaded = gpuFrameCacheUploadedRef.current.size;
+                }
               } else if (dbg) {
                 dbg.gpuFrameCacheHits = ((dbg.gpuFrameCacheHits as number | undefined) ?? 0) + 1;
               }
-            } else {
-              engine.uploadData(0, frame, c.width, c.height);
+            } else if (frame) {
+              engine.uploadData(0, frame, c.width, c.height, gpuRgbaCapacityHint);
               if (dbg) dbg.gpuFrameCacheUploaded = 0;
             }
+            if (canDirectGridCanvas) {
+              const gpuCtx = ensureGpuDisplayContext(engine, c.canvasW, c.canvasH);
+              if (gpuCtx) {
+                const n = panelCountForGrid;
+                const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+                const rows = Math.ceil(n / cols);
+                const gap = n > 1 ? (panelGapTrait ?? 10) : 0;
+                const sourcePanelWidthForGrid = sharedPanelSource
+                  ? Math.max(1, panelWidthPx || c.width)
+                  : Math.max(1, panelWidthPx || Math.round(c.width / n));
+                const gridOpts = {
+                  width: c.canvasW,
+                  height: c.canvasH,
+                  panelCount: n,
+                  cols,
+                  rows,
+                  gap,
+                  bgRgb: packedRgbFromHex(themeColors.bg),
+                  sourcePanelWidth: sourcePanelWidthForGrid,
+                  sharedSource: !!sharedPanelSource,
+                };
+                const usedExplicitPanelRanges = n > 1 && !c.linkContrast && !sharedPanelSource;
+                if (usedExplicitPanelRanges) {
+                  const panelW = sourcePanelWidthForGrid;
+                  const regions = Array.from({ length: n }, (_, p) => ({
+                    x: p * panelW, y: 0, width: panelW, height: c.height,
+                  }));
+                  const sharedAutoRange = c.autoContrast ? { vmin, vmax } : null;
+                  const ranges = Array.from({ length: n }, (_, p) => {
+                    const panelData = sharedAutoRange ? null : (frame ? extractPanelSlice(frame, p, c.logScale) : null);
+                    const panelRange = panelData && panelData.length > 0
+                      ? findDataRange(panelData)
+                      : resolveDisplayBounds(c.dataMin, c.dataMax, c.traitVmin, c.traitVmax, c.logScale);
+                    return resolvePanelRange(p, panelRange, sharedAutoRange);
+                  });
+                  const logs = c.logScale;
+                  const bitmaps = engine.renderPerPanelGpuExplicit(slotIdx, regions, ranges, logs);
+                  const offCtx = mainOffscreenRef.current.getContext("2d");
+                  if (bitmaps && offCtx) {
+                    offCtx.clearRect(0, 0, c.width, c.height);
+                    for (let p = 0; p < n; p++) {
+                      if (bitmaps[p]) {
+                        offCtx.drawImage(bitmaps[p], p * panelW, 0);
+                        bitmaps[p].close();
+                      }
+                    }
+                    rendered = true;
+                    if (dbg) dbg.lastRenderPath = "webgpu-grid-panels-explicit-ranges";
+                  }
+                } else {
+                  const renderedDirect = engine.renderSharedGridDirectToCanvas(slotIdx, { vmin, vmax }, c.logScale, gpuCtx, gridOpts);
+                  rendered = renderedDirect || engine.renderSharedGridToCanvas(slotIdx, { vmin, vmax }, c.logScale, gpuCtx, gridOpts);
+                  if (dbg) {
+                    const gridPath = n === 1
+                      ? "webgpu-grid-single-panel"
+                      : (sharedPanelSource ? "webgpu-grid-shared-panels" : "webgpu-grid-panels");
+                    dbg.lastRenderPath = renderedDirect ? `${gridPath}-direct-fragment` : gridPath;
+                  }
+                }
+                if (rendered) {
+                  setGpuDisplayVisible(!usedExplicitPanelRanges);
+                  drewDisplayDirect = !usedExplicitPanelRanges;
+                }
+              }
+            }
             if (canScaledDirect) {
-              const bitmap = engine.renderSlotScaledToImageBitmap(slotIdx, { vmin, vmax }, c.logScale, dw, dh);
+              const bitmap = rendered
+                ? null
+                : engine.renderSlotScaledToImageBitmap(slotIdx, { vmin, vmax }, c.logScale, dw, dh);
               const canvas = canvasRef.current;
               const ctx = canvas?.getContext("2d");
               if (bitmap && ctx) {
+                setGpuDisplayVisible(false);
                 if (canSharedPanelScaledDirect) {
                   drawSharedScaledBitmap(ctx, bitmap);
                 } else {
@@ -1798,7 +2999,7 @@ function Show3D() {
                 bitmap?.close();
               }
             }
-            if (!rendered) {
+            if (!rendered && frame) {
               const bitmaps = engine.renderSlotsToImageBitmap([slotIdx], [{ vmin, vmax }], c.logScale);
               if (bitmaps && bitmaps[0]) {
                 const offCtx = mainOffscreenRef.current.getContext("2d");
@@ -1810,15 +3011,26 @@ function Show3D() {
                 bitmaps[0].close();
               }
             }
-          } catch {
+          } catch (err) {
+            if (dbg) {
+              dbg.lastRenderError = err instanceof Error ? err.message : String(err);
+            }
             rendered = false;
             drewDisplayDirect = false;
           }
         }
         if (!rendered) {
-          if (cpuDataAlreadyLogged) {
+          if (!frame && !cpuData) {
+            if (dbg) {
+              dbg.missingFrame = next;
+              dbg.missingFrameAt = now;
+            }
+            scheduleTick();
+            return;
+          }
+          if (cpuDataAlreadyLogged && cpuData) {
             renderToOffscreenReuse(cpuData, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
-          } else {
+          } else if (frame) {
             renderFramePlayback(frame, mainImgDataRef.current.data, lut, vmin, vmax, c.logScale);
             mainOffscreenRef.current.getContext("2d")!.putImageData(mainImgDataRef.current, 0, 0);
           }
@@ -1855,13 +3067,22 @@ function Show3D() {
           }
         }
       }
+      if (dbg) {
+        dbg.lastRenderMs = Number((performance.now() - renderStartMs).toFixed(2));
+        recordFramePacingDebug(dbg, performance.now(), intervalMs);
+        dbg.renderedFrames = ((dbg.renderedFrames as number | undefined) ?? 0) + 1;
+      }
 
-      // Throttled UI updates - 10 FPS for slider/stats/profile (avoids costly MUI re-renders)
-      if (now - lastUIUpdate > 100) {
+      // Throttled UI updates for slider/stats/profile. At 90+ fps, keep React
+      // comfortably out of the frame loop; the canvas still renders every rAF.
+      if (now - lastUIUpdate > uiUpdateIntervalMs) {
         lastUIUpdate = now;
         setDisplaySliceIdx(next);
-        if (c.showStats) setLocalStats(computeStats(frame));
-        if (c.profileActive && c.profilePoints.length === 2) {
+        // See comment at the panel-render branch above: keep liveSliceIdx in
+        // sync so the offline static-paint pipeline doesn't freeze the canvas.
+        setLiveSliceIdx(next);
+        if (frame && c.showStats) setLocalStats(computeStats(frame));
+        if (frame && c.profileActive && c.profilePoints.length === 2) {
           const p0 = c.profilePoints[0], p1 = c.profilePoints[1];
           setProfileData(sampleLineProfile(frame, c.width, c.height, p0.row, p0.col, p1.row, p1.col, c.profileWidth));
         }
@@ -1870,15 +3091,30 @@ function Show3D() {
         // the prefetch buffer, not via Comm), so we drive histogram updates directly
         // here at the same 10 Hz cadence. Skip every 2nd tick → ~5 Hz refresh.
         playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
-        if (playbackHistogramCounterRef.current === 0) {
-          const histInput = c.logScale ? applyLogScale(frame) : frame;
-          setImageHistogramData(histInput);
+        if (frame && playbackHistogramCounterRef.current === 0) {
+          if ((nPanels || 1) > 1 && !linkContrast) {
+            const n = Math.max(1, nPanels || 1);
+            const nextData: (Float32Array | null)[] = [];
+            const nextRanges: { min: number; max: number }[] = [];
+            for (let panel = 0; panel < n; panel++) {
+              const panelData = extractPanelSlice(frame, panel, c.logScale);
+              nextData.push(panelData);
+              nextRanges.push(panelData && panelData.length > 0
+                ? findDataRange(panelData)
+                : resolveDisplayBounds(c.dataMin, c.dataMax, c.traitVmin, c.traitVmax, c.logScale));
+            }
+            setPanelHistogramData(nextData);
+            setPanelDataRanges(nextRanges);
+          } else {
+            const histInput = c.logScale ? applyLogScale(frame) : frame;
+            setImageHistogramData(histInput);
+          }
         }
       }
 
       // Prefetch at 25% buffer consumed - only if no next buffer is already queued.
       // Respect loop range so we don't fetch frames outside [loop_start, loop_end].
-      if (frameServerUrl) {
+      if (frameServerUrl && gpuFrameCacheUploadedRef.current.size < c.nSlices) {
         prefetchServerFrames(next, c.reverse, c.loop, c.loopStart, c.loopEnd);
       } else if (!prefetchPendingRef.current && !nextBufferRef.current && bufferCountRef.current > 0) {
         let idxInBuffer = next - bufferStartRef.current;
@@ -1897,11 +3133,13 @@ function Show3D() {
         }
       }
 
-      animId = requestAnimationFrame(tick);
+      scheduleTick();
     };
 
-    animId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(animId);
+    scheduleTick();
+    return () => {
+      cancelAnimationFrame(animId);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing]);
 
@@ -1949,6 +3187,22 @@ function Show3D() {
   const refreshHistogram = React.useCallback(async () => {
     const raw = rawFrameDataRef.current;
     if (!raw || raw.length === 0) return;
+    if (perPanelHistogramEnabled) {
+      const n = Math.max(1, nPanels || 1);
+      const nextData: (Float32Array | null)[] = [];
+      const nextRanges: { min: number; max: number }[] = [];
+      for (let panel = 0; panel < n; panel++) {
+        const panelData = extractPanelSlice(raw, panel, logScale);
+        nextData.push(panelData);
+        nextRanges.push(panelData && panelData.length > 0
+          ? findDataRange(panelData)
+          : resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+      }
+      setPanelHistogramData(nextData);
+      setPanelDataRanges(nextRanges);
+      setImageHistogramBins(null);
+      return;
+    }
     const data = logScale ? applyLogScale(raw) : raw;
     setImageDataRange(resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
     // GPU bins: the colormap engine has the frame data uploaded to slot 0
@@ -1966,7 +3220,7 @@ function Show3D() {
     }
     setImageHistogramBins(bins);
     setImageHistogramData(data);
-  }, [logScale, dataMin, dataMax]);
+  }, [logScale, dataMin, dataMax, perPanelHistogramEnabled, nPanels, extractPanelSlice]);
   React.useEffect(() => {
     const raw = rawFrameDataRef.current;
     if (!raw || raw.length === 0) return;
@@ -1996,6 +3250,7 @@ function Show3D() {
   React.useEffect(() => {
     const logScaleChanged = lastLogScaleRef.current !== logScale;
     lastLogScaleRef.current = logScale;
+    if (perPanelHistogramEnabled) return;
     if (!autoContrast || !imageHistogramData || imageHistogramData.length === 0) return;
     // Skip initial snap if user already moved thumbs (e.g. loaded from saved state).
     if (!initialAutoSnappedRef.current && (imageVminPct !== 0 || imageVmaxPct !== 100)) {
@@ -2004,14 +3259,35 @@ function Show3D() {
     }
     // After first snap, only re-snap on logScale transitions.
     if (initialAutoSnappedRef.current && !logScaleChanged) return;
-    const span = dataMax - dataMin;
+    const { min: autoMin, max: autoMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+    const span = autoMax - autoMin;
     if (span <= 0) return;
-    const cached = !logScale ? ensureLocalAutoRange(sliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
+    const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, sliceIdx, logScale)
+      || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, sliceIdx, logScale);
     const { vmin: pmin, vmax: pmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh);
-    setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
-    setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
+    setImageVminPct(Math.max(0, Math.min(100, ((pmin - autoMin) / span) * 100)));
+    setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - autoMin) / span) * 100)));
     initialAutoSnappedRef.current = true;
-  }, [autoContrast, imageHistogramData, dataMin, dataMax, autoVmins, autoVmaxs, sliceIdx, percentileLow, percentileHigh, logScale, imageVminPct, imageVmaxPct]);
+  }, [autoContrast, imageHistogramData, dataMin, dataMax, traitVmin, traitVmax, autoVmins, autoVmaxs, sliceIdx, percentileLow, percentileHigh, logScale, imageVminPct, imageVmaxPct, perPanelHistogramEnabled]);
+
+  React.useEffect(() => {
+    if (!perPanelHistogramEnabled || !autoContrast || panelHistogramData.length === 0) return;
+    const raw = rawFrameDataRef.current;
+    if (!raw || raw.length === 0) return;
+    const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, sliceIdx, logScale)
+      || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, sliceIdx, logScale);
+    const processed = logScale ? applyLogScale(raw) : raw;
+    const clipped = cached ?? percentileClip(processed, percentileLow, percentileHigh);
+    const { min: autoMin, max: autoMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+    if (autoMax <= autoMin) return;
+    setPanelStates(prev => prev.map(state => {
+      return {
+        ...state,
+        imageVminPct: valueToPct(clipped.vmin, autoMin, autoMax, state.imageVminPct),
+        imageVmaxPct: valueToPct(clipped.vmax, autoMin, autoMax, state.imageVmaxPct),
+      };
+    }));
+  }, [perPanelHistogramEnabled, autoContrast, panelHistogramData, dataMin, dataMax, traitVmin, traitVmax, logScale, sliceIdx, percentileLow, percentileHigh, autoVmins, autoVmaxs]);
 
   React.useEffect(() => {
     if (!roiActive || roiItems.length === 0 || !showRoiResizeHint) return;
@@ -2031,7 +3307,7 @@ function Show3D() {
       : frameData;
 
     const nP = Math.max(1, nPanels || 1);
-    const perPanelContrast = nP > 1 && !linkContrast && width % nP === 0 && height > 0;
+    const perPanelContrast = nP > 1 && !linkContrast && !sharedPanelSource && width % nP === 0 && height > 0;
 
     // Compute vmin/vmax (per-panel branch uses GPU multi-slot below)
     let vmin: number, vmax: number;
@@ -2047,7 +3323,8 @@ function Show3D() {
         imageVmaxPct,
       ));
     } else if (autoContrast) {
-      const cached = !logScale ? ensureLocalAutoRange(sliceIdx, frameData, percentileLow, percentileHigh) : null;
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, sliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, sliceIdx, logScale);
       if (cached) {
         ({ vmin, vmax } = cached);
       } else {
@@ -2074,7 +3351,7 @@ function Show3D() {
       // colormaps the panel sub-image using those values + slider pcts, and
       // blits to a panel-sized OffscreenCanvas. No JS slab extraction, no
       // findDataRange loop, no CPU readback between range and colormap.
-      const dataForGpu = logScale ? processed : frameData;
+      const dataForGpu = perPanelContrast ? frameData : (logScale ? processed : frameData);
       const ensureGpuUpload = () => {
         const prev = gpuUploadRef.current;
         if (
@@ -2097,12 +3374,19 @@ function Show3D() {
         const regions = Array.from({ length: nP }, (_, p) => ({
           x: p * pw, y: 0, width: pw, height,
         }));
-        const lowPct = Array(nP).fill(imageVminPct);
-        const highPct = Array(nP).fill(imageVmaxPct);
+        const sharedAutoRange = autoContrast ? { vmin, vmax } : null;
+        const panelRanges = Array.from({ length: nP }, (_, p) => {
+          const panelData = sharedAutoRange ? null : extractPanelSlice(frameData, p, logScale);
+          const panelRange = panelData && panelData.length > 0
+            ? findDataRange(panelData)
+            : resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+          return resolvePanelRange(p, panelRange, sharedAutoRange);
+        });
+        const panelLogs = logScale;
         requestAnimationFrame(() => {
           if (renderSerial !== gpuRenderSerialRef.current) return;
           if (!mainOffscreenRef.current) return;
-          const bitmaps = engine.renderPerPanelGpu(0, regions, lowPct, highPct, false);
+          const bitmaps = engine.renderPerPanelGpuExplicit(0, regions, panelRanges, panelLogs);
           if (bitmaps) {
             const ctx = mainOffscreenRef.current.getContext("2d");
             if (ctx) {
@@ -2168,11 +3452,13 @@ function Show3D() {
       const ctx = canvas.getContext("2d");
       if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
     }
-  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast]);
+  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast, panelStates, vminPerPanel, vmaxPerPanel]);
 
   // Per-panel render: each slot gets its own zoom/pan transform. 2px gap
   // between slots painted as the canvas bg (transparent through clearRect).
   const drawMain = (ctx: CanvasRenderingContext2D, offscreen: HTMLCanvasElement | OffscreenCanvas) => {
+    const keepDirectGpuVisible = separatePanelFrames && gpuFrameCacheUploadedRef.current.has(displaySliceIdx);
+    if (!keepDirectGpuVisible) setGpuDisplayVisible(false);
     ctx.imageSmoothingEnabled = smooth;
     // Clear entire canvas. Slot-level bg fill happens inside the per-panel
     // loop so empty grid cells (partial last row) stay transparent - the
@@ -2263,7 +3549,8 @@ function Show3D() {
     let cpuData: Float32Array = frame;
     let cpuDataAlreadyLogged = false;
     if (c.autoContrast) {
-      const cached = !c.logScale ? ensureLocalAutoRange(idx, frame, c.percentileLow, c.percentileHigh) : null;
+      const cached = cachedAutoDisplayRange(c.autoVmins, c.autoVmaxs, idx, c.logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, idx, c.logScale);
       if (cached) {
         ({ vmin, vmax } = cached);
       } else if (c.logScale && logBufferRef.current) {
@@ -2345,10 +3632,23 @@ function Show3D() {
   };
 
   const renderFetchedSlice = async (idx: number): Promise<boolean> => {
+    if (separatePanelFrames) {
+      const c = playRef.current;
+      const rgbaCapacity = Math.max(1, Math.round(c.canvasW * c.canvasH));
+      const ready = await ensurePanelFrameGpu(idx, rgbaCapacity);
+      if (!ready) return false;
+      return renderGpuPanelSlice(idx);
+    }
     const frame = getCachedServerFrame(idx) ?? await fetchFrameFromServer(idx);
     if (!frame) return false;
     return renderFloatFrameSlice(frame, idx);
   };
+
+  React.useEffect(() => {
+    if (!separatePanelFrames || !frameServerUrl || playing) return;
+    void renderFetchedSlice(sliceIdx);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [separatePanelFrames, frameServerUrl, frameServerVersion, sliceIdx, playing, canvasW, canvasH, cmap, imageVminPct, imageVmaxPct, autoContrast, logScale]);
 
   React.useLayoutEffect(() => {
     if (!mainOffscreenRef.current || !canvasRef.current) return;
@@ -2524,7 +3824,9 @@ function Show3D() {
         imageVmaxPct,
       ));
     } else if (autoContrast) {
-      ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
+      ({ vmin, vmax } = cached ?? percentileClip(processed, percentileLow, percentileHigh));
     } else if (imageDataRange.min !== imageDataRange.max) {
       ({ vmin, vmax } = sliderRange(imageDataRange.min, imageDataRange.max, imageVminPct, imageVmaxPct));
     } else {
@@ -2968,7 +4270,8 @@ function Show3D() {
           imageVmaxPct,
         ));
       } else if (autoContrast && imageHistogramData && imageHistogramData.length > 0) {
-        const cached = !logScale ? ensureLocalAutoRange(displaySliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
+        const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+          || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
         ({ vmin, vmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh));
       } else {
         ({ vmin, vmax } = sliderRange(imageDataRange.min, imageDataRange.max, imageVminPct, imageVmaxPct));
@@ -3255,7 +4558,9 @@ function Show3D() {
       const mainRange = findDataRange(mainProcessed);
       ({ vmin, vmax } = sliderRange(mainRange.min, mainRange.max, imageVminPct, imageVmaxPct));
     } else if (autoContrast) {
-      ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
+      ({ vmin, vmax } = cached ?? percentileClip(processed, percentileLow, percentileHigh));
     } else {
       const r = findDataRange(processed);
       vmin = r.min;
@@ -3388,26 +4693,28 @@ function Show3D() {
     const newPanY = localY - (localY - cur.panY) * zoomRatio;
     // Combine into one update per state slot to avoid stale linkedState when
     // only one of (zoom, pan) is linked.
-    if (linkZoom || linkPan) {
-      setLinkedState(s => ({
-        zoom: linkZoom ? newZoom : s.zoom,
-        panX: linkPan ? newPanX : s.panX,
-        panY: linkPan ? newPanY : s.panY,
-      }));
-    }
-    if (!linkZoom || !linkPan) {
-      setPanelStates(arr => arr.map((s, i) => i === panelIdx ? {
-        zoom: linkZoom ? s.zoom : newZoom,
-        panX: linkPan ? s.panX : newPanX,
-        panY: linkPan ? s.panY : newPanY,
-      } : s));
-    }
-  };
+	    if (linkZoom || linkPan) {
+	      setLinkedState(s => ({
+	        ...s,
+	        zoom: linkZoom ? newZoom : s.zoom,
+	        panX: linkPan ? newPanX : s.panX,
+	        panY: linkPan ? newPanY : s.panY,
+	      }));
+	    }
+	    if (!linkZoom || !linkPan) {
+	      setPanelStates(arr => arr.map((s, i) => i === panelIdx ? {
+	        ...s,
+	        zoom: linkZoom ? s.zoom : newZoom,
+	        panX: linkPan ? s.panX : newPanX,
+	        panY: linkPan ? s.panY : newPanY,
+	      } : s));
+	    }
+	  };
 
-  const handleDoubleClick = () => {
-    setLinkedState({ zoom: 1, panX: 0, panY: 0 });
-    setPanelStates(arr => arr.map(() => ({ zoom: 1, panX: 0, panY: 0 })));
-  };
+	  const handleDoubleClick = () => {
+	    setLinkedState(s => ({ ...s, zoom: 1, panX: 0, panY: 0 }));
+	    setPanelStates(arr => arr.map(s => ({ ...s, zoom: 1, panX: 0, panY: 0 })));
+	  };
 
   const addROIAt = (row: number, col: number, shape: "circle" | "square" | "rectangle" | "annular" = newRoiShape) => {
     const clampedRow = Math.max(0, Math.min(height - 1, Math.round(row)));
@@ -3511,7 +4818,9 @@ function Show3D() {
         imageVmaxPct,
       ));
     } else if (autoContrast) {
-      ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
+      ({ vmin, vmax } = cached ?? percentileClip(processed, percentileLow, percentileHigh));
     } else {
       const { min: pMin, max: pMax } = findDataRange(processed);
       ({ vmin, vmax } = sliderRange(pMin, pMax, imageVminPct, imageVmaxPct));
@@ -4328,6 +5637,7 @@ function Show3D() {
   const scrubToSlice = (idx: number) => {
     const next = clampSlice(idx);
     if (playing) setPlaying(false);
+    setLiveSliceIdx(next);
     if (renderBufferedSlice(next)) return;
     if (frameServerUrl) {
       setDisplaySliceIdx(next);
@@ -4339,8 +5649,12 @@ function Show3D() {
     setSliceIdx(next);
   };
   const commitSlice = (idx: number) => {
-    setSliceIdx(clampSlice(idx));
+    const next = clampSlice(idx);
+    setLiveSliceIdx(next);
+    setSliceIdx(next);
   };
+  const overlayCanvasVisible = roiActive || profileActive;
+  const lensCanvasVisible = showLens && lensPos !== null;
 
   return (
     <Box
@@ -4367,7 +5681,7 @@ function Show3D() {
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Profile: Click two points on image to draw a line intensity profile.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Lens: Magnifier inset that follows the cursor.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Scale: Linear or logarithmic intensity mapping.</Typography>
-              <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Auto: Percentile-based contrast (clips outliers). FFT Auto masks DC + clips to 99.9th.</Typography>
+              <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Auto: Stack-wide percentile contrast for Show3D image panels. FFT Auto masks DC + clips to 99.9th.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>ROI: Click empty image to add at cursor, click ROI to select, drag to move, hover edge to resize. Del removes selected; Ctrl/⌘+D duplicates.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Loop: Loop playback. Drag end markers on slider for loop range.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Bounce: Ping-pong playback - alternates forward and reverse.</Typography>
@@ -4426,8 +5740,9 @@ function Show3D() {
             {(nPanels || 1) > 1 && (
               <>
                 <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link:</Typography>
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Zoom</Typography>
                 <Switch checked={linkPanels} onChange={(e) => setLinkPanels(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link zoom and pan across panels" }} />
-                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Link contrast:</Typography>
+                <Typography sx={{ ...typography.label, fontSize: 10, ml: "2px" }}>Contrast</Typography>
                 <Switch checked={linkContrast} onChange={(e) => setLinkContrast(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Link contrast across panels" }} />
               </>
             )}
@@ -4471,10 +5786,11 @@ function Show3D() {
             onWheel={handleWheel}
             onDoubleClick={handleDoubleClick}
           >
-            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label={`Slice image ${displaySliceIdx + 1} of ${nSlices}${title ? `: ${title}` : ""} (${width} by ${height} pixels). Use arrow keys to scrub frames.`} />
-            <canvas ref={overlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
+            <canvas ref={canvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated", opacity: gpuDisplayVisible ? 0 : 1, display: gpuDisplayVisible ? "none" : "block" }} role="img" aria-label={`Slice image ${displaySliceIdx + 1} of ${nSlices}${title ? `: ${title}` : ""} (${width} by ${height} pixels). Use arrow keys to scrub frames.`} />
+            <canvas ref={gpuCanvasRef} width={canvasW} height={canvasH} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated", pointerEvents: "none", opacity: gpuDisplayVisible ? 1 : 0 }} aria-hidden="true" />
+            <canvas ref={overlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none", display: overlayCanvasVisible ? "block" : "none" }} aria-hidden="true" />
             <canvas ref={uiRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
-            <canvas ref={lensCanvasRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
+            <canvas ref={lensCanvasRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none", display: lensCanvasVisible ? "block" : "none" }} aria-hidden="true" />
             {/* Per-panel "best frame" stars. One gold ★ button top-right of
                 each panel. Click toggles the star on the currently displayed
                 slice for THAT panel. Programmatic API: widget.star_panel(i). */}
@@ -4648,25 +5964,10 @@ function Show3D() {
                     <MenuItem value="linear">Lin</MenuItem>
                     <MenuItem value="log">Log</MenuItem>
                   </Select>
-                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Auto:</Typography>
-	                  <Switch checked={autoContrast} onChange={(e) => {
-	                    const on = e.target.checked;
-	                    setAutoContrast(on);
-	                    if (on && imageHistogramData) {
-	                      // ON → snap slider thumbs to actual percentile clip so slider shows what's rendered.
-	                      const cached = !logScale ? ensureLocalAutoRange(displaySliceIdx, imageHistogramData, percentileLow, percentileHigh) : null;
-	                      const { vmin: pmin, vmax: pmax } = cached ?? percentileClip(imageHistogramData, percentileLow, percentileHigh);
-	                      const span = dataMax - dataMin;
-                      if (span > 0) {
-                        setImageVminPct(Math.max(0, Math.min(100, ((pmin - dataMin) / span) * 100)));
-                        setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - dataMin) / span) * 100)));
-                      }
-                    } else {
-                      // OFF → reset slider to full range so user sees raw data.
-                      setImageVminPct(0);
-                      setImageVmaxPct(100);
-                    }
-                  }} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle automatic percentile-based contrast" }} />
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }} title={perPanelHistogramEnabled ? "Stack-wide auto contrast. Turn off for independent panel clips." : "Automatic percentile-based contrast."}>
+                    {perPanelHistogramEnabled ? "Auto stack:" : "Auto:"}
+                  </Typography>
+                  <Switch checked={autoContrast} onChange={(e) => handleAutoContrastChange(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": perPanelHistogramEnabled ? "Toggle stack-wide automatic contrast" : "Toggle automatic percentile-based contrast" }} />
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
                   <Switch checked={showColorbar} onChange={(e) => setShowColorbar(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle colorbar overlay" }} />
                 </Box>
@@ -4714,8 +6015,8 @@ function Show3D() {
                   </Box>
                   <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>fps</Typography>
-                    <Slider value={fps} min={1} max={60} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 35, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
-                    <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 14, flexShrink: 0 }}>{Math.round(fps)}</Typography>
+                    <Slider value={fps} min={1} max={120} step={1} onChange={(_, v) => setFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 44, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
+                    <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 20, flexShrink: 0 }}>{Math.round(fps)}</Typography>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Loop</Typography>
                     <Switch size="small" checked={loop} onChange={() => setLoop(!loop)} sx={{ ...switchStyles.small, flexShrink: 0 }} inputProps={{ "aria-label": "Toggle loop playback" }} />
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>Bounce</Typography>
@@ -4728,6 +6029,57 @@ function Show3D() {
                 // Global stack range from Python (data_min/data_max trait), not per-frame.
                 // Log mode: log1p the range so bins line up with the log-scaled frame data.
                 const { min: histMin, max: histMax } = resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+                if (perPanelHistogramEnabled) {
+                  const n = Math.max(1, nPanels || 1);
+                  const cols = (maxCols && maxCols > 0) ? Math.min(maxCols, n) : n;
+                  return (
+                    <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "flex-start", gap: 0.5, overflow: "visible" }}>
+                      <Box sx={{ display: "grid", gridTemplateColumns: `repeat(${cols}, 112px)`, gap: "15px", overflow: "visible" }}>
+                      {Array.from({ length: n }, (_, panel) => {
+                        const state = panelStates[panel] || initialState;
+                        const panelRange = { min: histMin, max: histMax };
+                        const vminPct = autoContrast ? state.imageVminPct : valueToPct(vminPerPanel[panel], histMin, histMax, state.imageVminPct);
+                        const vmaxPct = autoContrast ? state.imageVmaxPct : valueToPct(vmaxPerPanel[panel], histMin, histMax, state.imageVmaxPct);
+                        return (
+                          <Histogram
+                            key={`panel-hist-${panel}`}
+                            data={panelHistogramData[panel] ?? null}
+                            bins={null}
+                            vminPct={vminPct}
+                            vmaxPct={vmaxPct}
+                            onRangeChange={(min, max) => {
+                              updatePanelState(panel, { imageVminPct: min, imageVmaxPct: max });
+                              if (autoContrast) {
+                                const sharedAutoRange = resolveCurrentSharedAutoRange();
+                                const nextVmins = Array.from({ length: n }, (_, i) => {
+                                  if (i === panel) return pctToValue(min, panelRange.min, panelRange.max);
+                                  const range = panelDataRanges[i] ?? resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+                                  return sharedAutoRange?.vmin ?? pctToValue((panelStates[i] || initialState).imageVminPct, range.min, range.max);
+                                });
+                                const nextVmaxs = Array.from({ length: n }, (_, i) => {
+                                  if (i === panel) return pctToValue(max, panelRange.min, panelRange.max);
+                                  const range = panelDataRanges[i] ?? resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+                                  return sharedAutoRange?.vmax ?? pctToValue((panelStates[i] || initialState).imageVmaxPct, range.min, range.max);
+                                });
+                                setVminPerPanel(nextVmins);
+                                setVmaxPerPanel(nextVmaxs);
+                                setAutoContrast(false);
+                              } else {
+                                setPanelRangeValues(panel, pctToValue(min, panelRange.min, panelRange.max), pctToValue(max, panelRange.min, panelRange.max));
+                              }
+                            }}
+                            width={110}
+                            height={58}
+                            theme={themeInfo.theme === "dark" ? "dark" : "light"}
+                            dataMin={panelRange.min}
+                            dataMax={panelRange.max}
+                          />
+                        );
+                      })}
+                      </Box>
+                    </Box>
+                  );
+                }
                 return (
                 <Box sx={{
                   // Match Show2D histogram shell exactly so visual stays consistent
