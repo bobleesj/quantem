@@ -2737,11 +2737,24 @@ function Show3D() {
 
       playbackIdxRef.current = next;
       if (frame) rawFrameDataRef.current = frame;
-      // Keep liveSliceIdx synced EVERY tick (no throttle): the static
-      // offline-paint pipeline depends on it, and any throttle here causes
-      // the React paint to lag the rAF direct paint by one frame, producing
-      // flicker. setState is batched by React; per-tick at 5-60 fps is cheap.
+      // Keep liveSliceIdx synced every tick. Offline HTML playback uses the
+      // same static paint pipeline as slider drag, so throttling this index
+      // lets the canvas lag behind the playback rAF.
       setLiveSliceIdx(next);
+      // Offline mode short-circuit: hand the frame to the React static paint
+      // pipeline (proven smooth on slider drag) and skip the rAF direct paint
+      // entirely. The two paths fought on Mac/retina (Linux didn't expose it),
+      // producing the "play is flaky while drag is smooth" symptom verified
+      // 2026-05-24 on samsung_logic_013_trial190.html.
+      if (offline) {
+        setGpuDisplayVisible(false);
+        if (now - lastUIUpdate > uiUpdateIntervalMs) {
+          lastUIUpdate = now;
+          setDisplaySliceIdx(next);
+        }
+        scheduleTick();
+        return;
+      }
       if (gpuPanelFrameReady) {
         if (!renderGpuPanelSlice(next, false)) {
           if (dbg) {
@@ -3320,8 +3333,9 @@ function Show3D() {
         imageVmaxPct,
       ));
     } else if (autoContrast) {
-      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, sliceIdx, logScale)
-        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, sliceIdx, logScale);
+      const renderIdx = offline ? liveSliceIdx : sliceIdx;
+      const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, renderIdx, logScale)
+        || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, renderIdx, logScale);
       if (cached) {
         ({ vmin, vmax } = cached);
       } else {
@@ -3449,12 +3463,13 @@ function Show3D() {
       const ctx = canvas.getContext("2d");
       if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
     }
-  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast, panelStates, vminPerPanel, vmaxPerPanel]);
+  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast, panelStates, vminPerPanel, vmaxPerPanel, offline, liveSliceIdx, sliceIdx]);
 
   // Per-panel render: each slot gets its own zoom/pan transform. 2px gap
   // between slots painted as the canvas bg (transparent through clearRect).
   const drawMain = (ctx: CanvasRenderingContext2D, offscreen: HTMLCanvasElement | OffscreenCanvas) => {
-    const keepDirectGpuVisible = separatePanelFrames && gpuFrameCacheUploadedRef.current.has(displaySliceIdx);
+    const drawSliceIdx = offline ? liveSliceIdx : displaySliceIdx;
+    const keepDirectGpuVisible = !offline && separatePanelFrames && gpuFrameCacheUploadedRef.current.has(displaySliceIdx);
     if (!keepDirectGpuVisible) setGpuDisplayVisible(false);
     ctx.imageSmoothingEnabled = smooth;
     // Clear entire canvas. Slot-level bg fill happens inside the per-panel
@@ -3485,7 +3500,7 @@ function Show3D() {
       // count, blur the (repeated last) frame + draw "end ({real}/{real})"
       // badge so operator sees they're scrubbing past real data.
       const realN = panelRealFrames && panelRealFrames[i];
-      const pastEnd = !!(realN && displaySliceIdx >= realN);
+      const pastEnd = !!(realN && drawSliceIdx >= realN);
       ctx.save();
       ctx.beginPath();
       ctx.rect(slotX, slotY, outPanelW, outPanelH);
@@ -3509,7 +3524,7 @@ function Show3D() {
       // don't bleed into the next column.
       if ((nPanels || 1) > 1 && panelTitles && panelTitles[i]) {
         const realN2 = panelRealFrames && panelRealFrames[i];
-        const cur = displaySliceIdx + 1;
+        const cur = drawSliceIdx + 1;
         const total = realN2 || nSlices;
         const shown = realN2 ? Math.min(cur, realN2) : cur;
         const label = `${panelTitles[i]}  ${shown}/${total}`;
@@ -3652,7 +3667,7 @@ function Show3D() {
     const ctx = canvasRef.current.getContext("2d");
     if (ctx) drawMain(ctx, mainOffscreenRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, panelGapTrait, panelTitleFontSize, panelWidthPx, sharedPanelSource, sliceIdx, displaySliceIdx, playing, nSlices]);
+  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, panelGapTrait, panelTitleFontSize, panelWidthPx, sharedPanelSource, sliceIdx, displaySliceIdx, liveSliceIdx, offline, playing, nSlices]);
 
   // Render overlay (ROI only) - HiDPI aware
   React.useEffect(() => {
