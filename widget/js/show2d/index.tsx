@@ -307,6 +307,13 @@ function cropROIRegion(
   return { cropped, cropW, cropH };
 }
 
+function computeAutoRange(data: Float32Array, logScale: boolean): { vmin: number; vmax: number } {
+  const processed = logScale ? applyLogScale(data) : data;
+  const { vmin, vmax, min, max } = percentileClip(processed, 2, 98);
+  if (Number.isFinite(vmin) && Number.isFinite(vmax) && vmax > vmin) return { vmin, vmax };
+  return { vmin: min, vmax: max };
+}
+
 // ============================================================================
 // Main Component
 // ============================================================================
@@ -823,6 +830,10 @@ function Show2D() {
   // Extract raw float32 bytes and parse into Float32Arrays
   const allFloats = React.useMemo(() => extractFloat32(frameBytes), [frameBytes]);
 
+  const [dataVersion, setDataVersion] = React.useState(0);
+  const [gpuCmapVersion, setGpuCmapVersion] = React.useState(0);
+  const [autoContrastVersion, setAutoContrastVersion] = React.useState(0);
+
   // Initialize WebGPU FFT + colormap engine on mount.
   // Sets refs (not state) — no effect re-triggers on GPU init.
   // Effects pick up GPU on their next natural re-run (data/slider change).
@@ -860,28 +871,11 @@ function Show2D() {
           const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
           engine.uploadLUT(cmap, lut);
           gpuDataVersionRef.current++;
-          // Warm-up: render once to compile GPU pipeline + fill canvases.
-          // Uses full data range (no slider adjustment) for the initial frame.
-          requestAnimationFrame(async () => {
-            const offscreens = mainOffscreensRef.current;
-            const imgDatas = mainImgDatasRef.current;
-            if (offscreens.length === 0 || imgDatas.length === 0) return;
-            const cachedRanges = dataRangesRef.current;
-            if (cachedRanges.length === 0) return;
-            const indices = Array.from({ length: nImg }, (_, i) => i);
-            const ranges = cachedRanges.map(r => ({ vmin: r.min, vmax: r.max }));
-            const ofs = indices.map(i => offscreens[i] || null);
-            const ids = indices.map(i => imgDatas[i] || null);
-            const logSc = logScaleRef.current ?? false;
-            await engine.renderSlots(indices, ranges, ofs, ids, logSc);
-            setOffscreenVersion(v => v + 1);
-          });
+          setGpuCmapVersion(v => v + 1);
         }
       }
     });
   }, []);
-
-  const [dataVersion, setDataVersion] = React.useState(0);
 
   // Keep inline FFT ref arrays in sync with nImages
   React.useEffect(() => {
@@ -1056,6 +1050,7 @@ function Show2D() {
     if (engine && gpuCmapReadyRef.current) {
       for (let i = 0; i < dataArrays.length; i++) engine.uploadData(i, dataArrays[i], width, height);
       gpuDataVersionRef.current++;
+      setGpuCmapVersion(v => v + 1);
     }
     setDataVersion(v => v + 1);
   }, [allFloats, nImages, floatsPerImage]);
@@ -1144,6 +1139,7 @@ function Show2D() {
   cmapRef.current = cmap;
   // Auto-contrast cache: GPU-computed percentile ranges per image
   const autoContrastCacheRef = React.useRef<{ vmin: number; vmax: number }[]>([]);
+  const autoContrastRequestRef = React.useRef(0);
 
   // Cache per-image data ranges (raw AND log) on data change only.
   // Log ranges are derived mathematically: log1p(rawMin), log1p(rawMax).
@@ -1152,6 +1148,8 @@ function Show2D() {
   const rawRangesRef = React.useRef<{ min: number; max: number }[]>([]);
   React.useEffect(() => {
     if (!rawDataRef.current || rawDataRef.current.length === 0) return;
+    autoContrastRequestRef.current += 1;
+    autoContrastCacheRef.current = [];
     const engine = gpuCmapRef.current;
     const nImg = rawDataRef.current.length;
 
@@ -1182,11 +1180,13 @@ function Show2D() {
       dataRangesRef.current = logScale ? logRanges : rawRanges;
     }
     logDataCacheRef.current = rawDataRef.current.slice();
-  }, [dataVersion]);
+  }, [dataVersion, gpuCmapVersion]);
 
   // When logScale toggles, just swap cached ranges (no data scan)
   React.useEffect(() => {
     if (rawRangesRef.current.length === 0) return;
+    autoContrastRequestRef.current += 1;
+    autoContrastCacheRef.current = [];
     const logRanges = rawRangesRef.current.map(r => ({
       min: Math.log1p(Math.max(r.min, 0)),
       max: Math.log1p(Math.max(r.max, 0)),
@@ -1205,6 +1205,7 @@ function Show2D() {
     const ls = logScale;
     const nImg = Math.min(rawDataRef.current.length, engine.slotCount);
     if (nImg === 0) return;
+    const request = ++autoContrastRequestRef.current;
 
     (async () => {
       const indices = Array.from({ length: nImg }, (_, i) => i);
@@ -1231,11 +1232,12 @@ function Show2D() {
         const range = cr.max - cr.min;
         acRanges.push({ vmin: cr.min + (binLow / 255) * range, vmax: cr.min + (binHigh / 255) * range });
       }
+      if (request !== autoContrastRequestRef.current) return;
       autoContrastCacheRef.current = acRanges;
       console.log(`[Show2D] GPU auto-contrast: ${nImg} images, ${allBins.length} histograms`);
-      setOffscreenVersion(v => v + 1);
+      setAutoContrastVersion(v => v + 1);
     })();
-  }, [autoContrast, dataVersion, logScale]);
+  }, [autoContrast, dataVersion, logScale, gpuCmapVersion]);
 
   // -------------------------------------------------------------------------
   // Data effect: normalize + colormap → reusable offscreen canvases
@@ -1290,14 +1292,19 @@ function Show2D() {
       }
 
       if (!hasAbsoluteRange && !hasPerImage && autoContrast) {
-        // Auto-contrast: use GPU-precomputed percentile ranges.
-        // If GPU cache not ready yet, use full data range as placeholder
-        // (GPU auto-contrast effect will fire async and trigger re-render).
+        // Auto-contrast: use GPU-precomputed percentile ranges when ready.
+        // Until then, compute the same 2-98% range on CPU so Auto is correct
+        // in offline exports, no-WebGPU browsers, and first paint races.
         const acCache = autoContrastCacheRef.current[i];
-        if (acCache) {
+        if (acCache && Number.isFinite(acCache.vmin) && Number.isFinite(acCache.vmax) && acCache.vmax > acCache.vmin) {
           vmin = acCache.vmin; vmax = acCache.vmax;
         } else {
-          vmin = rangeMin; vmax = rangeMax;
+          const raw = rawDataRef.current?.[i];
+          if (raw) {
+            ({ vmin, vmax } = computeAutoRange(raw, logScale));
+          } else {
+            vmin = rangeMin; vmax = rangeMax;
+          }
         }
       } else if (rangeMin !== rangeMax && (cs.vminPct > 0 || cs.vmaxPct < 100)) {
         ({ vmin, vmax } = sliderRange(rangeMin, rangeMax, cs.vminPct, cs.vmaxPct));
@@ -1370,7 +1377,7 @@ function Show2D() {
       }
       setOffscreenVersion(v => v + 1);
     }
-  }, [dataVersion, nImages, width, height, cmap, logScale, autoContrast, linkedContrast, linkedContrastState, contrastStates, traitVmin, traitVmax, traitVmins, traitVmaxs, diffMode]);
+  }, [dataVersion, gpuCmapVersion, autoContrastVersion, nImages, width, height, cmap, logScale, autoContrast, linkedContrast, linkedContrastState, contrastStates, traitVmin, traitVmax, traitVmins, traitVmaxs, diffMode]);
 
   // -------------------------------------------------------------------------
   // Draw effect: zoom/pan changes — cheap, just drawImage from cached offscreens

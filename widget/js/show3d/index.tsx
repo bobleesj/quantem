@@ -4555,7 +4555,10 @@ function Show3D() {
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
 
     let vmin: number, vmax: number;
-    if (traitVmin != null || traitVmax != null) {
+    const nP = Math.max(1, nPanels || 1);
+    const hasTraitRange = traitVmin != null || traitVmax != null;
+    const perPanelContrast = nP > 1 && !linkContrast && !sharedPanelSource && width % nP === 0 && height > 0;
+    if (hasTraitRange) {
       ({ vmin, vmax } = resolveDisplayRange(
         dataMin,
         dataMax,
@@ -4565,25 +4568,32 @@ function Show3D() {
         imageVminPct,
         imageVmaxPct,
       ));
-    } else if (imageDataRange.min !== imageDataRange.max && (imageVminPct > 0 || imageVmaxPct < 100)) {
-      const mainProcessed = logScale ? applyLogScale(raw) : raw;
-      const mainRange = findDataRange(mainProcessed);
-      ({ vmin, vmax } = sliderRange(mainRange.min, mainRange.max, imageVminPct, imageVmaxPct));
     } else if (autoContrast) {
       const cached = cachedAutoDisplayRange(autoVmins, autoVmaxs, displaySliceIdx, logScale)
         || cachedAutoDisplayRange(localAutoVminsRef.current, localAutoVmaxsRef.current, displaySliceIdx, logScale);
-      ({ vmin, vmax } = cached ?? percentileClip(processed, percentileLow, percentileHigh));
+      const mainProcessed = logScale ? applyLogScale(raw) : raw;
+      ({ vmin, vmax } = cached ?? percentileClip(mainProcessed, percentileLow, percentileHigh));
+    } else if (perPanelContrast) {
+      const panelW = width / nP;
+      const panel = Math.max(0, Math.min(nP - 1, Math.floor((Number(roi.col) || 0) / panelW)));
+      const panelData = extractPanelSlice(raw, panel, logScale);
+      const panelRange = panelData && panelData.length > 0
+        ? findDataRange(panelData)
+        : resolveDisplayBounds(dataMin, dataMax, traitVmin, traitVmax, logScale);
+      const resolved = resolvePanelRange(panel, panelRange, null);
+      vmin = resolved.vmin;
+      vmax = resolved.vmax;
     } else {
-      const r = findDataRange(processed);
-      vmin = r.min;
-      vmax = r.max;
+      const lo = logScale ? (dataMin >= 0 ? Math.log1p(dataMin) : -Math.log1p(-dataMin)) : dataMin;
+      const hi = logScale ? (dataMax >= 0 ? Math.log1p(dataMax) : -Math.log1p(-dataMax)) : dataMax;
+      ({ vmin, vmax } = sliderRange(lo, hi, imageVminPct, imageVmaxPct));
     }
 
     const offscreen = renderToOffscreen(processed, crop.cropW, crop.cropH, lut, vmin, vmax);
     previewOffscreenRef.current = offscreen;
     setPreviewVersion(v => v + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewVisible, selectedRoiKey, cmap, logScale, autoContrast, imageVminPct, imageVmaxPct, imageDataRange, dataMin, dataMax, traitVmin, traitVmax, percentileLow, percentileHigh, width, height, frameBytes, displaySliceIdx]);
+  }, [previewVisible, selectedRoiKey, cmap, logScale, autoContrast, imageVminPct, imageVmaxPct, dataMin, dataMax, traitVmin, traitVmax, percentileLow, percentileHigh, width, height, frameBytes, displaySliceIdx, autoVmins, autoVmaxs, nPanels, linkContrast, sharedPanelSource, panelStates, vminPerPanel, vmaxPerPanel]);
 
   // -------------------------------------------------------------------------
   // Preview panel - compute aspect-ratio-aware canvas dimensions
@@ -5550,7 +5560,12 @@ function Show3D() {
     const handleMouseMove = (e: MouseEvent) => {
       if (!resizeStart) return;
       const delta = Math.max(e.clientX - resizeStart.x, e.clientY - resizeStart.y);
-      latestSize = Math.max(initialCanvasSizeRef.current, resizeStart.size + delta);
+      // Absolute minimum: 200 px per panel column. Lets reader shrink BELOW
+      // the initial `size=` value (preset / kwarg) when their screen is small,
+      // without collapsing the canvas to an unreadable sliver.
+      const colsLocal = (maxCols && maxCols > 0) ? Math.min(maxCols, Math.max(1, nPanels || 1)) : Math.max(1, nPanels || 1);
+      const minSize = 200 * colsLocal;
+      latestSize = Math.max(minSize, resizeStart.size + delta);
       if (!rafId) {
         rafId = requestAnimationFrame(() => {
           rafId = 0;
