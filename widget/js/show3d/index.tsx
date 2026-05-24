@@ -2737,6 +2737,11 @@ function Show3D() {
 
       playbackIdxRef.current = next;
       if (frame) rawFrameDataRef.current = frame;
+      // Keep liveSliceIdx synced EVERY tick (no throttle): the static
+      // offline-paint pipeline depends on it, and any throttle here causes
+      // the React paint to lag the rAF direct paint by one frame, producing
+      // flicker. setState is batched by React; per-tick at 5-60 fps is cheap.
+      setLiveSliceIdx(next);
       if (gpuPanelFrameReady) {
         if (!renderGpuPanelSlice(next, false)) {
           if (dbg) {
@@ -2754,13 +2759,6 @@ function Show3D() {
         if (now - lastUIUpdate > uiUpdateIntervalMs) {
           lastUIUpdate = now;
           setDisplaySliceIdx(next);
-          // Keep liveSliceIdx in sync so the static offline-frame useMemo
-          // re-fires per tick. Without this, the rAF playback path advances
-          // the slider thumb but the React-driven canvas paint sees a stale
-          // liveSliceIdx and re-paints the initial frame on every unrelated
-          // re-render, freezing the canvas during play (verified bug 2026-05-24,
-          // samsung_logic_013_trial190.html: slider counts 0→14→0, canvas frozen).
-          setLiveSliceIdx(next);
         }
         scheduleTick();
         return;
@@ -3075,12 +3073,11 @@ function Show3D() {
 
       // Throttled UI updates for slider/stats/profile. At 90+ fps, keep React
       // comfortably out of the frame loop; the canvas still renders every rAF.
+      // liveSliceIdx is updated per-tick (above the rAF render branch) so the
+      // offline static-paint pipeline never lags the rAF direct paint.
       if (now - lastUIUpdate > uiUpdateIntervalMs) {
         lastUIUpdate = now;
         setDisplaySliceIdx(next);
-        // See comment at the panel-render branch above: keep liveSliceIdx in
-        // sync so the offline static-paint pipeline doesn't freeze the canvas.
-        setLiveSliceIdx(next);
         if (frame && c.showStats) setLocalStats(computeStats(frame));
         if (frame && c.profileActive && c.profilePoints.length === 2) {
           const p0 = c.profilePoints[0], p1 = c.profilePoints[1];

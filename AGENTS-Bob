@@ -1,0 +1,4 @@
+# Bob Agent Instructions
+
+- Never run browser tests, browser automation, or notebook/UI checks in headless mode.
+- Always interact with browser-based tools, notebooks, and UI through the visible Codex app in-app browser.
