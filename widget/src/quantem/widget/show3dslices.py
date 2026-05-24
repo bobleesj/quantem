@@ -111,6 +111,10 @@ class Show3DSlices(anywidget.AnyWidget):
         Labels for data axes 0, 1, 2 in that order. Default ["slice", "row", "col"]
         matches the project-wide detector-plane convention (axis 0 = multislice
         depth, axis 1 = row, axis 2 = col). Pass any 3-string list to override.
+    offline : bool, default False
+        Pack ``volume_bytes`` as uint8 plus global min/max metadata for static
+        nbconvert HTML reports. Leave False for live notebooks that need exact
+        float32 values in the browser.
 
     Example
     -------
@@ -153,6 +157,11 @@ class Show3DSlices(anywidget.AnyWidget):
     slice_z = traitlets.CInt(0).tag(sync=True)
     # Raw volume data (sent once)
     volume_bytes = traitlets.Bytes(b"").tag(sync=True)
+    # Offline HTML report mode: volume_bytes is uint8-quantized against this
+    # global range. Default live path keeps exact float32 bytes.
+    offline = traitlets.Bool(False).tag(sync=True)
+    _offline_min = traitlets.Float(0.0).tag(sync=True)
+    _offline_max = traitlets.Float(1.0).tag(sync=True)
     # Display
     title = traitlets.Unicode("").tag(sync=True)
     cmap = traitlets.Unicode("inferno").tag(sync=True)
@@ -361,6 +370,7 @@ class Show3DSlices(anywidget.AnyWidget):
         linked_contrast: bool = True,
         play_axis: int = 0,
         dim_labels: list[str] | None = None,
+        offline: bool = False,
         state=None,
         **kwargs,
     ):
@@ -525,11 +535,12 @@ class Show3DSlices(anywidget.AnyWidget):
         self.reverse = reverse
         self.boomerang = boomerang
         self.play_axis = play_axis
+        self.offline = bool(offline)
         if dim_labels is not None:
             self.dim_labels = dim_labels
 
         self._compute_stats()
-        self.volume_bytes = self._data.tobytes()
+        self._sync_volume_bytes()
         self.observe(self._on_slice_change, names=["slice_x", "slice_y", "slice_z"])
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_show_stats_change, names=["show_stats"])
@@ -548,6 +559,30 @@ class Show3DSlices(anywidget.AnyWidget):
     # =========================================================================
     # === Public API ===
     # =========================================================================
+
+    def _sync_volume_bytes(self) -> None:
+        """Sync exact live float32 bytes or packed offline report bytes."""
+        if self._data is None:
+            self.volume_bytes = b""
+            return
+
+        arr = np.ascontiguousarray(self._data, dtype=np.float32)
+        if not self.offline:
+            self._offline_min = 0.0
+            self._offline_max = 1.0
+            self.volume_bytes = arr.tobytes()
+            return
+
+        lo = float(arr.min())
+        hi = float(arr.max())
+        rng = hi - lo
+        if rng <= 0:
+            quantized = np.zeros(arr.shape, dtype=np.uint8)
+        else:
+            quantized = np.clip(np.rint((arr - lo) * (255.0 / rng)), 0, 255).astype(np.uint8)
+        self._offline_min = lo
+        self._offline_max = hi
+        self.volume_bytes = quantized.tobytes()
 
     def __repr__(self) -> str:
         return (

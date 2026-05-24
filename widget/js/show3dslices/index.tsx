@@ -28,7 +28,7 @@ import StopIcon from "@mui/icons-material/Stop";
 import { useTheme } from "../theme";
 import { VolumeRenderer, CameraState, DEFAULT_CAMERA } from "../webgpu-volume";
 import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar } from "../figure";
-import { extractFloat32, formatNumber } from "../format";
+import { extractBytes, extractFloat32, formatNumber } from "../format";
 import { findDataRange, applyLogScale, percentileClip, sliderRange, computeHistogramFromBytes } from "../stats";
 
 // ============================================================================
@@ -116,6 +116,29 @@ function extractYZ(vol: Float32Array, nx: number, ny: number, nz: number, x: num
   for (let z = 0; z < nz; z++) {
     for (let y = 0; y < ny; y++) out[z * ny + y] = vol[z * ny * nx + y * nx + x];
   }
+  return out;
+}
+
+function extractVolumeFloat32(
+  dataView: DataView | ArrayBuffer | Uint8Array,
+  offline: boolean,
+  offlineMin: number,
+  offlineMax: number,
+  nx: number,
+  ny: number,
+  nz: number,
+): Float32Array | null {
+  if (!offline) return extractFloat32(dataView);
+  const bytes = extractBytes(dataView);
+  const count = Math.max(0, Math.floor(nx) * Math.floor(ny) * Math.floor(nz));
+  if (bytes.length === 0 || count === 0) return null;
+  const out = new Float32Array(count);
+  const usable = Math.min(count, bytes.length);
+  const lo = Number.isFinite(offlineMin) ? offlineMin : 0;
+  const hi = Number.isFinite(offlineMax) ? offlineMax : lo;
+  const scale = hi > lo ? (hi - lo) / 255.0 : 0;
+  for (let i = 0; i < usable; i++) out[i] = bytes[i] * scale + lo;
+  if (usable < count) out.fill(lo, usable);
   return out;
 }
 
@@ -399,6 +422,9 @@ function Show3DSlices() {
   const [ny] = useModelState<number>("ny");
   const [nz] = useModelState<number>("nz");
   const [volumeBytes] = useModelState<DataView>("volume_bytes");
+  const [offline] = useModelState<boolean>("offline");
+  const [offlineMin] = useModelState<number>("_offline_min");
+  const [offlineMax] = useModelState<number>("_offline_max");
   const [sliceX, setSliceX] = useModelState<number>("slice_x");
   const [sliceY, setSliceY] = useModelState<number>("slice_y");
   const [sliceZ, setSliceZ] = useModelState<number>("slice_z");
@@ -533,8 +559,12 @@ function Show3DSlices() {
   // Cursor readout state
   const [cursorInfo, setCursorInfo] = React.useState<{ row: number; col: number; value: number; view: string } | null>(null);
 
-  // Parse volume data
-  const allFloats = React.useMemo(() => extractFloat32(volumeBytes), [volumeBytes]);
+  // Parse volume data. Live notebooks receive exact float32 bytes; offline
+  // reports receive uint8 bytes plus global min/max metadata to reduce HTML size.
+  const allFloats = React.useMemo(
+    () => extractVolumeFloat32(volumeBytes, offline, offlineMin, offlineMax, nx, ny, nz),
+    [volumeBytes, offline, offlineMin, offlineMax, nx, ny, nz],
+  );
 
   // Slice dimensions: [xy: ny x nx], [xz: nz x nx], [yz: nz x ny]
   const sliceDims: [number, number][] = [[ny, nx], [nz, nx], [nz, ny]];
