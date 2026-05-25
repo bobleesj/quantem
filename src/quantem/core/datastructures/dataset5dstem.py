@@ -120,21 +120,42 @@ class Dataset5dstem(Dataset):
         series_type: str = "generic",
         series=None,
     ) -> Self:
-        """Series-of-frames backing: each ``frame`` is a 4D tensor on its own device.
+        """Build a series from per-frame 4D tensors (each may be on its own device).
 
-        The frames keep whatever device they were created on (no moves, no
-        gather) - this is what lets a series exceed one card. The anchor tensor
-        (frame 0) carries dtype/device metadata for the base class; the logical
-        5D view is provided by the overrides.
+        This is the single place that decides the backing: if all frames share
+        ONE device they are stacked into a compact 5D tensor (the common path);
+        only a genuinely MULTI-device set is kept as a frame list. That keeps the
+        invariant ``_frames is not None`` ⟺ multi-device ⟺ ``is_sharded``, so
+        slices and inherited code never see a one-device frame list. Multi-device
+        frames keep their device (no gather) - that is what lets a series exceed
+        one card. The anchor tensor (frame 0) carries dtype/device metadata; the
+        logical 5D view comes from the overrides.
         """
-        base = tuple(frames[0].shape)
+        if not frames:
+            raise ValueError("from_4dstem needs at least one frame; got an empty list.")
+        base_shape = tuple(frames[0].shape)
+        base_dtype = frames[0].dtype
         for i, f in enumerate(frames):
             if f.ndim != 4:
                 raise ValueError(f"frame {i} must be 4D (scan, scan, k, k), got {tuple(f.shape)}.")
-            if tuple(f.shape) != base:
+            if tuple(f.shape) != base_shape:
                 raise ValueError(
-                    f"all frames must share shape; frame 0 is {base}, frame {i} is {tuple(f.shape)}."
+                    f"all frames must share shape; frame 0 is {base_shape}, frame {i} is {tuple(f.shape)}."
                 )
+            if f.dtype != base_dtype:
+                raise ValueError(
+                    f"all frames must share dtype; frame 0 is {base_dtype}, frame {i} is {f.dtype}."
+                )
+        # One device → stack into a single 5D tensor (compact, and the inherited
+        # single-tensor methods stay correct). Only keep a frame list when the
+        # frames genuinely span devices.
+        if len({str(f.device) for f in frames}) == 1:
+            return cls.from_tensor(
+                tensor=torch.stack(list(frames), dim=0), name=name,
+                sampling=sampling, units=units, origin=origin,
+                signal_units=signal_units, metadata=metadata,
+                series_type=series_type, series=series,
+            )
         obj = cls(
             tensor=frames[0], name=name,
             sampling=sampling, units=units, origin=origin,
@@ -142,7 +163,7 @@ class Dataset5dstem(Dataset):
             series_type=series_type, series=None, _token=cls._token,
         )
         obj._frames = list(frames)
-        obj.series = series  # validated against len(_frames)
+        obj.series = series  # validated against len(_frames), which is now set
         return obj
 
     @classmethod
@@ -155,24 +176,17 @@ class Dataset5dstem(Dataset):
     ) -> Self:
         """Stack tensor-backed ``Dataset4dstem`` into a series.
 
-        If every frame is on the SAME device, they are stacked into one 5D
-        tensor (the compact common case). If the frames live on DIFFERENT
-        devices, the series is kept as a list of per-frame tensors, each on its
-        own card - so a series larger than one GPU just works. Spatial
-        calibration inherits from the first frame.
+        Same-device frames stack into one compact 5D tensor; frames spread across
+        DIFFERENT devices stay a per-frame list (each on its own card), so a
+        series larger than one GPU just works. Spatial calibration inherits from
+        the first frame.
         """
-        member_tensors = [d.tensor for d in datasets]
-        devices = {str(t.device) for t in member_tensors}
+        if not datasets:
+            raise ValueError("from_4dstem needs at least one Dataset4dstem.")
         first = datasets[0]
         name = name if name is not None else f"{len(datasets)}x {first.name}"
-        if len(devices) == 1:
-            return cls.from_tensor(
-                tensor=torch.stack(member_tensors, dim=0), name=name,
-                sampling=first.sampling, units=first.units, origin=first.origin,
-                series_type=series_type, series=series,
-            )
         return cls._from_frames(
-            member_tensors, name=name,
+            [d.tensor for d in datasets], name=name,
             sampling=first.sampling, units=first.units, origin=first.origin,
             series_type=series_type, series=series,
         )
@@ -204,7 +218,13 @@ class Dataset5dstem(Dataset):
     def shape(self) -> tuple[int, ...]:
         if self._frames is not None:
             return (len(self._frames), *tuple(self._frames[0].shape))
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
         return tuple(self._tensor.shape)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)  # always 5 (base would report the anchor frame's 4)
 
     @property
     def devices(self) -> list[str]:
@@ -242,20 +262,18 @@ class Dataset5dstem(Dataset):
             print(f"  total {dev}: {gib:.2f} GiB")
         return per_device
 
-    def free(self, index: int | None = None) -> None:
-        """Release frame VRAM. ``index=None`` frees the whole series (dataset is
-        spent after; re-load to use again). The CUDA caching allocator is emptied
-        per freed device so the memory actually returns to the OS view."""
-        if self._frames is None:
-            devs = {self._tensor.device} if self._tensor is not None else set()
-            self._tensor = None
-        elif index is None:
+    def free(self) -> None:
+        """Release all frame VRAM. The dataset is spent afterward (accessing it
+        raises a clear error; re-load to use again). The CUDA caching allocator
+        is emptied per freed device so the memory returns to the OS view."""
+        if self._frames is not None:
             devs = {t.device for t in self._frames}
-            self._frames = None
-            self._tensor = None
+        elif self._tensor is not None:
+            devs = {self._tensor.device}
         else:
-            devs = {self._frames[index].device}
-            self._frames[index] = None  # tombstone; slot no longer accessible
+            devs = set()
+        self._frames = None
+        self._tensor = None
         for d in devs:
             if d.type == "cuda":
                 with torch.cuda.device(d):
@@ -281,6 +299,8 @@ class Dataset5dstem(Dataset):
     def __len__(self) -> int:
         if self._frames is not None:
             return len(self._frames)
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
         return int(self._tensor.shape[0])
 
     def _frame_tensor(self, index: int) -> torch.Tensor:

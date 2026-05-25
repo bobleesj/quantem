@@ -123,6 +123,45 @@ def test_summary_per_device_totals():
 
 
 @_needs_2gpu
+def test_one_device_framelist_restacks_not_sharded():
+    """A frame list that lands all on one device collapses to a single tensor
+    (invariant: _frames backing ⟺ genuinely multi-device)."""
+    frames = [_frame_on("cuda:0", i) for i in range(3)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt")
+    assert ds.is_sharded is False
+    # slicing a sharded dataset down to one device also collapses
+    shd = Dataset5dstem.from_4dstem([_frame_on(f"cuda:{i % 2}", i) for i in range(4)],
+                                    series_type="tilt")
+    one_card = shd[0:4:2]  # frames 0,2 -> both cuda:0
+    assert one_card.is_sharded is False
+    assert one_card.shape == (2, 4, 4, 6, 6)
+
+
+def test_empty_and_dtype_mismatch_raise():
+    with pytest.raises(ValueError, match="at least one"):
+        Dataset5dstem.from_4dstem([])
+    a = Dataset4dstem.from_tensor(torch.zeros(4, 4, 6, 6, dtype=torch.uint16))
+    b = Dataset4dstem.from_tensor(torch.zeros(4, 4, 6, 6, dtype=torch.uint32))
+    with pytest.raises(ValueError, match="share dtype"):
+        Dataset5dstem._from_frames([a.tensor.to("cpu"), b.tensor.to("cpu")],
+                                   name="x", sampling=None, units=None, origin=None)
+
+
+def test_ndim_is_five():
+    ds = Dataset5dstem.from_tensor(torch.zeros(3, 4, 4, 6, 6))
+    assert ds.ndim == 5
+
+
+def test_freed_dataset_errors_cleanly():
+    ds = Dataset5dstem.from_tensor(torch.zeros(3, 4, 4, 6, 6))
+    ds.free()
+    with pytest.raises(RuntimeError, match="freed"):
+        len(ds)
+    with pytest.raises(RuntimeError, match="freed"):
+        _ = ds.shape
+
+
+@_needs_2gpu
 def test_free_returns_vram():
     """free() drops frames and the CUDA allocator returns the memory."""
     # ~32 MiB per frame so the drop is clearly measurable.
