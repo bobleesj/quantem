@@ -1236,7 +1236,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         center_source = self._frame_data if self._sharded else self._data
         data_flat = center_source.reshape(-1, *self._det_shape)
         n_pos = data_flat.shape[0]
-        mean_dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
+        dev = data_flat.device  # follow the frame's device (multi-GPU series)
+        mean_dp = torch.zeros(self._det_shape, dtype=torch.float32, device=dev)
         # Float32 cast transient = positions × det_h × det_w × 4 bytes; cap at budget.
         pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1] * 4))
         for i in range(0, n_pos, pos_per_chunk):
@@ -1249,8 +1250,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         if total == 0:
             return self
 
-        cx = float((self._det_col_coords * mask).sum() / total)
-        cy = float((self._det_row_coords * mask).sum() / total)
+        cx = float((self._det_col_coords.to(dev) * mask).sum() / total)
+        cy = float((self._det_row_coords.to(dev) * mask).sum() / total)
         radius = float(torch.sqrt(total / torch.pi))
 
         # Apply detected values
@@ -2180,11 +2181,12 @@ class Show4DSTEM(anywidget.AnyWidget):
         # roughly duplicate the chunk in memory when the mask is dense). Sum/mean
         # use einsum over scan dims; max masks zero rows then takes amax.
         data_4d = data if data.ndim == 4 else data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
+        dev = data_4d.device  # follow the frame's device (multi-GPU series)
         rows_per_chunk = self._chunk_rows()
         if reduce == "sum" or reduce == "mean":
-            dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
+            dp = torch.zeros(self._det_shape, dtype=torch.float32, device=dev)
         else:  # max
-            dp = torch.full(self._det_shape, -float("inf"), dtype=torch.float32, device=self._device)
+            dp = torch.full(self._det_shape, -float("inf"), dtype=torch.float32, device=dev)
         for i in range(0, self._scan_shape[0], rows_per_chunk):
             row_mask = mask[i:i + rows_per_chunk]
             if not bool(row_mask.any()):
@@ -2192,7 +2194,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             chunk = data_4d[i:i + rows_per_chunk]
             if not torch.is_floating_point(chunk):
                 chunk = chunk.float()
-            row_mask_f = row_mask.float()
+            row_mask_f = row_mask.float().to(dev)
             if reduce == "max":
                 # Outside-mask positions become 0; doesn't affect amax provided
                 # the data has any non-negative pixels (true for detector counts).
@@ -2306,9 +2308,10 @@ class Show4DSTEM(anywidget.AnyWidget):
                 vi = data[:, row, col].reshape(self._scan_shape)
             return vi.cpu().numpy().astype(np.float32, copy=False)
         data_4d = data if data.ndim == 4 else data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
-        mask_f = mask.float()
+        dev = data_4d.device  # follow the frame's device (multi-GPU series)
+        mask_f = mask.float().to(dev)
         rows_per_chunk = self._chunk_rows()
-        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=self._device)
+        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=dev)
         for i in range(0, data_4d.shape[0], rows_per_chunk):
             chunk = data_4d[i:i + rows_per_chunk]
             if not torch.is_floating_point(chunk):
@@ -2338,10 +2341,13 @@ class Show4DSTEM(anywidget.AnyWidget):
             data_4d = data
         # Single chunked torch path. Per scan-row chunk: cast to float32, contract
         # with mask via tensordot. Transient memory bounded by chunk size. Same
-        # code on CUDA / MPS / CPU. Identical results regardless of device.
-        mask_f = mask.float()
+        # code on CUDA / MPS / CPU. The mask + accumulator follow the FRAME's
+        # device (in a multi-GPU series this frame may live on a different card
+        # than self._device), so the contraction never mixes devices.
+        dev = data_4d.device
+        mask_f = mask.float().to(dev)
         n_rows = data_4d.shape[0]
-        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=self._device)
+        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=dev)
         # Convert positions chunk size to row chunks based on scan width.
         rows_per_chunk = self._chunk_rows()
         for i in range(0, n_rows, rows_per_chunk):
