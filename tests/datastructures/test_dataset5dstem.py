@@ -147,6 +147,17 @@ def test_empty_and_dtype_mismatch_raise():
                                    name="x", sampling=None, units=None, origin=None)
 
 
+@_needs_2gpu
+def test_numpy_gathers_full_series():
+    """numpy() returns the whole 5D series (all frames, all cards), not just frame 0."""
+    frames = [_frame_on(f"cuda:{i % 2}", i) for i in range(4)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt")
+    arr = ds.numpy()
+    assert arr.shape == (4, 4, 4, 6, 6)
+    for i in range(4):
+        assert np.array_equal(arr[i], frames[i].tensor.cpu().numpy())
+
+
 def test_ndim_is_five():
     ds = Dataset5dstem.from_tensor(torch.zeros(3, 4, 4, 6, 6))
     assert ds.ndim == 5

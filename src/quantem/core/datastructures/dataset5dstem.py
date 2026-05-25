@@ -244,6 +244,21 @@ class Dataset5dstem(Dataset):
             return list(self._frames)
         return [self._tensor[i] for i in range(len(self))]
 
+    def numpy(self) -> NDArray:
+        """Gather the whole series to ONE host numpy array ``(N, scan, scan, k, k)``.
+
+        For a multi-device series this pulls every frame off its GPU and stacks
+        on the host - so the full 5D must fit in RAM (a 108 GiB no-bin series
+        will not; bin first or pull per-frame via ``dset[i].numpy()``). Base
+        ``Dataset.numpy()`` would return only the anchor frame, so this override
+        is what makes ``.numpy()`` correct for the frame-list backing.
+        """
+        if self._frames is not None:
+            return np.stack([f.detach().cpu().numpy() for f in self._frames], axis=0)
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+        return self._tensor.detach().cpu().numpy()
+
     def summary(self) -> dict[str, float]:
         """Print a frame | device | GiB | dtype table; return per-device GiB totals."""
         if self._frames is not None:
