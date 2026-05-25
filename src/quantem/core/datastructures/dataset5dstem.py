@@ -10,6 +10,7 @@ from quantem.core.utils.validators import validate_ndinfo, validate_units
 
 
 _SERIES_TYPES = ("time", "tilt", "energy", "dose", "focus", "generic")
+_GiB = 1 << 30
 
 
 class Dataset5dstem(Dataset):
@@ -24,12 +25,22 @@ class Dataset5dstem(Dataset):
     diverges from base Dataset's ``len(sampling) == ndim`` convention but keeps
     the user-facing API clean (no axis-0 placeholders).
 
-    Single-tensor / single-device only. Sharding deferred. API is experimental.
+    Two backings, one logical view:
+
+    - **single tensor** (one device) - the common case, axis 0 is the series.
+    - **series of frames** (multi-device) - each frame is its own 4D torch
+      tensor that knows its device, so a series larger than one card fits across
+      several GPUs (e.g. 6x 512²x192² no-bin = 108 GiB across two 96 GB cards)
+      while still presenting one ``(N, scan, scan, k, k)`` dataset. Each frame is
+      an independent acquisition, so placement is a per-frame property and freeing
+      VRAM is per-frame. Build via ``from_4dstem`` with frames that live on
+      different devices; inspect with ``.devices`` / ``.summary()``; release with
+      ``.free()``. API is experimental.
     """
 
     def __init__(
         self,
-        tensor: torch.Tensor,
+        tensor: torch.Tensor | None,
         name: str = "",
         sampling: NDArray | tuple | list | None = None,
         units: list[str] | tuple | list | None = None,
@@ -46,6 +57,13 @@ class Dataset5dstem(Dataset):
             )
         if series_type not in _SERIES_TYPES:
             raise ValueError(f"series_type must be one of {_SERIES_TYPES}, got {series_type!r}.")
+        # Multi-device backing (a list of per-frame 4D tensors, each on its own
+        # device) is attached by _from_frames AFTER construction; default to the
+        # single-tensor backing so base init + the series validator see a normal
+        # length. When _frames is set, the anchor self._tensor (frame 0) is used
+        # only for dtype/device metadata; the logical 5D view comes from the
+        # __len__ / shape / __getitem__ overrides below.
+        self._frames: list[torch.Tensor] | None = None
         super().__init__(
             tensor=tensor, name=name,
             sampling=sampling, units=units, origin=origin,
@@ -53,6 +71,11 @@ class Dataset5dstem(Dataset):
         )
         self.series_type = series_type
         self.series = series
+
+    @property
+    def is_sharded(self) -> bool:
+        """True if the series is a list of per-frame tensors across >1 device."""
+        return self._frames is not None and len({str(t.device) for t in self._frames}) > 1
 
     @classmethod
     def from_tensor(
@@ -87,6 +110,42 @@ class Dataset5dstem(Dataset):
         )
 
     @classmethod
+    def _from_frames(
+        cls,
+        frames: list[torch.Tensor],
+        name: str,
+        sampling, units, origin,
+        signal_units: str = "arb. units",
+        metadata: dict | None = None,
+        series_type: str = "generic",
+        series=None,
+    ) -> Self:
+        """Series-of-frames backing: each ``frame`` is a 4D tensor on its own device.
+
+        The frames keep whatever device they were created on (no moves, no
+        gather) - this is what lets a series exceed one card. The anchor tensor
+        (frame 0) carries dtype/device metadata for the base class; the logical
+        5D view is provided by the overrides.
+        """
+        base = tuple(frames[0].shape)
+        for i, f in enumerate(frames):
+            if f.ndim != 4:
+                raise ValueError(f"frame {i} must be 4D (scan, scan, k, k), got {tuple(f.shape)}.")
+            if tuple(f.shape) != base:
+                raise ValueError(
+                    f"all frames must share shape; frame 0 is {base}, frame {i} is {tuple(f.shape)}."
+                )
+        obj = cls(
+            tensor=frames[0], name=name,
+            sampling=sampling, units=units, origin=origin,
+            signal_units=signal_units, metadata=metadata,
+            series_type=series_type, series=None, _token=cls._token,
+        )
+        obj._frames = list(frames)
+        obj.series = series  # validated against len(_frames)
+        return obj
+
+    @classmethod
     def from_4dstem(
         cls,
         datasets: list[Dataset4dstem],
@@ -94,18 +153,26 @@ class Dataset5dstem(Dataset):
         series_type: str = "generic",
         series: NDArray | list | tuple | None = None,
     ) -> Self:
-        """Stack tensor-backed Dataset4dstem (same device). Spatial cal inherits from first."""
+        """Stack tensor-backed ``Dataset4dstem`` into a series.
+
+        If every frame is on the SAME device, they are stacked into one 5D
+        tensor (the compact common case). If the frames live on DIFFERENT
+        devices, the series is kept as a list of per-frame tensors, each on its
+        own card - so a series larger than one GPU just works. Spatial
+        calibration inherits from the first frame.
+        """
         member_tensors = [d.tensor for d in datasets]
         devices = {str(t.device) for t in member_tensors}
-        if len(devices) > 1:
-            raise ValueError(
-                f"All Dataset4dstem must share device; got {sorted(devices)}. "
-                f"Sharding not yet supported - move to one device first via ds.to('cuda:N')."
-            )
         first = datasets[0]
-        return cls.from_tensor(
-            tensor=torch.stack(member_tensors, dim=0),
-            name=name if name is not None else f"{len(datasets)}x {first.name}",
+        name = name if name is not None else f"{len(datasets)}x {first.name}"
+        if len(devices) == 1:
+            return cls.from_tensor(
+                tensor=torch.stack(member_tensors, dim=0), name=name,
+                sampling=first.sampling, units=first.units, origin=first.origin,
+                series_type=series_type, series=series,
+            )
+        return cls._from_frames(
+            member_tensors, name=name,
             sampling=first.sampling, units=first.units, origin=first.origin,
             series_type=series_type, series=series,
         )
@@ -132,6 +199,68 @@ class Dataset5dstem(Dataset):
     def units(self, value) -> None:
         self._units = validate_units(value, 4)
 
+    # --- Logical 5D view (single-tensor OR series-of-frames) ---
+    @property
+    def shape(self) -> tuple[int, ...]:
+        if self._frames is not None:
+            return (len(self._frames), *tuple(self._frames[0].shape))
+        return tuple(self._tensor.shape)
+
+    @property
+    def devices(self) -> list[str]:
+        """Device of each frame, in series order."""
+        if self._frames is not None:
+            return [str(t.device) for t in self._frames]
+        return [str(self._tensor.device)] * len(self)
+
+    @property
+    def frames(self) -> list[torch.Tensor]:
+        """The per-frame 4D torch tensors, in series order, each on its device.
+
+        This is the plain-torch view a viewer (e.g. ``Show4DSTEM``) consumes -
+        no dataset class needed downstream: ``Show4DSTEM(dset.frames)``.
+        """
+        if self._frames is not None:
+            return list(self._frames)
+        return [self._tensor[i] for i in range(len(self))]
+
+    def summary(self) -> dict[str, float]:
+        """Print a frame | device | GiB | dtype table; return per-device GiB totals."""
+        if self._frames is not None:
+            frames = self._frames
+        else:
+            frames = [self._tensor[i] for i in range(len(self))]
+        per_device: dict[str, float] = {}
+        print(f"{self.name}  ({self.series_type} series, {len(self)} frames)")
+        print(f"{'frame':>5}  {'device':>8}  {'GiB':>6}  dtype")
+        for i, f in enumerate(frames):
+            gib = f.element_size() * f.nelement() / _GiB
+            dev = str(f.device)
+            per_device[dev] = per_device.get(dev, 0.0) + gib
+            print(f"{i:>5}  {dev:>8}  {gib:>6.2f}  {f.dtype}")
+        for dev, gib in sorted(per_device.items()):
+            print(f"  total {dev}: {gib:.2f} GiB")
+        return per_device
+
+    def free(self, index: int | None = None) -> None:
+        """Release frame VRAM. ``index=None`` frees the whole series (dataset is
+        spent after; re-load to use again). The CUDA caching allocator is emptied
+        per freed device so the memory actually returns to the OS view."""
+        if self._frames is None:
+            devs = {self._tensor.device} if self._tensor is not None else set()
+            self._tensor = None
+        elif index is None:
+            devs = {t.device for t in self._frames}
+            self._frames = None
+            self._tensor = None
+        else:
+            devs = {self._frames[index].device}
+            self._frames[index] = None  # tombstone; slot no longer accessible
+        for d in devs:
+            if d.type == "cuda":
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+
     # --- Series metadata ---
     @property
     def series(self) -> NDArray | None:
@@ -150,16 +279,31 @@ class Dataset5dstem(Dataset):
 
     # --- Frame access ---
     def __len__(self) -> int:
+        if self._frames is not None:
+            return len(self._frames)
         return int(self._tensor.shape[0])
+
+    def _frame_tensor(self, index: int) -> torch.Tensor:
+        """The 4D tensor for series step ``index``, on its own device."""
+        if self._frames is not None:
+            return self._frames[index]
+        return self._tensor[index]
 
     def __getitem__(self, index: int | slice) -> Dataset4dstem | Self:
         if isinstance(index, int):
             return Dataset4dstem.from_tensor(
-                self._tensor[index],
+                self._frame_tensor(index),
                 name=f"{self.name}[{index}]",
                 sampling=self.sampling, units=self.units,
             )
         sub_series = None if self._series is None else self._series[index]
+        if self._frames is not None:
+            return Dataset5dstem._from_frames(
+                self._frames[index], name=self.name,
+                sampling=self.sampling, units=self.units, origin=self.origin,
+                signal_units=self.signal_units, metadata=self._metadata,
+                series_type=self.series_type, series=sub_series,
+            )
         return Dataset5dstem.from_tensor(
             tensor=self._tensor[index],
             name=self.name,

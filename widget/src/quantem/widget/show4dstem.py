@@ -55,6 +55,37 @@ DEFAULT_BF_RATIO = 0.125  # BF disk radius as fraction of detector size (1/8)
 MIN_LOG_VALUE = 1e-10  # Minimum value for log scale to avoid log(0)
 DEFAULT_VI_ROI_RATIO = 0.15  # Default VI ROI size as fraction of scan dimension
 
+
+class _FrameSeries:
+    """Per-frame view over a list of 4D torch tensors that may live on different
+    GPUs. Indexing ``[i]`` returns frame ``i`` on its OWN device. Each frame is a
+    complete 4D acquisition on a single card, so the widget reduces it exactly
+    like any single-device frame - no cross-device math. The widget only ever
+    indexes one frame at a time (``_frame_data``), so this minimal proxy is all
+    it needs. This is plain torch: no dataset class required.
+    """
+
+    def __init__(self, frames: list):
+        self._frames = list(frames)
+        frame0 = self._frames[0]
+        self.shape = (len(self._frames), *tuple(frame0.shape))
+        self.ndim = 5
+        self.dtype = frame0.dtype
+        self.device = frame0.device
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return self._frames[index]
+
+    def element_size(self) -> int:
+        return self._frames[0].element_size()
+
+    def numel(self) -> int:
+        return sum(f.numel() for f in self._frames)
+
+
 class Show4DSTEM(anywidget.AnyWidget):
     """
     Fast interactive 4D-STEM viewer with advanced features.
@@ -333,18 +364,38 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         _io_labels = None
 
-        # Extract underlying array / tensor + auto-calibrate from Dataset input
-        # (duck-typed via the dual-slot private attributes _tensor / _array).
-        tensor = getattr(data, "_tensor", None)
-        array = getattr(data, "_array", None)
-        if tensor is not None or array is not None:
+        # Multi-device series: a plain LIST of per-frame 4D torch tensors (each
+        # on its own card), or a sharded Dataset5dstem (we read its frame list +
+        # calibration). Detect FIRST so the single-tensor extraction below does
+        # not collapse the series. The widget stays torch-native - it only ever
+        # touches one frame at a time, on that frame's device.
+        frames = None
+        if isinstance(data, (list, tuple)) and len(data) and isinstance(data[0], torch.Tensor):
+            frames = list(data)
+        elif getattr(data, "is_sharded", False):
+            frames = list(data.frames)
             if not title and getattr(data, "name", ""):
                 title = str(data.name)
             if sampling is None:
                 sampling = tuple(float(s) for s in data.sampling)
             if units is None:
                 units = list(data.units)
-            data = tensor if tensor is not None else array
+        self._sharded = frames is not None
+        if self._sharded:
+            self._frame_series = _FrameSeries(frames)
+        else:
+            # Extract underlying array / tensor + auto-calibrate from Dataset input
+            # (duck-typed via the dual-slot private attributes _tensor / _array).
+            tensor = getattr(data, "_tensor", None)
+            array = getattr(data, "_array", None)
+            if tensor is not None or array is not None:
+                if not title and getattr(data, "name", ""):
+                    title = str(data.name)
+                if sampling is None:
+                    sampling = tuple(float(s) for s in data.sampling)
+                if units is None:
+                    units = list(data.units)
+                data = tensor if tensor is not None else array
 
         # Resolve sampling + units (4 axes for 4D-STEM):
         # [scan_row, scan_col, k_row, k_col]. Scalar/None broadcast to (1, 1, 1, 1).
@@ -381,74 +432,86 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._suppress_roi_recompute = False
         # Torch tensor input keeps its device (lets user pin a specific GPU via
         # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
-        if isinstance(data, torch.Tensor):
-            self._device = data.device
-            self._data_pre = data
-            data_np = None
-        else:
-            device_str, _ = validate_device(None)
-            self._device = torch.device(device_str)
-            data_np = to_numpy(data)
-            self._data_pre = None
-            self._saturation_value = (
-                65535 if data_np.dtype == np.uint16
-                else 255 if data_np.dtype == np.uint8
-                else None
-            )
-        # Handle dimensionality — 5D loads eagerly for instant frame switching
-        # Resolve shape from whichever input path we took
-        shape = tuple(self._data_pre.shape) if self._data_pre is not None else data_np.shape
-        ndim = len(shape)
         _tc = time.perf_counter()
-        if ndim == 5:
-            self.n_frames = shape[0]
-            self._scan_shape = (shape[1], shape[2])
-            self._det_shape = (shape[3], shape[4])
-        elif ndim == 3:
-            self.n_frames = 1
-            if scan_shape is not None:
-                self._scan_shape = scan_shape
+        if self._sharded:
+            # Series of frames across cards: dims come from the proxy, _data IS
+            # the proxy (the widget only ever indexes one frame at a time, on its
+            # own device). Skip the single-tensor saturation filter - the loader
+            # already masked dead pixels and a cross-device view/reshape is invalid.
+            fs = self._frame_series
+            self._device = fs.device
+            self.n_frames = fs.shape[0]
+            self._scan_shape = (fs.shape[1], fs.shape[2])
+            self._det_shape = (fs.shape[3], fs.shape[4])
+            self._data = fs
+        else:
+            if isinstance(data, torch.Tensor):
+                self._device = data.device
+                self._data_pre = data
+                data_np = None
             else:
-                n = shape[0]
-                side = int(n ** 0.5)
-                if side * side != n:
-                    raise ValueError(
-                        f"Cannot infer square scan_shape from N={n}. "
-                        f"Provide scan_shape explicitly."
-                    )
-                self._scan_shape = (side, side)
-            self._det_shape = (shape[1], shape[2])
-        elif ndim == 4:
-            self.n_frames = 1
-            self._scan_shape = (shape[0], shape[1])
-            self._det_shape = (shape[2], shape[3])
-        else:
-            raise ValueError(f"Show4DSTEM expects a 3D ((N, det_h, det_w) flat-scan), 4D ((scan_h, scan_w, det_h, det_w)), or 5D ((n_frames, scan_h, scan_w, det_h, det_w)) array. Got {ndim}D.")
-        if self._data_pre is not None:
-            self._data = self._data_pre if self._data_pre.device == self._device else self._data_pre.to(self._device)
-            del self._data_pre
-        else:
-            self._data = torch.from_numpy(data_np).to(self._device)
-            # Saturation filter: zero detector pixels at full-scale (65535 / 255).
-            # PyTorch lacks unsigned int comparison kernels, but uint16 viewed
-            # as int16 has identical bytes (65535 → -1) and int16 comparison
-            # works on every device. Apply in scan-row chunks so the transient
-            # bool mask stays bounded (≤600 MB) and fits constrained-VRAM
-            # devices (Mac 24 GB unified, etc.). View-write keeps native dtype.
-            sat = getattr(self, "_saturation_value", None)
-            view_dtype = (
-                torch.int16 if sat is not None and self._data.dtype == torch.uint16
-                else torch.int8 if sat is not None and self._data.dtype == torch.uint8
-                else None
-            )
-            if view_dtype is not None:
-                view = self._data.view(view_dtype).reshape(-1, *self._det_shape)
-                rows = view.shape[0]
-                # Bool mask transient = positions × det_h × det_w bytes; cap at budget.
-                pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1]))
-                for i in range(0, rows, pos_per_chunk):
-                    chunk = view[i:i + pos_per_chunk]
-                    chunk.masked_fill_(chunk == -1, 0)
+                device_str, _ = validate_device(None)
+                self._device = torch.device(device_str)
+                data_np = to_numpy(data)
+                self._data_pre = None
+                self._saturation_value = (
+                    65535 if data_np.dtype == np.uint16
+                    else 255 if data_np.dtype == np.uint8
+                    else None
+                )
+            # Handle dimensionality — 5D loads eagerly for instant frame switching
+            # Resolve shape from whichever input path we took
+            shape = tuple(self._data_pre.shape) if self._data_pre is not None else data_np.shape
+            ndim = len(shape)
+            if ndim == 5:
+                self.n_frames = shape[0]
+                self._scan_shape = (shape[1], shape[2])
+                self._det_shape = (shape[3], shape[4])
+            elif ndim == 3:
+                self.n_frames = 1
+                if scan_shape is not None:
+                    self._scan_shape = scan_shape
+                else:
+                    n = shape[0]
+                    side = int(n ** 0.5)
+                    if side * side != n:
+                        raise ValueError(
+                            f"Cannot infer square scan_shape from N={n}. "
+                            f"Provide scan_shape explicitly."
+                        )
+                    self._scan_shape = (side, side)
+                self._det_shape = (shape[1], shape[2])
+            elif ndim == 4:
+                self.n_frames = 1
+                self._scan_shape = (shape[0], shape[1])
+                self._det_shape = (shape[2], shape[3])
+            else:
+                raise ValueError(f"Show4DSTEM expects a 3D ((N, det_h, det_w) flat-scan), 4D ((scan_h, scan_w, det_h, det_w)), or 5D ((n_frames, scan_h, scan_w, det_h, det_w)) array. Got {ndim}D.")
+            if self._data_pre is not None:
+                self._data = self._data_pre if self._data_pre.device == self._device else self._data_pre.to(self._device)
+                del self._data_pre
+            else:
+                self._data = torch.from_numpy(data_np).to(self._device)
+                # Saturation filter: zero detector pixels at full-scale (65535 / 255).
+                # PyTorch lacks unsigned int comparison kernels, but uint16 viewed
+                # as int16 has identical bytes (65535 → -1) and int16 comparison
+                # works on every device. Apply in scan-row chunks so the transient
+                # bool mask stays bounded (≤600 MB) and fits constrained-VRAM
+                # devices (Mac 24 GB unified, etc.). View-write keeps native dtype.
+                sat = getattr(self, "_saturation_value", None)
+                view_dtype = (
+                    torch.int16 if sat is not None and self._data.dtype == torch.uint16
+                    else torch.int8 if sat is not None and self._data.dtype == torch.uint8
+                    else None
+                )
+                if view_dtype is not None:
+                    view = self._data.view(view_dtype).reshape(-1, *self._det_shape)
+                    rows = view.shape[0]
+                    # Bool mask transient = positions × det_h × det_w bytes; cap at budget.
+                    pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1]))
+                    for i in range(0, rows, pos_per_chunk):
+                        chunk = view[i:i + pos_per_chunk]
+                        chunk.masked_fill_(chunk == -1, 0)
         # Keep native dtype (uint8/uint16) to bound memory at ~ data_size.
         # Reductions cast in chunks (bounded transient).
         if _verbose:
@@ -1167,7 +1230,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Sum diffraction patterns over scan positions to find BF disk centroid.
         # Single chunked torch float path: works identically on CUDA / MPS / CPU.
         # Each chunk casts uint16 → float32 transiently (~600 MB max), accumulates.
-        data_flat = self._data.reshape(-1, *self._det_shape)
+        # Sharded series: detect the center from the current frame (one card);
+        # the BF center is the same across the series, and the proxy can't reshape
+        # across devices. Single-tensor: reshape the whole stack as before.
+        center_source = self._frame_data if self._sharded else self._data
+        data_flat = center_source.reshape(-1, *self._det_shape)
         n_pos = data_flat.shape[0]
         mean_dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
         # Float32 cast transient = positions × det_h × det_w × 4 bytes; cap at budget.

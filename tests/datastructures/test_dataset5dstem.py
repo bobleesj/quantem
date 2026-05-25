@@ -1,10 +1,21 @@
 """Tests for Dataset5dstem (quantem.core.datastructures.dataset5dstem)."""
 
 import numpy as np
+import pytest
 import torch
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.dataset5dstem import Dataset5dstem
+
+_TWO_GPUS = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+_needs_2gpu = pytest.mark.skipif(not _TWO_GPUS, reason="needs >= 2 CUDA devices")
+
+
+def _frame_on(device: str, n: int, *, scan=4, det=6) -> Dataset4dstem:
+    """A small uint16 frame on a given device, content = arange + n (distinct per frame)."""
+    t = ((torch.arange(scan * scan * det * det) + n)
+         .reshape(scan, scan, det, det).to(torch.uint16)).to(device)
+    return Dataset4dstem.from_tensor(t, sampling=(1, 1, 1, 1), name=f"f{n}")
 
 
 def test_from_tensor():
@@ -60,3 +71,66 @@ def test_from_4dstem():
     assert ds.units == ["nm", "nm", "1/nm", "1/nm"]
     assert ds.series_type == "tilt"
     assert np.array_equal(ds.series, np.array([-30.0, 0.0, 30.0]))
+    assert ds.is_sharded is False  # all on one (cpu) device -> stacked single tensor
+
+
+# --- multi-device (series of frames) ---
+
+
+@_needs_2gpu
+def test_from_4dstem_multidevice_routes_and_parity():
+    """Frames on different cards -> series of frames; dataset[i] equals its source."""
+    frames = [_frame_on(f"cuda:{i % 2}", i) for i in range(4)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt", series=[0, 1, 2, 3])
+    assert ds.is_sharded is True
+    assert len(ds) == 4
+    assert ds.shape == (4, 4, 4, 6, 6)
+    assert ds.devices == ["cuda:0", "cuda:1", "cuda:0", "cuda:1"]
+    for i in range(4):
+        got, src = ds[i].tensor, frames[i].tensor
+        assert str(got.device) == f"cuda:{i % 2}"
+        assert torch.equal(got.cpu(), src.cpu())
+
+
+@_needs_2gpu
+def test_multidevice_slice_keeps_frames():
+    frames = [_frame_on(f"cuda:{i % 2}", i) for i in range(4)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt", series=[0, 1, 2, 3])
+    sub = ds[1:3]
+    assert isinstance(sub, Dataset5dstem)
+    assert sub.shape == (2, 4, 4, 6, 6)
+    assert sub.devices == ["cuda:1", "cuda:0"]
+    assert np.array_equal(sub.series, np.array([1.0, 2.0]))
+
+
+@_needs_2gpu
+def test_single_device_4dstem_stacks_not_sharded():
+    """All frames on one card -> compact single tensor, not a frame list."""
+    frames = [_frame_on("cuda:0", i) for i in range(3)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="time")
+    assert ds.is_sharded is False
+    assert ds.shape == (3, 4, 4, 6, 6)
+
+
+@_needs_2gpu
+def test_summary_per_device_totals():
+    frames = [_frame_on(f"cuda:{i % 2}", i) for i in range(4)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt")
+    per_device = ds.summary()
+    assert set(per_device) == {"cuda:0", "cuda:1"}
+    # 2 frames per card, equal size
+    assert per_device["cuda:0"] == pytest.approx(per_device["cuda:1"])
+
+
+@_needs_2gpu
+def test_free_returns_vram():
+    """free() drops frames and the CUDA allocator returns the memory."""
+    # ~32 MiB per frame so the drop is clearly measurable.
+    frames = [_frame_on(f"cuda:{i % 2}", i, scan=64, det=64) for i in range(4)]
+    ds = Dataset5dstem.from_4dstem(frames, series_type="tilt")
+    del frames  # drop external refs so free() is the only holder
+    free_before, _ = torch.cuda.mem_get_info(0)
+    ds.free()
+    free_after, _ = torch.cuda.mem_get_info(0)
+    assert ds._frames is None
+    assert free_after >= free_before  # VRAM returned (>= guards against noise)
