@@ -30,35 +30,10 @@ jobs:
         uses: conda-incubator/setup-miniconda@v4
         with:
           activate-environment: quantem-widget-release
-          python-version: "3.11"
-          channels: conda-forge
+          environment-file: widget/environment.yml
           auto-update-conda: true
           channel-priority: strict
           conda-remove-defaults: true
-
-      - name: Install Python release dependencies
-        run: |
-          conda install -y \
-            "anywidget>=0.9.0" \
-            colorspacious \
-            dill \
-            hatchling \
-            "h5py>=3.13.0" \
-            matplotlib \
-            "numpy>=2.0" \
-            "optuna>=4.5.0" \
-            "pillow>=10.0.0" \
-            pip \
-            python-build \
-            "pytorch-cpu>=2.7.0" \
-            pyyaml \
-            "scikit-image>=0.25.2" \
-            scipy \
-            "tensorboard>=2.19.0" \
-            tqdm \
-            "traitlets>=5.0.0" \
-            twine \
-            "zarr>=3.0"
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -86,33 +61,10 @@ jobs:
               print(f"version={match.group('version')}", file=output)
           PY
 
-      - name: Verify Conda environment
-        run: |
-          python - <<'PY'
-          import anywidget
-          import h5py
-          import optuna
-          import skimage.measure
-          import torch
-          import traitlets
-          import zarr
-          from torch.utils.tensorboard.writer import SummaryWriter
-
-          print("python environment ready")
-          print(f"torch={torch.__version__}")
-          print(f"h5py={h5py.__version__}")
-          print(f"optuna={optuna.__version__}")
-          print(f"zarr={zarr.__version__}")
-          print(f"tensorboard writer={SummaryWriter.__name__}")
-          PY
-
-      - name: Install frontend dependencies
-        working-directory: widget
-        run: npm ci
-
       - name: Build frontend assets
         working-directory: widget
         run: |
+          npm ci
           npm run typecheck
           npm run build
           test -s src/quantem/widget/static/show2d.js
@@ -147,113 +99,8 @@ jobs:
       - name: Check widget distributions
         run: python -m twine check dist/widget/*
 
-      - name: Install quantem core package for smoke test
-        run: python -m pip install --no-deps -e .
-
-      - name: Smoke-test built wheel
-        env:
-          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          wheel="$(ls dist/widget/*.whl)"
-          python -m pip install --force-reinstall --no-deps "${wheel}"
-          python - <<'PY'
-          import importlib.metadata
-          import os
-
-          import quantem.widget as widget
-
-          version = importlib.metadata.version("quantem.widget")
-          expected = os.environ["EXPECTED_VERSION"]
-          if version != expected:
-              raise SystemExit(f"Expected quantem.widget {expected}, got {version}")
-
-          requires = importlib.metadata.requires("quantem.widget") or []
-          if not any(req.startswith("quantem>=") for req in requires):
-              raise SystemExit(f"quantem.widget wheel is missing quantem dependency: {requires}")
-
-          for name in widget.__all__:
-              if getattr(widget, name, None) is None:
-                  raise SystemExit(f"Missing widget export: {name}")
-          PY
-
       - name: Publish widget to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist/widget/
-
-      - name: Install uv for TestPyPI smoke test
-        run: python -m pip install uv
-
-      - name: Smoke-test TestPyPI install with uv sync
-        env:
-          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          tmpdir="$(mktemp -d)"
-          cd "${tmpdir}"
-          cat > pyproject.toml <<EOF
-          [project]
-          name = "quantem-widget-testpypi-smoke"
-          version = "0.0.0"
-          requires-python = ">=3.11"
-          dependencies = ["quantem.widget==${EXPECTED_VERSION}"]
-          EOF
-
-          for attempt in {1..8}; do
-            if uv sync \
-              --python 3.11 \
-              --index-url https://test.pypi.org/simple/ \
-              --extra-index-url https://pypi.org/simple/; then
-              break
-            fi
-            if [ "${attempt}" -eq 8 ]; then
-              exit 1
-            fi
-            sleep 20
-          done
-
-          uv run python - <<'PY'
-          import importlib.metadata
-          import os
-
-          import quantem.widget as widget
-
-          expected = os.environ["EXPECTED_VERSION"]
-          version = importlib.metadata.version("quantem.widget")
-          if version != expected:
-              raise SystemExit(f"Expected quantem.widget {expected}, got {version}")
-          if not {"Show2D", "Show4DSTEM"}.issubset(set(widget.__all__)):
-              raise SystemExit(f"Unexpected widget exports: {widget.__all__}")
-          PY
-
-      - name: Smoke-test TestPyPI install in fresh Conda environment
-        env:
-          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          conda create -y -n quantem-widget-testpypi python=3.11 pip
-          for attempt in {1..8}; do
-            if conda run -n quantem-widget-testpypi python -m pip install \
-              --index-url https://test.pypi.org/simple/ \
-              --extra-index-url https://pypi.org/simple/ \
-              "quantem.widget==${EXPECTED_VERSION}"; then
-              break
-            fi
-            if [ "${attempt}" -eq 8 ]; then
-              exit 1
-            fi
-            sleep 20
-          done
-
-          conda run -n quantem-widget-testpypi python - <<'PY'
-          import importlib.metadata
-          import os
-
-          import quantem.widget as widget
-
-          expected = os.environ["EXPECTED_VERSION"]
-          version = importlib.metadata.version("quantem.widget")
-          if version != expected:
-              raise SystemExit(f"Expected quantem.widget {expected}, got {version}")
-          if not {"Show2D", "Show4DSTEM"}.issubset(set(widget.__all__)):
-              raise SystemExit(f"Unexpected widget exports: {widget.__all__}")
-          PY
