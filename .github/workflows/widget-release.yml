@@ -1,0 +1,138 @@
+name: Widget release
+
+on:
+  push:
+    tags:
+      - "widget-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: widget-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  testpypi:
+    name: Build and publish quantem.widget
+    runs-on: ubuntu-latest
+    environment: testpypi
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: quantem-widget-release
+          auto-update-conda: true
+          channel-priority: strict
+          channels: conda-forge
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: widget/package-lock.json
+
+      - name: Resolve widget version from tag
+        id: version
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(r"widget-v(?P<version>\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)", tag)
+          if match is None:
+              raise SystemExit(
+                  f"Expected tag widget-vX.Y.Z, widget-vX.Y.ZrcN, or widget-vX.Y.Z.postN; got {tag!r}"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={match.group('version')}", file=output)
+          PY
+
+      - name: Install Python build tooling
+        run: |
+          conda install -y anywidget hatchling matplotlib numpy pillow pip pytest python-build pytorch traitlets twine
+
+      - name: Install frontend dependencies
+        working-directory: widget
+        run: npm ci
+
+      - name: Build frontend assets
+        working-directory: widget
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Stamp widget package version
+        env:
+          WIDGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          path = pathlib.Path("widget/pyproject.toml")
+          text = path.read_text(encoding="utf-8")
+          version = os.environ["WIDGET_VERSION"]
+          updated, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one project.version field")
+          path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Install widget package
+        run: python -m pip install --no-deps -e widget
+
+      - name: Run widget tests
+        run: pytest widget/tests
+
+      - name: Build widget distributions
+        run: python -m build widget --no-isolation --outdir dist/widget
+
+      - name: Check widget distributions
+        run: python -m twine check dist/widget/*
+
+      - name: Smoke-test built wheel
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          wheel="$(ls dist/widget/*.whl)"
+          python -m pip install --force-reinstall --no-deps "${wheel}"
+          python - <<'PY'
+          import importlib.metadata
+          import os
+
+          import quantem.widget as widget
+
+          version = importlib.metadata.version("quantem.widget")
+          expected = os.environ["EXPECTED_VERSION"]
+          if version != expected:
+              raise SystemExit(f"Expected quantem.widget {expected}, got {version}")
+
+          for name in widget.__all__:
+              if getattr(widget, name, None) is None:
+                  raise SystemExit(f"Missing widget export: {name}")
+          PY
+
+      - name: Publish widget to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/widget/
