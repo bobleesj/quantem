@@ -30,11 +30,10 @@ jobs:
         uses: conda-incubator/setup-miniconda@v4
         with:
           activate-environment: quantem-widget-release
+          environment-file: widget/environment-release.yml
           auto-update-conda: true
           channel-priority: strict
-          channels: conda-forge
           conda-remove-defaults: true
-          python-version: "3.11"
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -62,9 +61,20 @@ jobs:
               print(f"version={match.group('version')}", file=output)
           PY
 
-      - name: Install Python build tooling
+      - name: Verify Conda environment
         run: |
-          conda install -y anywidget hatchling matplotlib numpy pillow pip pytest python-build pytorch traitlets twine
+          python - <<'PY'
+          import anywidget
+          import h5py
+          import torch
+          import traitlets
+          import zarr
+
+          print("python environment ready")
+          print(f"torch={torch.__version__}")
+          print(f"h5py={h5py.__version__}")
+          print(f"zarr={zarr.__version__}")
+          PY
 
       - name: Install frontend dependencies
         working-directory: widget
@@ -75,6 +85,8 @@ jobs:
         run: |
           npm run typecheck
           npm run build
+          test -s src/quantem/widget/static/show2d.js
+          test -s src/quantem/widget/static/show4dstem.js
 
       - name: Stamp widget package version
         env:
@@ -130,6 +142,10 @@ jobs:
           expected = os.environ["EXPECTED_VERSION"]
           if version != expected:
               raise SystemExit(f"Expected quantem.widget {expected}, got {version}")
+
+          requires = importlib.metadata.requires("quantem.widget") or []
+          if not any(req.startswith("quantem>=") for req in requires):
+              raise SystemExit(f"quantem.widget wheel is missing quantem dependency: {requires}")
 
           for name in widget.__all__:
               if getattr(widget, name, None) is None:
