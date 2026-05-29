@@ -84,9 +84,16 @@ interface HistogramProps {
   dataMax?: number;
 }
 
-function Histogram({ data, precomputedBins, vminPct, vmaxPct, onRangeChange, width = 110, height = 40, theme = "dark", dataMin = 0, dataMax = 1 }: HistogramProps) {
+function Histogram({ data, precomputedBins, vminPct, vmaxPct, onRangeChange, width = 110, height = 40, theme = "dark", dataMin = 0, dataMax = 1, binMin, binMax }: HistogramProps & { binMin?: number; binMax?: number }) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const cpuBins = React.useMemo(() => precomputedBins ? null : computeHistogramFromBytes(data, 256, dataMin, dataMax), [data, precomputedBins, dataMin, dataMax]);
+  // binMin/binMax: range used to compute the histogram BARS. Falls back to
+  // dataMin/dataMax. Trait-anchored displays (vmin/vmax clip the image to a
+  // sub-range of the data) should set binMin/binMax to the FULL data range
+  // so bars show every value; dataMin/dataMax then label the slider in
+  // trait units. Without this split, traits hide most of the histogram.
+  const effBinMin = binMin !== undefined ? binMin : dataMin;
+  const effBinMax = binMax !== undefined ? binMax : dataMax;
+  const cpuBins = React.useMemo(() => precomputedBins ? null : computeHistogramFromBytes(data, 256, effBinMin, effBinMax), [data, precomputedBins, effBinMin, effBinMax]);
   const bins = precomputedBins || cpuBins || new Array(256).fill(0);
   const isDark = theme === "dark";
   const colors = isDark ? { bg: "#1a1a1a", barActive: "#888", barInactive: "#444", border: "#333" } : { bg: "#f0f0f0", barActive: "#666", barInactive: "#bbb", border: "#ccc" };
@@ -310,8 +317,15 @@ function cropROIRegion(
 function computeAutoRange(data: Float32Array, logScale: boolean): { vmin: number; vmax: number } {
   const processed = logScale ? applyLogScale(data) : data;
   const { vmin, vmax, min, max } = percentileClip(processed, 2, 98);
-  if (Number.isFinite(vmin) && Number.isFinite(vmax) && vmax > vmin) return { vmin, vmax };
-  return { vmin: min, vmax: max };
+  // If 2-98% percentile collapses (heavily clustered / sparse data → both
+  // percentile boundaries land in the same bin near 0), fall back to the
+  // full data extrema so the slider shows a real range instead of [0,0].
+  const eps = Math.max(1e-12, Math.abs(max - min) * 1e-6);
+  if (Number.isFinite(vmin) && Number.isFinite(vmax) && vmax - vmin > eps) return { vmin, vmax };
+  if (Number.isFinite(min) && Number.isFinite(max) && max > min) return { vmin: min, vmax: max };
+  // Truly degenerate (all values identical): pad ±0.5 so the slider is usable.
+  const v = Number.isFinite(min) ? min : 0;
+  return { vmin: v - 0.5, vmax: v + 0.5 };
 }
 
 function displayValue(value: number, logScale: boolean): number {
@@ -639,6 +653,11 @@ function Show2D() {
   const [imageHistogramData, setImageHistogramData] = React.useState<Float32Array | null>(null);
   const [imageHistogramBins, setImageHistogramBins] = React.useState<number[] | null>(null);
   const [imageDataRange, setImageDataRange] = React.useState<{ min: number; max: number }>({ min: 0, max: 1 });
+  // autoContrast cache + version forward-declared here so the histogram thumbs
+  // can read the populated cache. Effect that populates lives later in file.
+  const autoContrastCacheRef = React.useRef<{ vmin: number; vmax: number }[]>([]);
+  const [autoContrastVersion, setAutoContrastVersion] = React.useState(0);
+  void autoContrastVersion;  // consumed via re-render trigger
 
   // FFT display state (single mode)
   const [fftVminPct, setFftVminPct] = React.useState(0);
@@ -883,11 +902,26 @@ function Show2D() {
   const roiFftKey = roiFftActive ? selectedRoiKey : "";
 
   // Extract raw float32 bytes and parse into Float32Arrays
-  const allFloats = React.useMemo(() => extractFloat32(frameBytes), [frameBytes]);
+  const [offline] = useModelState<boolean>("offline");
+  const [offlineMin] = useModelState<number>("_offline_min");
+  const [offlineMax] = useModelState<number>("_offline_max");
+  const allFloats = React.useMemo(() => {
+    if (offline && frameBytes && frameBytes.byteLength > 0) {
+      // Offline mode: bytes are uint8-quantized. Dequantize back to float32
+      // using global (lo, hi) scale-bias. Same trick Show3D uses for HTML
+      // export to keep stack size under V8 / browser memory limits.
+      const u8 = new Uint8Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
+      const f32 = new Float32Array(u8.length);
+      const scale = (offlineMax - offlineMin) / 255.0;
+      for (let i = 0; i < u8.length; i++) f32[i] = u8[i] * scale + offlineMin;
+      return f32;
+    }
+    return extractFloat32(frameBytes);
+  }, [frameBytes, offline, offlineMin, offlineMax]);
 
   const [dataVersion, setDataVersion] = React.useState(0);
   const [gpuCmapVersion, setGpuCmapVersion] = React.useState(0);
-  const [autoContrastVersion, setAutoContrastVersion] = React.useState(0);
+  // autoContrastVersion declared earlier (forward declaration for histogram thumbs).
 
   // Initialize WebGPU FFT + colormap engine on mount.
   // Sets refs (not state) — no effect re-triggers on GPU init.
@@ -1154,14 +1188,38 @@ function Show2D() {
       if (linkedHistogram && engine.slotCount >= nImages) {
         const indices = Array.from({ length: nImages }, (_, i) => i);
         engine.computeHistogramBatch(indices, indices.map(() => range), logScale).then(histograms => {
-          setImageHistogramBins(mergeHistogramBins(histograms));
-          setImageHistogramData(null);
+          const merged = mergeHistogramBins(histograms);
+          // Detect race: GPU slots not yet populated → all-zero bins → no bars
+          // drawn. Fall back to CPU histogram from rawDataRef so the user always
+          // sees a populated distribution under the dual-thumb slider.
+          const hasSignal = histograms.length > 0 && merged.some(b => b > 0);
+          if (hasSignal) {
+            setImageHistogramBins(merged);
+            setImageHistogramData(null);
+          } else if (rawDataRef.current && rawDataRef.current.length > 0) {
+            const cpuHists = rawDataRef.current
+              .slice(0, nImages)
+              .map(d => computeHistogramFromBytes(logScale ? applyLogScale(d) : d, 256, range.min, range.max));
+            setImageHistogramBins(mergeHistogramBins(cpuHists));
+            setImageHistogramData(null);
+          }
         });
       } else {
         // GPU histogram - single image, persistent buffers
         engine.computeHistogramWithRange(idx, range.min, range.max, logScale).then(bins => {
-          setImageHistogramBins(bins);
-          setImageHistogramData(null);
+          // Race fallback: if GPU returns zero-only bins (slot data not yet
+          // populated), fall back to CPU compute on rawDataRef so the bar
+          // chart isn't empty. Same trick as linked-hist path.
+          const hasSignal = bins && bins.length > 0 && bins.some(b => b > 0);
+          if (hasSignal) {
+            setImageHistogramBins(bins);
+            setImageHistogramData(null);
+          } else if (rawDataRef.current && rawDataRef.current[idx]) {
+            const raw = rawDataRef.current[idx];
+            const cpu = computeHistogramFromBytes(logScale ? applyLogScale(raw) : raw, 256, range.min, range.max);
+            setImageHistogramBins(cpu);
+            setImageHistogramData(null);
+          }
         });
       }
     } else {
@@ -1213,8 +1271,7 @@ function Show2D() {
   logScaleRef.current = logScale;
   const cmapRef = React.useRef(cmap);
   cmapRef.current = cmap;
-  // Auto-contrast cache: GPU-computed percentile ranges per image
-  const autoContrastCacheRef = React.useRef<{ vmin: number; vmax: number }[]>([]);
+  // autoContrastCacheRef declared earlier (forward declaration for histogram thumbs).
   const autoContrastRequestRef = React.useRef(0);
 
   // Cache per-image data ranges (raw AND log) on data change only.
@@ -1299,12 +1356,66 @@ function Show2D() {
         const range = cr.max - cr.min;
         acRanges.push({ vmin: cr.min + (binLow / 255) * range, vmax: cr.min + (binHigh / 255) * range });
       }
+      // Race fallback: GPU slots not yet populated → allBins empty / acRanges
+      // empty. Compute from rawDataRef on the CPU so Auto applies a real range
+      // instead of staying at the full data extrema (same fix as linked-hist).
+      if (acRanges.length < nImg && rawDataRef.current && rawDataRef.current.length >= nImg) {
+        for (let i = acRanges.length; i < nImg; i++) {
+          const raw = rawDataRef.current[i];
+          if (raw) acRanges.push(computeAutoRange(raw, ls));
+        }
+      }
       if (request !== autoContrastRequestRef.current) return;
       autoContrastCacheRef.current = acRanges;
+      // Reflect the auto-computed range on the histogram dual-thumb slider so
+      // the operator sees what's actually applied. Without this, the slider
+      // sits at 0-100 (user's untouched state) while the image renders at
+      // 2-98 percentile — confusing.
+      // Histogram axis = full per-panel data range. Use cachedRanges if
+      // populated, else compute from raw data (handles the auto-toggled-before-
+      // histogram-effect-runs race).
+      const newPcts: Array<{i:number, vminPct:number, vmaxPct:number}> = [];
+      for (let k = 0; k < acRanges.length; k++) {
+        let cr = histRanges[k];
+        const ac = acRanges[k];
+        if (!ac) continue;
+        // cachedRanges can still be zero-init at this point — recompute from
+        // raw so percentile conversion has a real denominator.
+        if (!cr || cr.max <= cr.min) {
+          const raw = rawDataRef.current?.[k];
+          if (raw) cr = findDataRange(raw);
+        }
+        if (!cr || cr.max <= cr.min) continue;
+        const vminPct = Math.max(0, Math.min(100, ((ac.vmin - cr.min) / (cr.max - cr.min)) * 100));
+        const vmaxPct = Math.max(0, Math.min(100, ((ac.vmax - cr.min) / (cr.max - cr.min)) * 100));
+        newPcts.push({i: k, vminPct, vmaxPct});
+      }
+      // Skip the pct-write when explicit vmin/vmax traits are set — they
+      // anchor the display range, so writing pcts derived from data range
+      // produces a histogram-thumb mismatch (degenerate -0.3/-0.3 case).
+      const traitsAnchor = traitVmin != null && traitVmax != null;
+      const hasPerImageTraits = traitVmins && traitVmaxs && traitVmins.some((v, i) => v != null && traitVmaxs[i] != null);
+      if (!traitsAnchor && !hasPerImageTraits) {
+        // Write all panel pcts in a single state update.
+        setContrastStates(prev => {
+          const m = new Map(prev);
+          for (const p of newPcts) m.set(p.i, { vminPct: p.vminPct, vmaxPct: p.vmaxPct });
+          return m;
+        });
+        // Linked-contrast mode reads `linkedContrastState`, not the per-panel
+        // map. Mirror the auto range into it so the dual-thumb slider reflects
+        // Auto when contrast is grouped. Use the widest envelope so all panels
+        // still display within the active bars.
+        if (linkedContrast && newPcts.length > 0) {
+          const vminPct = Math.min(...newPcts.map(p => p.vminPct));
+          const vmaxPct = Math.max(...newPcts.map(p => p.vmaxPct));
+          setLinkedContrastState({ vminPct, vmaxPct });
+        }
+      }
       console.log(`[Show2D] GPU auto-contrast: ${nImg} images, ${allBins.length} histograms`);
       setAutoContrastVersion(v => v + 1);
     })();
-  }, [autoContrast, dataVersion, logScale, gpuCmapVersion]);
+  }, [autoContrast, dataVersion, logScale, gpuCmapVersion, linkedContrast, traitVmin, traitVmax, traitVmins, traitVmaxs]);
 
   // -------------------------------------------------------------------------
   // Data effect: normalize + colormap → reusable offscreen canvases
@@ -4126,7 +4237,7 @@ function Show2D() {
                         })}
                       </Box>
                     ) : (
-                      <Histogram data={imageHistogramData} precomputedBins={imageHistogramBins} vminPct={imageVminPct} vmaxPct={imageVmaxPct} onRangeChange={(min, max) => { if (autoContrast) setAutoContrast(false); setContrastState(activeContrastIdx, { vminPct: min, vmaxPct: max }); }} width={110} height={58} theme={themeInfo.theme === "dark" ? "dark" : "light"} dataMin={traitVmin != null && traitVmax != null ? displayValue(traitVmin, logScale) : imageDataRange.min} dataMax={traitVmin != null && traitVmax != null ? displayValue(traitVmax, logScale) : imageDataRange.max} />
+                      <Histogram data={imageHistogramData} precomputedBins={imageHistogramBins} vminPct={imageVminPct} vmaxPct={imageVmaxPct} onRangeChange={(min, max) => { if (autoContrast) setAutoContrast(false); setContrastState(activeContrastIdx, { vminPct: min, vmaxPct: max }); }} width={110} height={58} theme={themeInfo.theme === "dark" ? "dark" : "light"} dataMin={traitVmin != null && traitVmax != null ? displayValue(traitVmin, logScale) : imageDataRange.min} dataMax={traitVmin != null && traitVmax != null ? displayValue(traitVmax, logScale) : imageDataRange.max} binMin={imageDataRange.min} binMax={imageDataRange.max} />
                     )}
                   </Box>
                 )}

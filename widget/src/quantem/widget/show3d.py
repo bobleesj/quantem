@@ -5,10 +5,8 @@ For viewing a stack of 2D images (e.g., defocus sweep, time series, z-stack, mov
 Includes playback controls, statistics, ROI selection, FFT, and more.
 """
 
-import csv
 import gc
 import http.server
-import io
 import json
 import math
 import pathlib
@@ -19,7 +17,6 @@ import time
 import urllib.parse
 import warnings
 import weakref
-import zipfile
 from enum import Enum
 from typing import Self
 
@@ -30,7 +27,6 @@ import traitlets
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.show2d import _reject_unknown_kwargs
 from quantem.widget.state import (
-    build_json_header,
     resolve_widget_version,
     save_state_file,
     unwrap_state_payload,
@@ -52,6 +48,99 @@ def _all_finite(arr: np.ndarray, *, chunk_size: int = 1_000_000) -> bool:
         if not np.isfinite(flat[start : start + chunk_size]).all():
             return False
     return True
+
+
+def _normalize_padding(padding: object) -> tuple[int, int]:
+    """Normalize constructor spatial padding to (rows, cols)."""
+    if isinstance(padding, bool):
+        raise ValueError("padding must be a non-negative int or (rows, cols), not bool")
+    if isinstance(padding, (int, np.integer)):
+        pad = (int(padding), int(padding))
+    else:
+        try:
+            vals = tuple(padding)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError("padding must be a non-negative int or (rows, cols)") from exc
+        if len(vals) != 2:
+            raise ValueError("padding tuple must contain exactly two values: (rows, cols)")
+        if any(isinstance(v, bool) for v in vals):
+            raise ValueError("padding values must be non-negative integers, not bool")
+        pad = (int(vals[0]), int(vals[1]))
+    if pad[0] < 0 or pad[1] < 0:
+        raise ValueError(f"padding must be non-negative, got {pad}")
+    return pad
+
+
+def _pad_stack(data: np.ndarray, padding: tuple[int, int],
+               mode: str = "median") -> np.ndarray:
+    """Pad a (N, H, W) stack with a spatial border.
+
+    ``mode="median"`` (default) fills with the stack median so the border is
+    contrast-neutral - it sits at the histogram centre and does not shift the
+    per-frame percentile clip. ``mode="constant"`` fills with 0 (black), which
+    drags the low percentile down and darkens the real image.
+
+    Speed: ``np.pad`` has its own ``mode="median"`` but it recomputes a median
+    per pad-vector and is slow on a large stack. We compute ONE scalar median
+    (sampled to ~1e6 elements - the border value does not need an exact median)
+    and do a constant fill, so the pad itself is a fast memset.
+    """
+    pad_y, pad_x = padding
+    if pad_y == 0 and pad_x == 0:
+        return data
+    if mode == "constant":
+        fill = 0.0
+    elif mode == "median":
+        flat = data.ravel()
+        sample = flat[:: max(1, flat.size // 1_000_000)]
+        fill = float(np.median(sample))
+    else:
+        raise ValueError(f"pad_mode must be 'median' or 'constant', got {mode!r}")
+    return np.pad(data, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)),
+                  mode="constant", constant_values=fill)
+
+
+def _normalize_crop(crop: object) -> tuple[int, int, int, int]:
+    """Normalize constructor spatial crop to (top, bottom, left, right)."""
+    if isinstance(crop, bool):
+        raise ValueError("crop must be a non-negative int, (rows, cols), or (top, bottom, left, right), not bool")
+    if isinstance(crop, (int, np.integer)):
+        c = int(crop)
+        vals = (c, c, c, c)
+    else:
+        try:
+            raw = tuple(crop)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError("crop must be a non-negative int, (rows, cols), or (top, bottom, left, right)") from exc
+        if len(raw) == 2:
+            if any(isinstance(v, bool) for v in raw):
+                raise ValueError("crop values must be non-negative integers, not bool")
+            rows, cols = int(raw[0]), int(raw[1])
+            vals = (rows, rows, cols, cols)
+        elif len(raw) == 4:
+            if any(isinstance(v, bool) for v in raw):
+                raise ValueError("crop values must be non-negative integers, not bool")
+            vals = tuple(int(v) for v in raw)
+        else:
+            raise ValueError("crop tuple must contain 2 values (rows, cols) or 4 values (top, bottom, left, right)")
+    if any(v < 0 for v in vals):
+        raise ValueError(f"crop must be non-negative, got {vals}")
+    return vals
+
+
+def _crop_stack(data: np.ndarray, crop: tuple[int, int, int, int]) -> np.ndarray:
+    """Crop a (N, H, W) stack by (top, bottom, left, right) pixels."""
+    top, bottom, left, right = crop
+    if top == bottom == left == right == 0:
+        return data
+    h, w = int(data.shape[1]), int(data.shape[2])
+    if top + bottom >= h or left + right >= w:
+        raise ValueError(
+            f"crop {crop} removes the entire image: input spatial shape is {(h, w)}"
+        )
+    row_stop = h - bottom if bottom else h
+    col_stop = w - right if right else w
+    return data[:, top:row_stop, left:col_stop]
 
 
 class Colormap(str, Enum):
@@ -87,6 +176,7 @@ _VALID_CMAPS = frozenset({
 # Comm path to survive. The data is still exact float32; large stacks move as
 # sliding windows instead of browser-hostile 256 MB+ messages.
 _MAX_PLAYBACK_CHUNK_BYTES = 128 * 1024 * 1024
+_MAX_PLAYBACK_FPS = 60.0
 
 
 class _Show3DFrameHTTPServer(http.server.ThreadingHTTPServer):
@@ -116,7 +206,7 @@ class Show3D(anywidget.AnyWidget):
     - FFT panel with optional Hann window
     - Side-by-side multi-panel mode with linked or independent zoom / pan / contrast
     - Frame hiding (``hide``, ``show``, ``set_hidden``, ``show_all``) without rebuilding
-    - PNG / PDF / TIFF single-frame export, GIF and ZIP stack export
+    - Python-side PNG / PDF / TIFF single-frame save via ``save_image``
     - JSON state save/load via ``state_dict`` / ``load_state_dict`` / ``save``
     - Explicit ``free`` to release VRAM/RAM held by traitlets observers
 
@@ -150,7 +240,7 @@ class Show3D(anywidget.AnyWidget):
     percentile_high : float, default 99.5
         Upper percentile for auto-contrast.
     fps : float, default 5.0
-        Frames per second for playback.
+        Frames per second for playback, capped at 60.
     timestamps : list of float, optional
         Timestamps for each frame (e.g., seconds or dose values).
     timestamp_unit : str, default "s"
@@ -162,6 +252,15 @@ class Show3D(anywidget.AnyWidget):
         alongside a control panel.  This controls **display only** - the
         underlying stack resolution is never resampled; scrubbing and zoom
         still see every pixel of the full-resolution frame.
+    padding : int or tuple[int, int], default 0
+        Zero-valued spatial border added to every frame before display. Use
+        this when aligned movies need extra field of view so shifted frames do
+        not crop at the canvas edge. An int pads rows and columns equally;
+        ``(rows, cols)`` pads each axis independently.
+    crop : int or tuple[int, int] or tuple[int, int, int, int], default 0
+        Spatial crop applied before padding. Use an int to crop all sides,
+        ``(rows, cols)`` for symmetric row/column cropping, or
+        ``(top, bottom, left, right)`` for side-specific cropping.
     max_cols : int, default 4
         Multi-panel grid wrap.  ``0`` = single row (no wrap), ``N>0`` = wrap into
         rows of at most ``N`` panels.  Default ``4`` is a good fit for a
@@ -176,6 +275,9 @@ class Show3D(anywidget.AnyWidget):
         Font size in CSS pixels for the per-panel title drawn at the top of
         each multi-panel slot.  Bump to ``14–16`` for slide-projection clarity;
         drop to ``9`` to fit titles inside narrow panels on a small screen.
+    show_panel_titles : bool, default True
+        Draw the top-center per-panel title and frame counter on multi-panel
+        canvases. Set ``False`` for clean GIF/video exports.
     show_resize_handles : bool, default True
         Render the bottom-right corner triangle on every real panel.  Dragging
         any handle resizes the entire multi-panel canvas (linked).  Set
@@ -185,6 +287,10 @@ class Show3D(anywidget.AnyWidget):
         Draw the ``1.0×`` zoom readout at the bottom-left of every panel.
         Set ``False`` for clean static layouts or when the scale bar alone
         is enough to communicate scale.
+    show_scale_bar : bool, default True
+        Draw the bottom-right scale bar. When ``pixel_size`` is provided the
+        label uses physical units; otherwise it shows pixel units. Set
+        ``False`` for GIF/video exports or uncluttered figure captures.
     Attributes
     ----------
     render_total_ms : int or None
@@ -219,7 +325,7 @@ class Show3D(anywidget.AnyWidget):
       replaces the data without rebuilding the widget.
     - When the stack is large (>32 MB per frame), an internal display copy is
       binned for faster scrubbing; full-resolution data is kept for stats,
-      ROIs, FFT, profiles, and image export.
+      ROIs, FFT, profiles, and direct image saving.
     - Multi-panel mode is auto-detected from input shape and configured via
       ``n_panels``, ``panel_titles``, and the ``link_*`` traits.
     - Call ``free()`` before discarding the widget; ``del`` alone will not
@@ -247,8 +353,8 @@ class Show3D(anywidget.AnyWidget):
     frame_seq = traitlets.Int(0).tag(sync=True)
     # Offline mode: when True at __init__, the full (N, H, W) stack is packed
     # into _offline_stack so JS can slice client-side without a Python kernel.
-    # Use for nbconvert HTML exports where the kernel is dead after Save Widget
-    # State + Export. Slider still fires slice_idx change; JS reads from
+    # Use for saved nbconvert HTML where the kernel is dead after the
+    # widget state is embedded. Slider still fires slice_idx change; JS reads from
     # _offline_stack instead of waiting on a Comm round-trip.
     #
     # The packed stack is uint8-quantized against the global (min, max) of the
@@ -268,6 +374,8 @@ class Show3D(anywidget.AnyWidget):
     title = traitlets.Unicode("").tag(sync=True)
     cmap = traitlets.Unicode("magma").tag(sync=True)
     dim_label = traitlets.Unicode("Frame").tag(sync=True)
+    dim_sampling = traitlets.Float(1.0).tag(sync=True)
+    dim_unit = traitlets.Unicode("").tag(sync=True)
 
     # Multi-Panel (side-by-side stacks, independent zoom by default with optional link)
     n_panels = traitlets.Int(1).tag(sync=True)
@@ -293,6 +401,7 @@ class Show3D(anywidget.AnyWidget):
     # Per-widget customization for multi-panel display.
     show_resize_handles = traitlets.Bool(True).tag(sync=True)
     show_zoom_indicator = traitlets.Bool(True).tag(sync=True)
+    show_panel_titles = traitlets.Bool(True).tag(sync=True)
     panel_title_font_size = traitlets.Int(11).tag(sync=True)
     panel_gap = traitlets.Int(10).tag(sync=True)
     # Hover-x hide feature: enables UI to drop frames from scrubber without
@@ -308,6 +417,15 @@ class Show3D(anywidget.AnyWidget):
     reverse = traitlets.Bool(False).tag(sync=True)  # Play in reverse direction
     boomerang = traitlets.Bool(False).tag(sync=True)  # Ping-pong playback
     fps = traitlets.Float(5.0).tag(sync=True)  # Default 5 FPS for easier control
+    # Moving-window time average (temporal binning for noisy data). 1 = off.
+    # The displayed frame is the mean of `avg_window` consecutive frames.
+    # Edge behavior: the window slides inward to stay FULL-WIDTH rather than
+    # shrinking - so frame 0 with window 5 averages frames [0..4], and the last
+    # frame averages the final 5. This keeps denoising strength constant across
+    # the stack, at the cost of the average not being centered on the displayed
+    # index near the ends (frame 0 shows the mean centered ~2 frames in). Even
+    # windows are front-biased (window 4 = [idx-2 .. idx+1]).
+    avg_window = traitlets.Int(1).tag(sync=True)
     loop = traitlets.Bool(True).tag(sync=True)
     loop_start = traitlets.Int(0).tag(sync=True)  # Start frame for loop range
     loop_end = traitlets.Int(-1).tag(sync=True)  # End frame for loop (-1 = last)
@@ -398,17 +516,12 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     profile_line = traitlets.List(traitlets.Dict()).tag(sync=True)
     profile_width = traitlets.Int(1).tag(sync=True)
-
-    # =========================================================================
-    # Export (GIF / ZIP of PNGs)
-    # =========================================================================
-    _gif_export_requested = traitlets.Bool(False).tag(sync=True)
-    _gif_data = traitlets.Bytes(b"").tag(sync=True)
-    _gif_metadata_json = traitlets.Unicode("").tag(sync=True)
-    _zip_export_requested = traitlets.Bool(False).tag(sync=True)
-    _zip_data = traitlets.Bytes(b"").tag(sync=True)
-    _bundle_export_requested = traitlets.Bool(False).tag(sync=True)
-    _bundle_data = traitlets.Bytes(b"").tag(sync=True)
+    # Kymograph (space-time) side panel: when on with a drawn profile line, JS
+    # samples that line on every frame from _offline_stack into a static
+    # (n_slices, line_length) image - distance along the line on X, frame/time
+    # on Y. Single-panel only; JS hides the toggle when n_panels > 1 or the
+    # offline stack is absent (it needs every frame client-side to build it).
+    show_kymograph = traitlets.Bool(False).tag(sync=True)
 
     # =========================================================================
     # Playback Buffer (sliding prefetch)
@@ -441,6 +554,15 @@ class Show3D(anywidget.AnyWidget):
             raise traitlets.TraitError(
                 f"Invalid diff_mode '{val}'. Must be one of: {sorted(self._VALID_DIFF_MODES)}"
             )
+        return val
+
+    @traitlets.validate("avg_window")
+    def _validate_avg_window(self, proposal: dict) -> int:
+        val = int(proposal["value"])
+        if val < 1:
+            raise traitlets.TraitError(f"avg_window must be >= 1, got {val}")
+        if val > 15:
+            raise traitlets.TraitError(f"avg_window must be <= 15, got {val}")
         return val
 
     @traitlets.validate("playback_path")
@@ -536,7 +658,7 @@ class Show3D(anywidget.AnyWidget):
     @traitlets.validate("labels")
     def _validate_labels(self, proposal: dict) -> list:
         """Require labels length to match n_slices or be empty."""
-        # Length must match n_slices; mismatch caused IndexError in ZIP export.
+        # Length must match n_slices for label lookups.
         val = list(proposal["value"])
         if val and len(val) != int(self.n_slices):
             raise traitlets.TraitError(
@@ -628,13 +750,13 @@ class Show3D(anywidget.AnyWidget):
 
     @traitlets.validate("fps")
     def _validate_fps(self, proposal: dict) -> float:
-        """Reject non-finite or non-positive fps."""
+        """Reject invalid fps and cap playback at the browser budget."""
         val = float(proposal["value"])
         if not math.isfinite(val):
             raise traitlets.TraitError(f"fps must be finite, got {val}")
         if val <= 0:
             raise traitlets.TraitError(f"fps must be > 0, got {val}")
-        return val
+        return min(val, _MAX_PLAYBACK_FPS)
 
     @traitlets.validate("slice_idx")
     def _validate_slice_idx(self, proposal: dict) -> int:
@@ -729,7 +851,7 @@ class Show3D(anywidget.AnyWidget):
         vmin: float | None = None,
         vmax: float | None = None,
         pixel_size: float = 0.0,
-        pixel_unit: str = "A",
+        pixel_unit: str | None = None,
         smooth: bool = False,
         image_rotation: int = 0,
         log_scale: bool = False,
@@ -737,14 +859,18 @@ class Show3D(anywidget.AnyWidget):
         percentile_low: float = 0.5,
         percentile_high: float = 99.5,
         fps: float = 5.0,
+        avg_window: int = 1,
         timestamps: list[float] | None = None,
         timestamp_unit: str = "s",
         show_fft: bool = False,
         fft_window: bool = True,
         show_playback: bool = False,
-        show_stats: bool = False,
+        show_stats: bool | None = None,
         show_controls: bool = True,
         size: int = 0,
+        crop: int | tuple[int, int] | tuple[int, int, int, int] = 0,
+        padding: int | tuple[int, int] = 0,
+        pad_mode: str = "median",
         diff_mode: str = "off",
         buffer_size: int = 64,
         dim_label: str = "Frame",
@@ -757,8 +883,10 @@ class Show3D(anywidget.AnyWidget):
         max_cols: int | None = None,
         panel_gap: int | None = None,
         panel_title_font_size: int | None = None,
+        show_panel_titles: bool | None = None,
         show_resize_handles: bool | None = None,
         show_zoom_indicator: bool | None = None,
+        show_scale_bar: bool | None = None,
         dedupe_identical_panels: bool = False,
         **kwargs,
     ):
@@ -770,10 +898,14 @@ class Show3D(anywidget.AnyWidget):
             kwargs["panel_gap"] = int(panel_gap)
         if panel_title_font_size is not None:
             kwargs["panel_title_font_size"] = int(panel_title_font_size)
+        if show_panel_titles is not None:
+            kwargs["show_panel_titles"] = bool(show_panel_titles)
         if show_resize_handles is not None:
             kwargs["show_resize_handles"] = bool(show_resize_handles)
         if show_zoom_indicator is not None:
             kwargs["show_zoom_indicator"] = bool(show_zoom_indicator)
+        if show_scale_bar is not None:
+            kwargs["scale_bar_visible"] = bool(show_scale_bar)
         _t0 = time.perf_counter()
         # Reject unknown kwargs so typos raise instead of being silently ignored.
         _reject_unknown_kwargs(type(self), kwargs)
@@ -791,11 +923,12 @@ class Show3D(anywidget.AnyWidget):
                             smooth=smooth, image_rotation=image_rotation,
                             log_scale=log_scale,
                             auto_contrast=auto_contrast, percentile_low=percentile_low,
-                            percentile_high=percentile_high, fps=fps, timestamps=timestamps,
+                            percentile_high=percentile_high, fps=fps, avg_window=avg_window,
+                            timestamps=timestamps,
                             timestamp_unit=timestamp_unit, show_fft=show_fft,
                             fft_window=fft_window, show_playback=show_playback,
                             show_stats=show_stats, show_controls=show_controls,
-                            size=size,
+                            size=size, crop=crop, padding=padding, pad_mode=pad_mode,
                             diff_mode=diff_mode, buffer_size=buffer_size,
                             dim_label=dim_label, use_torch=use_torch, device=device,
                             display_bin=display_bin, offline=offline,
@@ -805,12 +938,15 @@ class Show3D(anywidget.AnyWidget):
     def _init_sync(self, data_args: tuple, *, labels: list[str] | None,
                    panel_titles: list[str] | None, title: str,
                    cmap: str | Colormap, vmin: float | None, vmax: float | None,
-                   pixel_size: float, pixel_unit: str, smooth: bool, image_rotation: int,
+                   pixel_size: float, pixel_unit: str | None, smooth: bool, image_rotation: int,
                    log_scale: bool, auto_contrast: bool, percentile_low: float,
-                   percentile_high: float, fps: float, timestamps: list[float] | None,
+                   percentile_high: float, fps: float, avg_window: int,
+                   timestamps: list[float] | None,
                    timestamp_unit: str, show_fft: bool, fft_window: bool,
-                   show_playback: bool, show_stats: bool, show_controls: bool,
-                   size: int, diff_mode: str, buffer_size: int, dim_label: str,
+                   show_playback: bool, show_stats: bool | None, show_controls: bool,
+                   size: int, crop: int | tuple[int, int] | tuple[int, int, int, int],
+                   padding: int | tuple[int, int], pad_mode: str,
+                   diff_mode: str, buffer_size: int, dim_label: str,
                    use_torch: bool | None, device: str | None,
                    display_bin: int | str, offline: bool | None,
                    state: dict | str | pathlib.Path | None,
@@ -824,6 +960,11 @@ class Show3D(anywidget.AnyWidget):
         self._frame_server_thread = None
         self._frame_server_token = secrets.token_urlsafe(18)
         self._separate_panel_data = None
+        self._crop = _normalize_crop(crop)
+        self._padding = _normalize_padding(padding)
+        if pad_mode not in ("median", "constant"):
+            raise ValueError(f"pad_mode must be 'median' or 'constant', got {pad_mode!r}")
+        self._pad_mode = pad_mode
 
         # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
         # merely because CUDA/MPS exists: real multi-panel ptycho stacks can be
@@ -877,14 +1018,20 @@ class Show3D(anywidget.AnyWidget):
         # Check if data is a Dataset3d and extract metadata
         _extracted_title = None
         _extracted_pixel_size = None
+        _extracted_pixel_unit = None
+        _extracted_dim_sampling = None
+        _extracted_dim_unit = None
         if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
             _extracted_title = data.name if data.name else None
             if hasattr(data, "sampling") and len(data.sampling) >= 3:
                 sampling_val = float(data.sampling[1])
+                _extracted_dim_sampling = float(data.sampling[0])
                 if hasattr(data, "units"):
                     units = list(data.units)
-                    if units[1] in ("nm", "nanometer"):
-                        sampling_val = sampling_val * 10  # nm → Å
+                    if len(units) >= 1:
+                        _extracted_dim_unit = str(units[0])
+                    if len(units) >= 2:
+                        _extracted_pixel_unit = str(units[1])
                 _extracted_pixel_size = sampling_val
             data = data.array
 
@@ -906,6 +1053,7 @@ class Show3D(anywidget.AnyWidget):
                 "Data contains NaN or inf. Clean first: "
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
             )
+        data = _pad_stack(_crop_stack(data, self._crop), self._padding, self._pad_mode)
 
         # Multi-panel: convert remaining args, validate shapes, concatenate.
         # If the caller repeats the same stack object across panels, keep the
@@ -972,6 +1120,7 @@ class Show3D(anywidget.AnyWidget):
                             f"Panel {i}: complex data not accepted. Convert first: "
                             "np.abs(arr) for magnitude or np.angle(arr) for phase."
                         )
+                    arr = _pad_stack(_crop_stack(arr, self._crop), self._padding, self._pad_mode)
                     # Image (H,W) must match across panels - viewer cannot composite
                     # different image sizes into one canvas.
                     if arr.shape[1:] != panels[0].shape[1:]:
@@ -1160,6 +1309,15 @@ class Show3D(anywidget.AnyWidget):
         # Use extracted pixel_size if not explicitly provided
         if pixel_size == 0.0 and _extracted_pixel_size is not None:
             pixel_size = _extracted_pixel_size
+            if (
+                (pixel_unit is None or pixel_unit in ("A", "Å", "angstrom", "Angstrom"))
+                and _extracted_pixel_unit in ("nm", "nanometer")
+            ):
+                pixel_size *= 10
+        if pixel_unit is None and _extracted_pixel_unit in ("nm", "nanometer"):
+            pixel_unit = "A"
+        elif pixel_unit is None:
+            pixel_unit = _extracted_pixel_unit or "A"
 
         # Display options
         self.pixel_size = pixel_size
@@ -1175,20 +1333,28 @@ class Show3D(anywidget.AnyWidget):
         self.vmax = vmax
         self._reset_panel_contrast_traits()
         self.fps = fps
+        self.avg_window = avg_window
 
         # Timestamps
         if timestamps is not None:
             self.timestamps = [float(t) for t in timestamps]
+        elif _extracted_dim_sampling is not None:
+            self.timestamps = [float(i * _extracted_dim_sampling) for i in range(self.n_slices)]
         else:
             self.timestamps = []
-        self.timestamp_unit = timestamp_unit
+        self.timestamp_unit = _extracted_dim_unit or timestamp_unit
         self.dim_label = dim_label
+        self.dim_sampling = _extracted_dim_sampling or 1.0
+        self.dim_unit = _extracted_dim_unit or ""
         self.diff_mode = diff_mode
         self._refresh_auto_contrast_ranges()
         self.show_fft = show_fft
         self.fft_window = fft_window
         self.show_playback = show_playback
-        self.show_stats = show_stats
+        # Stats panel on by default for single-panel (cheap, useful readout);
+        # off for multi-panel where N stat blocks would crowd the layout.
+        # Explicit True/False from the caller always wins.
+        self.show_stats = (int(self.n_panels) == 1) if show_stats is None else show_stats
         self.show_controls = show_controls
         self.size = size
         frame_bytes = self.height * self.width * 4  # float32
@@ -1245,9 +1411,6 @@ class Show3D(anywidget.AnyWidget):
             self._on_roi_change,
             names=["roi_active", "roi_list", "roi_selected_idx"],
         )
-        self.observe(self._on_gif_export, names=["_gif_export_requested"])
-        self.observe(self._on_zip_export, names=["_zip_export_requested"])
-        self.observe(self._on_bundle_export, names=["_bundle_export_requested"])
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_prefetch, names=["_prefetch_request"])
         self.observe(self._on_diff_mode_change, names=["diff_mode"])
@@ -1335,6 +1498,11 @@ class Show3D(anywidget.AnyWidget):
                 "Data contains NaN or inf. Clean first: "
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
             )
+        data = _pad_stack(
+            _crop_stack(data, getattr(self, "_crop", (0, 0, 0, 0))),
+            getattr(self, "_padding", (0, 0)),
+            getattr(self, "_pad_mode", "median"),
+        )
         # Stop playback so JS doesn't keep painting from the stale _buffer_bytes
         # while we swap data. Invalidate cached torch view of display data.
         # Cancel any pending ROI plot timer so it doesn't fire mid-swap with
@@ -1486,6 +1654,7 @@ class Show3D(anywidget.AnyWidget):
             "show_stats": self.show_stats,
             "show_controls": self.show_controls,
             "show_fft": self.show_fft,
+            "show_kymograph": self.show_kymograph,
             "fft_window": self.fft_window,
             "show_playback": self.show_playback,
             "pixel_size": self.pixel_size,
@@ -1495,6 +1664,7 @@ class Show3D(anywidget.AnyWidget):
             "scale_bar_visible": self.scale_bar_visible,
             "size": self.size,
             "fps": self.fps,
+            "avg_window": self.avg_window,
             "loop": self.loop,
             "reverse": self.reverse,
             "boomerang": self.boomerang,
@@ -1514,6 +1684,8 @@ class Show3D(anywidget.AnyWidget):
             "profile_width": self.profile_width,
             "diff_mode": self.diff_mode,
             "dim_label": self.dim_label,
+            "dim_sampling": self.dim_sampling,
+            "dim_unit": self.dim_unit,
             "labels": list(self.labels),
             "panel_titles": list(self.panel_titles),
             "timestamps": list(self.timestamps),
@@ -1640,6 +1812,9 @@ class Show3D(anywidget.AnyWidget):
         for key in panel_len_keys:
             if key in state and isinstance(state[key], list) and len(state[key]) != int(self.n_panels):
                 state.pop(key)
+        if int(self.n_panels) > 1:
+            for key in ("roi_active", "roi_list", "roi_selected_idx"):
+                state.pop(key, None)
         for key in list(state):
             if key not in allowed:
                 unknown.append(key)
@@ -2205,7 +2380,7 @@ class Show3D(anywidget.AnyWidget):
                    format: str | None = None, dpi: int = 150) -> pathlib.Path:
         """Save a single frame as a PNG, PDF, or TIFF file.
 
-        The exported image is colorized with the current ``cmap`` and contrast
+        The saved image is colorized with the current ``cmap`` and contrast
         (``vmin`` / ``vmax`` or percentile auto-contrast), so the saved file
         matches what the browser shows for that frame. ``diff_mode`` is
         respected: ``"previous"`` saves ``frame - frame[idx-1]`` and ``"first"``
@@ -2216,7 +2391,7 @@ class Show3D(anywidget.AnyWidget):
         path : str or pathlib.Path
             Output file path. Parent directories are created if needed.
         frame_idx : int | None, optional
-            Frame index to export. Defaults to the current ``slice_idx``.
+            Frame index to save. Defaults to the current ``slice_idx``.
         format : str | None, optional
             One of ``"png"``, ``"pdf"``, ``"tiff"``. If omitted, inferred
             from the file extension; defaults to ``"png"`` if no extension.
@@ -2240,8 +2415,7 @@ class Show3D(anywidget.AnyWidget):
         - PDF output is converted to RGB internally (no alpha channel).
         - Frame indices outside ``[0, n_slices)`` raise ``IndexError``;
           unsupported extensions raise ``ValueError``.
-        - For multi-frame export, use the widget's GIF / ZIP export buttons
-          or call ``save_image`` in a loop.
+        - For multi-frame output, call ``save_image`` in a loop.
         """
         from matplotlib import colormaps
         from PIL import Image
@@ -2277,8 +2451,8 @@ class Show3D(anywidget.AnyWidget):
         """Release VRAM and RAM held by this widget.
 
         Drops the numpy stack, the torch view (if any), the binned display
-        copy, every sync'd bytes trait (frame, ROI plot, GIF, ZIP, bundle,
-        prefetch buffer), and cancels any in-flight ROI debounce timer.
+        copy, synced frame / ROI / prefetch bytes, and cancels any in-flight
+        ROI debounce timer.
         When applicable, also flushes the CuPy memory pool and the FFT plan
         cache (in case a torch tensor was a view into CuPy memory), and
         releases the active torch device cache (``mps`` or ``cuda``).
@@ -2323,7 +2497,7 @@ class Show3D(anywidget.AnyWidget):
         self._data_torch = None
         self._display_data = None
         self._separate_panel_data = None
-        for trait in ("frame_bytes", "roi_plot_data", "_gif_data", "_zip_data", "_bundle_data", "_buffer_bytes"):
+        for trait in ("frame_bytes", "roi_plot_data", "_buffer_bytes"):
             setattr(self, trait, b"")
         gc.collect()
         # Flush cupy pool: _data may have been a torch view into cupy memory.
@@ -2435,6 +2609,10 @@ class Show3D(anywidget.AnyWidget):
     def _on_roi_change(self, change: dict | None = None) -> None:
         """Handle ROI change. Stats for current frame are instant.
         Full-stack ROI plot is debounced (500ms) to avoid UI freeze during drag."""
+        if int(self.n_panels) > 1:
+            self.roi_stats = {}
+            self.roi_plot_data = b""
+            return
         # Auto-select first ROI if the user added one programmatically and
         # roi_selected_idx is still -1 (otherwise stats stay empty silently).
         if self.roi_active and self.roi_list and self.roi_selected_idx < 0:
@@ -2449,35 +2627,6 @@ class Show3D(anywidget.AnyWidget):
         else:
             self.roi_stats = {}
             self.roi_plot_data = b""
-
-    def _on_gif_export(self, change: dict | None = None) -> None:
-        if not self._gif_export_requested:
-            return
-        self._gif_export_requested = False
-        try:
-            self._generate_gif()
-        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
-            # On error: clear _gif_data + bump frame_seq so JS observer fires
-            # and resets exporting=False. Without this the UI shows "..." forever.
-            warnings.warn(f"GIF export failed: {type(e).__name__}: {e}")
-            self._gif_data = b""
-
-    def _on_zip_export(self, change: dict | None = None) -> None:
-        if not self._zip_export_requested:
-            return
-        self._zip_export_requested = False
-        try:
-            self._generate_zip()
-        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
-            warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
-            self._zip_data = b""
-
-    def _on_bundle_export(self, change: dict | None = None) -> None:
-        if not self._bundle_export_requested:
-            return
-        self._bundle_export_requested = False
-        self._generate_bundle()
-
 
     # === Internal primitives ===
 
@@ -2757,9 +2906,8 @@ class Show3D(anywidget.AnyWidget):
 
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         """Normalize frame to uint8 with current display settings."""
-        # Signed log so negatives don't collapse to zero. Matches JS `slog` so
-        # GIF/PNG exports look identical to live render for signed data
-        # (diff_mode, phase, residuals, anything that can go negative).
+        # Signed log so negatives don't collapse to zero. Matches JS `slog` for
+        # signed data (diff_mode, phase, residuals, anything that can go negative).
         if self.log_scale:
             frame = np.sign(frame) * np.log1p(np.abs(frame))
 
@@ -2769,37 +2917,6 @@ class Show3D(anywidget.AnyWidget):
             normalized = np.clip((frame - vmin) / (vmax - vmin) * 255, 0, 255)
             return normalized.astype(np.uint8)
         return np.zeros(frame.shape, dtype=np.uint8)
-
-    def _normalize_frames_torch(self, start: int, end: int) -> np.ndarray:
-        """Batch-normalize frames [start, end] on GPU. Returns (N, H, W) uint8 numpy."""
-        frames = self._data_torch[start : end + 1].clone()
-        # Signed log so negatives don't collapse to 0 (matches _normalize_frame
-        # + JS slog). Without this, GIF export of phase/diff data looks wrong.
-        if self.log_scale:
-            frames = torch.sign(frames) * torch.log1p(torch.abs(frames))
-        if self.auto_contrast:
-            flat = frames.reshape(-1).float()
-            # torch.quantile fails with "input tensor is too large" above 2^24 ≈ 16.7M
-            # elements (e.g. 16 × 1370² = 30M). Subsample for percentile estimation -
-            # 1M samples is more than enough for the 2/98 percentile to within ~0.01%.
-            if flat.numel() > 16_000_000:
-                stride = flat.numel() // 1_000_000
-                flat_sub = flat[::stride]
-            else:
-                flat_sub = flat
-            vmin = float(torch.quantile(flat_sub, self.percentile_low / 100.0).item())
-            vmax = float(torch.quantile(flat_sub, self.percentile_high / 100.0).item())
-        else:
-            vmin = self._vmin
-            vmax = self._vmax
-            if self.log_scale:
-                vmin = float(np.sign(vmin) * np.log1p(abs(vmin)))
-                vmax = float(np.sign(vmax) * np.log1p(abs(vmax)))
-        if vmax > vmin:
-            normalized = torch.clamp((frames - vmin) / (vmax - vmin) * 255.0, 0, 255).to(torch.uint8)
-        else:
-            normalized = torch.zeros_like(frames, dtype=torch.uint8)
-        return normalized.cpu().numpy()
 
     def _update_all(self) -> None:
         """Ship frame_bytes to JS. Stats (mean/min/max/std/histogram) are
@@ -2904,6 +3021,8 @@ class Show3D(anywidget.AnyWidget):
         """Merge `updates` into the currently-selected ROI, or append a new ROI
         if none is selected. Fills defaults + cyclic color so single-field edits
         (e.g. `radius=20`) don't strip unspecified fields."""
+        if int(self.n_panels) > 1:
+            raise ValueError("Show3D ROI tools are only available for single-panel widgets.")
         rois = list(self.roi_list)
         color_cycle = ["#4fc3f7", "#81c784", "#ffb74d", "#ce93d8", "#ef5350", "#ffd54f", "#90a4ae", "#a1887f"]
         defaults = {
@@ -3003,196 +3122,3 @@ class Show3D(anywidget.AnyWidget):
         """Sample the line profile on the current display frame (binned, diff-aware)
         so the returned profile matches what the user sees."""
         return self._sample_profile_on(self._get_display_frame(), row0, col0, row1, col1)
-
-    def _roi_timeseries_csv(self) -> str:
-
-        rois = list(self.roi_list)
-        masks = [self._roi_mask(roi) for roi in rois]
-        out = io.StringIO()
-        writer = csv.writer(out)
-        header = ["frame_index", "label"]
-        if self.timestamps and len(self.timestamps) >= self.n_slices:
-            header.append(f"timestamp_{self.timestamp_unit or 'value'}")
-        header.extend([f"roi_{i + 1}_mean" for i in range(len(rois))])
-        writer.writerow(header)
-
-        if self._use_torch:
-            # Vectorized per-ROI means across all frames
-            masks_t = [torch.from_numpy(m).to(self._device) for m in masks]
-            roi_means = []
-            for mask_t in masks_t:
-                masked = self._data_torch[:, mask_t]  # (n_slices, n_pixels)
-                if masked.shape[1] > 0:
-                    roi_means.append(masked.mean(dim=1).cpu().numpy())
-                else:
-                    roi_means.append(np.full(self.n_slices, np.nan))
-            for i in range(self.n_slices):
-                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
-                if self.timestamps and len(self.timestamps) >= self.n_slices:
-                    row.append(float(self.timestamps[i]))
-                for rm in roi_means:
-                    val = rm[i]
-                    row.append(float(val) if not np.isnan(val) else "")
-                writer.writerow(row)
-        else:
-            for i in range(self.n_slices):
-                row = [i, self.labels[i] if i < len(self.labels) else str(i)]
-                if self.timestamps and len(self.timestamps) >= self.n_slices:
-                    row.append(float(self.timestamps[i]))
-                frame = self._data[i]
-                for mask in masks:
-                    region = frame[mask]
-                    row.append(float(region.mean()) if region.size > 0 else "")
-                writer.writerow(row)
-        return out.getvalue()
-
-    def _generate_gif(self) -> None:
-
-        from matplotlib import colormaps
-        from PIL import Image
-
-        start = max(0, self.loop_start)
-        end = self.loop_end if self.loop_end >= 0 else self.n_slices - 1
-        end = min(end, self.n_slices - 1)
-
-        cmap_fn = colormaps.get_cmap(self.cmap)
-        duration_ms = int(1000 / max(0.1, self.fps))
-
-        pil_frames = []
-        if self._use_torch:
-            normalized_all = self._normalize_frames_torch(start, end)
-            for i in range(normalized_all.shape[0]):
-                rgba = cmap_fn(normalized_all[i] / 255.0)
-                rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-                pil_frames.append(Image.fromarray(rgb))
-        else:
-            for i in range(start, end + 1):
-                frame = self._data[i]
-                normalized = self._normalize_frame(frame)
-                rgba = cmap_fn(normalized / 255.0)
-                rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-                pil_frames.append(Image.fromarray(rgb))
-
-        if not pil_frames:
-            with self.hold_sync():
-                self._gif_data = b""
-                self._gif_metadata_json = ""
-            return
-
-        buf = io.BytesIO()
-        # Use shared adaptive palette so frames don't quantize independently
-        # (default PIL per-frame palette caused colormap flicker between slices).
-        pil_p = [f.convert("P", palette=Image.ADAPTIVE, colors=256) for f in pil_frames]
-        pil_p[0].save(
-            buf,
-            format="GIF",
-            save_all=True,
-            append_images=pil_p[1:],
-            duration=duration_ms,
-            loop=0,
-            disposal=2,
-        )
-        metadata = {
-            **build_json_header("Show3D"),
-            "format": "gif",
-            "export_kind": "animated_frames",
-            "frame_range": {"start": int(start), "end": int(end)},
-            "n_frames": int(len(pil_frames)),
-            "duration_ms": int(duration_ms),
-            "display": {
-                "cmap": self.cmap,
-                "log_scale": bool(self.log_scale),
-                "auto_contrast": bool(self.auto_contrast),
-                "percentile_low": float(self.percentile_low),
-                "percentile_high": float(self.percentile_high),
-            },
-        }
-        gif_bytes = buf.getvalue()
-        with self.hold_sync():
-            self._gif_metadata_json = ""
-            self._gif_data = b""
-        with self.hold_sync():
-            self._gif_metadata_json = json.dumps(metadata, indent=2)
-            self._gif_data = gif_bytes
-
-    def _generate_zip(self) -> None:
-
-        from matplotlib import colormaps
-        from PIL import Image
-
-        start = max(0, self.loop_start)
-        end = self.loop_end if self.loop_end >= 0 else self.n_slices - 1
-        end = min(end, self.n_slices - 1)
-
-        cmap_fn = colormaps.get_cmap(self.cmap)
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            metadata = {
-                **build_json_header("Show3D"),
-                "format": "zip",
-                "export_kind": "png_frames",
-                "frame_range": {"start": int(start), "end": int(end)},
-                "n_frames": int(end - start + 1),
-                "display": {"cmap": self.cmap, "log_scale": bool(self.log_scale)},
-            }
-            zf.writestr("metadata.json", json.dumps(metadata, indent=2))
-            if self._use_torch:
-                normalized_all = self._normalize_frames_torch(start, end)
-                for j in range(normalized_all.shape[0]):
-                    i = start + j
-                    rgba = cmap_fn(normalized_all[j] / 255.0)
-                    rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-                    img = Image.fromarray(rgb)
-                    img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG")
-                    label = self.labels[i] if self.labels else str(i).zfill(4)
-                    zf.writestr(f"frame_{label}.png", img_buf.getvalue())
-            else:
-                for i in range(start, end + 1):
-                    frame = self._data[i]
-                    normalized = self._normalize_frame(frame)
-                    rgba = cmap_fn(normalized / 255.0)
-                    rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-                    img = Image.fromarray(rgb)
-                    img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG")
-                    label = self.labels[i] if self.labels else str(i).zfill(4)
-                    zf.writestr(f"frame_{label}.png", img_buf.getvalue())
-        zip_bytes = buf.getvalue()
-        self._zip_data = b""
-        self._zip_data = zip_bytes
-
-    def _generate_bundle(self) -> None:
-
-        from matplotlib import colormaps
-        from PIL import Image
-
-        idx = int(np.clip(self.slice_idx, 0, self.n_slices - 1))
-        cmap_fn = colormaps.get_cmap(self.cmap)
-        # Respect diff_mode so saved frame matches what user sees.
-        frame = self._data[idx]
-        if self.diff_mode == "previous":
-            frame = frame - self._data[idx - 1] if idx > 0 else np.zeros_like(frame)
-        elif self.diff_mode == "first":
-            frame = frame - self._data[0]
-        normalized = self._normalize_frame(frame)
-        rgba = cmap_fn(normalized / 255.0)
-        rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-        img = Image.fromarray(rgb)
-        img_buf = io.BytesIO()
-        img.save(img_buf, format="PNG")
-
-        state_payload = {**build_json_header("Show3D"), "state": self.state_dict()}
-        csv_text = self._roi_timeseries_csv()
-        label = self.labels[idx] if idx < len(self.labels) else str(idx)
-        safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(label)).strip("_") or str(idx)
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f"frame_{safe_label}.png", img_buf.getvalue())
-            zf.writestr("roi_timeseries.csv", csv_text)
-            zf.writestr("state.json", json.dumps(state_payload, indent=2))
-        bundle_bytes = buf.getvalue()
-        self._bundle_data = b""
-        self._bundle_data = bundle_bytes

@@ -430,7 +430,7 @@ function Show3DSlices() {
   const [sliceZ, setSliceZ] = useModelState<number>("slice_z");
   const [title] = useModelState<string>("title");
   const [cmap, setCmap] = useModelState<string>("cmap");
-  const [logScale] = useModelState<boolean>("log_scale");
+  const [logScale, setLogScale] = useModelState<boolean>("log_scale");
   const [autoContrast, setAutoContrast] = useModelState<boolean>("auto_contrast");
   const [traitVmin] = useModelState<number | null>("vmin");
   const [traitVmax] = useModelState<number | null>("vmax");
@@ -618,8 +618,9 @@ function Show3DSlices() {
   // uploads) on every toggle. Cache once per (volume, logScale) tuple.
   const volumeFloats = React.useMemo(() => {
     if (!allFloats) return null;
-    return logScale ? applyLogScale(allFloats) : allFloats;
-  }, [allFloats, logScale]);
+    const ls = logScale ? applyLogScale(allFloats) : allFloats;
+    return maybeFlip(ls, flip);
+  }, [allFloats, logScale, flip]);
 
   // Compute histogram from full volume (stable range across slices).
   // Read the shared `volumeFloats` memo so we don't re-allocate on logScale toggle.
@@ -2308,6 +2309,8 @@ function Show3DSlices() {
               <Switch checked={showCrosshair} onChange={(e) => setShowCrosshair(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle crosshair overlay on slice panels" }} />
               <Typography sx={{ ...controlLabel }} title="Negate displayed values. Useful when phase sign is inverted.">Flip</Typography>
               <Switch checked={flip} onChange={(e) => setFlip(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Flip (negate) displayed values" }} />
+              <Typography sx={{ ...controlLabel }} title="Log scale (signed log1p). Useful for high-dynamic-range volumes.">Log</Typography>
+              <Switch checked={logScale} onChange={(e) => setLogScale(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle log scale (signed log1p) display" }} />
               <Typography sx={{ ...controlLabel }}>Auto</Typography>
               <Switch checked={autoContrast} onChange={(e) => {
                 const on = e.target.checked;
@@ -2343,8 +2346,8 @@ function Show3DSlices() {
                 width={histogramW}
                 height={histogramH}
                 theme={themeInfo.theme === "dark" ? "dark" : "light"}
-                dataMin={flip ? -imageDataRange.max : imageDataRange.min}
-                dataMax={flip ? -imageDataRange.min : imageDataRange.max}
+                dataMin={imageDataRange.min}
+                dataMax={imageDataRange.max}
                 pinBinsToRange={false}
                 ariaHidden
               />

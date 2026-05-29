@@ -496,18 +496,18 @@ struct Params {
   src_height: u32,
   src_x0: u32,
   src_region_width: u32,
-  _unused_out_height: u32,
-  _unused_panel_count: u32,
+  out_height: u32,
+  out_width: u32,
   _unused_cols: u32,
   _unused_rows: u32,
   log_scale: u32,
-  _unused_bg_rgb: u32,
-  _unused_shared_source: u32,
+  bg_rgb: u32,
+  zoom: f32,
   _pad0: u32,
   vmin: f32,
   vmax: f32,
-  _unused_gap: f32,
-  _pad1: f32,
+  pan_x: f32,
+  pan_y: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -538,9 +538,18 @@ fn unpack_rgb(rgb: u32) -> vec4f {
   }
   let region_w = max(1u, min(params.src_region_width, params.src_width));
   let region_x0 = min(params.src_x0, params.src_width - 1u);
-  let local_x = min(u32(in.uv.x * f32(region_w)), region_w - 1u);
-  let src_x = min(region_x0 + local_x, params.src_width - 1u);
-  let src_y = min(u32(in.uv.y * f32(params.src_height)), params.src_height - 1u);
+  let out_w = f32(max(1u, params.out_width));
+  let out_h = f32(max(1u, params.out_height));
+  let local_x = in.uv.x * out_w;
+  let local_y = in.uv.y * out_h;
+  let image_x = (local_x - params.pan_x) / max(params.zoom, 1e-6);
+  let image_y = (local_y - params.pan_y) / max(params.zoom, 1e-6);
+  if (image_x < 0.0 || image_y < 0.0 || image_x >= out_w || image_y >= out_h) {
+    return unpack_rgb(params.bg_rgb);
+  }
+  let src_local_x = min(u32(image_x * f32(region_w) / out_w), region_w - 1u);
+  let src_x = min(region_x0 + src_local_x, params.src_width - 1u);
+  let src_y = min(u32(image_y * f32(params.src_height) / out_h), params.src_height - 1u);
   let src_idx = src_y * params.src_width + src_x;
   var val = data[src_idx];
   if (params.log_scale == 1u) {
@@ -1294,7 +1303,7 @@ export class GPUColormapEngine {
     range: { vmin: number; vmax: number },
     logScale: boolean,
     ctx: GPUCanvasContext,
-    opts: {
+  opts: {
       width: number;
       height: number;
       panelCount: number;
@@ -1482,6 +1491,7 @@ export class GPUColormapEngine {
       rows: number;
       gap: number;
       bgRgb: number;
+      transforms?: { zoom: number; panX: number; panY: number }[];
     },
   ): boolean {
     if (!this.lutBuffer || indices.length === 0) return false;
@@ -1513,17 +1523,18 @@ export class GPUColormapEngine {
       pu[2] = 0;
       pu[3] = slot.width;
       pu[4] = Math.max(1, Math.round(panelH));
-      pu[5] = 1;
+      pu[5] = Math.max(1, Math.round(panelW));
       pu[6] = 1;
       pu[7] = 1;
       pu[8] = panelLogScale ? 1 : 0;
       pu[9] = opts.bgRgb & 0xFFFFFF;
-      pu[10] = 1;
+      const transform = opts.transforms?.[panel];
+      pf[10] = Math.max(1e-6, transform?.zoom ?? 1);
       pu[11] = 0;
       pf[12] = panelRange.vmin;
       pf[13] = panelRange.vmax;
-      pf[14] = 0;
-      pf[15] = 0;
+      pf[14] = transform?.panX ?? 0;
+      pf[15] = transform?.panY ?? 0;
       this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
       if (!slot.directSlotBindGroup) {
         slot.directSlotBindGroup = this.device.createBindGroup({
@@ -2602,8 +2613,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
       const clearGroup = this.device.createBindGroup({
         layout: this.histClearPipeline!.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: slot.paramsBuffer } },
-          { binding: 1, resource: { buffer: slot.dataBuffer } },
           { binding: 2, resource: { buffer: slot.histBinsBuffer } },
         ],
       });
@@ -2688,8 +2697,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
     const clearGroup = this.device.createBindGroup({
       layout: this.histClearPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: slot.dataBuffer } },
         { binding: 2, resource: { buffer: binsBuffer } },
       ],
     });
