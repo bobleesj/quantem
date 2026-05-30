@@ -624,6 +624,10 @@ function pointToSegmentDistance(col: number, row: number, col0: number, row0: nu
 // ============================================================================
 // Constants
 // ============================================================================
+// Reserved GPU slot for offline-mode histogram compute (well above any
+// frame-server slot index = nSlices*nPanels), so uploading the scratch frame
+// never clobbers a cached playback slot.
+const OFFLINE_HIST_SLOT = 1_000_000;
 const CANVAS_TARGET_SIZE = 600;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 30;
@@ -632,6 +636,11 @@ const MAX_PLAYBACK_FPS = 60;
 const clampPlaybackFps = (value: number) => {
   const fps = Number.isFinite(value) ? value : 1;
   return Math.max(1, Math.min(MAX_PLAYBACK_FPS, fps));
+};
+
+const playbackIntervalMs = (value: number) => {
+  const fps = clampPlaybackFps(value);
+  return 1000 / fps;
 };
 
 type ROIItem = {
@@ -1574,7 +1583,7 @@ function Show3D() {
     const dbg = show3dPerfDebug();
     try {
       if (dbg) {
-        dbg.panelFrameFetchMisses = ((dbg.panelFrameFetchMisses as number | undefined) ?? 0) + 1;
+        dbg.panelFrameFetchAttempts = ((dbg.panelFrameFetchAttempts as number | undefined) ?? 0) + 1;
         dbg.lastPanelFrameFetch = `${normalized}:${panelIdx}`;
       }
       const response = await fetch(url.toString(), { cache: "no-store" });
@@ -1589,6 +1598,9 @@ function Show3D() {
       return new Float32Array(buffer);
     } catch (err) {
       if (dbg) {
+        // Real misses only (failed fetch), not every attempt - the old counter
+        // incremented at the top of try and read as "~every request missed".
+        dbg.panelFrameFetchMisses = ((dbg.panelFrameFetchMisses as number | undefined) ?? 0) + 1;
         dbg.lastPanelFrameFetchError = err instanceof Error ? err.message : String(err);
         dbg.lastPanelFrameFetchErrorAt = performance.now();
       }
@@ -2021,7 +2033,7 @@ function Show3D() {
         if (cancelled) return;
 
         const dbgStart = show3dPerfDebug() ?? {};
-        resetFramePacingDebug(dbgStart, 1000 / targetFps);
+        resetFramePacingDebug(dbgStart, playbackIntervalMs(targetFps));
         const startFrames = Number(dbgStart.renderedFrames ?? 0);
         const sampleStart = performance.now();
         setStatus("sampling");
@@ -2265,12 +2277,16 @@ function Show3D() {
                 d.gpuPreloadMisses = ((d.gpuPreloadMisses as number | undefined) ?? 0) + 1;
                 d.gpuPreloadLastMiss = i;
               }
-              break;
+              // One transient miss (stale 409, dropped socket, GPU not yet
+              // ready) must NOT abort the whole preload - skip this frame and
+              // keep going, matching the non-panel branch. `break` here left
+              // the cache permanently below nSlices.
+              continue;
             }
           } catch (err) {
             const d = show3dPerfDebug();
             if (d) d.gpuPreloadError = err instanceof Error ? err.message : String(err);
-            break;
+            continue;
           }
           const d = show3dPerfDebug();
           if (d) {
@@ -2866,6 +2882,9 @@ function Show3D() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [benchmarkRequest, nSlices, separatePanelFrames, canvasW, canvasH, width, height]);
 
+  const playbackHistogramCounterRef = React.useRef(0);
+  const refreshHistogramRef = React.useRef<((idxArg?: number) => void | Promise<void>) | null>(null);
+
   // Playback logic - rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
     if (!playing) {
@@ -2886,7 +2905,10 @@ function Show3D() {
       const c0 = playRef.current;
       const rs0 = c0.loop ? Math.max(0, Math.min(c0.loopStart, c0.nSlices - 1)) : 0;
       const re0 = c0.loop ? Math.max(rs0, Math.min(c0.loopEnd, c0.nSlices - 1)) : c0.nSlices - 1;
-      playbackIdxRef.current = Math.max(rs0, Math.min(re0, sliceIdx));
+      const liveStart = Number.isFinite(playbackIdxRef.current)
+        ? playbackIdxRef.current
+        : (Number.isFinite(displaySliceIdx) ? displaySliceIdx : sliceIdx);
+      playbackIdxRef.current = Math.max(rs0, Math.min(re0, Math.round(liveStart)));
     }
     const pathLen = playRef.current.playbackPath?.length ?? 0;
     pathIdxRef.current = pathLen > 0 ? (playRef.current.reverse ? pathLen : -1) : 0;
@@ -2904,18 +2926,19 @@ function Show3D() {
     };
     const startDbg = show3dPerfDebug();
     const startFps = clampPlaybackFps(benchmarkPlaybackFpsRef.current ?? playRef.current.fps);
-    if (startDbg) resetFramePacingDebug(startDbg, 1000 / Math.max(1, startFps));
+    if (startDbg) resetFramePacingDebug(startDbg, playbackIntervalMs(startFps));
 
-    tick = (now: number) => {
+    tick = (_now: number) => {
+      const tickNow = performance.now();
       const c = playRef.current;
       const effectiveFps = clampPlaybackFps(benchmarkPlaybackFpsRef.current ?? c.fps);
-      const intervalMs = 1000 / effectiveFps;
+      const intervalMs = playbackIntervalMs(effectiveFps);
       const uiUpdateIntervalMs = effectiveFps >= 60 ? 250 : 100;
       const dbg = show3dPerfDebug();
       if (dbg) {
         dbg.playing = true;
         dbg.effectiveFps = effectiveFps;
-        dbg.lastTickAt = now;
+        dbg.lastTickAt = tickNow;
         dbg.currentBufferFloatLength = bufferRef.current?.length ?? 0;
         dbg.currentBufferStart = bufferStartRef.current;
         dbg.currentBufferCount = bufferCountRef.current;
@@ -2927,16 +2950,23 @@ function Show3D() {
       // First tick paints immediately; otherwise every playback start drops
       // one frame before the cadence timer is even allowed to run.
       if (lastFrameTime === 0) {
-        lastFrameTime = now - intervalMs;
-        lastUIUpdate = now;
+        lastFrameTime = tickNow - intervalMs;
+        lastUIUpdate = tickNow;
       }
 
-      const elapsed = now - lastFrameTime;
-      if (elapsed < intervalMs) {
+      const elapsed = tickNow - lastFrameTime;
+      // Frame-pacing tolerance: at 60 fps intervalMs (16.67) equals the vsync
+      // period, so a rAF tick arriving a hair early (elapsed 16.6 < 16.67) would
+      // be dropped and cost a whole vsync -> steady 17/33 ms alternation = 30 fps.
+      // Allow a tick that is within tolerance of the deadline through, and
+      // phase-correct lastFrameTime by the deadline (not tickNow) so drift does
+      // not accumulate. Restores 60 fps on the GPU-cached multi-panel path.
+      const framePacingToleranceMs = Math.min(6, intervalMs * 0.2);
+      if (elapsed + framePacingToleranceMs < intervalMs) {
         scheduleTick();
         return;
       }
-      lastFrameTime = now;
+      lastFrameTime = tickNow - Math.max(0, elapsed - intervalMs);
 
       // Advance frame
       let next: number;
@@ -2987,7 +3017,13 @@ function Show3D() {
       const transformActive = c.diffMode !== "off" || Math.max(1, Math.round(c.avgWindow || 1)) > 1;
       let frame: Float32Array | null = null;
       let frameSource = "buffer";
-      const gpuCachedFrameReady = (offline || transformActive) ? false : gpuFrameCacheUploadedRef.current.has(next);
+      // The GPU-cache fast paths (renderGpuPanelSlice / direct-grid) only handle
+      // imageRotation%4===0; renderGpuPanelSlice bails (returns false) on a 90/270
+      // rotation, which froze playback (renderedFrames + canvas stuck, playing
+      // true). When rotated, skip the GPU-cache path so the frame is fetched and
+      // drawMain applies the rotation. Verified bug 2026-05-29.
+      const rotationAllowsGpuCache = (c.imageRotation % 4) === 0;
+      const gpuCachedFrameReady = (offline || transformActive || !rotationAllowsGpuCache) ? false : gpuFrameCacheUploadedRef.current.has(next);
       const gpuPanelFrameReady = separatePanelFrames && gpuCachedFrameReady;
       if (offline) {
         frame = getOfflineFrame(next);
@@ -3022,7 +3058,7 @@ function Show3D() {
         // Buffer not ready yet - keep requesting frames
         if (dbg) {
           dbg.missingFrame = next;
-          dbg.missingFrameAt = now;
+          dbg.missingFrameAt = tickNow;
         }
         scheduleTick();
         return;
@@ -3057,9 +3093,13 @@ function Show3D() {
           recordFramePacingDebug(d, performance.now(), intervalMs);
           d.renderedFrames = ((d.renderedFrames as number | undefined) ?? 0) + 1;
         }
-        if (now - lastUIUpdate > uiUpdateIntervalMs) {
-          lastUIUpdate = now;
+        if (tickNow - lastUIUpdate > uiUpdateIntervalMs) {
+          lastUIUpdate = tickNow;
           setDisplaySliceIdx(next);
+          playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
+          if (playbackHistogramCounterRef.current === 0) {
+            void refreshHistogramRef.current?.(next);
+          }
         }
         scheduleTick();
         return;
@@ -3078,9 +3118,13 @@ function Show3D() {
           recordFramePacingDebug(d, performance.now(), intervalMs);
           d.renderedFrames = ((d.renderedFrames as number | undefined) ?? 0) + 1;
         }
-        if (now - lastUIUpdate > uiUpdateIntervalMs) {
-          lastUIUpdate = now;
+        if (tickNow - lastUIUpdate > uiUpdateIntervalMs) {
+          lastUIUpdate = tickNow;
           setDisplaySliceIdx(next);
+          playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
+          if (playbackHistogramCounterRef.current === 0) {
+            void refreshHistogramRef.current?.(next);
+          }
         }
         scheduleTick();
         return;
@@ -3345,7 +3389,7 @@ function Show3D() {
           if (!frame && !cpuData) {
             if (dbg) {
               dbg.missingFrame = next;
-              dbg.missingFrameAt = now;
+              dbg.missingFrameAt = tickNow;
             }
             scheduleTick();
             return;
@@ -3399,8 +3443,8 @@ function Show3D() {
       // comfortably out of the frame loop; the canvas still renders every rAF.
       // liveSliceIdx is per-tick for static offline paint and throttled for
       // direct WebGPU offline paint to avoid a competing React render path.
-      if (now - lastUIUpdate > uiUpdateIntervalMs) {
-        lastUIUpdate = now;
+      if (tickNow - lastUIUpdate > uiUpdateIntervalMs) {
+        lastUIUpdate = tickNow;
         if (offlineDirectRender) setLiveSliceIdx(next);
         setDisplaySliceIdx(next);
         if (frame && c.showStats) setLocalStats(computeStats(frame));
@@ -3413,8 +3457,10 @@ function Show3D() {
         // the prefetch buffer, not via Comm), so we drive histogram updates directly
         // here at the same 10 Hz cadence. Skip every 2nd tick → ~5 Hz refresh.
         playbackHistogramCounterRef.current = (playbackHistogramCounterRef.current + 1) % 2;
-        if (frame && playbackHistogramCounterRef.current === 0) {
-          if ((nPanels || 1) > 1 && !linkContrast) {
+        if (playbackHistogramCounterRef.current === 0) {
+          if ((nPanels || 1) > 1 && !linkContrast && frame) {
+            // Per-panel histograms have no single GPU slot; keep the per-panel
+            // CPU extract (cold-ish, only when contrast is unlinked).
             const n = Math.max(1, nPanels || 1);
             const nextData: (Float32Array | null)[] = [];
             const nextRanges: { min: number; max: number }[] = [];
@@ -3428,8 +3474,11 @@ function Show3D() {
             setPanelHistogramData(nextData);
             setPanelDataRanges(nextRanges);
           } else {
-            const histInput = c.logScale ? applyLogScale(frame) : frame;
-            setImageHistogramData(histInput);
+            // GPU histogram for the current frame (honors WebGPU-first-class):
+            // refreshHistogram computes bins on the GPU (live slot or offline
+            // scratch slot) AND sets lastHistogramFrame so it is verifiable.
+            // Replaces the old CPU setImageHistogramData(frame).
+            void refreshHistogramRef.current?.(next);
           }
         }
       }
@@ -3505,7 +3554,6 @@ function Show3D() {
   // inside the Histogram component) still runs if WebGPU isn't available.
   // Debounce: 100 ms past the last scrub frame so drag doesn't fire bin scans
   // on every tick. Playback uses the established 2-tick (5 Hz) throttle.
-  const playbackHistogramCounterRef = React.useRef(0);
   const histogramTimerRef = React.useRef<number | null>(null);
   const histogramRefreshInFlightRef = React.useRef(false);
   const histogramRefreshPendingIdxRef = React.useRef<number | null>(null);
@@ -3519,6 +3567,35 @@ function Show3D() {
     histogramRefreshInFlightRef.current = true;
     const serial = ++histogramRefreshSerialRef.current;
     try {
+      // Offline path: ensurePanelFrameGpu returns false offline, so the GPU
+      // block below never runs and the CPU fallback hits raw==null for
+      // separate-panel -> histogram frozen on frame 0 during offline playback
+      // (the frame-server slots don't exist offline). Bin the dequantized
+      // offline frame directly so the histogram tracks the playing frame.
+      if (offline && !perPanelHistogramEnabled) {
+        const offFrame = getOfflineFrame(renderIdx);
+        if (offFrame && offFrame.length) {
+          const engine = gpuCmapRef.current;
+          let bins: number[] | null = null;
+          // GPU histogram (operator: everything WebGPU). Upload the dequantized
+          // offline frame to a reserved scratch slot, then compute bins on GPU.
+          if (engine && gpuCmapReadyRef.current && dataMax > dataMin) {
+            try {
+              const rgbaCapacity = Math.max(1, width * height);
+              engine.uploadData(OFFLINE_HIST_SLOT, offFrame, width, height, rgbaCapacity, true);
+              bins = await engine.computeHistogramWithRange(OFFLINE_HIST_SLOT, dataMin, dataMax, logScale);
+            } catch {
+              bins = null;  // Histogram component CPU-bins from imageHistogramData below
+            }
+          }
+          const dbg = show3dPerfDebug();
+          if (dbg) { dbg.lastHistogramFrame = renderIdx; dbg.lastHistogramSource = bins ? "offline-gpu" : "offline-cpu"; }
+          setImageDataRange(resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+          setImageHistogramBins(bins);
+          setImageHistogramData(bins ? null : (logScale ? applyLogScale(offFrame) : offFrame));
+          return;
+        }
+      }
       if (!perPanelHistogramEnabled) {
         const engine = gpuCmapRef.current;
         if (
@@ -3565,41 +3642,46 @@ function Show3D() {
         }
       }
 
-    const raw = rawFrameDataRef.current;
-    if (!raw || raw.length === 0) return;
-    if (perPanelHistogramEnabled) {
-      const n = Math.max(1, nPanels || 1);
-      const nextData: (Float32Array | null)[] = [];
-      const nextRanges: { min: number; max: number }[] = [];
-      for (let panel = 0; panel < n; panel++) {
-        const panelData = extractPanelSlice(raw, panel, logScale);
-        nextData.push(panelData);
-        nextRanges.push(panelData && panelData.length > 0
-          ? findDataRange(panelData)
-          : resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+      const raw = rawFrameDataRef.current;
+      if (!raw || raw.length === 0) return;
+      if (perPanelHistogramEnabled) {
+        const n = Math.max(1, nPanels || 1);
+        const nextData: (Float32Array | null)[] = [];
+        const nextRanges: { min: number; max: number }[] = [];
+        for (let panel = 0; panel < n; panel++) {
+          const panelData = extractPanelSlice(raw, panel, logScale);
+          nextData.push(panelData);
+          nextRanges.push(panelData && panelData.length > 0
+            ? findDataRange(panelData)
+            : resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+        }
+        setPanelHistogramData(nextData);
+        setPanelDataRanges(nextRanges);
+        setImageHistogramBins(null);
+        return;
       }
-      setPanelHistogramData(nextData);
-      setPanelDataRanges(nextRanges);
-      setImageHistogramBins(null);
-      return;
-    }
-    const data = logScale ? applyLogScale(raw) : raw;
-    setImageDataRange(resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
-    // GPU bins: the colormap engine has the frame data uploaded to slot 0
-    // already (via the render effect). Reuse that slot's buffer for a
-    // 256-bin compute pass; fall back to CPU bins in the Histogram component
-    // when the engine isn't ready or returns null.
-    const engine = gpuCmapRef.current;
-    let bins: number[] | null = null;
-    if (engine && gpuCmapReadyRef.current && dataMax > dataMin) {
-      try {
-        bins = await engine.computeHistogramWithRange(0, dataMin, dataMax, logScale);
-      } catch {
-        bins = null;  // fall through to CPU path
+      const data = logScale ? applyLogScale(raw) : raw;
+      setImageDataRange(resolveDisplayBounds(dataMin, dataMax, null, null, logScale));
+      // GPU bins: the colormap engine has the frame data uploaded to slot 0
+      // already (via the render effect). Reuse that slot's buffer for a
+      // 256-bin compute pass; fall back to CPU bins in the Histogram component
+      // when the engine isn't ready or returns null.
+      const engine = gpuCmapRef.current;
+      let bins: number[] | null = null;
+      if (engine && gpuCmapReadyRef.current && dataMax > dataMin) {
+        try {
+          // Use the requested frame's slot, not a hardcoded 0 (which is whatever
+          // the data effect last uploaded, not the playing frame).
+          const slot = gpuFrameCacheUploadedRef.current.has(renderIdx) ? renderIdx : 0;
+          bins = await engine.computeHistogramWithRange(slot, dataMin, dataMax, logScale);
+        } catch {
+          bins = null;  // fall through to CPU path
+        }
       }
-    }
-    setImageHistogramBins(bins);
-    setImageHistogramData(data);
+      const dbg = show3dPerfDebug();
+      if (dbg) { dbg.lastHistogramFrame = renderIdx; dbg.lastHistogramSource = bins ? "gpu-slot" : "cpu-data"; }
+      setImageHistogramBins(bins);
+      setImageHistogramData(data);
     } finally {
       histogramRefreshInFlightRef.current = false;
       const pending = histogramRefreshPendingIdxRef.current;
@@ -3609,6 +3691,7 @@ function Show3D() {
       }
     }
   }, [logScale, dataMin, dataMax, perPanelHistogramEnabled, nPanels, extractPanelSlice, displaySliceIdx, separatePanelFrames, canvasW, canvasH, ensurePanelFrameGpu]);
+  refreshHistogramRef.current = refreshHistogram;
   React.useEffect(() => {
     if (playing) {
       return;
@@ -3693,7 +3776,6 @@ function Show3D() {
     const frameData = rawFrameDataRef.current;
     if (!frameData || frameData.length === 0) return;
     if (!mainOffscreenRef.current || !mainImgDataRef.current) return;
-
     // Apply log scale using reusable buffer
     const processed = logScale && logBufferRef.current
       ? applyLogScaleInPlace(frameData, logBufferRef.current)
@@ -3805,9 +3887,9 @@ function Show3D() {
       }
       ensureGpuUpload();
       const capturedVmin = vmin, capturedVmax = vmax;
-      requestAnimationFrame(async () => {
-        if (renderSerial !== gpuRenderSerialRef.current) return;
-        if (!mainOffscreenRef.current) return;
+      const blitAndDraw = async (): Promise<boolean> => {
+        if (renderSerial !== gpuRenderSerialRef.current) return false;
+        if (!mainOffscreenRef.current) return false;
         // Zero-copy: GPU → OffscreenCanvas → ImageBitmap → drawImage
         const bitmaps = engine.renderSlotsToImageBitmap([0], [{ vmin: capturedVmin, vmax: capturedVmax }], false);
         if (bitmaps && bitmaps[0]) {
@@ -3823,7 +3905,7 @@ function Show3D() {
               [0], [{ vmin: capturedVmin, vmax: capturedVmax }],
               [mainOffscreenRef.current], [mainImgDataRef.current], false,
             );
-            if (renderSerial !== gpuRenderSerialRef.current) return;
+            if (renderSerial !== gpuRenderSerialRef.current) return false;
             if (rendered === 0) {
               renderToOffscreenReuse(processed, lut, capturedVmin, capturedVmax, mainOffscreenRef.current!, mainImgDataRef.current!);
             }
@@ -3831,10 +3913,21 @@ function Show3D() {
         }
         // Redraw main canvas (per-panel)
         const canvas = canvasRef.current;
-        if (!canvas) return;
+        if (!canvas) return false;
         const ctx = canvas.getContext("2d");
-        if (renderSerial !== gpuRenderSerialRef.current) return;
+        if (renderSerial !== gpuRenderSerialRef.current) return false;
         if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
+        return true;
+      };
+      requestAnimationFrame(async () => {
+        const ok = await blitAndDraw();
+        // Mac/Metal flush race: a one-shot static render captures the ImageBitmap
+        // before the GPU submit has flushed ~2/3 of the time, leaving the canvas
+        // blank until something re-renders. Playback's continuous rAF self-heals;
+        // a static offline mount has no follow-up frame, so the panels stay black
+        // (D6). Re-blit on a confirming second rAF when NOT playing - by the next
+        // frame the GPU work has flushed and the bitmap is valid. Idempotent.
+        if (ok && !playing) requestAnimationFrame(() => { void blitAndDraw(); });
       });
     } else {
       gpuRenderSerialRef.current++;
@@ -3849,7 +3942,7 @@ function Show3D() {
       const ctx = canvas.getContext("2d");
       if (ctx && mainOffscreenRef.current) drawMain(ctx, mainOffscreenRef.current);
     }
-  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast, panelStates, vminPerPanel, vmaxPerPanel, offline, liveSliceIdx, sliceIdx, diffMode, avgWindow]);
+  }, [frameBytes, frameSeq, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax, dataMin, dataMax, autoVmins, autoVmaxs, smooth, imageRotation, nPanels, linkContrast, panelStates, vminPerPanel, vmaxPerPanel, offline, liveSliceIdx, sliceIdx, diffMode, avgWindow, playing]);
 
   // Per-panel render: each slot gets its own zoom/pan transform. 2px gap
   // between slots painted as the canvas bg (transparent through clearRect).
@@ -6358,6 +6451,45 @@ function Show3D() {
     };
   }, [isResizingMain, resizeStart]);
 
+  const clampSlice = (idx: number) => Math.max(0, Math.min(nSlices - 1, Math.round(idx)));
+  const currentPlaybackIndex = () => (
+    Number.isFinite(playbackIdxRef.current)
+      ? playbackIdxRef.current
+      : (Number.isFinite(displaySliceIdx) ? displaySliceIdx : sliceIdx)
+  );
+  const playFromCurrentFrame = (direction: 1 | -1 | null = null) => {
+    const nextReverse = direction === null ? reverse : direction < 0;
+    const rangeStart = loop ? Math.max(0, Math.min(loopStart, nSlices - 1)) : 0;
+    const rangeEnd = loop ? Math.max(rangeStart, Math.min(effectiveLoopEnd, nSlices - 1)) : nSlices - 1;
+    let start = Math.max(rangeStart, Math.min(rangeEnd, Math.round(currentPlaybackIndex())));
+    if (!loop) {
+      if (!nextReverse && start >= rangeEnd) start = rangeStart;
+      if (nextReverse && start <= rangeStart) start = rangeEnd;
+    }
+    playbackIdxRef.current = start;
+    setDisplaySliceIdx(start);
+    setLiveSliceIdx(start);
+    setSliceIdx(start);
+    if (direction !== null) setReverse(nextReverse);
+    setPlaying(true);
+  };
+  const pausePlayback = () => {
+    const current = clampSlice(currentPlaybackIndex());
+    playbackIdxRef.current = current;
+    setDisplaySliceIdx(current);
+    setLiveSliceIdx(current);
+    setSliceIdx(current);
+    setPlaying(false);
+  };
+  const stopPlayback = () => {
+    const home = loop ? Math.max(0, Math.min(loopStart, nSlices - 1)) : 0;
+    playbackIdxRef.current = home;
+    setDisplaySliceIdx(home);
+    setLiveSliceIdx(home);
+    setSliceIdx(home);
+    setPlaying(false);
+  };
+
   // Keyboard
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (shouldIgnoreWidgetShortcut(e.target)) return;
@@ -6366,7 +6498,8 @@ function Show3D() {
 
     switch (e.key) {
         case " ":
-          setPlaying(!playing);
+          if (playing) pausePlayback();
+          else playFromCurrentFrame();
           handled = true;
           break;
         case "ArrowLeft": {
@@ -6430,7 +6563,6 @@ function Show3D() {
 
   // Check if view needs reset
   const needsReset = zoom !== 1 || panX !== 0 || panY !== 0;
-  const clampSlice = (idx: number) => Math.max(0, Math.min(nSlices - 1, Math.round(idx)));
   const scrubToSlice = (idx: number) => {
     const next = clampSlice(idx);
     if (playing) setPlaying(false);
@@ -6699,7 +6831,6 @@ function Show3D() {
               return (
                 <Box sx={{ position: "absolute", top: panelTop + 3, right: canvasW - (panelLeft + panelW) + 3, bgcolor: "rgba(0,0,0,0.35)", px: 0.5, py: 0.15, pointerEvents: "none", maxWidth: Math.max(80, panelW - 6), textAlign: "right" }}>
                   <Typography sx={{ fontSize: 9, fontFamily: "monospace", color: "rgba(255,255,255,0.7)", whiteSpace: "nowrap", lineHeight: 1.2, overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {(nPanels || 1) > 1 ? `${(panelTitles && panelTitles[panel]) || `Panel ${panel + 1}`} ` : ""}
                     ({cursorInfo.row}, {cursorInfo.col}) {formatNumber(cursorInfo.value)}
                   </Typography>
                 </Box>
@@ -6814,10 +6945,10 @@ function Show3D() {
                     <MenuItem value="log">Log</MenuItem>
                   </Select>
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }} title={perPanelHistogramEnabled ? "Stack-wide auto contrast. Turn off for independent panel clips." : "Automatic percentile-based contrast."}>
-                    {perPanelHistogramEnabled ? "Auto stack:" : "Auto:"}
+                    {perPanelHistogramEnabled ? "Auto stack" : "Auto"}
                   </Typography>
                   <Switch checked={autoContrast} onChange={(e) => handleAutoContrastChange(e.target.checked)} size="small" sx={switchStyles.small} slotProps={{ input: { "aria-label": perPanelHistogramEnabled ? "Toggle stack-wide automatic contrast" : "Toggle automatic percentile-based contrast" } }} />
-                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar:</Typography>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Colorbar</Typography>
                   <Switch checked={showColorbar} onChange={(e) => setShowColorbar(e.target.checked)} size="small" sx={switchStyles.small} slotProps={{ input: { "aria-label": "Toggle colorbar overlay" } }} />
                 </Box>
                 {/* Row 2: Color + Smooth + Diff + zoom indicator */}
@@ -6826,7 +6957,7 @@ function Show3D() {
                   <Select size="small" value={cmap} onChange={(e) => setCmap(e.target.value)} MenuProps={themedMenuProps} sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} inputProps={{ "aria-label": "Image colormap" }}>
                     {COLORMAP_NAMES.map((name) => (<MenuItem key={name} value={name}>{name.charAt(0).toUpperCase() + name.slice(1)}</MenuItem>))}
                   </Select>
-                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Smooth:</Typography>
+                  <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Smooth</Typography>
                   <Switch checked={smooth} onChange={(e) => setSmooth(e.target.checked)} size="small" sx={switchStyles.small} slotProps={{ input: { "aria-label": "Toggle bilinear smoothing" } }} />
                   <Typography sx={{ ...typography.label, fontSize: 10, color: themeColors.textMuted }}>Diff:</Typography>
                   <Select value={diffMode} onChange={(e) => setDiffMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 45, fontSize: 10 }} MenuProps={themedMenuProps} inputProps={{ "aria-label": "Difference mode (off, previous frame, first frame)" }}>
@@ -6842,16 +6973,16 @@ function Show3D() {
                 <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, minWidth: 320, justifyContent: "center" }}>
                   <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Stack direction="row" spacing={0} sx={{ flexShrink: 0, mr: 0.5 }}>
-                      <IconButton size="small" onClick={() => { setReverse(true); setPlaying(true); }} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
+                      <IconButton size="small" onClick={() => playFromCurrentFrame(-1)} sx={{ color: reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play in reverse" title="Play reverse">
                         <FastRewindIcon sx={{ fontSize: 18 }} />
                       </IconButton>
-                      <IconButton size="small" onClick={() => setPlaying(!playing)} sx={{ color: themeColors.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
+                      <IconButton size="small" onClick={() => { if (playing) pausePlayback(); else playFromCurrentFrame(); }} sx={{ color: themeColors.accent, p: 0.25 }} aria-label={playing ? "Pause playback" : "Play"} title={playing ? "Pause (Space)" : "Play (Space)"}>
                         {playing ? <PauseIcon sx={{ fontSize: 18 }} /> : <PlayArrowIcon sx={{ fontSize: 18 }} />}
                       </IconButton>
-                      <IconButton size="small" onClick={() => { setReverse(false); setPlaying(true); }} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
+                      <IconButton size="small" onClick={() => playFromCurrentFrame(1)} sx={{ color: !reverse && playing ? themeColors.accent : themeColors.textMuted, p: 0.25 }} aria-label="Play forward" title="Play forward">
                         <FastForwardIcon sx={{ fontSize: 18 }} />
                       </IconButton>
-                      <IconButton size="small" onClick={() => { const home = loop ? Math.max(0, loopStart) : 0; playbackIdxRef.current = home; setPlaying(false); setLiveSliceIdx(home); setSliceIdx(home); }} sx={{ color: themeColors.textMuted, p: 0.25 }} aria-label="Stop and rewind to start" title="Stop">
+                      <IconButton size="small" onClick={stopPlayback} sx={{ color: themeColors.textMuted, p: 0.25 }} aria-label="Stop and rewind to start" title="Stop">
                         <StopIcon sx={{ fontSize: 16 }} />
                       </IconButton>
                     </Stack>
@@ -6862,7 +6993,7 @@ function Show3D() {
                     )}
                     <Typography sx={{ ...typography.value, color: themeColors.textMuted, minWidth: hiddenSet.size ? `${String(nSlices).length * 2 + String(visibleCount).length + 5}ch` : `${String(nSlices).length * 2 + 1}ch`, fontVariantNumeric: "tabular-nums", textAlign: "right", flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{hiddenSet.size ? `${activeIdx + 1}/${visibleCount} (${nSlices})` : `${activeIdx + 1}/${nSlices}`}</Typography>
                   </Box>
-                  <Box sx={{ ...controlRow, width: 360, maxWidth: 360, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Box sx={{ ...controlRow, width: 372, maxWidth: 372, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, flexShrink: 0 }}>fps</Typography>
                     <Slider value={playbackFps} min={1} max={MAX_PLAYBACK_FPS} step={1} onChange={(_, v) => setPlaybackFps(v as number)} size="small" sx={{ ...sliderStyles.small, width: 44, flexShrink: 0 }} aria-label="Playback frames per second" valueLabelDisplay="auto" />
                     <Typography sx={{ ...typography.label, color: themeColors.textMuted, minWidth: 20, flexShrink: 0 }}>{Math.round(playbackFps)}</Typography>

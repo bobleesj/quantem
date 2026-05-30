@@ -1812,6 +1812,19 @@ class Show3D(anywidget.AnyWidget):
         for key in panel_len_keys:
             if key in state and isinstance(state[key], list) and len(state[key]) != int(self.n_panels):
                 state.pop(key)
+        # Apply per-panel vmin/vmax as a pair, pre-cleared, so the cross-validator
+        # (vmin_per_panel[i] <= vmax_per_panel[i]) never trips mid-load on the
+        # generic setattr loop when the incoming vmin exceeds the CURRENT vmax.
+        pp_vmin = state.pop("vmin_per_panel", None)
+        pp_vmax = state.pop("vmax_per_panel", None)
+        if pp_vmin is not None or pp_vmax is not None:
+            n_pan = int(self.n_panels)
+            self.vmin_per_panel = [None] * n_pan
+            self.vmax_per_panel = [None] * n_pan
+            if pp_vmax is not None:
+                self.vmax_per_panel = list(pp_vmax)
+            if pp_vmin is not None:
+                self.vmin_per_panel = list(pp_vmin)
         if int(self.n_panels) > 1:
             for key in ("roi_active", "roi_list", "roi_selected_idx"):
                 state.pop(key, None)
@@ -2497,7 +2510,10 @@ class Show3D(anywidget.AnyWidget):
         self._data_torch = None
         self._display_data = None
         self._separate_panel_data = None
-        for trait in ("frame_bytes", "roi_plot_data", "_buffer_bytes"):
+        # _offline_stack holds the full uint8 stack (up to ~1 GB) in a synced
+        # Bytes trait; without clearing it free() leaves that RAM pinned by the
+        # traitlets HasTraits even after _data is dropped. Clear it too.
+        for trait in ("frame_bytes", "roi_plot_data", "_buffer_bytes", "_offline_stack"):
             setattr(self, trait, b"")
         gc.collect()
         # Flush cupy pool: _data may have been a torch view into cupy memory.
