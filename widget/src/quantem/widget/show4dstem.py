@@ -381,7 +381,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._suppress_roi_recompute = False
         # Torch tensor input keeps its device (lets user pin a specific GPU via
         # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
-        if isinstance(data, torch.Tensor):
+        if isinstance(data, torch.Tensor) or getattr(data, "_is_gpu_frames", False):
+            # `_is_gpu_frames` lets a duck-typed GPU array (e.g. a chunk-backed
+            # no-bin stack that can't be one tensor) take the GPU path without a
+            # numpy round-trip. It must expose .shape/.dtype/.ndim/.device and
+            # single-frame integer indexing.
             self._device = data.device
             self._data_pre = data
             data_np = None
