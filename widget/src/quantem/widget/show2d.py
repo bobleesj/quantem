@@ -213,6 +213,9 @@ class Show2D(anywidget.AnyWidget):
     # JS dequantizes on read. Eye can't tell uint8 from float32 after colormap
     # reduces to 256 levels anyway.
     offline = traitlets.Bool(False).tag(sync=True)
+    # True only on a clone written by export_html: forces the standalone HTML to
+    # render on a light/white background regardless of the viewer's OS theme.
+    _export_light = traitlets.Bool(False).tag(sync=True)
     _offline_min = traitlets.Float(0.0).tag(sync=True)
     _offline_max = traitlets.Float(1.0).tag(sync=True)
     labels = traitlets.List(traitlets.Unicode()).tag(sync=True)

@@ -395,8 +395,9 @@ const sliderStyles = {
 };
 
 function Show2D() {
-  // Theme
-  const { themeInfo, colors: tc } = useTheme();
+  // Theme (offline HTML exports force a light/white background)
+  const [offlineForTheme] = useModelState<boolean>("_export_light");
+  const { themeInfo, colors: tc } = useTheme(offlineForTheme);
   const themeColors = {
     ...tc,
     accentGreen: themeInfo.theme === "dark" ? "#0f0" : "#1a7a1a",

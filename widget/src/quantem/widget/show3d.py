@@ -14,6 +14,7 @@ import secrets
 import sys
 import threading
 import time
+import tempfile
 import urllib.parse
 import warnings
 import weakref
@@ -25,6 +26,14 @@ import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
+from quantem.widget.config_utils import (
+    _config_float,
+    _load_quantem_config,
+    _normalize_rotation_deg,
+    _pixel_size_from_quantem_config,
+    _post_crop_from_quantem_config,
+    _rotate_stack_inplane,
+)
 from quantem.widget.show2d import _reject_unknown_kwargs
 from quantem.widget.state import (
     resolve_widget_version,
@@ -176,7 +185,7 @@ _VALID_CMAPS = frozenset({
 # Comm path to survive. The data is still exact float32; large stacks move as
 # sliding windows instead of browser-hostile 256 MB+ messages.
 _MAX_PLAYBACK_CHUNK_BYTES = 128 * 1024 * 1024
-_MAX_PLAYBACK_FPS = 60.0
+_MAX_PLAYBACK_FPS = 30.0
 
 
 class _Show3DFrameHTTPServer(http.server.ThreadingHTTPServer):
@@ -239,8 +248,8 @@ class Show3D(anywidget.AnyWidget):
         Lower percentile for auto-contrast.
     percentile_high : float, default 99.5
         Upper percentile for auto-contrast.
-    fps : float, default 5.0
-        Frames per second for playback, capped at 60.
+    fps : float, default 30.0
+        Frames per second for playback, capped at 30.
     timestamps : list of float, optional
         Timestamps for each frame (e.g., seconds or dose values).
     timestamp_unit : str, default "s"
@@ -327,7 +336,7 @@ class Show3D(anywidget.AnyWidget):
       binned for faster scrubbing; full-resolution data is kept for stats,
       ROIs, FFT, profiles, and direct image saving.
     - Multi-panel mode is auto-detected from input shape and configured via
-      ``n_panels``, ``panel_titles``, and the ``link_*`` traits.
+      ``n_panels``, ``panel_titles``, and ``link_panels``.
     - Call ``free()`` before discarding the widget; ``del`` alone will not
       release VRAM because traitlets observers pin the refcount.
     """
@@ -351,28 +360,33 @@ class Show3D(anywidget.AnyWidget):
     # to this counter as a guaranteed-changing dep so render effects always
     # re-fire on slice scrubs / playback ticks.
     frame_seq = traitlets.Int(0).tag(sync=True)
-    # Offline mode: when True at __init__, the full (N, H, W) stack is packed
-    # into _offline_stack so JS can slice client-side without a Python kernel.
-    # Use for saved nbconvert HTML where the kernel is dead after the
-    # widget state is embedded. Slider still fires slice_idx change; JS reads from
-    # _offline_stack instead of waiting on a Comm round-trip.
-    #
-    # The packed stack is uint8-quantized against the global (min, max) of the
-    # display data. uint8 = 4x smaller than float32, sidesteps V8's ~512 MB
-    # JSON.parse limit on the widget-state script that nbconvert inlines.
-    # Eye can't tell uint8 from float32 once colormap reduces to 256 levels.
-    # JS dequantizes per-slice: f32 = u8 * (max - min) / 255 + min.
+    # Offline/export mode packs the full display stack so JS can slice
+    # client-side without a Python kernel. _offline_stack is the compact
+    # uint8 path; _offline_float_stack is exact float32 for precision-preserving
+    # standalone HTML exports.
     offline = traitlets.Bool(False).tag(sync=True)
+    # True only on a clone written by export_html: forces the standalone HTML to
+    # render on a light/white background regardless of the viewer's OS theme.
+    # Decoupled from `offline` (which selects uint8 vs float data packing).
+    _export_light = traitlets.Bool(False).tag(sync=True)
     _offline_stack = traitlets.Bytes(b"").tag(sync=True)
+    _offline_float_stack = traitlets.Bytes(b"").tag(sync=True)
     _offline_min = traitlets.Float(0.0).tag(sync=True)
     _offline_max = traitlets.Float(1.0).tag(sync=True)
-    _display_bin_factor = traitlets.Int(1)  # Python-only: JS doesn't read
+    # Frontend-triggered standalone HTML export. The request is JSON so repeated
+    # exports of the same mode can include a unique id and still sync.
+    export_request = traitlets.Unicode("").tag(sync=True)
+    export_status = traitlets.Unicode("").tag(sync=True)
+    export_enabled = traitlets.Bool(True).tag(sync=True)
+    export_payload = traitlets.Bytes(b"").tag(sync=True)
+    export_payload_id = traitlets.Unicode("").tag(sync=True)
+    export_filename = traitlets.Unicode("").tag(sync=True)
     # Flipped True by JS after the first colormap pass has painted to canvas.
     # Drives the truthful timing print (end-to-end, not __init__-only).
     _js_rendered = traitlets.Bool(False).tag(sync=True)
     labels = traitlets.List(traitlets.Unicode()).tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
-    cmap = traitlets.Unicode("magma").tag(sync=True)
+    cmap = traitlets.Unicode("plasma").tag(sync=True)
     dim_label = traitlets.Unicode("Frame").tag(sync=True)
     dim_sampling = traitlets.Float(1.0).tag(sync=True)
     dim_unit = traitlets.Unicode("").tag(sync=True)
@@ -391,9 +405,7 @@ class Show3D(anywidget.AnyWidget):
     # lengths get auto-padded to the longest; this trait lets JS mark
     # "end-of-stack" frames (frame idx >= real[panel]). Empty = all real.
     panel_real_frames = traitlets.List(traitlets.Int()).tag(sync=True)
-    # Single Link toggle controls both zoom AND pan (independent axes proved confusing).
-    link_zoom = traitlets.Bool(True)  # Python-only: JS uses link_panels for linked zoom+pan
-    link_pan = traitlets.Bool(True)   # Python-only: JS uses link_panels for linked zoom+pan
+    # Single Link toggle controls both zoom and pan (independent axes proved confusing).
     link_panels = traitlets.Bool(True).tag(sync=True)
     link_contrast = traitlets.Bool(True).tag(sync=True)  # share vmin/vmax across panels
     # 0 = single row (no wrap). N > 0 = wrap into rows of at most N panels.
@@ -415,8 +427,8 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     playing = traitlets.Bool(False).tag(sync=True)
     reverse = traitlets.Bool(False).tag(sync=True)  # Play in reverse direction
-    boomerang = traitlets.Bool(False).tag(sync=True)  # Ping-pong playback
-    fps = traitlets.Float(5.0).tag(sync=True)  # Default 5 FPS for easier control
+    boomerang = traitlets.Bool(True).tag(sync=True)  # Ping-pong playback
+    fps = traitlets.Float(30.0).tag(sync=True)
     # Moving-window time average (temporal binning for noisy data). 1 = off.
     # The displayed frame is the mean of `avg_window` consecutive frames.
     # Edge behavior: the window slides inward to stay FULL-WIDTH rather than
@@ -441,14 +453,6 @@ class Show3D(anywidget.AnyWidget):
     stats_min = traitlets.Float(0.0).tag(sync=True)
     stats_max = traitlets.Float(0.0).tag(sync=True)
     stats_std = traitlets.Float(0.0).tag(sync=True)
-    # Per-panel stats (length = n_panels). Empty for single-panel.
-    # Per-panel stats: JS computes its own locally (`localPanelStats`), so these
-    # are Python-only readouts. Don't sync - saves shipping 4 List[Float] per scrub.
-    stats_mean_per_panel = traitlets.List(traitlets.Float())
-    stats_min_per_panel = traitlets.List(traitlets.Float())
-    stats_max_per_panel = traitlets.List(traitlets.Float())
-    stats_std_per_panel = traitlets.List(traitlets.Float())
-
     # =========================================================================
     # Display Options
     # =========================================================================
@@ -456,6 +460,8 @@ class Show3D(anywidget.AnyWidget):
     auto_contrast = traitlets.Bool(True).tag(sync=True)
     percentile_low = traitlets.Float(0.5).tag(sync=True)
     percentile_high = traitlets.Float(99.5).tag(sync=True)
+    image_vmin_pct = traitlets.Float(0.0).tag(sync=True)
+    image_vmax_pct = traitlets.Float(100.0).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmin_per_panel = traitlets.List(traitlets.Float(None, allow_none=True), default_value=[]).tag(sync=True)
@@ -472,7 +478,7 @@ class Show3D(anywidget.AnyWidget):
     pixel_unit = traitlets.Unicode("A").tag(sync=True)
     scale_bar_visible = traitlets.Bool(True).tag(sync=True)
     # Canvas smoothing: False = nearest-neighbor (sharp atoms); True = bilinear.
-    smooth = traitlets.Bool(False).tag(sync=True)
+    smooth = traitlets.Bool(True).tag(sync=True)
     # Whole-stack rotation as k * 90 deg (k = 0..3). Applied in Python by rotating
     # _data and re-broadcasting frame_bytes; cheap for typical EM stacks.
     image_rotation = traitlets.Int(0).tag(sync=True)
@@ -482,7 +488,6 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     timestamps = traitlets.List(traitlets.Float()).tag(sync=True)
     timestamp_unit = traitlets.Unicode("s").tag(sync=True)
-    current_timestamp = traitlets.Float(0.0)  # Python-only: JS reads timestamps[slice_idx] directly
 
     # =========================================================================
     # ROI Selection
@@ -509,7 +514,6 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     show_fft = traitlets.Bool(False).tag(sync=True)
     fft_window = traitlets.Bool(True).tag(sync=True)
-    show_playback = traitlets.Bool(False)         # Python-only: not consumed in JS
     widget_version = traitlets.Unicode("unknown")  # Python-only: telemetry readout
     # =========================================================================
     # Line Profile
@@ -563,6 +567,15 @@ class Show3D(anywidget.AnyWidget):
             raise traitlets.TraitError(f"avg_window must be >= 1, got {val}")
         if val > 15:
             raise traitlets.TraitError(f"avg_window must be <= 15, got {val}")
+        return val
+
+    @traitlets.validate("image_vmin_pct", "image_vmax_pct")
+    def _validate_image_clip_pct(self, proposal: dict) -> float:
+        val = float(proposal["value"])
+        if not math.isfinite(val):
+            raise traitlets.TraitError(f"{proposal['trait'].name} must be finite, got {val}")
+        if val < 0 or val > 100:
+            raise traitlets.TraitError(f"{proposal['trait'].name} must be in [0, 100], got {val}")
         return val
 
     @traitlets.validate("playback_path")
@@ -847,30 +860,35 @@ class Show3D(anywidget.AnyWidget):
         panel_titles: list[str] | None = None,
         panel_real_frames: list[int] | None = None,
         title: str = "",
-        cmap: str | Colormap = Colormap.MAGMA,
+        cmap: str | Colormap = Colormap.PLASMA,
         vmin: float | None = None,
         vmax: float | None = None,
         pixel_size: float = 0.0,
         pixel_unit: str | None = None,
-        smooth: bool = False,
+        smooth: bool = True,
         image_rotation: int = 0,
         log_scale: bool = False,
         auto_contrast: bool = True,
+        image_vmin_pct: float = 0.0,
+        image_vmax_pct: float = 100.0,
         percentile_low: float = 0.5,
         percentile_high: float = 99.5,
-        fps: float = 5.0,
+        fps: float = 30.0,
         avg_window: int = 1,
         timestamps: list[float] | None = None,
         timestamp_unit: str = "s",
         show_fft: bool = False,
         fft_window: bool = True,
-        show_playback: bool = False,
         show_stats: bool | None = None,
         show_controls: bool = True,
         size: int = 0,
         crop: int | tuple[int, int] | tuple[int, int, int, int] = 0,
         padding: int | tuple[int, int] = 0,
         pad_mode: str = "median",
+        config: "Mapping | str | pathlib.Path | None" = None,
+        rotation_deg: float | None = None,
+        post_crop: int | tuple[int, int] | tuple[int, int, int, int] | None = None,
+        apply_config_transforms: bool = True,
         diff_mode: str = "off",
         buffer_size: int = 64,
         dim_label: str = "Frame",
@@ -906,6 +924,16 @@ class Show3D(anywidget.AnyWidget):
             kwargs["show_zoom_indicator"] = bool(show_zoom_indicator)
         if show_scale_bar is not None:
             kwargs["scale_bar_visible"] = bool(show_scale_bar)
+        kwargs.pop("show_playback", None)
+        legacy_link_zoom = kwargs.pop("link_zoom", None)
+        legacy_link_pan = kwargs.pop("link_pan", None)
+        if "link_panels" not in kwargs:
+            if legacy_link_zoom is not None and legacy_link_pan is not None:
+                kwargs["link_panels"] = bool(legacy_link_zoom) and bool(legacy_link_pan)
+            elif legacy_link_zoom is not None:
+                kwargs["link_panels"] = bool(legacy_link_zoom)
+            elif legacy_link_pan is not None:
+                kwargs["link_panels"] = bool(legacy_link_pan)
         _t0 = time.perf_counter()
         # Reject unknown kwargs so typos raise instead of being silently ignored.
         _reject_unknown_kwargs(type(self), kwargs)
@@ -922,13 +950,19 @@ class Show3D(anywidget.AnyWidget):
                             pixel_size=pixel_size, pixel_unit=pixel_unit,
                             smooth=smooth, image_rotation=image_rotation,
                             log_scale=log_scale,
-                            auto_contrast=auto_contrast, percentile_low=percentile_low,
+                            auto_contrast=auto_contrast,
+                            image_vmin_pct=image_vmin_pct,
+                            image_vmax_pct=image_vmax_pct,
+                            percentile_low=percentile_low,
                             percentile_high=percentile_high, fps=fps, avg_window=avg_window,
                             timestamps=timestamps,
                             timestamp_unit=timestamp_unit, show_fft=show_fft,
-                            fft_window=fft_window, show_playback=show_playback,
+                            fft_window=fft_window,
                             show_stats=show_stats, show_controls=show_controls,
                             size=size, crop=crop, padding=padding, pad_mode=pad_mode,
+                            config=config, rotation_deg=rotation_deg,
+                            post_crop=post_crop,
+                            apply_config_transforms=apply_config_transforms,
                             diff_mode=diff_mode, buffer_size=buffer_size,
                             dim_label=dim_label, use_torch=use_torch, device=device,
                             display_bin=display_bin, offline=offline,
@@ -939,13 +973,16 @@ class Show3D(anywidget.AnyWidget):
                    panel_titles: list[str] | None, title: str,
                    cmap: str | Colormap, vmin: float | None, vmax: float | None,
                    pixel_size: float, pixel_unit: str | None, smooth: bool, image_rotation: int,
-                   log_scale: bool, auto_contrast: bool, percentile_low: float,
-                   percentile_high: float, fps: float, avg_window: int,
+                   log_scale: bool, auto_contrast: bool,
+                   image_vmin_pct: float, image_vmax_pct: float,
+                   percentile_low: float, percentile_high: float,
+                   fps: float, avg_window: int,
                    timestamps: list[float] | None,
                    timestamp_unit: str, show_fft: bool, fft_window: bool,
-                   show_playback: bool, show_stats: bool | None, show_controls: bool,
+                   show_stats: bool | None, show_controls: bool,
                    size: int, crop: int | tuple[int, int] | tuple[int, int, int, int],
                    padding: int | tuple[int, int], pad_mode: str,
+                   config, rotation_deg, post_crop, apply_config_transforms: bool,
                    diff_mode: str, buffer_size: int, dim_label: str,
                    use_torch: bool | None, device: str | None,
                    display_bin: int | str, offline: bool | None,
@@ -965,6 +1002,28 @@ class Show3D(anywidget.AnyWidget):
         if pad_mode not in ("median", "constant"):
             raise ValueError(f"pad_mode must be 'median' or 'constant', got {pad_mode!r}")
         self._pad_mode = pad_mode
+
+        # ── QuantEM config convenience (mirrors Show3DSlices) ──
+        # config supplies in-plane rotation + post-crop alignment and pixel size
+        # so a ptycho z-stack calibrates with no manual array math. Explicit
+        # rotation_deg / post_crop / pixel_size always win over config values.
+        config_data = _load_quantem_config(config)
+        post_crop_was_set = post_crop is not None
+        if rotation_deg is None and config_data is not None and apply_config_transforms:
+            rotation_deg = _config_float(config_data, "data", "rotation_deg") or 0.0
+        config_rotation = _normalize_rotation_deg(rotation_deg) if rotation_deg is not None else 0.0
+
+        def _apply_config_transform(arr):
+            """Rotate then post-crop a (N, H, W) stack per config / explicit args."""
+            if config_rotation:
+                arr = _rotate_stack_inplane(arr, config_rotation)
+            if post_crop_was_set:
+                crop_spec = post_crop
+            elif config_data is not None and apply_config_transforms:
+                crop_spec = _post_crop_from_quantem_config(arr.shape, config_data)
+            else:
+                crop_spec = 0
+            return _crop_stack(arr, _normalize_crop(crop_spec))
 
         # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
         # merely because CUDA/MPS exists: real multi-panel ptycho stacks can be
@@ -1054,6 +1113,7 @@ class Show3D(anywidget.AnyWidget):
                 "np.nan_to_num(arr, nan=0, posinf=0, neginf=0)."
             )
         data = _pad_stack(_crop_stack(data, self._crop), self._padding, self._pad_mode)
+        data = _apply_config_transform(data)
 
         # Multi-panel: convert remaining args, validate shapes, concatenate.
         # If the caller repeats the same stack object across panels, keep the
@@ -1121,6 +1181,7 @@ class Show3D(anywidget.AnyWidget):
                             "np.abs(arr) for magnitude or np.angle(arr) for phase."
                         )
                     arr = _pad_stack(_crop_stack(arr, self._crop), self._padding, self._pad_mode)
+                    arr = _apply_config_transform(arr)
                     # Image (H,W) must match across panels - viewer cannot composite
                     # different image sizes into one canvas.
                     if arr.shape[1:] != panels[0].shape[1:]:
@@ -1255,13 +1316,11 @@ class Show3D(anywidget.AnyWidget):
             self._display_data = self._data
             self.height = orig_h
             self.width = int(self.panel_width_px) * int(self.n_panels)
-            self._display_bin_factor = 1
         elif self._display_bin > 1:
             from quantem.widget.array_utils import bin2d
             self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
             self.height = int(self._display_data.shape[1])
             self.width = int(self._display_data.shape[2])
-            self._display_bin_factor = self._display_bin
             if pixel_size > 0:
                 pixel_size = pixel_size * self._display_bin
             print(f"  Display bin {self._display_bin}× (explicit): {orig_h}×{orig_w} → {self.height}×{self.width}")
@@ -1269,7 +1328,6 @@ class Show3D(anywidget.AnyWidget):
             self._display_data = self._data
             self.height = orig_h
             self.width = orig_w
-            self._display_bin_factor = 1
         if self.shared_panel_source:
             self.panel_width_px = self.width
 
@@ -1306,6 +1364,16 @@ class Show3D(anywidget.AnyWidget):
         self.title = title if title else (_extracted_title or "")
         self.cmap = str(cmap)  # Convert Colormap enum to string
 
+        # Config sampling wins over a Dataset3d's default [1,1,1] sampling when
+        # the user did not pass pixel_size explicitly: a ptycho config carries
+        # the true Å/px (lateral) and slice thickness (depth) calibration.
+        if config_data is not None and pixel_size == 0.0:
+            config_pixel_size = _pixel_size_from_quantem_config(config_data)
+            if config_pixel_size is not None:
+                _extracted_pixel_size = config_pixel_size[1]
+                _extracted_pixel_unit = "A"
+                _extracted_dim_sampling = config_pixel_size[0]
+                _extracted_dim_unit = _extracted_dim_unit or "A"
         # Use extracted pixel_size if not explicitly provided
         if pixel_size == 0.0 and _extracted_pixel_size is not None:
             pixel_size = _extracted_pixel_size
@@ -1327,6 +1395,8 @@ class Show3D(anywidget.AnyWidget):
         self.image_rotation = image_rotation % 4
         self.log_scale = log_scale
         self.auto_contrast = auto_contrast
+        self.image_vmin_pct = image_vmin_pct
+        self.image_vmax_pct = image_vmax_pct
         self.percentile_low = percentile_low
         self.percentile_high = percentile_high
         self.vmin = vmin
@@ -1350,7 +1420,6 @@ class Show3D(anywidget.AnyWidget):
         self._refresh_auto_contrast_ranges()
         self.show_fft = show_fft
         self.fft_window = fft_window
-        self.show_playback = show_playback
         # Stats panel on by default for single-panel (cheap, useful readout);
         # off for multi-panel where N stat blocks would crowd the layout.
         # Explicit True/False from the caller always wins.
@@ -1367,16 +1436,10 @@ class Show3D(anywidget.AnyWidget):
         self.slice_idx = int(self.n_slices // 2)
         self._roi_plot_timer = None
 
-        # Offline mode: pack the entire display stack so JS can slice
-        # client-side. Required for nbconvert HTML exports - once the kernel
-        # dies, slice_idx changes can no longer trigger _on_slice_change /
-        # frame_bytes refresh. With offline=True the stack lives in widget
-        # state and JS handles scrub locally.
-        # Stored as uint8 against global (min, max) - 4x smaller than float32
-        # and stays under V8's ~512 MB JSON.parse limit on the widget-state
-        # script. Eye can't tell uint8 from float32 after viridis colormap.
-        # Default (offline=None): auto-enable when the packed uint8 stack fits
-        # a 1 GB budget; opt-out with offline=False for absurdly huge stacks.
+        # Offline mode stores the quantized uint8 stack for kernel-free scrub.
+        # Exact standalone exports use _offline_float_stack on an export clone.
+        # Default (offline=None): auto-enable uint8 when the pack fits a 1 GB
+        # budget; opt out with offline=False for absurdly huge stacks.
         # Pick the right stack source for offline packing. separate_panel_frames
         # keeps each panel as its own array in self._separate_panel_data; the
         # offline path needs every panel, concatenated horizontally so JS
@@ -1414,6 +1477,7 @@ class Show3D(anywidget.AnyWidget):
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_prefetch, names=["_prefetch_request"])
         self.observe(self._on_diff_mode_change, names=["diff_mode"])
+        self.observe(self._on_export_request_change, names=["export_request"])
 
         self._start_frame_server()
 
@@ -1550,7 +1614,6 @@ class Show3D(anywidget.AnyWidget):
         self._display_data = self._data
         self.height = orig_h
         self.width = orig_w
-        self._display_bin_factor = 1
 
         if self._use_torch:
             self.data_min = float(self._data_torch.min().item())
@@ -1646,9 +1709,12 @@ class Show3D(anywidget.AnyWidget):
             # percentile_high before percentile_low so cross-validator doesn't reject mid-load.
             "percentile_high": self.percentile_high,
             "percentile_low": self.percentile_low,
+            "image_vmin_pct": self.image_vmin_pct,
+            "image_vmax_pct": self.image_vmax_pct,
             "vmin": self.vmin,
             "vmax": self.vmax,
             "link_contrast": self.link_contrast,
+            "link_panels": self.link_panels,
             "vmin_per_panel": list(self.vmin_per_panel),
             "vmax_per_panel": list(self.vmax_per_panel),
             "show_stats": self.show_stats,
@@ -1656,7 +1722,6 @@ class Show3D(anywidget.AnyWidget):
             "show_fft": self.show_fft,
             "show_kymograph": self.show_kymograph,
             "fft_window": self.fft_window,
-            "show_playback": self.show_playback,
             "pixel_size": self.pixel_size,
             "pixel_unit": self.pixel_unit,
             "smooth": self.smooth,
@@ -1724,6 +1789,46 @@ class Show3D(anywidget.AnyWidget):
         """
         save_state_file(path, "Show3D", self.state_dict())
 
+    def export_html(
+        self,
+        path: str | pathlib.Path | None = None,
+        *,
+        quantized: bool = False,
+        title: str | None = None,
+    ) -> pathlib.Path:
+        """Write a standalone HTML viewer for sharing.
+
+        The exact export embeds the current float32 stack bytes and preserves
+        numerical precision. The quantized export writes the existing offline
+        uint8 representation plus global min/max metadata, making a smaller
+        single-file report for visual sharing.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path, optional
+            Destination HTML path. Defaults to the current working directory
+            with the widget title, stack shape, and export mode in the name.
+        quantized : bool, default False
+            If True, write the uint8 offline pack. If False, write exact
+            float32 bytes.
+        title : str, optional
+            Browser page title. Defaults to the widget title or class name.
+
+        Returns
+        -------
+        pathlib.Path
+            The written HTML file.
+        """
+        if self._data is None:
+            raise ValueError("Cannot export HTML after free(); rebuild the widget first.")
+
+        export_path = pathlib.Path(path) if path is not None else self._default_html_export_path(quantized)
+        self._write_html_export(export_path, quantized=quantized, title=title)
+        size_mb = export_path.stat().st_size / (1024 * 1024)
+        mode = "quantized" if quantized else "exact float32"
+        self.export_status = f"Exported {export_path.name} ({size_mb:.1f} MB, {mode})"
+        return export_path
+
     def load_state_dict(self, state: dict) -> None:
         """Apply a saved ``state_dict`` snapshot to this widget.
 
@@ -1788,6 +1893,8 @@ class Show3D(anywidget.AnyWidget):
         # `display_bin` is constructor/data dependent. Loading only the private
         # integer leaves display_data/height/width stale, so ignore saved values.
         state.pop("display_bin", None)
+        # Removed no-op trait from older saved states.
+        state.pop("show_playback", None)
         # Drop length-coupled traits when stack size differs from saved state.
         # Otherwise the labels/timestamps validators raise, breaking the common
         # workflow of saving a state from one trial and loading into another.
@@ -2460,6 +2567,61 @@ class Show3D(anywidget.AnyWidget):
         img.save(str(path), dpi=(dpi, dpi))
         return path
 
+    def save_gif(self, path: str | pathlib.Path, *, quality: str = "high",
+                 fps: float | None = None) -> pathlib.Path:
+        """Save the z-stack as an animated GIF matching the live view.
+
+        Each frame is colorized with the current ``cmap`` and contrast
+        (``vmin`` / ``vmax`` or percentile auto-contrast, ``log_scale`` honored),
+        carries a burnt-in scale bar when ``pixel_size`` is set, and plays at the
+        widget's ``fps`` so the shared file looks like what the operator scrubs.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Output ``.gif`` path. Parent directories are created.
+        quality : {"high", "medium", "low"}, default "high"
+            Spatial resolution tier (1.0 / 0.6 / 0.35). GIF is always a 256-color
+            palette, so quality trades resolution for file size.
+        fps : float, optional
+            Playback rate. Defaults to the widget's ``fps``.
+
+        Returns
+        -------
+        pathlib.Path
+            The written GIF path.
+
+        Notes
+        -----
+        Single-panel Show3D only; multi-panel raises. Browser zoom/pan is a
+        view-only transform and is not reflected (the full frame is exported).
+        """
+        from quantem.widget import gif_utils
+        if getattr(self, "n_panels", 1) > 1:
+            raise ValueError("save_gif supports single-panel Show3D only.")
+        if quality not in gif_utils.QUALITY_SCALE:
+            raise ValueError(f"quality must be one of {list(gif_utils.QUALITY_SCALE)}, got {quality!r}.")
+        fps = float(self.fps) if fps is None else float(fps)
+        unit = self.pixel_unit or "A"
+        rendered = []
+        for idx in range(self.n_slices):
+            frame = self._data[idx]
+            if self.diff_mode == "previous":
+                frame = frame - self._data[idx - 1] if idx > 0 else np.zeros_like(frame)
+            elif self.diff_mode == "first":
+                frame = frame - self._data[0]
+            img = gif_utils.colorize(self._normalize_frame(frame), self.cmap)
+            rendered.append(gif_utils.finalize_frame(img, quality, self.pixel_size, unit))
+        # Boomerang from the middle: open on the centre slice, sweep up to the
+        # top, down to the bottom, back to the centre - so the GIF starts and
+        # ends on the same middle frame the live widget opens on.
+        mid = self.n_slices // 2
+        order = (list(range(mid, self.n_slices))
+                 + list(range(self.n_slices - 2, -1, -1))
+                 + list(range(1, mid + 1)))
+        frames = [rendered[i] for i in order]
+        return gif_utils.write_gif(frames, path, fps)
+
     def free(self) -> None:
         """Release VRAM and RAM held by this widget.
 
@@ -2510,10 +2672,16 @@ class Show3D(anywidget.AnyWidget):
         self._data_torch = None
         self._display_data = None
         self._separate_panel_data = None
-        # _offline_stack holds the full uint8 stack (up to ~1 GB) in a synced
-        # Bytes trait; without clearing it free() leaves that RAM pinned by the
-        # traitlets HasTraits even after _data is dropped. Clear it too.
-        for trait in ("frame_bytes", "roi_plot_data", "_buffer_bytes", "_offline_stack"):
+        # Offline/export stacks are synced Bytes traits; without clearing them
+        # free() leaves that RAM pinned by traitlets after _data is dropped.
+        for trait in (
+            "frame_bytes",
+            "roi_plot_data",
+            "_buffer_bytes",
+            "_offline_stack",
+            "_offline_float_stack",
+            "export_payload",
+        ):
             setattr(self, trait, b"")
         gc.collect()
         # Flush cupy pool: _data may have been a torch view into cupy memory.
@@ -2644,7 +2812,195 @@ class Show3D(anywidget.AnyWidget):
             self.roi_stats = {}
             self.roi_plot_data = b""
 
+    def _on_export_request_change(self, change: dict) -> None:
+        """Handle toolbar export requests from the live notebook frontend."""
+        raw = str(change.get("new") or "")
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw)
+            mode = str(payload.get("mode", "exact"))
+            if mode == "clear":
+                self.export_payload = b""
+                self.export_payload_id = ""
+                self.export_filename = ""
+                return
+            if mode not in ("exact", "quantized"):
+                raise ValueError(f"unknown export mode {mode!r}")
+            quantized = mode == "quantized"
+            if payload.get("download"):
+                filename = str(payload.get("filename") or self._default_html_export_path(quantized).name)
+                request_id = str(payload.get("id") or "")
+                self.export_status = f"Preparing {filename}..."
+                html = self._html_export_bytes(quantized=quantized)
+                self.export_filename = filename
+                self.export_payload = html
+                self.export_payload_id = request_id
+                size_mb = len(html) / (1024 * 1024)
+                label = "quantized" if quantized else "exact float32"
+                self.export_status = f"Ready {filename} ({size_mb:.1f} MB, {label})"
+            else:
+                self.export_status = f"Exporting {mode} HTML..."
+                self.export_html(quantized=quantized)
+        except Exception as exc:
+            self.export_status = f"Export failed: {exc}"
+
     # === Internal primitives ===
+
+    def _default_html_export_path(self, quantized: bool) -> pathlib.Path:
+        """Build a stable, human-readable export filename in the kernel cwd."""
+        label = self.title.strip() or "show3d"
+        slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in label).strip("_")
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        if not slug:
+            slug = "show3d"
+        mode = "quantized" if quantized else "exact"
+        return pathlib.Path.cwd() / f"{slug}_{self.n_slices}x{self.height}x{self.width}_{mode}.html"
+
+    def _write_html_export(
+        self,
+        path: str | pathlib.Path,
+        *,
+        quantized: bool,
+        title: str | None = None,
+    ) -> pathlib.Path:
+        """Write a standalone HTML export without updating toolbar status."""
+        from ipywidgets.embed import dependency_state, embed_minimal_html
+
+        export_path = pathlib.Path(path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        page_title = title or self.title or "Show3D"
+        export_widget = self._clone_for_html_export(quantized=quantized)
+        try:
+            state = dependency_state([export_widget], drop_defaults=False)
+            embed_minimal_html(
+                str(export_path),
+                views=[export_widget],
+                title=page_title,
+                drop_defaults=False,
+                state=state,
+            )
+        finally:
+            export_widget.free()
+        return export_path
+
+    def _html_export_bytes(self, *, quantized: bool) -> bytes:
+        """Build a standalone HTML export in a temp directory and return bytes."""
+        with tempfile.TemporaryDirectory(prefix="show3d-export-") as tmp:
+            path = pathlib.Path(tmp) / self._default_html_export_path(quantized).name
+            self._write_html_export(path, quantized=quantized)
+            return path.read_bytes()
+
+    def _export_data_args(self) -> tuple[np.ndarray, ...]:
+        """Return display-shaped data args so exported HTML matches the widget."""
+        if self._display_data is None:
+            raise ValueError("Cannot export HTML after free(); rebuild the widget first.")
+        n_panels = int(self.n_panels)
+        if self.shared_panel_source and n_panels > 1:
+            src = np.ascontiguousarray(self._display_data, dtype=np.float32)
+            return tuple(src for _ in range(n_panels))
+        if self._separate_panel_data is not None:
+            return tuple(
+                np.ascontiguousarray(panel, dtype=np.float32)
+                for panel in self._separate_panel_data
+            )
+        if n_panels > 1 and int(self.panel_width_px) > 0:
+            panel_w = int(self.panel_width_px)
+            if int(self.width) == panel_w * n_panels:
+                return tuple(
+                    np.ascontiguousarray(
+                        self._display_data[:, :, i * panel_w : (i + 1) * panel_w],
+                        dtype=np.float32,
+                    )
+                    for i in range(n_panels)
+                )
+        return (np.ascontiguousarray(self._display_data, dtype=np.float32),)
+
+    def _offline_stack_source(self) -> np.ndarray:
+        """Return the stack shape that the offline frontend indexes per frame."""
+        if self._display_data is None:
+            raise ValueError("Cannot export HTML after free(); rebuild the widget first.")
+        if self.separate_panel_frames and self._separate_panel_data is not None:
+            return np.concatenate(self._separate_panel_data, axis=2)
+        return np.ascontiguousarray(self._display_data, dtype=np.float32)
+
+    def _pack_exact_offline_stack(self) -> None:
+        """Embed the full display stack as float32 for exact standalone HTML."""
+        arr = np.ascontiguousarray(self._offline_stack_source(), dtype=np.float32)
+        if arr.size:
+            lo = float(arr.min())
+            hi = float(arr.max())
+        else:
+            lo, hi = 0.0, 1.0
+        self.offline = True
+        self._offline_min = lo
+        self._offline_max = hi
+        self._offline_stack = b""
+        self._offline_float_stack = arr.tobytes()
+        self.frame_bytes = b""
+        self._buffer_bytes = b""
+
+    def _clone_for_html_export(self, *, quantized: bool) -> Self:
+        """Create an export-only widget with current state and requested packing."""
+        clone = type(self)(
+            *self._export_data_args(),
+            labels=list(self.labels) if self.labels else None,
+            panel_titles=list(self.panel_titles) if self.panel_titles else None,
+            panel_real_frames=list(self.panel_real_frames) if self.panel_real_frames else None,
+            title=self.title,
+            cmap=self.cmap,
+            vmin=self.vmin,
+            vmax=self.vmax,
+            pixel_size=self.pixel_size,
+            pixel_unit=self.pixel_unit,
+            smooth=self.smooth,
+            image_rotation=self.image_rotation,
+            log_scale=self.log_scale,
+            auto_contrast=self.auto_contrast,
+            image_vmin_pct=self.image_vmin_pct,
+            image_vmax_pct=self.image_vmax_pct,
+            percentile_low=self.percentile_low,
+            percentile_high=self.percentile_high,
+            fps=self.fps,
+            avg_window=self.avg_window,
+            timestamps=list(self.timestamps) if self.timestamps else None,
+            timestamp_unit=self.timestamp_unit,
+            show_fft=self.show_fft,
+            fft_window=self.fft_window,
+            show_stats=self.show_stats,
+            show_controls=self.show_controls,
+            size=self.size,
+            diff_mode=self.diff_mode,
+            buffer_size=getattr(self, "_buffer_size", 64),
+            dim_label=self.dim_label,
+            use_torch=False,
+            display_bin=1,
+            offline=quantized,
+            max_cols=self.max_cols,
+            panel_gap=self.panel_gap,
+            panel_title_font_size=self.panel_title_font_size,
+            show_panel_titles=self.show_panel_titles,
+            show_resize_handles=self.show_resize_handles,
+            show_zoom_indicator=self.show_zoom_indicator,
+            show_scale_bar=self.scale_bar_visible,
+        )
+        clone.load_state_dict(self.state_dict())
+        if quantized:
+            clone._offline_float_stack = b""
+        else:
+            clone._pack_exact_offline_stack()
+        clone.playing = False
+        clone.export_enabled = False
+        clone.export_status = ""
+        clone.export_payload = b""
+        clone.export_payload_id = ""
+        clone.export_filename = ""
+        clone._stop_frame_server()
+        clone.frame_server_url = ""
+        clone._buffer_bytes = b""
+        clone._export_light = True
+        return clone
 
     def _start_frame_server(self) -> None:
         """Start the localhost exact-frame endpoint used by browser playback."""

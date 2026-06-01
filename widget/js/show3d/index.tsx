@@ -19,6 +19,7 @@ import Stack from "@mui/material/Stack";
 import Slider from "@mui/material/Slider";
 import IconButton from "@mui/material/IconButton";
 import Select from "@mui/material/Select";
+import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import Switch from "@mui/material/Switch";
 import Button from "@mui/material/Button";
@@ -30,7 +31,7 @@ import FastForwardIcon from "@mui/icons-material/FastForward";
 import StopIcon from "@mui/icons-material/Stop";
 import { useTheme } from "../theme";
 import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, roundToNiceValue, unitSymbol } from "../figure";
-import { extractFloat32, formatNumber } from "../format";
+import { downloadBlob, extractBytes, extractFloat32, formatNumber } from "../format";
 import { findDataRange, applyLogScale, applyLogScaleInPlace, percentileClip, sliderRange, computeStats, computeHistogramFromBytes } from "../stats";
 // ============================================================================
 // Style tokens (inlined - matches Show2D/Show4DSTEM single-file convention)
@@ -80,6 +81,64 @@ const typography = {
 // Inlined utilities (matches Show2D/Show4DSTEM single-file convention)
 // ============================================================================
 const signedLog1p = (x: number): number => x >= 0 ? Math.log1p(x) : -Math.log1p(-x);
+
+type Show3DWritableFile = {
+  write: (data: BlobPart) => Promise<void>;
+  close: () => Promise<void>;
+};
+
+type Show3DFileHandle = {
+  createWritable: () => Promise<Show3DWritableFile>;
+};
+
+type Show3DSavePickerOptions = {
+  suggestedName?: string;
+  types?: { description: string; accept: Record<string, string[]> }[];
+};
+
+type Show3DWindow = Window & typeof globalThis & {
+  showSaveFilePicker?: (options?: Show3DSavePickerOptions) => Promise<Show3DFileHandle>;
+};
+
+function makeExportFilename(title: string, nSlices: number, height: number, width: number, mode: string): string {
+  let slug = (title || "show3d")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  while (slug.includes("__")) slug = slug.replace(/__/g, "_");
+  if (!slug) slug = "show3d";
+  const suffix = mode === "quantized" ? "quantized" : "exact";
+  return `${slug}_${nSlices}x${height}x${width}_${suffix}.html`;
+}
+
+function formatSavedBytes(bytes: number): string {
+  const mb = Math.max(0, bytes) / (1024 * 1024);
+  if (mb >= 100) return `${Math.round(mb)} MB`;
+  if (mb >= 10) return `${mb.toFixed(1)} MB`;
+  return `${mb.toFixed(2)} MB`;
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function float32FrameFromDataView(stack: DataView, frameIdx: number, pixelCount: number, copy: boolean): Float32Array | null {
+  const byteStart = frameIdx * pixelCount * 4;
+  const byteLength = pixelCount * 4;
+  if (byteStart < 0 || byteStart + byteLength > stack.byteLength) return null;
+  const byteOffset = stack.byteOffset + byteStart;
+  let view: Float32Array;
+  if (byteOffset % 4 === 0) {
+    view = new Float32Array(stack.buffer, byteOffset, pixelCount);
+  } else {
+    const bytes = new Uint8Array(stack.buffer, byteOffset, byteLength);
+    const aligned = new Uint8Array(byteLength);
+    aligned.set(bytes);
+    view = new Float32Array(aligned.buffer);
+  }
+  return copy ? new Float32Array(view) : view;
+}
+
 const clampPct = (x: number): number => Math.max(0, Math.min(100, x));
 const valueToPct = (value: number | null | undefined, min: number, max: number, fallback: number): number => {
   if (value == null || !Number.isFinite(value) || max <= min) return fallback;
@@ -631,7 +690,16 @@ const OFFLINE_HIST_SLOT = 1_000_000;
 const CANVAS_TARGET_SIZE = 600;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 30;
-const MAX_PLAYBACK_FPS = 60;
+const MAX_PLAYBACK_FPS = 30;
+const HTML_EXPORT_OVERHEAD_BYTES = 700_000;
+
+function formatEstimatedHtmlSize(payloadBytes: number): string {
+  const htmlBytes = Math.max(0, payloadBytes) * 4 / 3 + HTML_EXPORT_OVERHEAD_BYTES;
+  const mb = htmlBytes / (1024 * 1024);
+  if (mb >= 100) return `~${Math.round(mb)} MB`;
+  if (mb >= 10) return `~${mb.toFixed(1)} MB`;
+  return `~${mb.toFixed(2)} MB`;
+}
 
 const clampPlaybackFps = (value: number) => {
   const fps = Number.isFinite(value) ? value : 1;
@@ -910,8 +978,9 @@ function computeROIPixelStats(
 // Main Component
 // ============================================================================
 function Show3D() {
-  // Theme detection
-  const { themeInfo, colors: baseColors } = useTheme();
+  // Theme detection (offline HTML exports force a light/white background)
+  const [offlineForTheme] = useModelState<boolean>("_export_light");
+  const { themeInfo, colors: baseColors } = useTheme(offlineForTheme);
   const themeColors = {
     ...baseColors,
     accentGreen: themeInfo.theme === "dark" ? "#0f0" : "#1a7a1a",
@@ -944,15 +1013,12 @@ function Show3D() {
   // and length are similar. frame_seq is incremented Python-side on every write
   // so JS effects always see a change. Use it in dep arrays alongside frameBytes.
   const [frameSeq] = useModelState<number>("frame_seq");
-  // Offline mode (nbconvert HTML export): when True at __init__, the full
-  // (N, H, W) uint8-quantized stack is shipped in _offline_stack plus the
-  // global (min, max). JS dequantizes the requested slice on every sliceIdx
-  // change — no kernel round-trip needed. Use case: ship a Show3D widget
-  // embedded in an HTML page that a colleague can scrub without a Python
-  // environment running. uint8 keeps the widget-state JSON under V8's
-  // ~512 MB JSON.parse limit on multi-widget reports.
+  // Offline mode: standalone HTML can carry either a compact uint8 stack
+  // (_offline_stack) or an exact float32 stack (_offline_float_stack). JS
+  // slices locally on scrub so exported reports do not need a Python kernel.
   const [offline] = useModelState<boolean>("offline");
   const [offlineStack] = useModelState<DataView>("_offline_stack");
+  const [offlineFloatStack] = useModelState<DataView>("_offline_float_stack");
   const [offlineMin] = useModelState<number>("_offline_min");
   const [offlineMax] = useModelState<number>("_offline_max");
   // Reused scratch Float32Array sized to one frame so per-scrub dequant
@@ -969,8 +1035,12 @@ function Show3D() {
   const [liveSliceIdx, setLiveSliceIdx] = React.useState<number>(sliceIdx);
   React.useEffect(() => { setLiveSliceIdx(sliceIdx); }, [sliceIdx]);
   const frameBytes = React.useMemo<DataView>(() => {
+    const pixelCount = width * height;
+    if (offline && offlineFloatStack && offlineFloatStack.byteLength > 0 && pixelCount > 0) {
+      const f32 = float32FrameFromDataView(offlineFloatStack, liveSliceIdx, pixelCount, false);
+      if (f32) return new DataView(f32.buffer, f32.byteOffset, f32.byteLength);
+    }
     if (offline && offlineStack && offlineStack.byteLength > 0 && width > 0 && height > 0) {
-      const pixelCount = width * height;
       const start = liveSliceIdx * pixelCount;
       if (start + pixelCount <= offlineStack.byteLength) {
         const u8 = new Uint8Array(offlineStack.buffer, offlineStack.byteOffset + start, pixelCount);
@@ -986,7 +1056,7 @@ function Show3D() {
       }
     }
     return rawFrameBytes;
-  }, [offline, offlineStack, offlineMin, offlineMax, rawFrameBytes, liveSliceIdx, width, height]);
+  }, [offline, offlineStack, offlineFloatStack, offlineMin, offlineMax, rawFrameBytes, liveSliceIdx, width, height]);
   const getOfflineFrame = (idx: number): Float32Array | null => {
     // Allocate a FRESH Float32Array per call so the GPU upload path's
     // pointer-equality cache can't short-circuit the upload and leave
@@ -994,8 +1064,12 @@ function Show3D() {
     // scratch buffer in place; engine.uploadData saw identical reference
     // every tick and skipped the texture refresh — autoplay frame counter
     // advanced but canvas stayed on initial frame. Verified 2026-05-24.
-    if (!offline || !offlineStack || offlineStack.byteLength === 0 || width <= 0 || height <= 0) return null;
+    if (!offline || width <= 0 || height <= 0) return null;
     const pixelCount = width * height;
+    if (offlineFloatStack && offlineFloatStack.byteLength > 0) {
+      return float32FrameFromDataView(offlineFloatStack, idx, pixelCount, true);
+    }
+    if (!offlineStack || offlineStack.byteLength === 0) return null;
     const start = idx * pixelCount;
     if (start < 0 || start + pixelCount > offlineStack.byteLength) return null;
     const u8 = new Uint8Array(offlineStack.buffer, offlineStack.byteOffset + start, pixelCount);
@@ -1062,9 +1136,6 @@ function Show3D() {
   const [panelTitleFontSize] = useModelState<number>("panel_title_font_size");
   const [panelGapTrait] = useModelState<number>("panel_gap");
   const [linkContrast, setLinkContrast] = useModelState<boolean>("link_contrast");
-  // Back-compat: both old axis flags follow the single Link toggle.
-  const linkZoom = linkPanels;
-  const linkPan = linkPanels;
   const [cmap, setCmap] = useModelState<string>("cmap");
 
   // Playback
@@ -1103,6 +1174,9 @@ function Show3D() {
   const [percentileHigh] = useModelState<number>("percentile_high");
   const [traitVmin] = useModelState<number | null>("vmin");
   const [traitVmax] = useModelState<number | null>("vmax");
+  const [imageVminPct, setImageVminPct] = useModelState<number>("image_vmin_pct");
+  const [imageVmaxPct, setImageVmaxPct] = useModelState<number>("image_vmax_pct");
+  const manualImageRangeBeforeAutoRef = React.useRef<{ min: number; max: number } | null>(null);
   const [vminPerPanel, setVminPerPanel] = useModelState<(number | null)[]>("vmin_per_panel");
   const [vmaxPerPanel, setVmaxPerPanel] = useModelState<(number | null)[]>("vmax_per_panel");
   const [dataMin] = useModelState<number>("data_min");
@@ -1145,6 +1219,12 @@ function Show3D() {
   const [frameServerVersion] = useModelState<number>("frame_server_version");
   const [benchmarkRequest] = useModelState<Record<string, unknown>>("benchmark_request");
   const [, setBenchmarkResult] = useModelState<Record<string, unknown>>("benchmark_result");
+  const [, setExportRequest] = useModelState<string>("export_request");
+  const [exportStatus] = useModelState<string>("export_status");
+  const [exportEnabled] = useModelState<boolean>("export_enabled");
+  const [exportPayload] = useModelState<DataView>("export_payload");
+  const [exportPayloadId] = useModelState<string>("export_payload_id");
+  const [exportPayloadFilename] = useModelState<string>("export_filename");
 
   // Canvas refs
   const rootRef = React.useRef<HTMLDivElement>(null);
@@ -1158,6 +1238,102 @@ function Show3D() {
   const canvasWheelHandlerRef = React.useRef<((event: WheelEvent) => void) | null>(null);
   const fftCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const fftOverlayRef = React.useRef<HTMLCanvasElement>(null);
+
+  const [exportMenuAnchor, setExportMenuAnchor] = React.useState<HTMLElement | null>(null);
+  const [exportBusy, setExportBusy] = React.useState(false);
+  const [localExportStatus, setLocalExportStatus] = React.useState("");
+  const pendingExportRef = React.useRef<{
+    id: string;
+    filename: string;
+    mode: string;
+    handle: Show3DFileHandle | null;
+  } | null>(null);
+  React.useEffect(() => {
+    if (!exportStatus) return;
+    const preparing = exportStatus.startsWith("Preparing ") || exportStatus.startsWith("Exporting ");
+    if (preparing) {
+      setExportBusy(true);
+    } else if (!pendingExportRef.current) {
+      setExportBusy(false);
+    }
+  }, [exportStatus]);
+  const voxelCount = Math.max(0, Math.floor(nSlices) * Math.floor(height) * Math.floor(width));
+  const exactExportSize = formatEstimatedHtmlSize(voxelCount * 4);
+  const quantizedExportSize = formatEstimatedHtmlSize(voxelCount);
+  const handleExportMenuOpen = (event: React.MouseEvent<HTMLElement>) => {
+    setExportMenuAnchor(event.currentTarget);
+  };
+  const handleExportMenuClose = () => {
+    setExportMenuAnchor(null);
+  };
+  const handleExportSelect = async (mode: string) => {
+    setExportMenuAnchor(null);
+    if (mode !== "exact" && mode !== "quantized") return;
+    const filename = makeExportFilename(title, nSlices, height, width, mode);
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setExportBusy(true);
+    setLocalExportStatus("Choose export location...");
+    const picker = (window as Show3DWindow).showSaveFilePicker;
+    let handle: Show3DFileHandle | null = null;
+    if (picker) {
+      try {
+        handle = await picker({
+          suggestedName: filename,
+          types: [{ description: "Standalone HTML", accept: { "text/html": [".html"] } }],
+        });
+      } catch (err) {
+        if (isAbortLikeError(err)) {
+          setExportBusy(false);
+          setLocalExportStatus("Export canceled");
+          return;
+        }
+        setExportBusy(false);
+        setLocalExportStatus(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+    pendingExportRef.current = { id, filename, mode, handle };
+    setLocalExportStatus(`Preparing ${filename}...`);
+    setExportRequest(JSON.stringify({ mode, id, filename, download: true }));
+  };
+
+  React.useEffect(() => {
+    const pending = pendingExportRef.current;
+    if (!pending || exportPayloadId !== pending.id) return;
+    const bytes = extractBytes(exportPayload);
+    if (bytes.length === 0) return;
+    let canceled = false;
+    const save = async () => {
+      const payload = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes
+        : bytes.slice();
+      const filename = exportPayloadFilename || pending.filename;
+      const blob = new Blob([payload as BlobPart], { type: "text/html;charset=utf-8" });
+      try {
+        if (pending.handle) {
+          setLocalExportStatus(`Saving ${filename}...`);
+          const writable = await pending.handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+        } else {
+          downloadBlob(blob, filename);
+        }
+        if (canceled) return;
+        pendingExportRef.current = null;
+        setExportBusy(false);
+        setLocalExportStatus(`Saved ${filename} (${formatSavedBytes(bytes.byteLength)})`);
+        setExportRequest(JSON.stringify({ mode: "clear", id: `${pending.id}-clear` }));
+      } catch (err) {
+        if (canceled) return;
+        pendingExportRef.current = null;
+        setExportBusy(false);
+        setLocalExportStatus(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+        setExportRequest(JSON.stringify({ mode: "clear", id: `${pending.id}-clear` }));
+      }
+    };
+    void save();
+    return () => { canceled = true; };
+  }, [exportPayload, exportPayloadId, exportPayloadFilename, setExportRequest]);
 
   // Local state
   const [isDraggingROI, setIsDraggingROI] = React.useState(false);
@@ -1188,9 +1364,8 @@ function Show3D() {
     newList[roiSelectedIdx] = { ...newList[roiSelectedIdx], ...updates };
     setRoiList(newList);
   };
-  // Per-panel zoom/pan: index 0 is also used as the SHARED state for
-  // single-panel widgets, and as the linked state when link_zoom or
-  // link_pan are on. Each panel keeps its own state when unlinked.
+  // Per-panel zoom/pan: index 0 is also used as the shared linked state.
+  // Each panel keeps its own state when unlinked.
   type PanelState = {
     zoom: number;
     panX: number;
@@ -1236,37 +1411,18 @@ function Show3D() {
     }
     prevLinkRef.current = linkPanels;
   }, [linkPanels]);
-  const getState = (panelIdx: number, axis: "zoom" | "pan"): PanelState => {
-    const linked = axis === "zoom" ? linkZoom : linkPan;
-    return linked ? linkedState : (panelStates[panelIdx] || initialState);
-  };
-  const stateFor = (panelIdx: number): PanelState => ({
-    ...(panelStates[panelIdx] || initialState),
-    zoom: getState(panelIdx, "zoom").zoom,
-    panX: getState(panelIdx, "pan").panX,
-    panY: getState(panelIdx, "pan").panY,
-  });
+  const stateFor = (panelIdx: number): PanelState =>
+    linkPanels ? linkedState : (panelStates[panelIdx] || initialState);
   const syncPlaybackPanelTransform = (panelIdx: number, nextZoom: number, nextPanX: number, nextPanY: number) => {
     const c = playRef.current;
-    if (linkZoom || linkPan) {
-      const nextLinked = {
-        ...c.linkedState,
-        zoom: linkZoom ? nextZoom : c.linkedState.zoom,
-        panX: linkPan ? nextPanX : c.linkedState.panX,
-        panY: linkPan ? nextPanY : c.linkedState.panY,
-      };
+    if (c.linkPanels) {
+      const nextLinked = { ...c.linkedState, zoom: nextZoom, panX: nextPanX, panY: nextPanY };
       c.linkedState = nextLinked;
       linkedStateLiveRef.current = nextLinked;
-    }
-    if (!linkZoom || !linkPan) {
+    } else {
       const next = c.panelStates.slice();
       const prev = next[panelIdx] || initialState;
-      next[panelIdx] = {
-        ...prev,
-        zoom: linkZoom ? prev.zoom : nextZoom,
-        panX: linkPan ? prev.panX : nextPanX,
-        panY: linkPan ? prev.panY : nextPanY,
-      };
+      next[panelIdx] = { ...prev, zoom: nextZoom, panX: nextPanX, panY: nextPanY };
       c.panelStates = next;
       panelStatesLiveRef.current = next;
     }
@@ -1325,7 +1481,10 @@ function Show3D() {
   const nextBufferStartRef = React.useRef(0);
   const nextBufferCountRef = React.useRef(0);
   const prefetchPendingRef = React.useRef(false);
-  const playbackIdxRef = React.useRef(0);
+  // Seed from the model's slice_idx (not 0): on mount the not-playing branch
+  // of the playback effect syncs this ref back onto slice_idx in offline mode,
+  // and a stale 0 would clobber a baked middle-slice start.
+  const playbackIdxRef = React.useRef(Number.isFinite(sliceIdx) ? sliceIdx : 0);
   const frameFetchCacheRef = React.useRef<Map<number, Float32Array>>(new Map());
   const frameFetchPendingRef = React.useRef<Map<number, Promise<Float32Array | null>>>(new Map());
   const panelGpuFramePendingRef = React.useRef<Map<number, Promise<boolean>>>(new Map());
@@ -1799,8 +1958,6 @@ function Show3D() {
   }, [sliceIdx, playing, setGpuDisplayVisible]);
 
   // Histogram state for main image
-  const [imageVminPct, setImageVminPct] = React.useState(0);
-  const [imageVmaxPct, setImageVmaxPct] = React.useState(100);
   const [imageHistogramData, setImageHistogramData] = React.useState<Float32Array | null>(null);
   // GPU-computed 256-bin histogram. When non-null, the Histogram component
   // uses these bins directly and skips its CPU bin-scan fallback.
@@ -1903,12 +2060,21 @@ function Show3D() {
     setImageVmaxPct(maxPct);
   };
   const handleAutoContrastChange = (on: boolean) => {
+    if (on) {
+      manualImageRangeBeforeAutoRef.current = { min: imageVminPct, max: imageVmaxPct };
+    }
     setAutoContrast(on);
     if (perPanelHistogramEnabled) {
       if (on) {
         snapPerPanelClipsToStackAuto();
       } else {
-        resetPerPanelClips();
+        const restore = manualImageRangeBeforeAutoRef.current;
+        if (restore) {
+          setAllPanelClipPcts(restore.min, restore.max);
+          manualImageRangeBeforeAutoRef.current = null;
+        } else {
+          resetPerPanelClips();
+        }
       }
       return;
     }
@@ -1924,9 +2090,16 @@ function Show3D() {
         setImageVmaxPct(Math.max(0, Math.min(100, ((pmax - autoMin) / span) * 100)));
       }
     } else {
-      // OFF -> reset slider to full range so user sees raw data.
-      setImageVminPct(0);
-      setImageVmaxPct(100);
+      // OFF -> restore the user's manual window from before Auto was enabled.
+      const restore = manualImageRangeBeforeAutoRef.current;
+      if (restore) {
+        setImageVminPct(restore.min);
+        setImageVmaxPct(restore.max);
+        manualImageRangeBeforeAutoRef.current = null;
+      } else {
+        setImageVminPct(0);
+        setImageVmaxPct(100);
+      }
     }
   };
 
@@ -2417,7 +2590,7 @@ function Show3D() {
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     autoVmins, autoVmaxs,
     linkContrast,
-    linkedState, linkZoom, linkPan,
+    linkedState, linkPanels,
     panelStates, vminPerPanel, vmaxPerPanel,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
@@ -2442,7 +2615,7 @@ function Show3D() {
       dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
       autoVmins, autoVmaxs,
       linkContrast,
-      linkedState: liveLinkedState, linkZoom, linkPan,
+      linkedState: liveLinkedState, linkPanels,
       panelStates: livePanelStates, vminPerPanel, vmaxPerPanel,
       zoom, panX, panY, playbackPath,
       profileActive, profilePoints, profileWidth,
@@ -2453,7 +2626,7 @@ function Show3D() {
     nSlices, width, height, displayScale, canvasW, canvasH,
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
-    autoVmins, autoVmaxs, linkContrast, linkedState, linkZoom, linkPan, panelStates, vminPerPanel, vmaxPerPanel,
+    autoVmins, autoVmaxs, linkContrast, linkedState, linkPanels, panelStates, vminPerPanel, vmaxPerPanel,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
     traitVmin, traitVmax, smooth, imageRotation, showStats, diffMode, avgWindow]);
@@ -2494,6 +2667,21 @@ function Show3D() {
     if (end >= n) {
       start = Math.max(0, start - (end - n + 1));
       end = n - 1;
+    }
+    if (offline && offlineFloatStack && offlineFloatStack.byteLength >= n * frameSize * 4) {
+      const out = new Float32Array(frameSize);
+      let count = 0;
+      for (let j = start; j <= end; j++) {
+        const frame = float32FrameFromDataView(offlineFloatStack, j, frameSize, false);
+        if (!frame || frame.length < frameSize) continue;
+        for (let k = 0; k < frameSize; k++) out[k] += frame[k];
+        count++;
+      }
+      if (count > 0) {
+        const inv = 1 / count;
+        for (let k = 0; k < frameSize; k++) out[k] *= inv;
+        return out;
+      }
     }
     if (offline && offlineStack && offlineStack.byteLength >= n * frameSize) {
       const out = new Float32Array(frameSize);
@@ -2617,9 +2805,9 @@ function Show3D() {
     const transforms = Array.from({ length: n }, (_, panel) => {
       const base = c.panelStates[panel] || initialState;
       return {
-        zoom: c.linkZoom ? c.linkedState.zoom : base.zoom,
-        panX: c.linkPan ? c.linkedState.panX : base.panX,
-        panY: c.linkPan ? c.linkedState.panY : base.panY,
+        zoom: c.linkPanels ? c.linkedState.zoom : base.zoom,
+        panX: c.linkPanels ? c.linkedState.panX : base.panX,
+        panY: c.linkPanels ? c.linkedState.panY : base.panY,
       };
     });
     const rendered = engine.renderPanelSlotsDirectToCanvas(
@@ -4235,7 +4423,7 @@ function Show3D() {
     if (offline || !separatePanelFrames || !frameServerUrl || playing) return;
     void renderFetchedSlice(sliceIdx);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offline, separatePanelFrames, frameServerUrl, frameServerVersion, sliceIdx, playing, canvasW, canvasH, cmap, imageVminPct, imageVmaxPct, autoContrast, logScale, panelStates, linkedState, linkZoom, linkPan, panelGapTrait, maxCols]);
+  }, [offline, separatePanelFrames, frameServerUrl, frameServerVersion, sliceIdx, playing, canvasW, canvasH, cmap, imageVminPct, imageVmaxPct, autoContrast, logScale, panelStates, linkedState, linkPanels, panelGapTrait, maxCols]);
 
   React.useLayoutEffect(() => {
     if (!mainOffscreenRef.current || !canvasRef.current) return;
@@ -4243,7 +4431,7 @@ function Show3D() {
     const ctx = canvasRef.current.getContext("2d");
     if (ctx) drawMain(ctx, mainOffscreenRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, showPanelTitles, panelGapTrait, panelTitleFontSize, panelWidthPx, sharedPanelSource, sliceIdx, displaySliceIdx, liveSliceIdx, offline, playing, nSlices]);
+  }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkPanels, themeColors.bg, panelRealFrames, panelTitles, showPanelTitles, panelGapTrait, panelTitleFontSize, panelWidthPx, sharedPanelSource, sliceIdx, displaySliceIdx, liveSliceIdx, offline, playing, nSlices]);
 
   // Render overlay (ROI only) - HiDPI aware
   React.useEffect(() => {
@@ -4402,7 +4590,7 @@ function Show3D() {
         ctx.restore();
       }
     }
-  }, [effectiveRoiActive, roiItems, roiSelectedIdx, isDraggingROI, canvasW, canvasH, displayScale, zoom, panX, panY, themeColors, profileActive, profilePoints, profileWidth, profilePanelIdx, nPanels, panelTitles, imageRotation, width, height, panelStates, linkedState, linkZoom, linkPan, panelGapTrait, sourcePanelWidth, sourcePanelHeight, sharedPanelSource]);
+  }, [effectiveRoiActive, roiItems, roiSelectedIdx, isDraggingROI, canvasW, canvasH, displayScale, zoom, panX, panY, themeColors, profileActive, profilePoints, profileWidth, profilePanelIdx, nPanels, panelTitles, imageRotation, width, height, panelStates, linkedState, linkPanels, panelGapTrait, sourcePanelWidth, sourcePanelHeight, sharedPanelSource]);
 
   // Lens inset rendering
   React.useEffect(() => {
@@ -4892,7 +5080,7 @@ function Show3D() {
       drawColorbar(ctx, cssW, cssH, lut, vmin, vmax, logScale);
       ctx.restore();
     }
-  }, [pixelSize, pixelUnit, scaleBarVisible, width, sourcePanelWidth, canvasW, canvasH, displayScale, zoom, nPanels, maxCols, panelStates, linkedState, linkZoom, panelGapTrait, showZoomIndicator, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, autoVmins, autoVmaxs, displaySliceIdx, percentileLow, percentileHigh, dataMin, dataMax, traitVmin, traitVmax]);
+  }, [pixelSize, pixelUnit, scaleBarVisible, width, sourcePanelWidth, canvasW, canvasH, displayScale, zoom, nPanels, maxCols, panelStates, linkedState, linkPanels, panelGapTrait, showZoomIndicator, showColorbar, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, autoVmins, autoVmaxs, displaySliceIdx, percentileLow, percentileHigh, dataMin, dataMax, traitVmin, traitVmax]);
 
   // Compute FFT magnitude (expensive, async - only re-run on data/GPU changes)
   // Supports ROI-scoped FFT: when ROI is active with a selected ROI, compute
@@ -5064,7 +5252,9 @@ function Show3D() {
   // image ... distance along the line ... time axis"). Requires the profile tool
   // ON with a drawn line and some way to read every frame: the offline pack for
   // exported HTML, or the live frame server while the notebook kernel is up.
-  const kymoOfflineStackReady = offline && !!offlineStack && offlineStack.byteLength > 0;
+  const kymoExactStackReady = offline && !!offlineFloatStack && offlineFloatStack.byteLength > 0;
+  const kymoQuantizedStackReady = offline && !!offlineStack && offlineStack.byteLength > 0;
+  const kymoOfflineStackReady = kymoExactStackReady || kymoQuantizedStackReady;
   const kymoLiveStackReady = !offline && !!frameServerUrl;
   const kymographAvailable = (nPanels || 1) === 1
     && (kymoOfflineStackReady || kymoLiveStackReady)
@@ -5090,7 +5280,26 @@ function Show3D() {
       setKymoVersion(v => v + 1);
     };
 
-    if (kymoOfflineStackReady && offlineStack) {
+    if (kymoExactStackReady && offlineFloatStack) {
+      const sampleFrame = (frameIdx: number): Float32Array => {
+        const frame = float32FrameFromDataView(offlineFloatStack, frameIdx, pixelCount, false);
+        return frame
+          ? sampleLineProfile(frame, width, height, row0, col0, row1, col1, profileWidth)
+          : new Float32Array(0);
+      };
+      const first = sampleFrame(0);
+      const lineLen = first.length;
+      if (lineLen < 2) { kymoDataRef.current = null; return; }
+      const kymo = new Float32Array(nSlices * lineLen);
+      kymo.set(first.subarray(0, lineLen), 0);
+      for (let f = 1; f < nSlices; f++) {
+        kymo.set(sampleFrame(f).subarray(0, lineLen), f * lineLen);
+      }
+      publish(kymo, lineLen);
+      return () => { cancelled = true; };
+    }
+
+    if (kymoQuantizedStackReady && offlineStack) {
       const scale = (offlineMax - offlineMin) / 255.0;
       // Read straight from the packed uint8 stack, dequantizing only the
       // bilinear corners per sample point. No whole-frame dequant.
@@ -5143,7 +5352,7 @@ function Show3D() {
     kymoDataRef.current = null;
     return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kymoReady, kymoOfflineStackReady, kymoLiveStackReady, offlineStack, offlineMin, offlineMax, width, height, nSlices,
+  }, [kymoReady, kymoExactStackReady, kymoQuantizedStackReady, kymoLiveStackReady, offlineStack, offlineFloatStack, offlineMin, offlineMax, width, height, nSlices,
       profileWidth, profilePoints[0]?.row, profilePoints[0]?.col,
       profilePoints[1]?.row, profilePoints[1]?.col, profilePanelIdx, fetchFrameFromServer]);
 
@@ -5532,9 +5741,9 @@ function Show3D() {
     const base = live.panelStates[idx] || stateFor(idx);
     const s = {
       ...base,
-      zoom: live.linkZoom ? live.linkedState.zoom : base.zoom,
-      panX: live.linkPan ? live.linkedState.panX : base.panX,
-      panY: live.linkPan ? live.linkedState.panY : base.panY,
+      zoom: live.linkPanels ? live.linkedState.zoom : base.zoom,
+      panX: live.linkPanels ? live.linkedState.panX : base.panX,
+      panY: live.linkPanels ? live.linkedState.panY : base.panY,
     };
     setIsDraggingPan(true);
     setPanStart({ x: e.clientX, y: e.clientY, pX: s.panX, pY: s.panY });
@@ -5552,9 +5761,9 @@ function Show3D() {
     const base = live.panelStates[panelIdx] || stateFor(panelIdx);
     const cur = {
       ...base,
-      zoom: live.linkZoom ? live.linkedState.zoom : base.zoom,
-      panX: live.linkPan ? live.linkedState.panX : base.panX,
-      panY: live.linkPan ? live.linkedState.panY : base.panY,
+      zoom: live.linkPanels ? live.linkedState.zoom : base.zoom,
+      panX: live.linkPanels ? live.linkedState.panX : base.panX,
+      panY: live.linkPanels ? live.linkedState.panY : base.panY,
     };
     const zoomFactor = Math.max(0.75, Math.min(1.35, Math.exp(-deltaY * 0.002)));
     const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, cur.zoom * zoomFactor));
@@ -5887,9 +6096,9 @@ function Show3D() {
       const base = live.panelStates[panStartPanelRef.current] || stateFor(panStartPanelRef.current);
       const current = {
         ...base,
-        zoom: live.linkZoom ? live.linkedState.zoom : base.zoom,
-        panX: live.linkPan ? live.linkedState.panX : base.panX,
-        panY: live.linkPan ? live.linkedState.panY : base.panY,
+        zoom: live.linkPanels ? live.linkedState.zoom : base.zoom,
+        panX: live.linkPanels ? live.linkedState.panX : base.panX,
+        panY: live.linkPanels ? live.linkedState.panY : base.panY,
       };
       syncPlaybackPanelTransform(panStartPanelRef.current, current.zoom, newPanX, newPanY);
       transformInputAtRef.current = performance.now();
@@ -6595,6 +6804,37 @@ function Show3D() {
     scrubToSlice(next);
     commitSlice(next);
   };
+  const handleLoopSliderPointerDownCapture = (e: React.PointerEvent<HTMLSpanElement>) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest(".MuiSlider-thumb")) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const sliceFromClientX = (clientX: number) => {
+      const pct = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+      return clampSlice(pct * Math.max(0, nSlices - 1));
+    };
+    const moveCurrent = (clientX: number, commit: boolean) => {
+      const next = sliceFromClientX(clientX);
+      scrubToSlice(next);
+      if (commit) commitSlice(next);
+    };
+    e.preventDefault();
+    e.stopPropagation();
+    e.nativeEvent.stopImmediatePropagation();
+    moveCurrent(e.clientX, false);
+    const onMove = (ev: PointerEvent) => {
+      ev.preventDefault();
+      moveCurrent(ev.clientX, false);
+    };
+    const onUp = (ev: PointerEvent) => {
+      ev.preventDefault();
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      moveCurrent(ev.clientX, true);
+    };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+  };
   const overlayCanvasVisible = effectiveRoiActive || profileActive;
   const lensCanvasVisible = showLens && lensPos !== null;
   const keyboardShortcutItems: [string, string][] = [
@@ -6724,6 +6964,50 @@ function Show3D() {
             <Box sx={{ flex: 1 }} />
             <Box sx={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <Button size="small" sx={compactButton} onClick={handleCopy} aria-label="Copy current frame to clipboard as PNG">Copy</Button>
+              {exportEnabled && (
+                <>
+                  <Button
+                    size="small"
+                    sx={compactButton}
+                    disabled={exportBusy}
+                    onClick={handleExportMenuOpen}
+                    aria-label="Export standalone HTML"
+                    aria-controls={exportMenuAnchor ? "show3d-export-menu" : undefined}
+                    aria-expanded={exportMenuAnchor ? "true" : undefined}
+                    aria-haspopup="menu"
+                    title={localExportStatus || exportStatus || "Export standalone HTML with a save dialog"}
+                  >
+                    {exportBusy ? "Exporting" : "Export"}
+                  </Button>
+                  <Menu
+                    id="show3d-export-menu"
+                    anchorEl={exportMenuAnchor}
+                    open={Boolean(exportMenuAnchor)}
+                    onClose={handleExportMenuClose}
+                    MenuListProps={{ "aria-label": "Export standalone HTML options" }}
+                    {...themedMenuProps}
+                  >
+                    <MenuItem onClick={() => handleExportSelect("exact")}>HTML exact float32 ({exactExportSize})</MenuItem>
+                    <MenuItem onClick={() => handleExportSelect("quantized")}>HTML quantized uint8 ({quantizedExportSize})</MenuItem>
+                  </Menu>
+                </>
+              )}
+              {exportEnabled && (localExportStatus || exportStatus) && (
+                <Typography
+                  sx={{
+                    ...typography.label,
+                    fontSize: 10,
+                    maxWidth: 120,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    color: (localExportStatus || exportStatus).startsWith("Export failed") ? "#d32f2f" : themeColors.textMuted,
+                  }}
+                  title={localExportStatus || exportStatus}
+                >
+                  {localExportStatus || exportStatus}
+                </Typography>
+              )}
               <Button size="small" sx={compactButton} disabled={!needsReset} onClick={handleDoubleClick} aria-label="Reset zoom and pan">Reset</Button>
             </Box>
           </Box>
@@ -6987,7 +7271,7 @@ function Show3D() {
                       </IconButton>
                     </Stack>
                     {loop ? (
-                      <Slider value={[loopStart, activeIdx, effectiveLoopEnd]} onMouseDown={handleLoopSliderMouseDown} onChange={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); scrubToSlice(vals[1]); setLoopEnd(vals[2]); }} onChangeCommitted={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); commitSlice(vals[1]); setLoopEnd(vals[2]); }} disableSwap min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Loop range and current ${dimLabel.toLowerCase()} (frame ${activeIdx + 1} of ${nSlices}, loop ${loopStart + 1} to ${effectiveLoopEnd + 1})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-thumb[data-index='0']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-thumb[data-index='1']": { width: 12, height: 12 }, "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" }, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
+                      <Slider value={[loopStart, activeIdx, effectiveLoopEnd]} onMouseDown={handleLoopSliderMouseDown} onPointerDownCapture={handleLoopSliderPointerDownCapture} onChange={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); scrubToSlice(vals[1]); setLoopEnd(vals[2]); }} onChangeCommitted={(_, v) => { const vals = v as number[]; setLoopStart(vals[0]); commitSlice(vals[1]); setLoopEnd(vals[2]); }} disableSwap min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Loop range and current ${dimLabel.toLowerCase()} (frame ${activeIdx + 1} of ${nSlices}, loop ${loopStart + 1} to ${effectiveLoopEnd + 1})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-thumb[data-index='0']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-thumb[data-index='1']": { width: 12, height: 12 }, "& .MuiSlider-thumb[data-index='2']": { width: 8, height: 8, bgcolor: themeColors.textMuted }, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" }, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} />
                     ) : (
                       <Slider value={activeIdx} onChange={(_, v) => scrubToSlice(v as number)} onChangeCommitted={(_, v) => commitSlice(v as number)} min={0} max={nSlices - 1} size="small" valueLabelDisplay="auto" valueLabelFormat={(v) => `${v + 1}`} marks={bookmarkedFrames.map(f => ({ value: f }))} aria-label={`Current ${dimLabel.toLowerCase()} (${activeIdx + 1} of ${nSlices})`} sx={{ ...sliderStyles.small, flex: 1, minWidth: 40, "& .MuiSlider-mark": { bgcolor: themeColors.accent, width: 4, height: 4, borderRadius: "50%", top: "50%", transform: "translate(-50%, -50%)" } }} />
                     )}
@@ -7062,6 +7346,7 @@ function Show3D() {
                                 });
                                 setVminPerPanel(nextVmins);
                                 setVmaxPerPanel(nextVmaxs);
+                                manualImageRangeBeforeAutoRef.current = null;
                                 setAutoContrast(false);
                               } else {
                                 setPanelRangeValues(panel, pctToValue(min, panelRange.min, panelRange.max), pctToValue(max, panelRange.min, panelRange.max));
@@ -7095,7 +7380,10 @@ function Show3D() {
                     onRangeChange={(min, max) => {
                       setImageVminPct(min);
                       setImageVmaxPct(max);
-                      if (autoContrast) setAutoContrast(false);
+                      if (autoContrast) {
+                        manualImageRangeBeforeAutoRef.current = null;
+                        setAutoContrast(false);
+                      }
                     }}
                     width={110}
                     height={58}

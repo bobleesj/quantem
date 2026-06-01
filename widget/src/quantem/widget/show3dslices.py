@@ -12,9 +12,10 @@ import io
 import json
 import math
 import pathlib
+import tempfile
 import warnings
 from numbers import Real
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Self
 
 import anywidget
@@ -22,6 +23,26 @@ import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
+from quantem.widget.show3d import (
+    _crop_stack,
+    _normalize_crop,
+    _normalize_padding,
+    _pad_stack,
+)
+# Config helpers live in a widget-free module so Show3D can share them without a
+# circular import. Re-exported here for back-compat (notebooks import them from
+# this module).
+from quantem.widget.config_utils import (
+    _centered_crop_for_shape,
+    _config_float,
+    _config_get,
+    _is_default_pixel_size,
+    _load_quantem_config,
+    _normalize_rotation_deg,
+    _pixel_size_from_quantem_config,
+    _post_crop_from_quantem_config,
+    _rotate_stack_inplane,
+)
 from quantem.widget.show2d import _reject_unknown_kwargs
 from quantem.widget.state import (
     resolve_widget_version,
@@ -36,6 +57,7 @@ _VALID_CMAPS = frozenset({
     "inferno", "viridis", "plasma", "magma", "hot", "gray", "hsv", "turbo",
     "cividis", "RdBu", "RdBu_r", "seismic", "twilight", "twilight_shifted",
 })
+_MAX_PLAYBACK_FPS = 30.0
 
 
 class Show3DSlices(anywidget.AnyWidget):
@@ -64,6 +86,33 @@ class Show3DSlices(anywidget.AnyWidget):
     - JSON state save/load via ``state_dict`` / ``load_state_dict`` / ``save``
     - Explicit ``free`` to release RAM held by traitlets observers
 
+    Config Contract
+    ---------------
+    The ``config`` argument is an explicit QuantEM reconstruction convenience,
+    not a general-purpose transform registry. It accepts either a parsed
+    ``config.json`` mapping or a path to that JSON file. Show3DSlices reads only
+    the following keys:
+
+    - ``reconstruction.slice_thickness_A`` and
+      ``reconstruction.obj_sampling_A_per_px`` for ``pixel_size`` when
+      ``pixel_size`` is not provided.
+    - ``data.rotation_deg`` for ``rotation_deg`` when ``rotation_deg`` is not
+      provided and ``apply_config_transforms`` is True.
+    - ``object.cropped_shape`` for a centered post-rotation crop when
+      ``post_crop`` is not provided and ``apply_config_transforms`` is True.
+      If that key is absent, it falls back to
+      ``reconstruction.obj_padding_px`` and then ``input.padding``.
+
+    Explicit constructor arguments always win over config-derived values. To
+    use only config sampling metadata, pass ``apply_config_transforms=False``.
+    To force no config rotation or post-crop while still leaving transforms
+    enabled, pass ``rotation_deg=0`` and/or ``post_crop=0`` explicitly.
+
+    The spatial transform order is fixed and intentionally visible:
+    ``crop`` -> ``padding`` -> ``rotation_deg`` -> ``post_crop``. The resulting
+    float32 volume is then sent to the browser. No hidden JS-side rotation,
+    crop, or precision-changing transform is applied from ``config``.
+
     Parameters
     ----------
     data : array_like
@@ -71,7 +120,7 @@ class Show3DSlices(anywidget.AnyWidget):
         (uses ``.array`` and ``.sampling`` automatically).
     title : str, optional
         Title displayed above the viewer.
-    cmap : str, default "inferno"
+    cmap : str, default "plasma"
         Colormap name. One of the project's valid colormaps (``"inferno"``,
         ``"viridis"``, ``"magma"``, ``"gray"``, ``"plasma"``, ...).
     pixel_size : float or sequence of 3 floats, optional
@@ -79,6 +128,37 @@ class Show3DSlices(anywidget.AnyWidget):
         3-tuple `(pz, py, px)` for anisotropic data (e.g. multislice ptycho
         with z-thickness >> xy-sampling). Per-axis values flow to JS via the
         `pixel_size_axes` trait for correct scale bars on each panel.
+    config : mapping or path-like, optional
+        Parsed QuantEM reconstruction ``config.json`` data, or a path to it.
+        This is only used for the keys listed in "Config Contract" above.
+        It can infer sampling metadata, scan-alignment rotation, and
+        post-rotation FOV crop, but explicit constructor arguments override
+        every inferred value.
+    apply_config_transforms : bool, default True
+        If True, use config-derived ``rotation_deg`` and ``post_crop`` only
+        when those arguments are omitted. If False, ``config`` may still fill
+        ``pixel_size`` but will not rotate or crop the volume.
+    crop : int or tuple[int, int] or tuple[int, int, int, int], default 0
+        Spatial crop applied before padding and rotation. Use an int to crop
+        all sides, ``(rows, cols)`` for symmetric row/column cropping, or
+        ``(top, bottom, left, right)`` for side-specific cropping.
+    padding : int or tuple[int, int], default 0
+        Spatial padding applied after crop and before rotation. This mirrors
+        Show3D and is useful when rotating a scan-aligned view without clipping
+        real signal at the canvas edge.
+    pad_mode : {"median", "constant"}, default "median"
+        Padding fill mode. ``"median"`` uses a single stack median so borders
+        are contrast-neutral; ``"constant"`` fills with 0.
+    rotation_deg : float, optional
+        In-plane row/column rotation in degrees, applied after crop/padding.
+        If omitted and ``config`` is provided, uses ``data.rotation_deg`` from
+        the config; otherwise defaults to 0. Uses built-in float32 bilinear
+        interpolation with nearest-edge fill, no SciPy dependency, and keeps
+        the output shape fixed.
+    post_crop : int or tuple[int, int] or tuple[int, int, int, int], optional
+        Spatial crop applied after rotation. If omitted and ``config`` is
+        provided, uses ``object.cropped_shape`` or reconstruction padding from
+        the config; otherwise defaults to 0.
     show_stats : bool, default False
         Compute per-slice statistics traits on each slice change (`widget.stats_mean`,
         `stats_min`, `stats_max`, `stats_std`, each a list of 3 floats: XY/XZ/YZ).
@@ -103,8 +183,8 @@ class Show3DSlices(anywidget.AnyWidget):
         (long-tailed histogram - manual contrast usually crushes the signal).
     vmin, vmax : float, optional
         Manual contrast limits.
-    fps : float, default 5.0
-        Playback speed when scrubbing one axis.
+    fps : float, default 30.0
+        Playback speed when scrubbing one axis, capped at 30.
     play_axis : int, default 0
         Which axis to animate (0=Z, 1=Y, 2=X, 3=cycle all).
     dim_labels : list of str, optional
@@ -160,11 +240,22 @@ class Show3DSlices(anywidget.AnyWidget):
     # Offline HTML report mode: volume_bytes is uint8-quantized against this
     # global range. Default live path keeps exact float32 bytes.
     offline = traitlets.Bool(False).tag(sync=True)
+    # True only on a clone written by export_html: forces the standalone HTML to
+    # render on a light/white background regardless of the viewer's OS theme.
+    _export_light = traitlets.Bool(False).tag(sync=True)
     _offline_min = traitlets.Float(0.0).tag(sync=True)
     _offline_max = traitlets.Float(1.0).tag(sync=True)
+    # Frontend-triggered standalone HTML export. The request is JSON so repeated
+    # exports of the same mode can include a unique id and still sync.
+    export_request = traitlets.Unicode("").tag(sync=True)
+    export_status = traitlets.Unicode("").tag(sync=True)
+    export_enabled = traitlets.Bool(True).tag(sync=True)
+    export_payload = traitlets.Bytes(b"").tag(sync=True)
+    export_payload_id = traitlets.Unicode("").tag(sync=True)
+    export_filename = traitlets.Unicode("").tag(sync=True)
     # Display
     title = traitlets.Unicode("").tag(sync=True)
-    cmap = traitlets.Unicode("inferno").tag(sync=True)
+    cmap = traitlets.Unicode("plasma").tag(sync=True)
     log_scale = traitlets.Bool(False).tag(sync=True)
     auto_contrast = traitlets.Bool(True).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
@@ -187,11 +278,22 @@ class Show3DSlices(anywidget.AnyWidget):
     show_crosshair = traitlets.Bool(True).tag(sync=True)
     show_fft = traitlets.Bool(False).tag(sync=True)
     fft_window = traitlets.Bool(False).tag(sync=True)
+    fft_colormap = traitlets.Unicode("inferno").tag(sync=True)
+    fft_log_scale = traitlets.Bool(False).tag(sync=True)
+    fft_auto = traitlets.Bool(True).tag(sync=True)
     orthographic = traitlets.Bool(False).tag(sync=True)
-    smooth = traitlets.Bool(False).tag(sync=True)
-    # Deprecated compatibility no-op. The JS widget always renders the compact layout.
-    compact = traitlets.Bool(True)
+    smooth = traitlets.Bool(True).tag(sync=True)
     flip = traitlets.Bool(False).tag(sync=True)
+    show_colorbar = traitlets.Bool(False).tag(sync=True)
+    image_vmin_pct = traitlets.Float(0.0).tag(sync=True)
+    image_vmax_pct = traitlets.Float(100.0).tag(sync=True)
+    show_slice_planes = traitlets.Bool(True).tag(sync=True)
+    plane_visibility = traitlets.List(
+        traitlets.Bool(),
+        default_value=[True, True, True],
+    ).tag(sync=True)
+    volume_opacity = traitlets.Float(0.5).tag(sync=True)
+    slice_plane_opacity = traitlets.Float(0.35).tag(sync=True)
     # Axis labels (dim 0, 1, 2). Use detector-plane convention: axis 0 = slice
     # (multislice depth), axis 1 = row, axis 2 = col. Panel headers display as
     # "<dl[1]><dl[2]> (<dl[0]>=...)" so default reads as e.g. "row col (slice=7)".
@@ -205,8 +307,8 @@ class Show3DSlices(anywidget.AnyWidget):
     # Playback
     playing = traitlets.Bool(False).tag(sync=True)
     reverse = traitlets.Bool(False).tag(sync=True)
-    boomerang = traitlets.Bool(False).tag(sync=True)
-    fps = traitlets.Float(5.0).tag(sync=True)
+    boomerang = traitlets.Bool(True).tag(sync=True)
+    fps = traitlets.Float(30.0).tag(sync=True)
     loop = traitlets.Bool(True).tag(sync=True)
     play_axis = traitlets.Int(0).tag(sync=True)  # 0=Z, 1=Y, 2=X, 3=All
     # Validators (consistent with Show3D)
@@ -221,15 +323,51 @@ class Show3DSlices(anywidget.AnyWidget):
             )
         return val
 
+    @traitlets.validate("fft_colormap")
+    def _validate_fft_colormap(self, proposal: dict) -> str:
+        """Reject unknown FFT colormap names. Keeps JS LUT lookup safe."""
+        val = str(proposal["value"])
+        if val not in _VALID_CMAPS:
+            raise traitlets.TraitError(
+                f"Unknown fft_colormap {val!r}. Valid: {sorted(_VALID_CMAPS)}"
+            )
+        return val
+
+    @traitlets.validate("image_vmin_pct", "image_vmax_pct")
+    def _validate_image_percent(self, proposal: dict) -> float:
+        """Clamp histogram contrast handles to [0, 100]."""
+        val = float(proposal["value"])
+        if not math.isfinite(val):
+            raise traitlets.TraitError(f"{proposal['trait'].name} must be finite, got {val}")
+        return max(0.0, min(val, 100.0))
+
+    @traitlets.validate("volume_opacity", "slice_plane_opacity")
+    def _validate_opacity(self, proposal: dict) -> float:
+        """Clamp volume display opacity sliders to [0, 1]."""
+        val = float(proposal["value"])
+        if not math.isfinite(val):
+            raise traitlets.TraitError(f"{proposal['trait'].name} must be finite, got {val}")
+        return max(0.0, min(val, 1.0))
+
+    @traitlets.validate("plane_visibility")
+    def _validate_plane_visibility(self, proposal: dict) -> list[bool]:
+        """Require exactly three flags in [XY, XZ, YZ] order."""
+        val = [bool(v) for v in proposal["value"]]
+        if len(val) != 3:
+            raise traitlets.TraitError(
+                f"plane_visibility must have length 3 [XY, XZ, YZ], got {len(val)}"
+            )
+        return val
+
     @traitlets.validate("fps")
     def _validate_fps(self, proposal: dict) -> float:
-        """Reject non-finite or non-positive playback speed."""
+        """Reject invalid fps and cap playback at the browser budget."""
         val = float(proposal["value"])
         if not math.isfinite(val):
             raise traitlets.TraitError(f"fps must be finite, got {val}")
         if val <= 0:
             raise traitlets.TraitError(f"fps must be > 0, got {val}")
-        return val
+        return min(val, _MAX_PLAYBACK_FPS)
 
     @traitlets.validate("pixel_size")
     def _validate_pixel_size(self, proposal: dict) -> float:
@@ -346,8 +484,15 @@ class Show3DSlices(anywidget.AnyWidget):
         *,
         title: str = "",
         title_b: str = "",
-        cmap: str = "inferno",
+        cmap: str = "plasma",
         pixel_size: float | Sequence[float] | None = 0.0,
+        config: Mapping | str | pathlib.Path | None = None,
+        apply_config_transforms: bool = True,
+        crop: int | tuple[int, int] | tuple[int, int, int, int] = 0,
+        padding: int | tuple[int, int] = 0,
+        pad_mode: str = "median",
+        rotation_deg: float | None = None,
+        post_crop: int | tuple[int, int] | tuple[int, int, int, int] | None = None,
         scale_bar_visible: bool = True,
         z_stretch: float | None = None,
         show_controls: bool = True,
@@ -356,17 +501,19 @@ class Show3DSlices(anywidget.AnyWidget):
         show_fft: bool = False,
         fft_window: bool = False,
         orthographic: bool = False,
-        smooth: bool = False,
+        smooth: bool = True,
         flip: bool = False,
         show_diff: bool = False,
         log_scale: bool = False,
         auto_contrast: bool = True,
         vmin: float | None = None,
         vmax: float | None = None,
-        fps: float = 5.0,
+        image_vmin_pct: float = 0.0,
+        image_vmax_pct: float = 100.0,
+        fps: float = 30.0,
         loop: bool = True,
         reverse: bool = False,
-        boomerang: bool = False,
+        boomerang: bool = True,
         linked_contrast: bool = True,
         play_axis: int = 0,
         dim_labels: list[str] | None = None,
@@ -374,6 +521,7 @@ class Show3DSlices(anywidget.AnyWidget):
         state=None,
         **kwargs,
     ):
+        kwargs.pop("compact", None)
         _reject_unknown_kwargs(type(self), kwargs)
         if data_b is not None:
             raise ValueError(
@@ -400,6 +548,10 @@ class Show3DSlices(anywidget.AnyWidget):
         # Pre-seed so free() / __repr__ / summary() are safe even if a validator
         # raises before _data is assigned below (e.g. wrong ndim or complex data).
         self._data: np.ndarray | None = None
+        self._syncing_plane_visibility = False
+        config_data = _load_quantem_config(config)
+        rotation_deg_was_set = rotation_deg is not None
+        post_crop_was_set = post_crop is not None
 
         # Duck-typed Dataset3d extraction (matches Show2D / Show3D pattern).
         # `array` is the required payload; title/sampling/units are optional
@@ -408,9 +560,7 @@ class Show3DSlices(anywidget.AnyWidget):
             name = getattr(data, "name", "")
             if not title and name:
                 title = name
-            pixel_size_is_default = pixel_size is None or (
-                np.isscalar(pixel_size) and float(pixel_size) == 0.0
-            )
+            pixel_size_is_default = _is_default_pixel_size(pixel_size)
             if pixel_size_is_default and hasattr(data, "sampling"):
                 try:
                     units = list(getattr(data, "units", []) or [])
@@ -446,6 +596,11 @@ class Show3DSlices(anywidget.AnyWidget):
                     pass
             data = data.array
 
+        if config_data is not None and _is_default_pixel_size(pixel_size):
+            config_pixel_size = _pixel_size_from_quantem_config(config_data)
+            if config_pixel_size is not None:
+                pixel_size = config_pixel_size
+
         data = to_numpy(data)
         if data.ndim != 3:
             raise ValueError(f"Show3DSlices requires 3D data, got {data.ndim}D")
@@ -468,6 +623,25 @@ class Show3DSlices(anywidget.AnyWidget):
                 "Data exceeds float32 range (|value| > 3.4e38) after cast; "
                 "rescale first before passing to Show3DSlices."
             )
+        if config_data is not None and apply_config_transforms:
+            if not rotation_deg_was_set:
+                rotation_deg = _config_float(config_data, "data", "rotation_deg") or 0.0
+            if not post_crop_was_set:
+                post_crop = _post_crop_from_quantem_config(self._data.shape, config_data)
+        if rotation_deg is None:
+            rotation_deg = 0.0
+        if post_crop is None:
+            post_crop = 0
+        self._crop = _normalize_crop(crop)
+        self._padding = _normalize_padding(padding)
+        self._pad_mode = str(pad_mode)
+        self._rotation_deg = _normalize_rotation_deg(rotation_deg)
+        self._post_crop = _normalize_crop(post_crop)
+        self._data = _crop_stack(self._data, self._crop)
+        self._data = _pad_stack(self._data, self._padding, self._pad_mode)
+        self._data = _rotate_stack_inplane(self._data, self._rotation_deg)
+        self._data = _crop_stack(self._data, self._post_crop)
+        self._data = np.ascontiguousarray(self._data, dtype=np.float32)
         self.nz, self.ny, self.nx = self._data.shape
 
         # Default to middle slices
@@ -515,9 +689,6 @@ class Show3DSlices(anywidget.AnyWidget):
         if z_stretch is None:
             z_stretch = 15.0 if thin_z_ratio > 4 else 1.0
         self.z_stretch = float(z_stretch)
-        # Slices viewer is always compact. The 3D panel is an orientation/context
-        # view, while detailed comparison/tomography workflows stay in Show3DVolume.
-        self.compact = True
         self.show_controls = show_controls
         self.show_stats = show_stats
         self.show_crosshair = show_crosshair
@@ -530,6 +701,8 @@ class Show3DSlices(anywidget.AnyWidget):
         self.auto_contrast = auto_contrast
         self.vmin = vmin
         self.vmax = vmax
+        self.image_vmin_pct = image_vmin_pct
+        self.image_vmax_pct = image_vmax_pct
         self.fps = fps
         self.loop = loop
         self.reverse = reverse
@@ -544,6 +717,9 @@ class Show3DSlices(anywidget.AnyWidget):
         self.observe(self._on_slice_change, names=["slice_x", "slice_y", "slice_z"])
         self.observe(self._on_playing_change, names=["playing"])
         self.observe(self._on_show_stats_change, names=["show_stats"])
+        self.observe(self._on_export_request_change, names=["export_request"])
+        self.observe(self._on_show_slice_planes_change, names=["show_slice_planes"])
+        self.observe(self._on_plane_visibility_change, names=["plane_visibility"])
 
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
@@ -583,6 +759,36 @@ class Show3DSlices(anywidget.AnyWidget):
         self._offline_min = lo
         self._offline_max = hi
         self.volume_bytes = quantized.tobytes()
+
+    def _on_plane_visibility_change(self, change: dict) -> None:
+        if self._syncing_plane_visibility:
+            return
+        visible = any(bool(v) for v in change["new"])
+        if self.show_slice_planes == visible:
+            return
+        self._syncing_plane_visibility = True
+        try:
+            self.show_slice_planes = visible
+        finally:
+            self._syncing_plane_visibility = False
+
+    def _on_show_slice_planes_change(self, change: dict) -> None:
+        if self._syncing_plane_visibility:
+            return
+        visible = bool(change["new"])
+        if visible:
+            if any(bool(v) for v in self.plane_visibility):
+                return
+            next_visibility = [True, True, True]
+        else:
+            next_visibility = [False, False, False]
+        if list(self.plane_visibility) == next_visibility:
+            return
+        self._syncing_plane_visibility = True
+        try:
+            self.plane_visibility = next_visibility
+        finally:
+            self._syncing_plane_visibility = False
 
     def __repr__(self) -> str:
         return (
@@ -635,9 +841,19 @@ class Show3DSlices(anywidget.AnyWidget):
             "show_crosshair": self.show_crosshair,
             "show_fft": self.show_fft,
             "fft_window": self.fft_window,
+            "fft_colormap": self.fft_colormap,
+            "fft_log_scale": self.fft_log_scale,
+            "fft_auto": self.fft_auto,
             "orthographic": self.orthographic,
             "smooth": self.smooth,
             "flip": self.flip,
+            "show_colorbar": self.show_colorbar,
+            "image_vmin_pct": self.image_vmin_pct,
+            "image_vmax_pct": self.image_vmax_pct,
+            "show_slice_planes": self.show_slice_planes,
+            "plane_visibility": list(self.plane_visibility),
+            "volume_opacity": self.volume_opacity,
+            "slice_plane_opacity": self.slice_plane_opacity,
             "pixel_size": self.pixel_size,
             "pixel_size_axes": list(self.pixel_size_axes),
             "scale_bar_visible": self.scale_bar_visible,
@@ -682,6 +898,46 @@ class Show3DSlices(anywidget.AnyWidget):
           volume and call ``w.load_state_dict(json.loads(open(path).read()))``.
         """
         save_state_file(path, self._widget_name, self.state_dict())
+
+    def export_html(
+        self,
+        path: str | pathlib.Path | None = None,
+        *,
+        quantized: bool = False,
+        title: str | None = None,
+    ) -> pathlib.Path:
+        """Write a standalone HTML viewer for sharing.
+
+        The exact export embeds the current float32 volume bytes and preserves
+        numerical precision. The quantized export writes the existing offline
+        uint8 representation plus global min/max metadata, which makes a much
+        smaller single-file report for visual sharing.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path, optional
+            Destination HTML path. Defaults to the current working directory
+            with the widget title, volume shape, and export mode in the name.
+        quantized : bool, default False
+            If True, write the uint8 offline pack. If False, write exact
+            float32 bytes.
+        title : str, optional
+            Browser page title. Defaults to the widget title or class name.
+
+        Returns
+        -------
+        pathlib.Path
+            The written HTML file.
+        """
+        if self._data is None:
+            raise ValueError("Cannot export HTML after free(); rebuild the widget first.")
+
+        export_path = pathlib.Path(path) if path is not None else self._default_html_export_path(quantized)
+        self._write_html_export(export_path, quantized=quantized, title=title)
+        size_mb = export_path.stat().st_size / (1024 * 1024)
+        mode = "quantized" if quantized else "exact float32"
+        self.export_status = f"Exported {export_path.name} ({size_mb:.1f} MB, {mode})"
+        return export_path
 
     def load_state_dict(self, state: dict) -> None:
         """Apply a saved ``state_dict`` snapshot to this widget.
@@ -742,7 +998,7 @@ class Show3DSlices(anywidget.AnyWidget):
             )
         # Derive allowed keys from state_dict() so the two stay in lockstep -
         # adding a trait to state_dict() automatically lets load_state_dict()
-        # accept it. Plus deprecated/back-compat keys that get popped below.
+        # accept it. Deprecated/back-compat keys are tolerated, then filtered.
         allowed = set(self.state_dict().keys())
         deprecated = {"dual_mode", "show_diff", "title_b", "linked_contrast", "compact"}
         unknown = [k for k in state if k not in allowed and k not in deprecated]
@@ -753,10 +1009,11 @@ class Show3DSlices(anywidget.AnyWidget):
                 stacklevel=2,
             )
         state = {k: v for k, v in state.items() if k in allowed}
+        if "plane_visibility" in state:
+            state["show_slice_planes"] = any(bool(v) for v in state["plane_visibility"])
+        elif "show_slice_planes" in state:
+            state["plane_visibility"] = [bool(state["show_slice_planes"])] * 3
         state.pop("viewer_kind", None)
-        # Saved states from older versions may include compact=False. The current
-        # widget intentionally ignores it and always uses the compact layout.
-        state.pop("compact", None)
         vmin_marker = object()
         vmax_marker = object()
         vmin = state.pop("vmin", vmin_marker)
@@ -1063,6 +1320,39 @@ class Show3DSlices(anywidget.AnyWidget):
         if change.get("new"):
             self._compute_stats()
 
+    def _on_export_request_change(self, change: dict) -> None:
+        """Handle toolbar export requests from the live notebook frontend."""
+        raw = str(change.get("new") or "")
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw)
+            mode = str(payload.get("mode", "exact"))
+            if mode == "clear":
+                self.export_payload = b""
+                self.export_payload_id = ""
+                self.export_filename = ""
+                return
+            if mode not in ("exact", "quantized"):
+                raise ValueError(f"unknown export mode {mode!r}")
+            quantized = mode == "quantized"
+            if payload.get("download"):
+                filename = str(payload.get("filename") or self._default_html_export_path(quantized).name)
+                request_id = str(payload.get("id") or "")
+                self.export_status = f"Preparing {filename}..."
+                html = self._html_export_bytes(quantized=quantized)
+                self.export_filename = filename
+                self.export_payload = html
+                self.export_payload_id = request_id
+                size_mb = len(html) / (1024 * 1024)
+                label = "quantized" if quantized else "exact float32"
+                self.export_status = f"Ready {filename} ({size_mb:.1f} MB, {label})"
+            else:
+                self.export_status = f"Exporting {mode} HTML..."
+                self.export_html(quantized=quantized)
+        except Exception as exc:
+            self.export_status = f"Export failed: {exc}"
+
     # =========================================================================
     # === Internal primitives ===
     # =========================================================================
@@ -1086,6 +1376,87 @@ class Show3DSlices(anywidget.AnyWidget):
             self.stats_min = [float(np.min(s)) for s in slices]
             self.stats_max = [float(np.max(s)) for s in slices]
             self.stats_std = [float(np.std(s, dtype=np.float64)) for s in slices]
+
+    def _default_html_export_path(self, quantized: bool) -> pathlib.Path:
+        """Build a stable, human-readable export filename in the kernel cwd."""
+        label = self.title.strip() or self._widget_name
+        slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in label).strip("_")
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        if not slug:
+            slug = "show3dslices"
+        mode = "quantized" if quantized else "exact"
+        return pathlib.Path.cwd() / f"{slug}_{self.nz}x{self.ny}x{self.nx}_{mode}.html"
+
+    def _write_html_export(
+        self,
+        path: str | pathlib.Path,
+        *,
+        quantized: bool,
+        title: str | None = None,
+    ) -> pathlib.Path:
+        """Write a standalone HTML export without updating toolbar status."""
+        from ipywidgets.embed import dependency_state, embed_minimal_html
+
+        export_path = pathlib.Path(path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        page_title = title or self.title or self._widget_name
+        export_widget = self._clone_for_html_export(quantized=quantized)
+        try:
+            state = dependency_state([export_widget], drop_defaults=False)
+            embed_minimal_html(
+                str(export_path),
+                views=[export_widget],
+                title=page_title,
+                drop_defaults=False,
+                state=state,
+            )
+        finally:
+            export_widget.free()
+        return export_path
+
+    def _html_export_bytes(self, *, quantized: bool) -> bytes:
+        """Build a standalone HTML export in a temp directory and return bytes."""
+        with tempfile.TemporaryDirectory(prefix="show3dslices-export-") as tmp:
+            path = pathlib.Path(tmp) / self._default_html_export_path(quantized).name
+            self._write_html_export(path, quantized=quantized)
+            return path.read_bytes()
+
+    def _clone_for_html_export(self, *, quantized: bool) -> Self:
+        """Create an export-only widget with current state and requested packing."""
+        clone = type(self)(
+            self._data,
+            title=self.title,
+            cmap=self.cmap,
+            pixel_size=list(self.pixel_size_axes),
+            scale_bar_visible=self.scale_bar_visible,
+            z_stretch=self.z_stretch,
+            show_controls=self.show_controls,
+            show_stats=self.show_stats,
+            show_crosshair=self.show_crosshair,
+            show_fft=self.show_fft,
+            fft_window=self.fft_window,
+            orthographic=self.orthographic,
+            smooth=self.smooth,
+            flip=self.flip,
+            log_scale=self.log_scale,
+            auto_contrast=self.auto_contrast,
+            vmin=self.vmin,
+            vmax=self.vmax,
+            image_vmin_pct=self.image_vmin_pct,
+            image_vmax_pct=self.image_vmax_pct,
+            fps=self.fps,
+            loop=self.loop,
+            reverse=self.reverse,
+            boomerang=self.boomerang,
+            play_axis=self.play_axis,
+            dim_labels=list(self.dim_labels),
+            offline=quantized,
+        )
+        clone.load_state_dict(self.state_dict())
+        clone.export_enabled = False
+        clone._export_light = True
+        return clone
 
     def _normalize_slice(self, slc: np.ndarray) -> np.ndarray:
         """Map a 2D slice into a uint8 buffer matching what JS renders. Mirrors

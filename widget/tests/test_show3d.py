@@ -1,3 +1,6 @@
+import json
+import re
+
 import numpy as np
 import pytest
 
@@ -34,6 +37,7 @@ def test_per_panel_histogram_state_round_trip():
     w.auto_contrast = False
     w.log_scale = True
     w.avg_window = 5
+    w.link_panels = False
     w.percentile_high = 97.0
     w.percentile_low = 2.0
     w.vmin_per_panel = [0.0, 1.0, 2.0, 3.0]
@@ -47,10 +51,24 @@ def test_per_panel_histogram_state_round_trip():
     assert w2.auto_contrast is False
     assert w2.log_scale is True
     assert w2.avg_window == 5
+    assert w2.link_panels is False
     assert w2.percentile_low == 2.0
     assert w2.percentile_high == 97.0
     assert w2.vmin_per_panel == [0.0, 1.0, 2.0, 3.0]
     assert w2.vmax_per_panel == [4.0, 5.0, 6.0, 7.0]
+
+
+def test_removed_noop_constructor_knobs_are_accepted_for_compatibility():
+    data = np.zeros((3, 4, 4), dtype=np.float32)
+
+    w = Show3D(data, show_playback=True)
+    assert "show_playback" not in w.traits()
+
+    w = Show3D(data, link_zoom=False)
+    assert w.link_panels is False
+
+    w = Show3D(data, link_pan=False)
+    assert w.link_panels is False
 
 
 def test_dataset3d_micron_sampling_and_time_axis():
@@ -117,13 +135,22 @@ def test_avg_window_validation_default_and_state_round_trip():
     assert w2.avg_window == 15
 
 
-def test_fps_validation_caps_playback_at_sixty():
+def test_show3d_visual_playback_defaults():
+    w = Show3D(np.zeros((3, 4, 4), dtype=np.float32))
+
+    assert w.cmap == "plasma"
+    assert w.smooth is True
+    assert w.fps == 30
+    assert w.boomerang is True
+
+
+def test_fps_validation_caps_playback_at_thirty():
     w = Show3D(np.zeros((3, 4, 4), dtype=np.float32), fps=120)
 
-    assert w.fps == 60
+    assert w.fps == 30
 
     w.fps = 90
-    assert w.fps == 60
+    assert w.fps == 30
 
     with pytest.raises(Exception, match="fps must be > 0"):
         w.fps = 0
@@ -201,6 +228,109 @@ def test_auto_contrast_range_is_stack_level():
 
     assert w.auto_vmins == [0.0, 0.0, 0.0]
     assert w.auto_vmaxs == [20.0, 20.0, 20.0]
+
+
+def test_show3d_export_html_writes_exact_and_quantized(tmp_path):
+    data = np.linspace(-1.0, 1.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    w = Show3D(data, title="Export Probe", cmap="gray", image_vmin_pct=12.5, image_vmax_pct=87.5)
+    w.show_fft = True
+    w.show_kymograph = True
+    w.smooth = True
+    w.diff_mode = "first"
+    w.avg_window = 3
+    w.set_profile((0, 0), (2, 3))
+
+    exact = w.export_html(tmp_path / "exact.html", quantized=False)
+    quantized = w.export_html(tmp_path / "quantized.html", quantized=True)
+
+    assert exact.exists()
+    assert quantized.exists()
+    exact_text = exact.read_text()
+    quantized_text = quantized.read_text()
+    assert '"offline": true' in exact_text
+    assert '"offline": true' in quantized_text
+    assert '"_esm"' in exact_text
+    assert '"show_fft": true' in exact_text
+    assert '"show_kymograph": true' in exact_text
+    assert '"smooth": true' in exact_text
+    assert '"diff_mode": "first"' in exact_text
+    assert '"avg_window": 3' in exact_text
+    assert '"image_vmin_pct": 12.5' in exact_text
+    assert '"image_vmax_pct": 87.5' in exact_text
+    assert '"export_enabled": false' in exact_text
+    assert '"_offline_float_stack"' in exact_text
+    assert '"_offline_stack"' in quantized_text
+    assert "quantized" in w.export_status
+
+    state_json = re.search(
+        r'<script type="application/vnd.jupyter.widget-state\+json">\n(.*?)\n</script>',
+        exact_text,
+        flags=re.S,
+    ).group(1)
+    state = json.loads(state_json)["state"]
+    exact_models = [
+        model for model in state.values()
+        if any(buffer["path"] == ["_offline_float_stack"] for buffer in model.get("buffers", []))
+    ]
+    assert len(exact_models) == 1
+    assert exact_models[0]["state"]["offline"] is True
+    assert exact_models[0]["state"]["export_enabled"] is False
+
+
+def test_show3d_histogram_percent_range_round_trips():
+    data = np.linspace(-1.0, 1.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    w = Show3D(data, image_vmin_pct=10.0, image_vmax_pct=90.0)
+
+    state = w.state_dict()
+    restored = Show3D(data)
+    restored.load_state_dict(state)
+
+    assert w.vmin is None
+    assert w.vmax is None
+    assert restored.image_vmin_pct == 10.0
+    assert restored.image_vmax_pct == 90.0
+    assert restored.vmin is None
+    assert restored.vmax is None
+
+
+def test_show3d_export_request_trait_writes_toolbar_html(tmp_path, monkeypatch):
+    data = np.linspace(0.0, 1.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    w = Show3D(data, title="Toolbar Export")
+    monkeypatch.chdir(tmp_path)
+
+    w.export_request = json.dumps({"mode": "quantized"})
+
+    exported = tmp_path / "toolbar_export_2x3x4_quantized.html"
+    assert exported.exists()
+    assert "Exported toolbar_export_2x3x4_quantized.html" in w.export_status
+    assert "quantized" in w.export_status
+    assert '"offline": true' in exported.read_text()
+
+
+def test_show3d_export_request_can_return_download_payload():
+    data = np.linspace(0.0, 1.0, 24, dtype=np.float32).reshape(2, 3, 4)
+    w = Show3D(data, title="Toolbar Download")
+
+    w.export_request = json.dumps({
+        "mode": "exact",
+        "download": True,
+        "filename": "picked-folder.html",
+        "id": "req-1",
+    })
+
+    assert w.export_filename == "picked-folder.html"
+    assert w.export_payload_id == "req-1"
+    assert len(w.export_payload) > 0
+    text = w.export_payload.decode()
+    assert '"offline": true' in text
+    assert '"_offline_float_stack"' in text
+    assert "Ready picked-folder.html" in w.export_status
+
+    w.export_request = json.dumps({"mode": "clear", "id": "req-1-clear"})
+
+    assert w.export_payload == b""
+    assert w.export_payload_id == ""
+    assert w.export_filename == ""
 
 
 

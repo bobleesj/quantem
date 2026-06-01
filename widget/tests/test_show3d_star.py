@@ -67,7 +67,7 @@ def test_identical_panel_dedupe_keeps_full_res_source():
     assert w.height == 8
     assert w.width == 8
     assert w.panel_width_px == 8
-    assert w._display_bin_factor == 1
+    assert w._display_bin == 1
     np.testing.assert_array_equal(w._data, panels[0])
 
 
@@ -85,7 +85,7 @@ def test_nonidentical_panels_stay_separate_full_res():
         assert w.height == 5
         assert w.width == 18
         assert w.panel_width_px == 6
-        assert w._display_bin_factor == 1
+        assert w._display_bin == 1
 
         for panel_idx, panel in enumerate(panels):
             np.testing.assert_array_equal(w._get_display_panel_frame(panel_idx, 2), panel[2])
