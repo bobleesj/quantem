@@ -1373,7 +1373,10 @@ class Show3D(anywidget.AnyWidget):
                 _extracted_pixel_size = config_pixel_size[1]
                 _extracted_pixel_unit = "A"
                 _extracted_dim_sampling = config_pixel_size[0]
-                _extracted_dim_unit = _extracted_dim_unit or "A"
+                if _extracted_dim_unit is None or _extracted_dim_unit.lower() in {"", "index", "idx"}:
+                    _extracted_dim_unit = "A"
+                if dim_label == "Frame":
+                    dim_label = "Slice"
         # Use extracted pixel_size if not explicitly provided
         if pixel_size == 0.0 and _extracted_pixel_size is not None:
             pixel_size = _extracted_pixel_size

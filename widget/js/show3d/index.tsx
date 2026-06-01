@@ -118,6 +118,17 @@ function formatSavedBytes(bytes: number): string {
   return `${mb.toFixed(2)} MB`;
 }
 
+function isGenericIndexUnit(unit: string | null | undefined): boolean {
+  const normalized = (unit || "").trim().toLowerCase();
+  return normalized === "" || normalized === "index" || normalized === "idx";
+}
+
+function pluralizeUnitLabel(label: string, count: number): string {
+  const trimmed = (label || "frame").trim().toLowerCase();
+  const base = trimmed || "frame";
+  return Math.abs(count) === 1 || base.endsWith("s") ? base : `${base}s`;
+}
+
 function isAbortLikeError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
@@ -1096,6 +1107,10 @@ function Show3D() {
   const [dimLabel] = useModelState<string>("dim_label");
   const [dimSampling] = useModelState<number>("dim_sampling");
   const [dimUnit] = useModelState<string>("dim_unit");
+  const dimUnitIsGeneric = isGenericIndexUnit(dimUnit);
+  const dimUnitSymbol = dimUnit && !dimUnitIsGeneric ? unitSymbol(dimUnit) : "";
+  const dimItemLabel = (dimLabel || "Frame").trim() || "Frame";
+  const dimItemLabelLower = dimItemLabel.toLowerCase();
   const [nPanels] = useModelState<number>("n_panels");
   const [panelTitles] = useModelState<string[]>("panel_titles");
   const [panelWidthPx] = useModelState<number>("panel_width_px");
@@ -5391,7 +5406,7 @@ function Show3D() {
     if (kymoCanvasRef.current) {
       const ctx = kymoCanvasRef.current.getContext("2d");
       if (ctx) {
-        ctx.imageSmoothingEnabled = lineLen < canvasW || nFrames < canvasH;
+        ctx.imageSmoothingEnabled = smooth;
         ctx.clearRect(0, 0, canvasW, canvasH);
         ctx.save();
         ctx.translate(kymoPanX, kymoPanY);
@@ -5401,7 +5416,7 @@ function Show3D() {
       }
     }
   }, [kymoReady, kymoVersion, kymoLogScale, kymoAuto, kymoVminPct, kymoVmaxPct, kymoColormap,
-      percentileLow, percentileHigh, canvasW, canvasH]);
+      percentileLow, percentileHigh, canvasW, canvasH, smooth]);
 
   // Redraw cached kymograph with zoom/pan (cheap - no recomputation)
   React.useEffect(() => {
@@ -5409,16 +5424,14 @@ function Show3D() {
     const canvas = kymoCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const offW = kymoOffscreenRef.current.width;
-    const offH = kymoOffscreenRef.current.height;
-    ctx.imageSmoothingEnabled = offW < canvasW || offH < canvasH;
+    ctx.imageSmoothingEnabled = smooth;
     ctx.clearRect(0, 0, canvasW, canvasH);
     ctx.save();
     ctx.translate(kymoPanX, kymoPanY);
     ctx.scale(kymoZoom, kymoZoom);
     ctx.drawImage(kymoOffscreenRef.current, 0, 0, canvasW, canvasH);
     ctx.restore();
-  }, [kymoReady, kymoZoom, kymoPanX, kymoPanY, canvasW, canvasH]);
+  }, [kymoReady, kymoZoom, kymoPanX, kymoPanY, canvasW, canvasH, smooth]);
 
   // Render kymograph overlay (playhead + axis scale bars + colorbar + click
   // crosshair). Mirrors the FFT overlay structure; the playhead is the only
@@ -5450,9 +5463,10 @@ function Show3D() {
       drawScaleBarHiDPI(overlay, DPR, kymoZoom, pixelSize, pixelUnit || "px", kymo.lineLen);
     }
 
-    // Time scale bar along the left edge (time axis, dimUnit). Vertical bar +
-    // label so the operator can read the temporal extent of the kymograph.
-    if (dimSampling > 0 && dimUnit) {
+    // Vertical scale bar along the stack axis. With physical calibration this
+    // reads as depth (for example "50 A"); otherwise it reads as a count of
+    // frames/slices so generic units like "index" do not leak into the UI.
+    if (dimSampling > 0) {
       ctx.save();
       ctx.scale(DPR, DPR);
       const targetBarPx = 60;
@@ -5460,9 +5474,13 @@ function Show3D() {
       const margin = 12;
       const scaleY = canvasH / kymo.nFrames;
       const effectiveZoom = kymoZoom * scaleY;
-      const targetPhysical = (targetBarPx / effectiveZoom) * dimSampling;
-      const nicePhysical = roundToNiceValue(targetPhysical);
-      const barPx = (nicePhysical / dimSampling) * effectiveZoom;
+      const targetUnits = dimUnitIsGeneric
+        ? targetBarPx / effectiveZoom
+        : (targetBarPx / effectiveZoom) * dimSampling;
+      const niceUnits = roundToNiceValue(targetUnits);
+      const barPx = dimUnitIsGeneric
+        ? niceUnits * effectiveZoom
+        : (niceUnits / dimSampling) * effectiveZoom;
       const barX = margin;
       const barY = margin;
       ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
@@ -5474,7 +5492,9 @@ function Show3D() {
       ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
-      const label = nicePhysical >= 1 ? `${nicePhysical} ${dimUnit}` : `${nicePhysical.toPrecision(2)} ${dimUnit}`;
+      const label = dimUnitIsGeneric
+        ? `${niceUnits >= 1 ? Math.round(niceUnits) : niceUnits.toPrecision(2)} ${pluralizeUnitLabel(dimItemLabel, niceUnits)}`
+        : `${niceUnits >= 1 ? niceUnits : niceUnits.toPrecision(2)} ${dimUnitSymbol}`;
       ctx.fillText(label, barX + barThickness + 4, barY + barPx / 2);
       ctx.restore();
     }
@@ -5512,7 +5532,7 @@ function Show3D() {
       ctx.restore();
     }
   }, [kymoReady, kymoVersion, liveSliceIdx, canvasW, canvasH, themeColors.accent, kymoZoom, kymoPanX, kymoPanY,
-      pixelSize, pixelUnit, dimSampling, dimUnit, kymoShowColorbar, kymoDataRange, kymoVminPct, kymoVmaxPct,
+      pixelSize, pixelUnit, dimSampling, dimUnitIsGeneric, dimUnitSymbol, dimItemLabel, kymoShowColorbar, kymoDataRange, kymoVminPct, kymoVmaxPct,
       kymoColormap, kymoLogScale, kymoClickInfo]);
 
   // Render FFT overlay (reciprocal-space scale bar + colorbar)
@@ -6488,6 +6508,8 @@ function Show3D() {
   const [kymoPanStart, setKymoPanStart] = React.useState<{ x: number, y: number, pX: number, pY: number } | null>(null);
 
   const handleKymoWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
     const canvas = kymoCanvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -6551,8 +6573,8 @@ function Show3D() {
           const frame = Math.max(0, Math.min(kymo.nFrames - 1, Math.round(pos.row)));
           const dist = Math.max(0, Math.min(kymo.lineLen - 1, Math.round(pos.col)));
           const intensity = kymo.data[frame * kymo.lineLen + dist];
-          const timeVal = dimSampling > 0 && dimUnit ? frame * dimSampling : frame;
-          const timeUnit = dimSampling > 0 && dimUnit ? unitSymbol(dimUnit) : "frame";
+          const timeVal = dimSampling > 0 && !dimUnitIsGeneric ? frame * dimSampling : frame + 1;
+          const timeUnit = dimSampling > 0 && !dimUnitIsGeneric ? dimUnitSymbol : pluralizeUnitLabel(dimItemLabel, 1);
           const distVal = pixelSize > 0 ? dist * pixelSize : dist;
           const distUnit = pixelSize > 0 ? unitSymbol(pixelUnit || "px") : "px";
           setKymoClickInfo({ timeVal, timeUnit, distVal, distUnit, intensity, col: dist, row: frame });
@@ -7658,8 +7680,8 @@ function Show3D() {
           </Box>
         )}
 
-        {/* Kymograph Panel - static space-time image (X = distance along line,
-            Y = frame/time). Shares the side slot with FFT (mutually exclusive).
+        {/* Kymograph Panel - static stack-distance image (X = distance along
+            line, Y = slice/frame/depth). Shares the side slot with FFT (mutually exclusive).
             Mirrors the FFT panel's adjustability (contrast, zoom/pan, colormap). */}
         {kymoReady && (
           <Box sx={{ width: canvasW }}>
@@ -7668,7 +7690,7 @@ function Show3D() {
             {/* Controls row - title on left, Reset on right */}
             <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
               <Typography sx={{ ...typography.label, color: themeColors.accentGreen }}>
-                Kymograph ({kymoDataRef.current?.nFrames ?? nSlices} {dimUnit ? unitSymbol(dimUnit) : "frames"} &times; {kymoDataRef.current?.lineLen ?? 0} px)
+                Kymograph ({kymoDataRef.current?.nFrames ?? nSlices} {pluralizeUnitLabel(dimItemLabel, kymoDataRef.current?.nFrames ?? nSlices)} &times; {kymoDataRef.current?.lineLen ?? 0} px)
               </Typography>
               <Button size="small" sx={compactButton} disabled={!kymoNeedsReset} onClick={handleKymoReset} aria-label="Reset kymograph zoom and pan">Reset</Button>
             </Stack>
@@ -7683,13 +7705,13 @@ function Show3D() {
               onWheel={handleKymoWheel}
               onDoubleClick={handleKymoReset}
             >
-              <canvas ref={kymoCanvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: "pixelated" }} role="img" aria-label="Kymograph space-time image: distance along profile line versus frame index" />
+              <canvas ref={kymoCanvasRef} width={canvasW} height={canvasH} style={{ width: canvasW, height: canvasH, imageRendering: smooth ? "auto" : "pixelated" }} role="img" aria-label="Kymograph image: distance along profile line versus stack slice or frame" />
               <canvas ref={kymoOverlayRef} width={Math.round(canvasW * DPR)} height={Math.round(canvasH * DPR)} style={{ position: "absolute", top: 0, left: 0, width: canvasW, height: canvasH, pointerEvents: "none" }} aria-hidden="true" />
             </Box>
             {/* Axis labels - kymograph-specific footer */}
             <Box sx={{ display: "flex", justifyContent: "space-between", mt: 0.5, px: 0.5 }}>
               <Typography sx={{ fontSize: 9, color: themeColors.textMuted }}>
-                {dimUnit ? `time (${unitSymbol(dimUnit)})${dimSampling && dimSampling !== 1 ? `, ${(dimSampling).toFixed(2)}/frame` : ""} ↓` : "frame ↓"}
+                {dimUnitSymbol ? `depth (${dimUnitSymbol})${dimSampling && dimSampling !== 1 ? `, ${dimSampling.toFixed(2)}/${dimItemLabelLower}` : ""} ↓` : `${dimItemLabelLower} ↓`}
               </Typography>
               <Typography sx={{ fontSize: 9, color: themeColors.textMuted }}>distance along line →</Typography>
             </Box>
