@@ -37,8 +37,6 @@ def load_4dstem_macbook(masters, *, det_bin: int = 4, scan_size: int | None = No
     stack is uniform. Reads HDF5 headers only, no decode.
     """
     from quantem.widget.io import discover_masters, load
-    from quantem.widget.kernels.compute.mps import ChunkedFrames, MultiChunkedFrames
-    from quantem.widget.show4dstem_mps import Show4DSTEM_MACBOOK
 
     # folder -> auto-discover (optionally filtered to one scan size); list -> as given
     if isinstance(masters, (str, os.PathLike)) and os.path.isdir(os.path.expanduser(str(masters))):
@@ -51,6 +49,41 @@ def load_4dstem_macbook(masters, *, det_bin: int = 4, scan_size: int | None = No
         raise ValueError("no master files found")
     names = [os.path.basename(m)[:-len("_master.h5")]
              if m.endswith("_master.h5") else os.path.basename(m) for m in masters]
+
+    # CUDA / CPU: no Metal-chunk lazy path. Eager-load each master at det_bin and
+    # stack into a 5D (N, scan_r, scan_c, det_r, det_c) array; the base Show4DSTEM
+    # 5D viewer gives a dataset slider with instant switching. Cheap on a big-VRAM
+    # box (and the user's "just a regular list of 4D-STEM datasets" request).
+    from quantem.widget.io import detect_backend
+    if detect_backend() != "mps":
+        import numpy as np
+        from quantem.widget.show4dstem import Show4DSTEM
+
+        def _to_np(arr):
+            try:
+                import cupy as cp
+                if isinstance(arr, cp.ndarray):
+                    return cp.asnumpy(arr)
+            except ImportError:
+                pass
+            return np.asarray(arr)
+
+        arrs = []
+        for i, path in enumerate(masters):
+            _t = time.perf_counter()
+            if verbose:
+                print(f"[{i + 1}/{n}] loading {names[i]} ...", flush=True)
+            res = load(path, det_bin=det_bin, verbose=False)
+            arrs.append(_to_np(res.data))
+            if verbose:
+                print(f"[{i + 1}/{n}] {names[i]} ready in {time.perf_counter() - _t:.1f}s", flush=True)
+        stacked = arrs[0][None] if n == 1 else np.stack(arrs, axis=0)
+        return Show4DSTEM(stacked, frame_labels=names, **viewer_kwargs)
+
+    # MPS (MacBook): lazy Metal-chunk path — imported only here so CUDA/CPU never
+    # pull pyobjc Metal.
+    from quantem.widget.kernels.compute.mps import ChunkedFrames, MultiChunkedFrames
+    from quantem.widget.show4dstem_mps import Show4DSTEM_MACBOOK
 
     def _decode(path):
         # load() returns a LoadResult(data, meta); data is the MPSChunked4DSTEM
