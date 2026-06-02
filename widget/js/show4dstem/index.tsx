@@ -1363,6 +1363,16 @@ function Show4DSTEM() {
   const [fftZoom, setFftZoom] = React.useState(1);
   const [fftPanX, setFftPanX] = React.useState(0);
   const [fftPanY, setFftPanY] = React.useState(0);
+  // Live view refs for rAF-coalesced wheel zoom. A Mac trackpad fires MANY wheel
+  // events per frame; without coalescing each one triggers a full re-render of
+  // this large component and zoom feels laggy. The handler accumulates against
+  // the ref (synchronous, accurate) and flushes to React state once per frame.
+  const dpViewRef = React.useRef({ zoom: 1, panX: 0, panY: 0, raf: 0 });
+  const viViewRef = React.useRef({ zoom: 1, panX: 0, panY: 0, raf: 0 });
+  const fftViewRef = React.useRef({ zoom: 1, panX: 0, panY: 0, raf: 0 });
+  React.useEffect(() => { const r = dpViewRef.current; r.zoom = dpZoom; r.panX = dpPanX; r.panY = dpPanY; }, [dpZoom, dpPanX, dpPanY]);
+  React.useEffect(() => { const r = viViewRef.current; r.zoom = viZoom; r.panX = viPanX; r.panY = viPanY; }, [viZoom, viPanX, viPanY]);
+  React.useEffect(() => { const r = fftViewRef.current; r.zoom = fftZoom; r.panX = fftPanX; r.panY = fftPanY; }, [fftZoom, fftPanX, fftPanY]);
   const [fftScaleMode, setFftScaleMode] = useModelState<"linear" | "log">("fft_scale_mode");
   const [fftColormap, setFftColormap] = useModelState<string>("fft_colormap");
   const [fftAuto, setFftAuto] = useModelState<boolean>("fft_auto");
@@ -2616,7 +2626,7 @@ function Show4DSTEM() {
     setZoom: React.Dispatch<React.SetStateAction<number>>,
     setPanX: React.Dispatch<React.SetStateAction<number>>,
     setPanY: React.Dispatch<React.SetStateAction<number>>,
-    zoom: number, panX: number, panY: number,
+    viewRef: React.RefObject<{ zoom: number; panX: number; panY: number; raf: number }>,
     canvasRef: React.RefObject<HTMLCanvasElement | null>,
   ) => (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
@@ -2625,12 +2635,21 @@ function Show4DSTEM() {
     const rect = canvas.getBoundingClientRect();
     const mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
     const mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+    const v = viewRef.current;
     const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * zoomFactor));
-    const zoomRatio = newZoom / zoom;
-    setZoom(newZoom);
-    setPanX(mouseX - (mouseX - panX) * zoomRatio);
-    setPanY(mouseY - (mouseY - panY) * zoomRatio);
+    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, v.zoom * zoomFactor));
+    const zoomRatio = newZoom / v.zoom;
+    // Accumulate synchronously against the live ref (handles a burst of trackpad
+    // wheel events within one frame correctly), flush to React state once per rAF.
+    v.zoom = newZoom;
+    v.panX = mouseX - (mouseX - v.panX) * zoomRatio;
+    v.panY = mouseY - (mouseY - v.panY) * zoomRatio;
+    if (v.raf === 0) {
+      v.raf = requestAnimationFrame(() => {
+        v.raf = 0;
+        setZoom(v.zoom); setPanX(v.panX); setPanY(v.panY);
+      });
+    }
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -3784,7 +3803,7 @@ function Show4DSTEM() {
               ref={dpOverlayRef} width={detCols} height={detRows}
               onPointerDown={handleDpMouseDown} onPointerMove={handleDpMouseMove}
               onMouseUp={handleDpMouseUp} onMouseLeave={handleDpMouseLeave}
-              onWheel={createZoomHandler(setDpZoom, setDpPanX, setDpPanY, dpZoom, dpPanX, dpPanY, dpOverlayRef)}
+              onWheel={createZoomHandler(setDpZoom, setDpPanX, setDpPanY, dpViewRef, dpOverlayRef)}
               onDoubleClick={handleDpDoubleClick}
               style={{
                 position: "absolute",
@@ -3960,7 +3979,7 @@ function Show4DSTEM() {
               ref={virtualOverlayRef} width={shapeCols} height={shapeRows}
               onMouseDown={handleViMouseDown} onMouseMove={handleViMouseMove}
               onMouseUp={handleViMouseUp} onMouseLeave={handleViMouseLeave}
-              onWheel={createZoomHandler(setViZoom, setViPanX, setViPanY, viZoom, viPanX, viPanY, virtualOverlayRef)}
+              onWheel={createZoomHandler(setViZoom, setViPanX, setViPanY, viViewRef, virtualOverlayRef)}
               onDoubleClick={handleViDoubleClick}
               style={{
                 position: "absolute",
@@ -4102,7 +4121,7 @@ function Show4DSTEM() {
                 ref={fftOverlayRef} width={shapeCols} height={shapeRows}
                 onMouseDown={handleFftMouseDown} onMouseMove={handleFftMouseMove}
                 onMouseUp={handleFftMouseUp} onMouseLeave={handleFftMouseLeave}
-                onWheel={createZoomHandler(setFftZoom, setFftPanX, setFftPanY, fftZoom, fftPanX, fftPanY, fftOverlayRef)}
+                onWheel={createZoomHandler(setFftZoom, setFftPanX, setFftPanY, fftViewRef, fftOverlayRef)}
                 onDoubleClick={handleFftDoubleClick}
                 style={{ position: "absolute", width: "100%", height: "100%", cursor: isDraggingFFT ? "grabbing" : "grab" }}
               />
