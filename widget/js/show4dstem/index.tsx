@@ -2809,7 +2809,7 @@ function Show4DSTEM() {
   React.useEffect(() => {
     if (!isDraggingResize && !isDraggingResizeInner) return;
 
-    const onMove = (event: MouseEvent) => {
+    const onMove = (event: MouseEvent | PointerEvent) => {
       const coords = getDpImageCoordsFromClient(event.clientX, event.clientY);
       if (!coords) return;
       if (resizeDpRoiFromImagePoint(coords.imgX, coords.imgY, event.shiftKey)) {
@@ -2822,15 +2822,21 @@ function Show4DSTEM() {
       setLocalRoiRadius(null);
     };
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp); window.addEventListener("pointercancel", onUp);
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp); window.removeEventListener("pointercancel", onUp);
     };
   }, [getDpImageCoordsFromClient, isDraggingResize, isDraggingResizeInner, resizeDpRoiFromImagePoint]);
 
-  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
+    // Capture the pointer so a fast edge-drag resize keeps receiving move/up
+    // events even when the cursor leaves the canvas (#751). Without capture the
+    // window listener can miss events and the radius never updates.
+    if ("pointerId" in e) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    }
     dpClickStartRef.current = { x: e.clientX, y: e.clientY };
     const coords = getDpImageCoordsFromClient(e.clientX, e.clientY);
     if (!coords) return;
@@ -2894,7 +2900,7 @@ function Show4DSTEM() {
     model.save_changes();
   };
 
-  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
     const coords = getDpImageCoordsFromClient(e.clientX, e.clientY);
     if (!coords) return;
     const { imgX, imgY } = coords;
@@ -3776,7 +3782,7 @@ function Show4DSTEM() {
             <canvas ref={dpCanvasRef} width={detCols} height={detRows} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
             <canvas
               ref={dpOverlayRef} width={detCols} height={detRows}
-              onMouseDown={handleDpMouseDown} onMouseMove={handleDpMouseMove}
+              onPointerDown={handleDpMouseDown} onPointerMove={handleDpMouseMove}
               onMouseUp={handleDpMouseUp} onMouseLeave={handleDpMouseLeave}
               onWheel={createZoomHandler(setDpZoom, setDpPanX, setDpPanY, dpZoom, dpPanX, dpPanY, dpOverlayRef)}
               onDoubleClick={handleDpDoubleClick}
