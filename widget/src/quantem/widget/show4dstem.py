@@ -24,8 +24,8 @@ import anywidget
 import numpy as np
 import torch
 import traitlets
-from quantem.widget.array_utils import to_numpy
-from quantem.widget.state import (
+from quantem.widget._show4dstem_array_utils import to_numpy
+from quantem.widget._show4dstem_state import (
     build_json_header,
     resolve_widget_version,
     save_state_file,
@@ -92,7 +92,7 @@ class Show4DSTEM(anywidget.AnyWidget):
     Examples
     --------
     >>> import numpy as np
-    >>> from quantem.widget import Show4DSTEM
+    >>> from quantem.widget.show4dstem import Show4DSTEM
 
     4D NumPy array ``(scan_rows, scan_cols, det_rows, det_cols)``:
 
@@ -379,6 +379,20 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._path_points: list[tuple[int, int]] = []
         # Suppress per-trait recompute during apply_preset batch writes
         self._suppress_roi_recompute = False
+        # Accept the io.load(...) output directly so `Show4DSTEM(load(path))` just
+        # works on any backend. Unwrap a LoadResult NamedTuple, then wrap a raw MPS
+        # chunked-load (MPSChunked4DSTEM) for the Metal compute path.
+        if hasattr(data, "_fields") and "data" in getattr(data, "_fields", ()):
+            data = data.data
+        if hasattr(data, "chunks") and not getattr(data, "_is_gpu_frames", False):
+            from quantem.widget.kernels.compute.mps import ChunkedFrames
+            data = ChunkedFrames(data, row_prefix=bool(getattr(data, "row_prefix", False)))
+        # cupy array (io.load default on CUDA) -> ZERO-COPY torch tensor on the same
+        # GPU via dlpack. Without this, the fallback cp.asnumpy round-trips the whole
+        # block to CPU and re-uploads (a 19.3 GB no-bin load -> ~58 GB transient and
+        # an OOM kernel crash). dlpack keeps it on-device, no copy.
+        if type(data).__module__.split(".")[0] == "cupy":
+            data = torch.from_dlpack(data)
         # Torch tensor input keeps its device (lets user pin a specific GPU via
         # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
         if isinstance(data, torch.Tensor) or getattr(data, "_is_gpu_frames", False):
@@ -588,7 +602,13 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         if _verbose:
             shape = "x".join(str(s) for s in self._data.shape)
-            print(f"Show4DSTEM: {shape} {self._device}, {time.perf_counter() - _t0:.2f}s total")
+            # name the COMPUTE device, not the torch-coord-tensor device. Metal
+            # compute reports "mps" even though tiny coord helpers live on cpu;
+            # printing self._device there says "cpu" and reads wrong.
+            label = {"TorchCompute": str(self._device), "MetalCompute": "mps (Metal)",
+                     "CudaKernelCompute": "cuda (cupy)"}.get(
+                self._compute.__class__.__name__, str(self._device))
+            print(f"Show4DSTEM: {shape} on {label}, {time.perf_counter() - _t0:.2f}s total")
 
     def __repr__(self) -> str:
         shape = (
@@ -795,6 +815,20 @@ class Show4DSTEM(anywidget.AnyWidget):
         if self.n_frames > 1:
             return self._data[self.frame_idx]
         return self._data
+
+    @property
+    def _compute(self):
+        """UI-agnostic compute backend for the CURRENT frame's data, rebuilt when
+        the frame changes. TorchCompute for a torch tensor (cuda/mps/cpu),
+        MetalCompute for chunk-backed Metal frames. One layer for masked_sum /
+        mean_dp / reduce_frames, shared with the web Browse (see
+        kernels/compute/backends.py). Construction is cheap (views, no copy)."""
+        fd = self._frame_data
+        if getattr(self, "_compute_for", None) is not fd:
+            from quantem.widget.kernels.compute.backends import compute_backend
+            self._compute_backend = compute_backend(fd)
+            self._compute_for = fd
+        return self._compute_backend
 
     # =========================================================================
     # Line Profile
@@ -1176,15 +1210,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         # error a single full-stack reduce hits once positions*det > 2^31 (a bin2
         # 512x512x96x96 stack = 2.42e9 elements). The chunk cap keeps each op's
         # element count well under 2^31; the (det, det) accumulator is tiny.
-        data_flat = self._data.reshape(-1, *self._det_shape)
-        n_pos = data_flat.shape[0]
-        mean_dp = torch.zeros(self._det_shape, dtype=torch.int64, device=self._device)
-        pos_per_chunk = max(1, (1 << 30) // max(1, self._det_shape[0] * self._det_shape[1]))
-        for i in range(0, n_pos, pos_per_chunk):
-            mean_dp += data_flat[i:i + pos_per_chunk].sum(dim=0, dtype=torch.int64)
-
-        # float only on the tiny (det, det) summed image, never on the full stack
-        mean_dp = mean_dp.float()
+        # Mean DP over all scan positions via the compute backend (TorchCompute
+        # int64-accumulates in chunks; MetalCompute uses the raw detector_sum
+        # kernel). Centroid + radius are scale-invariant, so mean vs sum is the
+        # same center/radius. The (det, det) result is tiny - torch for the centroid.
+        mean_dp = torch.as_tensor(self._compute.mean_dp(), device=self._device).float()
         threshold = mean_dp.mean() + mean_dp.std()
         mask = mean_dp > threshold
 
@@ -1211,15 +1241,13 @@ class Show4DSTEM(anywidget.AnyWidget):
         return self
 
     def _get_frame(self, row: int, col: int) -> np.ndarray:
-        """Get single diffraction frame at position (row, col) as numpy array."""
+        """Get single diffraction frame at position (row, col) as numpy array.
+
+        Via the compute backend (torch index on tensor data, Metal buffer read on
+        chunk-backed frames) so the cursor DP works on every backend."""
         if self._data is None:
             return np.zeros((self.det_rows, self.det_cols), dtype=np.float32)
-        data = self._frame_data
-        if data.ndim == 3:
-            idx = row * self.shape_cols + col
-            return data[idx].cpu().numpy()
-        else:
-            return data[row, col].cpu().numpy()
+        return np.asarray(self._compute.frame(row * self.shape_cols + col))
 
     def _apply_scale_mode(self, data: np.ndarray, mode: str) -> np.ndarray:
         arr = np.asarray(data, dtype=np.float32)
@@ -2115,37 +2143,13 @@ class Show4DSTEM(anywidget.AnyWidget):
         if n_positions == 0:
             self.vi_roi_dp_bytes = b""
             return
-
-        reduce = self.vi_roi_reduce
-        data = self._frame_data
-        # Single chunked torch path. For each scan-row chunk: cast to float32 and
-        # broadcast-multiply by the mask (no `chunk[row_mask]` slab, which would
-        # roughly duplicate the chunk in memory when the mask is dense). Sum/mean
-        # use einsum over scan dims; max masks zero rows then takes amax.
-        data_4d = data if data.ndim == 4 else data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
-        rows_per_chunk = self._chunk_rows()
-        if reduce == "sum" or reduce == "mean":
-            dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
-        else:  # max
-            dp = torch.full(self._det_shape, -float("inf"), dtype=torch.float32, device=self._device)
-        for i in range(0, self._scan_shape[0], rows_per_chunk):
-            row_mask = mask[i:i + rows_per_chunk]
-            if not bool(row_mask.any()):
-                continue
-            chunk = data_4d[i:i + rows_per_chunk]
-            if not torch.is_floating_point(chunk):
-                chunk = chunk.float()
-            row_mask_f = row_mask.float()
-            if reduce == "max":
-                # Outside-mask positions become 0; doesn't affect amax provided
-                # the data has any non-negative pixels (true for detector counts).
-                dp = torch.maximum(dp, (chunk * row_mask_f[..., None, None]).amax(dim=(0, 1)))
-            else:
-                dp += torch.einsum("rcij,rc->ij", chunk, row_mask_f)
-        if reduce == "mean":
-            dp /= float(n_positions)
-
-        self.vi_roi_dp_bytes = dp.cpu().numpy().tobytes()
+        # Flat scan indices inside the ROI, reduced (mean/sum/max) by the compute
+        # backend (torch gather on tensor data, Metal mean_frames on chunk-backed
+        # frames). One path for every backend; gives consistent results across
+        # CUDA / MPS instead of the old torch-vs-subclass index-math divergence.
+        indices = torch.nonzero(mask.reshape(-1), as_tuple=False).flatten().cpu().numpy()
+        dp = self._compute.reduce_frames(indices, self.vi_roi_reduce)
+        self.vi_roi_dp_bytes = np.ascontiguousarray(dp, dtype=np.float32).tobytes()
 
     def _create_circular_mask(self, cx: float, cy: float, radius: float):
         """Create circular mask (boolean tensor on device)."""
@@ -2268,31 +2272,17 @@ class Show4DSTEM(anywidget.AnyWidget):
         per_row = self._scan_shape[1] * self._det_shape[0] * self._det_shape[1] * 4
         return max(1, _CHUNK_BYTE_BUDGET // max(1, per_row))
 
-    def _fast_masked_sum(self, mask: torch.Tensor) -> torch.Tensor:
-        """Sum data over scan positions weighted by detector mask.
+    def _fast_masked_sum(self, mask) -> np.ndarray:
+        """Virtual image: sum data over scan positions weighted by a detector mask.
 
-        Chunked tensordot. Per-chunk float32 cast bounded by _CHUNK_BYTE_BUDGET.
-        Identical math on CUDA / MPS / CPU.
-        """
-        data = self._frame_data
-        if data.ndim == 3:
-            data_4d = data.reshape(self._scan_shape[0], self._scan_shape[1], *self._det_shape)
-        else:
-            data_4d = data
-        # Single chunked torch path. Per scan-row chunk: cast to float32, contract
-        # with mask via tensordot. Transient memory bounded by chunk size. Same
-        # code on CUDA / MPS / CPU. Identical results regardless of device.
-        mask_f = mask.float()
-        n_rows = data_4d.shape[0]
-        out = torch.zeros(self._scan_shape, dtype=torch.float32, device=self._device)
-        # Convert positions chunk size to row chunks based on scan width.
-        rows_per_chunk = self._chunk_rows()
-        for i in range(0, n_rows, rows_per_chunk):
-            chunk = data_4d[i:i + rows_per_chunk]
-            if not torch.is_floating_point(chunk):
-                chunk = chunk.float()
-            out[i:i + rows_per_chunk] = torch.tensordot(chunk, mask_f, dims=([2, 3], [0, 1]))
-        return out
+        Delegates to the compute backend (TorchCompute chunked tensordot on any
+        torch device, MetalCompute raw kernel on chunk-backed Metal frames) so the
+        widget runs identically on CUDA / MPS / CPU and on the MacBook fast path.
+        Returns numpy (scan_r, scan_c) float32; the only consumer is
+        `_to_float32_bytes`. Verified bit-identical to the old inline tensordot
+        (tests/kernels/test_backend_parity.py + frozen widget baseline)."""
+        mask_np = mask.detach().cpu().numpy() if hasattr(mask, "detach") else np.asarray(mask)
+        return self._compute.masked_sum(mask_np)
 
     def _to_float32_bytes(self, arr: torch.Tensor) -> bytes:
         """Convert tensor (any numeric dtype) to float32 bytes for JS transfer.
@@ -2305,6 +2295,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         from click N-1, producing a wrong colormap normalization (uniform white
         flash on rapid preset switching).
         """
+        if isinstance(arr, np.ndarray):
+            return np.ascontiguousarray(arr, dtype=np.float32).tobytes()
         if arr.dtype != torch.float32:
             arr = arr.float()
         return arr.cpu().numpy().tobytes()
@@ -2329,15 +2321,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         elif self.roi_mode == "rect" and self.roi_width > 0 and self.roi_height > 0:
             mask = self._create_rect_mask(cx, cy, self.roi_width / 2, self.roi_height / 2)
         else:
-            # Point mode: single-pixel indexing
+            # Point mode: single detector pixel via a one-hot mask through the same
+            # backend (sum of data[:, :, row, col] * one-hot == that pixel). One path
+            # for every backend - no tensor-only fancy-indexing that breaks on Metal.
             row = int(max(0, min(round(cy), self._det_shape[0] - 1)))
             col = int(max(0, min(round(cx), self._det_shape[1] - 1)))
-            data = self._frame_data
-            if data.ndim == 4:
-                virtual_image = data[:, :, row, col]
-            else:
-                virtual_image = data[:, row, col].reshape(self._scan_shape)
-            self.virtual_image_bytes = self._to_float32_bytes(virtual_image)
+            point_mask = np.zeros(self._det_shape, dtype=np.float32)
+            point_mask[row, col] = 1.0
+            self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(point_mask))
             return
 
         self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(mask))

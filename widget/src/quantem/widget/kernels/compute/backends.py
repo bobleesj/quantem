@@ -1,0 +1,243 @@
+"""UI-agnostic 4D-STEM compute backends (duck-typed, no Protocol).
+
+ONE compute layer consumed by BOTH the Jupyter widget (`show4dstem_base`) AND the
+web Browse (`server/routers/browse.py`). The same masked-sum math is implemented
+three ways across the repo (torch tensordot, raw Metal, CuPy RawKernel); this
+module is the single interface they collapse into.
+
+A backend is constructed from a data source and exposes these primitives (every
+backend implements the same names + shapes, so callers never branch on hardware):
+
+    scan_shape -> (rows, cols)
+    det_shape  -> (rows, cols)
+    n_frames   -> int                                      scan rows*cols
+    frame(idx) -> np.ndarray (det_r, det_c)                one diffraction pattern
+    masked_sum(det_mask) -> np.ndarray (scan_r, scan_c) f32   virtual image (BF/DF/ADF)
+    mean_dp() -> np.ndarray (det_r, det_c) f32             mean DP over all scan positions
+    reduce_frames(scan_indices, reduce) -> np.ndarray (det_r, det_c) f32   DP over a scan ROI
+
+`compute_backend(data)` duck-types the data source and returns the right backend.
+The detector-mask geometry (point/circle/square/annular/rect) is UI/geometry that
+produces a `(det, det)` mask any backend consumes - it is NOT part of the backend
+(kept in one shared helper, `detector_mask`).
+
+Backends:
+  - TorchCompute  (torch tensor; cuda / mps / cpu) - universal default
+  - MetalCompute  (ChunkedFrames; mps raw-Metal + bin2 fast mode + lazy multi-dataset)
+  - CudaKernelCompute (cupy; the web Browse fused RawKernel) - future, designed-for
+
+The math is ported faithfully from `show4dstem_base` (torch) and wraps the existing
+`MetalVirtualImage` (Metal), so a backend swap is bit-for-bit on equal inputs
+(verified: tests/kernels/test_masked_sum_parity.py).
+"""
+from __future__ import annotations
+
+import threading
+
+import numpy as np
+
+# Cap transient float32 memory per reduction chunk (matches the widget budget).
+_CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
+
+
+def compute_backend(data):
+    """Return the compute backend for ``data``, duck-typed on its type.
+
+    torch tensor / Dataset wrapping a tensor -> TorchCompute (any torch device).
+    ChunkedFrames / anything with ``_is_gpu_frames`` -> MetalCompute (raw Metal).
+    cupy ndarray -> CudaKernelCompute (the web Browse fused kernel).
+
+    Why duck-typed, not Protocol: the kernels design keeps backends flexible; a new
+    backend just implements the primitive names. One selection point here means
+    callers (widget + web Browse) never branch on hardware themselves.
+    """
+    if getattr(data, "_is_gpu_frames", False):
+        return MetalCompute(data)
+    cls_name = type(data).__module__.split(".")[0]
+    if cls_name == "cupy":
+        return CudaKernelCompute(data)
+    try:
+        import torch
+        if isinstance(data, torch.Tensor):
+            return TorchCompute(data)
+    except ImportError:
+        pass
+    # Dataset-like: unwrap a torch tensor if present, else hand to TorchCompute to
+    # numpy-ify (it owns the conversion so the widget doesn't have to).
+    return TorchCompute(data)
+
+
+# ---
+
+
+class TorchCompute:
+    """Torch backend - one chunked path on CUDA / MPS / CPU.
+
+    Ports the widget's `_fast_masked_sum` / `auto_detect_center` / `_compute_vi_roi_dp`
+    math verbatim (chunked tensordot, int64 mean-DP, einsum/amax reduce) so the
+    universal-device path is identical to today. uint16 stays integer until the
+    small reduced output; the per-chunk float32 cast is bounded by the byte budget.
+    """
+
+    def __init__(self, data, *, scan_shape=None, det_shape=None, device=None):
+        import torch
+        self.torch = torch
+        tensor = data if isinstance(data, torch.Tensor) else torch.as_tensor(np.asarray(data))
+        if device is not None:
+            tensor = tensor.to(device)
+        self._t = tensor
+        if tensor.ndim == 4:
+            sr, sc, dr, dc = tensor.shape
+        elif tensor.ndim == 3:
+            n, dr, dc = tensor.shape
+            if scan_shape is None:
+                sr = int(round(n ** 0.5))
+                sc = n // sr
+            else:
+                sr, sc = scan_shape
+        else:
+            raise ValueError(f"expected 3D/4D tensor, got {tuple(tensor.shape)}")
+        self.scan_shape = (int(sr), int(sc))
+        self.det_shape = (int(dr), int(dc))
+        self.n_frames = int(sr) * int(sc)
+        self.device = tensor.device
+        self._4d = tensor.reshape(self.scan_shape[0], self.scan_shape[1], dr, dc)
+        self._flat = tensor.reshape(-1, dr, dc)
+        self._row = torch.arange(dr, device=self.device, dtype=torch.float32)[:, None]
+        self._col = torch.arange(dc, device=self.device, dtype=torch.float32)[None, :]
+
+    def _chunk_rows(self) -> int:
+        bytes_per_row = self.scan_shape[1] * self.det_shape[0] * self.det_shape[1] * 4
+        return max(1, _CHUNK_BYTE_BUDGET // max(1, bytes_per_row))
+
+    def frame(self, idx: int) -> np.ndarray:
+        return self._flat[int(idx)].cpu().numpy()
+
+    def masked_sum(self, det_mask: np.ndarray) -> np.ndarray:
+        """Virtual image: sum masked detector pixels per scan position (chunked)."""
+        torch = self.torch
+        mask = torch.as_tensor(np.ascontiguousarray(det_mask), device=self.device).float()
+        out = torch.zeros(self.scan_shape, dtype=torch.float32, device=self.device)
+        step = self._chunk_rows()
+        for i in range(0, self.scan_shape[0], step):
+            chunk = self._4d[i:i + step]
+            if not torch.is_floating_point(chunk):
+                chunk = chunk.float()
+            out[i:i + step] = torch.tensordot(chunk, mask, dims=([2, 3], [0, 1]))
+        return out.cpu().numpy()
+
+    def mean_dp(self) -> np.ndarray:
+        """Mean DP over all scan positions - int64 accumulate, float only at output."""
+        torch = self.torch
+        acc = torch.zeros(self.det_shape, dtype=torch.int64, device=self.device)
+        step = max(1, (1 << 30) // max(1, self.det_shape[0] * self.det_shape[1]))
+        for i in range(0, self.n_frames, step):
+            acc += self._flat[i:i + step].sum(dim=0, dtype=torch.int64)
+        return (acc.float() / self.n_frames).cpu().numpy()
+
+    def reduce_frames(self, scan_indices: np.ndarray, reduce: str = "mean") -> np.ndarray:
+        """Summed / mean / max DP over a set of scan positions (flat indices)."""
+        torch = self.torch
+        idx = torch.as_tensor(np.asarray(scan_indices, dtype=np.int64), device=self.device)
+        frames = self._flat.index_select(0, idx).float()
+        if reduce == "sum":
+            dp = frames.sum(dim=0)
+        elif reduce == "max":
+            dp = frames.amax(dim=0)
+        else:
+            dp = frames.mean(dim=0)
+        return dp.cpu().numpy()
+
+
+# ---
+
+
+class MetalCompute:
+    """Metal backend - wraps the existing `MetalVirtualImage` over `ChunkedFrames`.
+
+    Preserves the MacBook fast paths untouched: the bin2 sidecar (`fast_vi`), the
+    row-prefix exact reductions, and the lazy multi-dataset container. The base
+    primitives use full-resolution `vi`; the widget keeps reaching for `fast_vi`
+    via `fast` for real-time interaction.
+    """
+
+    def __init__(self, frames):
+        self._cf = frames  # ChunkedFrames (or MultiChunkedFrames, duck-types the same)
+        det = tuple(int(x) for x in self._cf.vi.det)
+        n = int(self._cf._n)
+        sr = int(round(n ** 0.5))
+        self.scan_shape = (sr, n // sr)
+        self.det_shape = det
+        self.n_frames = n
+        self.device = "mps"
+        self.det_bin = int(getattr(self._cf, "det_bin", 1))
+        # Auto fast-mode: on a big NO-BIN detector, full-res masked_sum is ~8-10 fps
+        # (40 GB/s scattered uint16). Build a bin2 sidecar (96x96) in the background
+        # so interaction jumps to real-time once ready; serve full-res until then.
+        # Already-binned data (det_bin>1) is small enough - no sidecar.
+        self._auto_fast = (self.det_bin == 1 and det[0] >= 96
+                           and hasattr(self._cf, "ensure_fast_interaction"))
+        if self._auto_fast and getattr(self._cf, "fast_vi", None) is None:
+            threading.Thread(target=self._build_fast, daemon=True).start()
+
+    def _build_fast(self):
+        try:
+            self._cf.ensure_fast_interaction(verbose=False)
+        except Exception:
+            pass  # fall back to full-res; interaction just stays at the no-bin rate
+
+    @property
+    def has_fast(self) -> bool:
+        return getattr(self._cf, "fast_vi", None) is not None
+
+    def frame(self, idx: int) -> np.ndarray:
+        return self._cf.frame(int(idx))
+
+    def masked_sum(self, det_mask: np.ndarray) -> np.ndarray:
+        cf = self._cf
+        fv = getattr(cf, "fast_vi", None)
+        if self._auto_fast and fv is not None:
+            # bin2 sidecar ready: downsample the detector mask + reduce on 96x96
+            # (4x fewer pixels = real-time). The scan-space output shape is unchanged.
+            from quantem.widget.kernels.compute.mps import _bin2_mask
+            vi = np.asarray(fv.masked_sum(_bin2_mask(np.ascontiguousarray(det_mask))))
+        else:
+            vi = np.asarray(cf.vi.masked_sum(np.ascontiguousarray(det_mask)))
+        return vi.reshape(self.scan_shape).astype(np.float32, copy=False)
+
+    def mean_dp(self) -> np.ndarray:
+        return np.asarray(self._cf.vi.detector_sum(), dtype=np.float32) / self.n_frames
+
+    def reduce_frames(self, scan_indices: np.ndarray, reduce: str = "mean") -> np.ndarray:
+        idx = np.asarray(scan_indices, dtype=np.uint32)
+        if reduce == "mean":
+            return np.asarray(self._cf.vi.mean_frames(idx), dtype=np.float32)
+        # sum / max: mean_frames gives the average; scale for sum, fall back to
+        # per-frame max (rare path - the widget's max accumulates frames directly).
+        if reduce == "sum":
+            return np.asarray(self._cf.vi.mean_frames(idx), dtype=np.float32) * len(idx)
+        dp = None
+        for i in idx:
+            f = np.asarray(self._cf.frame(int(i)), dtype=np.float32)
+            dp = f if dp is None else np.maximum(dp, f)
+        return dp if dp is not None else np.zeros(self.det_shape, dtype=np.float32)
+
+
+# ---
+
+
+class CudaKernelCompute:
+    """CuPy backend - the web Browse fused RawKernel path (designed-for, not yet wired).
+
+    Placeholder so `compute_backend(cupy_array)` resolves; the real implementation
+    moves `server/routers/browse.py:_vi_mask_kernel` here so the web Browse and the
+    widget share one CUDA masked-sum. Until then this raises a clear error.
+    """
+
+    def __init__(self, data):
+        self._data = data
+        raise NotImplementedError(
+            "CudaKernelCompute is reserved for folding the web Browse RawKernel into "
+            "the shared compute layer (see docs/2026-06-01-show4dstem-compute-backends.md). "
+            "Use TorchCompute for CUDA today."
+        )

@@ -18,12 +18,12 @@ import StopIcon from "@mui/icons-material/Stop";
 import FastRewindIcon from "@mui/icons-material/FastRewind";
 import FastForwardIcon from "@mui/icons-material/FastForward";
 import JSZip from "jszip";
-import { useTheme } from "../theme";
-import { COLORMAPS, applyColormap, renderToOffscreen } from "../colormaps";
-import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "../fft";
-import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "../figure";
-import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "../stats";
-import { downloadBlob, formatNumber, downloadDataView } from "../format";
+import { useTheme } from "./theme";
+import { COLORMAPS, applyColormap, renderToOffscreen } from "./colormaps";
+import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "./fft";
+import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "./figure";
+import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "./stats";
+import { downloadBlob, formatNumber, downloadDataView } from "./format";
 
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 10;
@@ -207,9 +207,14 @@ function drawViPositionMarker(
   const scaleX = cssWidth / imageWidth;
   const scaleY = cssHeight / imageHeight;
 
-  // Convert image coordinates to CSS pixel coordinates
-  const screenX = posCol * zoom * scaleX + panX * scaleX;
-  const screenY = posRow * zoom * scaleY + panY * scaleY;
+  // posRow/posCol are integer scan indices. Center the crosshair on the SAMPLED
+  // pixel (+0.5) so it sits in the middle of the scan position the CBED came from,
+  // not at the pixel corner - otherwise on a zoomed coarse grid it reads as
+  // ambiguous between two adjacent positions.
+  const cellRow = Math.round(posRow);
+  const cellCol = Math.round(posCol);
+  const screenX = (cellCol + 0.5) * zoom * scaleX + panX * scaleX;
+  const screenY = (cellRow + 0.5) * zoom * scaleY + panY * scaleY;
 
   // Simple crosshair (no circle)
   const crosshairSize = 12;
@@ -230,6 +235,22 @@ function drawViPositionMarker(
   ctx.moveTo(screenX, screenY - crosshairSize);
   ctx.lineTo(screenX, screenY + crosshairSize);
   ctx.stroke();
+
+  // Label the exact scan position (row, col) so the scientist knows which
+  // position the diffraction pattern was sampled from.
+  const label = `(${cellRow}, ${cellCol})`;
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
+  ctx.font = "11px monospace";
+  ctx.textBaseline = "bottom";
+  const textW = ctx.measureText(label).width;
+  const labelX = Math.min(cssWidth - textW - 4, screenX + crosshairSize + 4);
+  const labelY = Math.max(13, screenY - 4);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  ctx.fillRect(labelX - 2, labelY - 12, textW + 4, 13);
+  ctx.fillStyle = isDragging ? "rgba(255, 255, 0, 0.95)" : "rgba(255, 160, 160, 0.95)";
+  ctx.fillText(label, labelX, labelY);
 
   ctx.restore();
 }
@@ -969,7 +990,7 @@ function Show4DSTEM() {
 
   // ROI state
   const [roiRadiusModel, setRoiRadius] = useModelState<number>("roi_radius");
-  const [roiRadiusInnerModel, setRoiRadiusInner] = useModelState<number>("roi_radius_inner");
+  const [roiRadiusInner, setRoiRadiusInner] = useModelState<number>("roi_radius_inner");
   const [roiMode, setRoiMode] = useModelState<string>("roi_mode");
   const [roiWidth, setRoiWidth] = useModelState<number>("roi_width");
   const [roiHeight, setRoiHeight] = useModelState<number>("roi_height");
@@ -1050,6 +1071,12 @@ function Show4DSTEM() {
   // Effective radius used by ALL render/hit-test code below: the live local value
   // while dragging, else the model value. Keeps the ring glued to the cursor.
   const roiRadius = localRoiRadius != null ? localRoiRadius : roiRadiusModel;
+  // Coalesce radius writes with requestAnimationFrame, always flushing the LATEST
+  // radius (issue #751). Do NOT gate sends on virtual_image_bytes: the old guard
+  // waited for the VI bytes to change before sending the next radius, so if a send
+  // didn't land changed bytes the final drag value stayed local and Python never
+  // recomputed — the hand-drag resize silently did nothing. rAF flush is robust:
+  // one Python recompute per frame, last-value-wins, no stuck in-flight guard.
   const roiRadiusPendingRef = React.useRef<number | null>(null);
   const roiRadiusRafRef = React.useRef<number | null>(null);
   const flushRoiRadius = React.useCallback(() => {
@@ -1067,39 +1094,6 @@ function Show4DSTEM() {
       roiRadiusRafRef.current = requestAnimationFrame(flushRoiRadius);
     }
   }, [flushRoiRadius]);
-  React.useEffect(() => {
-    if (localRoiRadius != null && Math.abs(localRoiRadius - roiRadiusModel) < 0.5) {
-      setLocalRoiRadius(null);
-    }
-  }, [localRoiRadius, roiRadiusModel]);
-  const [localRoiRadiusInner, setLocalRoiRadiusInner] = React.useState<number | null>(null);
-  const roiRadiusInner = localRoiRadiusInner != null ? localRoiRadiusInner : roiRadiusInnerModel;
-  const roiRadiusInnerPendingRef = React.useRef<number | null>(null);
-  const roiRadiusInnerRafRef = React.useRef<number | null>(null);
-  const flushRoiRadiusInner = React.useCallback(() => {
-    if (roiRadiusInnerPendingRef.current !== null) {
-      const r = roiRadiusInnerPendingRef.current;
-      roiRadiusInnerPendingRef.current = null;
-      model.set("roi_radius_inner", r);
-      model.save_changes();
-    }
-    roiRadiusInnerRafRef.current = null;
-  }, [model]);
-  const sendRoiRadiusInner = React.useCallback((radius: number) => {
-    roiRadiusInnerPendingRef.current = radius;
-    if (roiRadiusInnerRafRef.current === null) {
-      roiRadiusInnerRafRef.current = requestAnimationFrame(flushRoiRadiusInner);
-    }
-  }, [flushRoiRadiusInner]);
-  React.useEffect(() => {
-    if (localRoiRadiusInner != null && Math.abs(localRoiRadiusInner - roiRadiusInnerModel) < 0.5) {
-      setLocalRoiRadiusInner(null);
-    }
-  }, [localRoiRadiusInner, roiRadiusInnerModel]);
-  React.useEffect(() => () => {
-    if (roiRadiusRafRef.current !== null) cancelAnimationFrame(roiRadiusRafRef.current);
-    if (roiRadiusInnerRafRef.current !== null) cancelAnimationFrame(roiRadiusInnerRafRef.current);
-  }, []);
   const [isDraggingVI, setIsDraggingVI] = React.useState(false);
   const [isDraggingFFT, setIsDraggingFFT] = React.useState(false);
   const [fftDragStart, setFftDragStart] = React.useState<{ x: number, y: number, panX: number, panY: number } | null>(null);
@@ -1134,6 +1128,18 @@ function Show4DSTEM() {
   // range and nearest-neighbor blit.
   const [viAutoContrast, setViAutoContrast] = useModelState<boolean>("vi_auto_contrast");
   const [viSmooth, setViSmooth] = useModelState<boolean>("vi_smooth");
+  const viPreAutoPctRef = React.useRef<[number, number] | null>(null);
+  const toggleViAutoContrast = React.useCallback((on: boolean) => {
+    if (on) {
+      viPreAutoPctRef.current = [viVminPct, viVmaxPct];
+    } else if (viPreAutoPctRef.current) {
+      const [vmn, vmx] = viPreAutoPctRef.current;
+      setViVminPct(vmn);
+      setViVmaxPct(vmx);
+      viPreAutoPctRef.current = null;
+    }
+    setViAutoContrast(on);
+  }, [setViAutoContrast, setViVmaxPct, setViVminPct, viVmaxPct, viVminPct]);
 
   // VI ROI state (real-space region selection for summed DP) - synced with Python
   const [viRoiMode, setViRoiMode] = useModelState<string>("vi_roi_mode");
@@ -1241,11 +1247,15 @@ function Show4DSTEM() {
   // moving to JS skips 4 sync trait round-trips per scan-position click).
   const [dpStats, setDpStats] = React.useState<number[]>([0, 0, 0, 0]);
 
-  // Parse DP frame bytes for histogram (float32 now)
+  const usesViRoiDp = viRoiMode && viRoiMode !== "off" && viRoiDpBytes && viRoiDpBytes.byteLength > 0;
+  const displayedDpBytes = usesViRoiDp ? viRoiDpBytes : frameBytes;
+
+  // Parse displayed DP bytes for stats/histogram. When a VI ROI is active, the
+  // DP panel shows the ROI-reduced DP, so its stats must use the same bytes.
   React.useEffect(() => {
-    if (!frameBytes) return;
+    if (!displayedDpBytes) return;
     // Parse as Float32Array since Python now sends raw float32
-    const rawData = new Float32Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength / 4);
+    const rawData = new Float32Array(displayedDpBytes.buffer, displayedDpBytes.byteOffset, displayedDpBytes.byteLength / 4);
     // Store raw data for profile sampling
     if (!rawDpDataRef.current || rawDpDataRef.current.length !== rawData.length) {
       rawDpDataRef.current = new Float32Array(rawData.length);
@@ -1264,7 +1274,7 @@ function Show4DSTEM() {
       scaledData.set(rawData);
     }
     setDpHistogramData(scaledData);
-  }, [frameBytes, dpScaleMode]);
+  }, [displayedDpBytes, dpScaleMode]);
 
   // GPU FFT state
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
@@ -1358,6 +1368,20 @@ function Show4DSTEM() {
   const [fftAuto, setFftAuto] = useModelState<boolean>("fft_auto");
   const [fftVminPct, setFftVminPct] = useModelState<number>("fft_vmin_pct");
   const [fftVmaxPct, setFftVmaxPct] = useModelState<number>("fft_vmax_pct");
+  // Remember the manual histogram thumbs from BEFORE Auto was switched on, so
+  // switching Auto back off restores the user's previous range instead of
+  // leaving whatever the auto pass (or a mid-auto thumb drag) left behind.
+  const fftPreAutoPctRef = React.useRef<[number, number] | null>(null);
+  const toggleFftAuto = React.useCallback((on: boolean) => {
+    if (on) {
+      fftPreAutoPctRef.current = [fftVminPct, fftVmaxPct];
+    } else if (fftPreAutoPctRef.current) {
+      const [vmn, vmx] = fftPreAutoPctRef.current;
+      setFftVminPct(vmn); setFftVmaxPct(vmx);
+      fftPreAutoPctRef.current = null;
+    }
+    setFftAuto(on);
+  }, [fftVminPct, fftVmaxPct, setFftAuto, setFftVminPct, setFftVmaxPct]);
   const [fftStats, setFftStats] = React.useState<number[] | null>(null);  // [mean, min, max, std]
   const [fftHistogramData, setFftHistogramData] = React.useState<Float32Array | null>(null);
   const [fftDataMin, setFftDataMin] = React.useState(0);
@@ -1552,9 +1576,7 @@ function Show4DSTEM() {
   // Render DP with zoom (use summed DP when VI ROI is active)
   // Expensive: colormap + data processing → cached offscreen canvas
   React.useEffect(() => {
-    // Determine which bytes to display: summed DP (if VI ROI active) or single frame
-    const usesViRoiDp = viRoiMode && viRoiMode !== "off" && viRoiDpBytes && viRoiDpBytes.byteLength > 0;
-    const sourceBytes = usesViRoiDp ? viRoiDpBytes : frameBytes;
+    const sourceBytes = displayedDpBytes;
     if (!sourceBytes) return;
 
     const lut = COLORMAPS[dpColormap] || COLORMAPS.inferno;
@@ -1611,7 +1633,7 @@ function Show4DSTEM() {
     dpColorbarVminRef.current = vmin;
     dpColorbarVmaxRef.current = vmax;
     setDpOffscreenVersion(v => v + 1);
-  }, [frameBytes, viRoiDpBytes, viRoiMode, detRows, detCols, dpColormap, dpVminPct, dpVmaxPct, dpScaleMode, traitDpVmin, traitDpVmax]);
+  }, [displayedDpBytes, detRows, detCols, dpColormap, dpVminPct, dpVmaxPct, dpScaleMode, traitDpVmin, traitDpVmax]);
 
   // Cheap: zoom/pan redraw — just drawImage from cached offscreen
   // useLayoutEffect prevents black flash when canvas dimensions change (resize)
@@ -2618,30 +2640,60 @@ function Show4DSTEM() {
   // Helper: convert screen-pixel hit radius to image-pixel radius
   // handleRadius=6 CSS px drawn, hit area ~10 CSS px → convert to image coords
   const dpHitRadius = RESIZE_HIT_AREA_PX * Math.max(detCols, detRows) / canvasSize / dpZoom;
+  const activeRoiCenterCol = Number.isFinite(localKCol) ? localKCol : roiCenterCol;
+  const activeRoiCenterRow = Number.isFinite(localKRow) ? localKRow : roiCenterRow;
 
-  // Helper: check if point is near the outer resize handle
+  const isInResizableRadiusBand = (distance: number, radius: number, innerRadius: number = 0): boolean => {
+    if (!Number.isFinite(distance) || !Number.isFinite(radius) || radius <= 0) return false;
+    const ringWidth = Math.max(radius - innerRadius, 1);
+    const edgePad = Math.max(dpHitRadius, Math.min(radius * 0.35, 8), ringWidth * 0.35);
+    if (innerRadius > 0) {
+      return distance >= Math.max(0, innerRadius - edgePad) && distance <= radius + edgePad;
+    }
+    return distance >= Math.max(0, radius * 0.45 - edgePad) && distance <= radius + edgePad;
+  };
+
+  // Helper: check if point is near the outer resize handle.
+  // The drawn handle is a tiny 6px dot - too small to grab by hand, especially
+  // on a binned detector where the whole pattern is ~48px. So we accept a click
+  // anywhere on the ROI's EDGE (circle perimeter / square border), not just the
+  // 45-deg handle dot. Dragging the edge is the natural "resize" gesture.
   const isNearResizeHandle = (imgX: number, imgY: number): boolean => {
     if (roiMode === "rect") {
-      // For rectangle, check near bottom-right corner
-      const handleX = roiCenterCol + roiWidth / 2;
-      const handleY = roiCenterRow + roiHeight / 2;
-      const dist = Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2);
-      return dist < dpHitRadius;
+      const handleX = activeRoiCenterCol + roiWidth / 2;
+      const handleY = activeRoiCenterRow + roiHeight / 2;
+      if (Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2) < dpHitRadius) return true;
+      const dx = Math.abs(imgX - activeRoiCenterCol), dy = Math.abs(imgY - activeRoiCenterRow);
+      const onVert = Math.abs(dx - roiWidth / 2) < dpHitRadius && dy <= roiHeight / 2 + dpHitRadius;
+      const onHorz = Math.abs(dy - roiHeight / 2) < dpHitRadius && dx <= roiWidth / 2 + dpHitRadius;
+      return onVert || onHorz;
     }
     if ((roiMode !== "circle" && roiMode !== "square" && roiMode !== "annular") || !roiRadius) return false;
     const offset = roiMode === "square" ? roiRadius : roiRadius * CIRCLE_HANDLE_ANGLE;
-    const handleX = roiCenterCol + offset;
-    const handleY = roiCenterRow + offset;
-    const dist = Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2);
-    return dist < dpHitRadius;
+    const handleX = activeRoiCenterCol + offset;
+    const handleY = activeRoiCenterRow + offset;
+    if (Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2) < dpHitRadius) return true;
+    const dx = imgX - activeRoiCenterCol, dy = imgY - activeRoiCenterRow;
+    // GENEROUS grab: a hand can't hit a thin ring. Treat the OUTER HALF of the
+    // ROI (and just outside it) as the resize zone; the inner half is the move
+    // zone. So grabbing anywhere near the rim resizes - no pixel precision needed.
+    if (roiMode === "square") {
+      const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+      return isInResizableRadiusBand(cheb, roiRadius);
+    }
+    const distFromCenter = Math.sqrt(dx ** 2 + dy ** 2);
+    if (roiMode === "annular") {
+      return isInResizableRadiusBand(distFromCenter, roiRadius, roiRadiusInner || 0);
+    }
+    return isInResizableRadiusBand(distFromCenter, roiRadius);
   };
 
   // Helper: check if point is near the inner resize handle (annular mode only)
   const isNearResizeHandleInner = (imgX: number, imgY: number): boolean => {
     if (roiMode !== "annular" || !roiRadiusInner) return false;
     const offset = roiRadiusInner * CIRCLE_HANDLE_ANGLE;
-    const handleX = roiCenterCol + offset;
-    const handleY = roiCenterRow + offset;
+    const handleX = activeRoiCenterCol + offset;
+    const handleY = activeRoiCenterRow + offset;
     const dist = Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2);
     return dist < dpHitRadius;
   };
@@ -2666,10 +2718,16 @@ function Show4DSTEM() {
       const offset = viRoiMode === "square" ? radius : radius * CIRCLE_HANDLE_ANGLE;
       const handleX = localViRoiCenterRow + offset;
       const handleY = localViRoiCenterCol + offset;
-      const dist = Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2);
-      // Cap hit area to 50% of radius so center remains draggable
       const hitArea = Math.min(viHitRadius, radius * 0.5);
-      return dist < hitArea;
+      if (Math.sqrt((imgX - handleX) ** 2 + (imgY - handleY) ** 2) < hitArea) return true;
+      // GENEROUS grab: outer half of the ROI (and just outside) resizes; inner
+      // half moves. No pixel precision needed to grab the rim by hand.
+      const dx = imgX - localViRoiCenterRow, dy = imgY - localViRoiCenterCol;
+      if (viRoiMode === "square") {
+        const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+        return cheb >= radius * 0.5 && cheb <= radius * 1.8 + viHitRadius;
+      }
+      return Math.sqrt(dx ** 2 + dy ** 2) >= radius * 0.5 && Math.sqrt(dx ** 2 + dy ** 2) <= radius * 1.8 + viHitRadius;
     }
     return false;
   };
@@ -2677,8 +2735,8 @@ function Show4DSTEM() {
   // Helper: check if point is inside the DP ROI area
   const isInsideDpRoi = (imgX: number, imgY: number): boolean => {
     if (roiMode === "point") return false;
-    const dx = imgX - roiCenterCol;
-    const dy = imgY - roiCenterRow;
+    const dx = imgX - activeRoiCenterCol;
+    const dy = imgY - activeRoiCenterRow;
     if (roiMode === "circle") return Math.sqrt(dx * dx + dy * dy) <= (roiRadius || 5);
     if (roiMode === "square") return Math.abs(dx) <= (roiRadius || 5) && Math.abs(dy) <= (roiRadius || 5);
     if (roiMode === "annular") { const d = Math.sqrt(dx * dx + dy * dy); return d <= (roiRadius || 20) && d >= (roiRadiusInner || 5); }
@@ -2697,19 +2755,86 @@ function Show4DSTEM() {
     return false;
   };
 
-  // Pointer handlers
-  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
-    if ("pointerId" in e) {
-      try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
-    }
-    dpClickStartRef.current = { x: e.clientX, y: e.clientY };
+  // Mouse handlers
+  const getDpImageCoordsFromClient = React.useCallback((clientX: number, clientY: number): { imgX: number; imgY: number } | null => {
     const canvas = dpOverlayRef.current;
-    if (!canvas) return;
+    if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    const screenX = (e.clientX - rect.left) * (canvas.width / rect.width);
-    const screenY = (e.clientY - rect.top) * (canvas.height / rect.height);
-    const imgX = (screenX - dpPanX) / dpZoom;
-    const imgY = (screenY - dpPanY) / dpZoom;
+    const screenX = (clientX - rect.left) * (canvas.width / rect.width);
+    const screenY = (clientY - rect.top) * (canvas.height / rect.height);
+    return {
+      imgX: (screenX - dpPanX) / dpZoom,
+      imgY: (screenY - dpPanY) / dpZoom,
+    };
+  }, [dpPanX, dpPanY, dpZoom]);
+
+  const resizeDpRoiFromImagePoint = React.useCallback((imgX: number, imgY: number, shiftKey: boolean = false): boolean => {
+    if (isDraggingResizeInner) {
+      const dx = Math.abs(imgX - activeRoiCenterCol);
+      const dy = Math.abs(imgY - activeRoiCenterRow);
+      const newRadius = Math.sqrt(dx ** 2 + dy ** 2);
+      setRoiRadiusInner(Math.max(1, Math.min(roiRadius - 1, Math.round(newRadius))));
+      return true;
+    }
+
+    if (isDraggingResize) {
+      const dx = Math.abs(imgX - activeRoiCenterCol);
+      const dy = Math.abs(imgY - activeRoiCenterRow);
+      if (roiMode === "rect") {
+        let newW = Math.max(2, Math.round(dx * 2));
+        let newH = Math.max(2, Math.round(dy * 2));
+        if (shiftKey && resizeAspectRef.current != null) {
+          const aspect = resizeAspectRef.current;
+          if (newW / newH > aspect) newH = Math.max(2, Math.round(newW / aspect));
+          else newW = Math.max(2, Math.round(newH * aspect));
+        }
+        setRoiWidth(newW);
+        setRoiHeight(newH);
+      } else {
+        const newRadius = roiMode === "square" ? Math.max(dx, dy) : Math.sqrt(dx ** 2 + dy ** 2);
+        const minRadius = roiMode === "annular" ? (roiRadiusInner || 0) + 1 : 1;
+        const rad = Math.max(minRadius, Math.round(newRadius));
+        setLocalRoiRadius(rad);
+        sendRoiRadius(rad);
+      }
+      return true;
+    }
+
+    return false;
+  }, [
+    activeRoiCenterCol, activeRoiCenterRow, isDraggingResize, isDraggingResizeInner,
+    roiMode, roiRadius, roiRadiusInner, sendRoiRadius, setRoiHeight, setRoiRadiusInner, setRoiWidth
+  ]);
+
+  React.useEffect(() => {
+    if (!isDraggingResize && !isDraggingResizeInner) return;
+
+    const onMove = (event: MouseEvent) => {
+      const coords = getDpImageCoordsFromClient(event.clientX, event.clientY);
+      if (!coords) return;
+      if (resizeDpRoiFromImagePoint(coords.imgX, coords.imgY, event.shiftKey)) {
+        event.preventDefault();
+      }
+    };
+    const onUp = () => {
+      setIsDraggingResize(false);
+      setIsDraggingResizeInner(false);
+      setLocalRoiRadius(null);
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [getDpImageCoordsFromClient, isDraggingResize, isDraggingResizeInner, resizeDpRoiFromImagePoint]);
+
+  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    dpClickStartRef.current = { x: e.clientX, y: e.clientY };
+    const coords = getDpImageCoordsFromClient(e.clientX, e.clientY);
+    if (!coords) return;
+    const { imgX, imgY } = coords;
 
     // When profile mode is active, use profile interactions only
     if (profileActive) {
@@ -2755,7 +2880,7 @@ function Show4DSTEM() {
     setIsDraggingDP(true);
     // If clicking inside the ROI, drag with offset (grab-and-drag)
     if (roiMode !== "off" && roiMode !== "point" && isInsideDpRoi(imgX, imgY)) {
-      dpDragOffsetRef.current = { dRow: imgY - roiCenterRow, dCol: imgX - roiCenterCol };
+      dpDragOffsetRef.current = { dRow: imgY - activeRoiCenterRow, dCol: imgX - activeRoiCenterCol };
       return;
     }
     // Clicking outside ROI — teleport center to click position
@@ -2769,14 +2894,10 @@ function Show4DSTEM() {
     model.save_changes();
   };
 
-  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = dpOverlayRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const screenX = (e.clientX - rect.left) * (canvas.width / rect.width);
-    const screenY = (e.clientY - rect.top) * (canvas.height / rect.height);
-    const imgX = (screenX - dpPanX) / dpZoom;
-    const imgY = (screenY - dpPanY) / dpZoom;
+  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const coords = getDpImageCoordsFromClient(e.clientX, e.clientY);
+    if (!coords) return;
+    const { imgX, imgY } = coords;
 
     // Fast path: skip cursor readout during any active drag — avoids setCursorInfo re-renders
     const anyDrag = isDraggingDP || isDraggingResize || isDraggingResizeInner
@@ -2846,39 +2967,7 @@ function Show4DSTEM() {
     }
 
     // Handle inner resize dragging (annular mode)
-    if (isDraggingResizeInner) {
-      const dx = Math.abs(imgX - roiCenterCol);
-      const dy = Math.abs(imgY - roiCenterRow);
-      const newRadius = Math.sqrt(dx ** 2 + dy ** 2);
-      // Inner radius must be less than outer radius
-      const rad = Math.max(1, Math.min(roiRadius - 1, Math.round(newRadius)));
-      setLocalRoiRadiusInner(rad);
-      sendRoiRadiusInner(rad);
-      return;
-    }
-
-    // Handle outer resize dragging - use model state center, not local values
-    if (isDraggingResize) {
-      const dx = Math.abs(imgX - roiCenterCol);
-      const dy = Math.abs(imgY - roiCenterRow);
-      if (roiMode === "rect") {
-        let newW = Math.max(2, Math.round(dx * 2));
-        let newH = Math.max(2, Math.round(dy * 2));
-        if (e.shiftKey && resizeAspectRef.current != null) {
-          const aspect = resizeAspectRef.current;
-          if (newW / newH > aspect) newH = Math.max(2, Math.round(newW / aspect));
-          else newW = Math.max(2, Math.round(newH * aspect));
-        }
-        setRoiWidth(newW);
-        setRoiHeight(newH);
-      } else {
-        const newRadius = roiMode === "square" ? Math.max(dx, dy) : Math.sqrt(dx ** 2 + dy ** 2);
-        // For annular mode, outer radius must be greater than inner radius
-        const minRadius = roiMode === "annular" ? (roiRadiusInner || 0) + 1 : 1;
-        const rad = Math.max(minRadius, Math.round(newRadius));
-        setLocalRoiRadius(rad);   // ring follows the cursor instantly
-        sendRoiRadius(rad);       // coalesced Python recompute (latest-only)
-      }
+    if (resizeDpRoiFromImagePoint(imgX, imgY, e.shiftKey)) {
       return;
     }
 
@@ -2898,10 +2987,7 @@ function Show4DSTEM() {
     queueRoiCenter(newRow, newCol);
   };
 
-  const handleDpMouseUp = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
-    if ("pointerId" in e) {
-      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-    }
+  const handleDpMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (draggingDpProfileEndpoint !== null || isDraggingDpProfileLine) {
       setDraggingDpProfileEndpoint(null);
       setIsDraggingDpProfileLine(false);
@@ -2909,7 +2995,9 @@ function Show4DSTEM() {
       dpClickStartRef.current = null;
       setIsDraggingDP(false);
       setIsDraggingResize(false);
+      setLocalRoiRadius(null);  // revert ring to committed model radius on release
       setIsDraggingResizeInner(false);
+      setLocalRoiRadius(null);
       setHoveredDpProfileEndpoint(null);
       setIsHoveringDpProfileLine(false);
       return;
@@ -2943,6 +3031,7 @@ function Show4DSTEM() {
     }
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -2950,12 +3039,9 @@ function Show4DSTEM() {
     dpProfileDragStartRef.current = null;
   };
   const handleDpMouseLeave = () => {
-    if (isDraggingDP || isDraggingResize || isDraggingResizeInner || draggingDpProfileEndpoint !== null || isDraggingDpProfileLine) {
-      setCursorInfo(prev => prev?.panel === "DP" ? null : prev);
-      return;
-    }
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -3032,10 +3118,11 @@ function Show4DSTEM() {
 
     // Regular position selection (when ROI is off)
     setIsDraggingVI(true);
-    setLocalPosRow(imgX); setLocalPosCol(imgY);
-    // Batch X and Y updates into a single sync
+    // Snap to the integer scan index so the crosshair marks the exact pixel the
+    // CBED is sampled from (not the fractional cursor position).
     const newX = Math.round(Math.max(0, Math.min(shapeRows - 1, imgX)));
     const newY = Math.round(Math.max(0, Math.min(shapeCols - 1, imgY)));
+    setLocalPosRow(newX); setLocalPosCol(newY);
     model.set("pos_row", newX);
     model.set("pos_col", newY);
     model.save_changes();
@@ -3153,10 +3240,11 @@ function Show4DSTEM() {
 
     // Handle regular position dragging (when ROI is off)
     if (!isDraggingVI) return;
-    setLocalPosRow(imgX); setLocalPosCol(imgY);
-    // Batch position updates into a single sync
+    // Snap to the integer scan index so the crosshair tracks discrete sampled
+    // positions, matching the CBED actually shown.
     const newX = Math.round(Math.max(0, Math.min(shapeRows - 1, imgX)));
     const newY = Math.round(Math.max(0, Math.min(shapeCols - 1, imgY)));
+    setLocalPosRow(newX); setLocalPosCol(newY);
     model.set("pos_row", newX);
     model.set("pos_col", newY);
     model.save_changes();
@@ -3688,9 +3776,8 @@ function Show4DSTEM() {
             <canvas ref={dpCanvasRef} width={detCols} height={detRows} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
             <canvas
               ref={dpOverlayRef} width={detCols} height={detRows}
-              onPointerDown={handleDpMouseDown} onPointerMove={handleDpMouseMove}
-              onPointerUp={handleDpMouseUp} onPointerCancel={handleDpMouseUp}
-              onMouseLeave={handleDpMouseLeave}
+              onMouseDown={handleDpMouseDown} onMouseMove={handleDpMouseMove}
+              onMouseUp={handleDpMouseUp} onMouseLeave={handleDpMouseLeave}
               onWheel={createZoomHandler(setDpZoom, setDpPanX, setDpPanY, dpZoom, dpPanX, dpPanY, dpOverlayRef)}
               onDoubleClick={handleDpDoubleClick}
               style={{
@@ -3900,7 +3987,7 @@ function Show4DSTEM() {
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(viStats[3])}</Box></Typography>
               <Box sx={{ ml: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
                 <Typography sx={{ ...typo.label, fontSize: 10 }}>Auto:</Typography>
-                <Switch checked={viAutoContrast} onChange={(e) => setViAutoContrast(e.target.checked)} size="small" sx={switchStyles.small} />
+                <Switch checked={viAutoContrast} onChange={(e) => toggleViAutoContrast(e.target.checked)} size="small" sx={switchStyles.small} />
                 <Typography sx={{ ...typo.label, fontSize: 10 }} title="CSS bilinear interpolation. Same data, browser smooths visually.">Smooth:</Typography>
                 <Switch checked={viSmooth} onChange={(e) => setViSmooth(e.target.checked)} size="small" sx={switchStyles.small} />
               </Box>
@@ -3985,7 +4072,7 @@ function Show4DSTEM() {
               </Box>
               {/* Right: Histogram spanning both rows */}
               <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-                <Histogram data={viHistogramData} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { if (viAutoContrast) setViAutoContrast(false); setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={viDataMin} dataMax={viDataMax} />
+                <Histogram data={viHistogramData} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { if (viAutoContrast) { viPreAutoPctRef.current = null; setViAutoContrast(false); } setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={viDataMin} dataMax={viDataMax} />
               </Box>
             </Box>
           )}
@@ -4062,7 +4149,7 @@ function Show4DSTEM() {
 
                     </Select>
                     <Typography sx={{ ...typo.label, fontSize: 10 }}>Auto:</Typography>
-                    <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} size="small" sx={switchStyles.small} />
+                    <Switch checked={fftAuto} onChange={(e) => toggleFftAuto(e.target.checked)} size="small" sx={switchStyles.small} />
                     {fftCropDims && (
                       <>
                         <Typography sx={{ ...typo.label, fontSize: 10 }}>Win:</Typography>

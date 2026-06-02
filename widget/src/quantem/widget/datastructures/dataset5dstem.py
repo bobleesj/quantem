@@ -1,0 +1,381 @@
+"""Standalone torch 5D-STEM series for quantem.live.
+
+TEMPORARY home. This belongs in quantem core (PR electronmicroscopy/quantem#231,
+on top of the torch-native Dataset work #228), but core PR review takes time and
+that torch stack is not on quantem core main yet (its ``Dataset4dstem`` is still
+array-backed). So this is a self-contained torch container - it does NOT depend
+on quantem core - and ships with quantem.live today.
+
+Migrate back to ``quantem.core.datastructures.Dataset5dstem`` once #228/#231
+merge: re-point the import in ``quantem.widget.io.hdf5`` and delete this file. The
+public surface (from_tensor / from_frames / shape / devices / summary / free /
+to / offload / numpy / frames / is_sharded / indexing) mirrors the core version to keep that
+swap mechanical. See the migration GitHub issue.
+
+Model: a series (axis 0 = tilt / time / dose / focus / energy) of 4D-STEM
+acquisitions ``(N, scan_row, scan_col, k_row, k_col)``. Two backings, one logical
+view:
+- single tensor (one device) - the common case.
+- series of frames (multi-device) - each frame is its own 4D torch tensor on its
+  own card, so a series larger than one GPU fits across several. Each frame is an
+  independent acquisition: placement is per-frame, freeing VRAM is per-frame.
+"""
+
+from typing import Iterator, Self
+
+import numpy as np
+import torch
+from numpy.typing import NDArray
+
+_SERIES_TYPES = ("time", "tilt", "energy", "dose", "focus", "generic")
+_GiB = 1 << 30
+
+
+def _validate_4(value, default, name: str) -> NDArray:
+    if value is None:
+        return np.asarray(default, dtype=float)
+    arr = np.asarray(value, dtype=float)
+    if arr.shape != (4,):
+        raise ValueError(f"{name} must be length 4 (scan_row, scan_col, k_row, k_col), got {arr.shape}.")
+    return arr
+
+
+class Dataset5dstem:
+    def __init__(
+        self,
+        *,
+        tensor: torch.Tensor | None = None,
+        frames: list[torch.Tensor] | None = None,
+        name: str = "",
+        sampling=None,
+        units=None,
+        series_type: str = "generic",
+        series=None,
+    ):
+        if (tensor is None) == (frames is None):
+            raise ValueError("provide exactly one of tensor= or frames=.")
+        if series_type not in _SERIES_TYPES:
+            raise ValueError(f"series_type must be one of {_SERIES_TYPES}, got {series_type!r}.")
+        self._tensor = tensor          # 5D torch tensor, or None
+        self._frames = frames          # list of 4D torch tensors, or None
+        self.name = name
+        self.series_type = series_type
+        self.sampling = sampling
+        self.units = units
+        self.series = series
+
+    # --- constructors ---
+    @classmethod
+    def from_tensor(
+        cls, tensor: torch.Tensor, name: str | None = None,
+        sampling=None, units=None, series_type: str = "generic", series=None,
+    ) -> Self:
+        """Wrap a single 5D torch tensor ``(N, scan, scan, k, k)``."""
+        if tensor.ndim != 5:
+            raise ValueError(
+                f"from_tensor needs a 5D tensor (N, scan, scan, k, k), got {tuple(tensor.shape)}."
+            )
+        return cls(tensor=tensor, name=name or "5D-STEM series (torch)",
+                   sampling=sampling, units=units, series_type=series_type, series=series)
+
+    @classmethod
+    def from_frames(
+        cls, frames: list[torch.Tensor], name: str | None = None,
+        sampling=None, units=None, series_type: str = "generic", series=None,
+    ) -> Self:
+        """Build a series from per-frame 4D tensors (each may be on its own device).
+
+        Same-device frames stack into one compact 5D tensor; frames spanning
+        DIFFERENT devices stay a per-frame list (each on its card), so a series
+        larger than one GPU just works. Invariant: a frame list is kept ONLY when
+        the frames genuinely span devices, so ``is_sharded`` is reliable.
+        """
+        if not frames:
+            raise ValueError("from_frames needs at least one 4D tensor.")
+        base_shape = tuple(frames[0].shape)
+        base_dtype = frames[0].dtype
+        for i, f in enumerate(frames):
+            if f.ndim != 4:
+                raise ValueError(f"frame {i} must be 4D (scan, scan, k, k), got {tuple(f.shape)}.")
+            if tuple(f.shape) != base_shape:
+                raise ValueError(f"all frames must share shape; frame 0 is {base_shape}, frame {i} is {tuple(f.shape)}.")
+            if f.dtype != base_dtype:
+                raise ValueError(f"all frames must share dtype; frame 0 is {base_dtype}, frame {i} is {f.dtype}.")
+        if len({str(f.device) for f in frames}) == 1:
+            return cls.from_tensor(torch.stack(list(frames), dim=0), name=name,
+                                   sampling=sampling, units=units, series_type=series_type, series=series)
+        return cls(frames=list(frames), name=name or "5D-STEM series (torch)",
+                   sampling=sampling, units=units, series_type=series_type, series=series)
+
+    # Alias: "tensors" reads more naturally than "frames" at the io.read5dstem call site.
+    from_tensors = from_frames
+
+    # --- calibration (4-length: scan + k; series axis is separate) ---
+    @property
+    def sampling(self) -> NDArray: return self._sampling
+
+    @sampling.setter
+    def sampling(self, value) -> None:
+        self._sampling = _validate_4(value, [1, 1, 1, 1], "sampling")
+
+    @property
+    def units(self) -> list[str]: return self._units
+
+    @units.setter
+    def units(self, value) -> None:
+        if value is None:
+            self._units = ["pixels"] * 4
+        else:
+            u = [str(x) for x in value]
+            if len(u) != 4:
+                raise ValueError(f"units must be length 4, got {len(u)}.")
+            self._units = u
+
+    # --- series metadata ---
+    @property
+    def series(self) -> NDArray | None: return self._series
+
+    @series.setter
+    def series(self, value) -> None:
+        if value is None:
+            self._series = None
+            return
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim != 1 or len(arr) != len(self):
+            raise ValueError(f"series must be 1D length {len(self)}, got shape {arr.shape}.")
+        self._series = arr
+
+    # --- logical 5D view ---
+    @property
+    def is_sharded(self) -> bool:
+        """True when the series spans more than one device."""
+        return self._frames is not None and len({str(t.device) for t in self._frames}) > 1
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        if self._frames is not None:
+            return (len(self._frames), *tuple(self._frames[0].shape))
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+        return tuple(self._tensor.shape)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)  # 5
+
+    @property
+    def dtype(self):
+        return self._frames[0].dtype if self._frames is not None else self._tensor.dtype
+
+    @property
+    def devices(self) -> list[str]:
+        """Device of each frame, in series order."""
+        if self._frames is not None:
+            return [str(t.device) for t in self._frames]
+        return [str(self._tensor.device)] * len(self)
+
+    @property
+    def frames(self) -> list[torch.Tensor]:
+        """Per-frame 4D torch tensors, in series order, each on its device.
+
+        The plain-torch view a viewer consumes: ``Show4DSTEM(dset.frames)``.
+        """
+        if self._frames is not None:
+            return list(self._frames)
+        return [self._tensor[i] for i in range(len(self))]
+
+    def numpy(self) -> NDArray:
+        """Gather the whole series to ONE host numpy array ``(N, scan, scan, k, k)``.
+
+        Pulls every frame off its GPU and stacks on the host - the full 5D must
+        fit RAM (a 108 GiB no-bin series will not; bin first, or pull per frame
+        via ``dset[i].cpu().numpy()``).
+        """
+        if self._frames is not None:
+            return np.stack([f.detach().cpu().numpy() for f in self._frames], axis=0)
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+        return self._tensor.detach().cpu().numpy()
+
+    def summary(self) -> dict[str, float]:
+        """Print a frame | device | GiB | dtype table; return per-device GiB totals."""
+        frames = self.frames
+        per_device: dict[str, float] = {}
+        sr, sc = self.shape[1], self.shape[2]
+        kr, kc = self.shape[3], self.shape[4]
+        print(f"{self.name}  ({self.series_type} series, {len(self)} frames)")
+        print(f"  scan {sr}x{sc}  detector {kr}x{kc}  sampling {tuple(self._sampling)} {self._units}")
+        if self._series is not None:
+            print(f"  series: {self.series_type} {list(self._series)}")
+        print(f"{'frame':>5}  {'device':>8}  {'GiB':>6}  dtype")
+        for i, f in enumerate(frames):
+            gib = f.element_size() * f.nelement() / _GiB
+            dev = str(f.device)
+            per_device[dev] = per_device.get(dev, 0.0) + gib
+            print(f"{i:>5}  {dev:>8}  {gib:>6.2f}  {f.dtype}")
+        for dev, gib in sorted(per_device.items()):
+            print(f"  total {dev}: {gib:.2f} GiB")
+        return per_device
+
+    # --- placement + lifecycle (per-frame VRAM control) ---
+    @staticmethod
+    def _as_device(device) -> torch.device:
+        """One spelling for placement args: int -> cuda:int; str/torch.device pass through."""
+        if isinstance(device, torch.device):
+            return device
+        if isinstance(device, int):
+            return torch.device(f"cuda:{device}")
+        return torch.device(device)
+
+    def _materialize_frames(self) -> list[torch.Tensor]:
+        """Force the per-frame list backing so frames can be placed/freed independently.
+
+        A single 5D tensor is split into independent per-frame tensors (own storage via
+        ``clone``) and the 5D backing dropped, so moving or freeing one frame does not pin
+        the rest. No-op when already frame-backed (the multi-device load path)."""
+        if self._frames is None:
+            if self._tensor is None:
+                raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+            self._frames = [self._tensor[i].clone() for i in range(self._tensor.shape[0])]
+            self._tensor = None
+        return self._frames
+
+    def _indices(self, idx) -> list[int]:
+        """Normalize idx (None=all, int, or iterable) to a sorted unique in-range index list."""
+        if idx is None:
+            return list(range(len(self)))
+        if isinstance(idx, int):
+            idx = [idx]
+        return sorted({i % len(self) for i in idx})
+
+    @staticmethod
+    def _reclaim(devs) -> None:
+        """Empty torch AND cupy caching pools on each device so freed VRAM returns.
+
+        Frames are cupy-backed (io.load -> from_dlpack), so released memory sits in cupy's
+        pool and ``torch.cuda.empty_cache()`` alone does NOT return it. Safe on a device that
+        still hosts live frames: both calls only release unreferenced blocks."""
+        cuda_devs = {d for d in devs if d.type == "cuda"}
+        for d in cuda_devs:
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
+        try:
+            import cupy as cp  # noqa: PLC0415  (lazy: keep torch-only import on a CUDA-less laptop)
+        except ImportError:
+            return
+        for d in cuda_devs:
+            with cp.cuda.Device(d.index):
+                cp.get_default_memory_pool().free_all_blocks()
+
+    def to(self, device, idx=None) -> Self:
+        """Move frame(s) to a device, in place; return self.
+
+        ``device``: int (cuda:N), str/torch.device, or a LIST to round-robin the WHOLE
+        series across cards (``idx`` must be None when spreading). ``idx`` (int or iterable)
+        moves a subset and leaves the rest put, so the series spans devices afterward.
+        Source-card VRAM is reclaimed once the old tensors drop. Needed to consolidate a
+        series onto one card, spread it across several, or rebalance per frame."""
+        if isinstance(device, (list, tuple)):
+            if idx is not None:
+                raise ValueError("cannot pass idx= when spreading across a device list; spread moves the whole series.")
+            targets = [self._as_device(d) for d in device]
+            old = self._materialize_frames()
+            src = {f.device for f in old}
+            self._frames = [f.to(targets[i % len(targets)]) for i, f in enumerate(old)]
+            del old
+            self._reclaim(src)
+            return self
+        target = self._as_device(device)
+        if idx is None and self._frames is None:
+            if self._tensor is None:
+                raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+            src = self._tensor.device
+            if src != target:
+                self._tensor = self._tensor.to(target)
+                self._reclaim({src})
+            return self
+        old = self._materialize_frames()
+        move = set(self._indices(idx))
+        src = {old[i].device for i in move}
+        self._frames = [f.to(target) if i in move else f for i, f in enumerate(old)]
+        del old
+        self._reclaim(src)
+        return self
+
+    def offload(self, idx=None) -> Self:
+        """Spill frame(s) to host RAM (``to('cpu')``), keeping them in the series; return self.
+
+        Reclaims a card's VRAM without losing the data; bring it back with ``.to(device, idx)``.
+        The non-destructive counterpart to ``.free`` - use this when a series is bigger than
+        total VRAM and you want to page frames in and out."""
+        return self.to("cpu", idx)
+
+    def free(self, idx=None, device=None) -> None:
+        """Release frame VRAM, reclaiming the torch + cupy pools.
+
+        No args -> free the WHOLE series (spent afterward; accessing it raises). ``idx``
+        (int/iterable) or ``device`` (int/str) frees a SUBSET: those frames are removed from
+        the series and their card's VRAM reclaimed, while the remaining frames stay usable.
+        Destructive (the data is gone) - use ``.offload`` to keep it on CPU instead."""
+        if idx is None and device is None:
+            devs = set()
+            if self._frames is not None:
+                devs = {t.device for t in self._frames}
+            elif self._tensor is not None:
+                devs = {self._tensor.device}
+            self._frames = None
+            self._tensor = None
+            self._series = None
+            self._reclaim(devs)
+            return
+        old = self._materialize_frames()
+        drop = set(self._indices(idx)) if idx is not None else set()
+        if device is not None:
+            dev = self._as_device(device)
+            drop |= {i for i, f in enumerate(old) if f.device == dev}
+        if not drop:
+            return
+        src = {old[i].device for i in drop}
+        keep = [i for i in range(len(old)) if i not in drop]
+        self._frames = [old[i] for i in keep]
+        if self._series is not None:
+            self._series = self._series[keep]
+        del old
+        if not self._frames:
+            self._frames = None
+            self._tensor = None
+            self._series = None
+        self._reclaim(src)
+
+    # --- frame access ---
+    def __len__(self) -> int:
+        if self._frames is not None:
+            return len(self._frames)
+        if self._tensor is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+        return int(self._tensor.shape[0])
+
+    def __getitem__(self, index: int | slice) -> torch.Tensor | Self:
+        if isinstance(index, int):
+            return self._frames[index] if self._frames is not None else self._tensor[index]
+        sub_series = None if self._series is None else self._series[index]
+        if self._frames is not None:
+            return Dataset5dstem.from_frames(
+                self._frames[index], name=self.name, sampling=self._sampling,
+                units=self._units, series_type=self.series_type, series=sub_series)
+        return Dataset5dstem.from_tensor(
+            self._tensor[index], name=self.name, sampling=self._sampling,
+            units=self._units, series_type=self.series_type, series=sub_series)
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        for i in range(len(self)):
+            yield self[i]
+
+    def __repr__(self) -> str:
+        try:
+            shp = self.shape
+        except RuntimeError:
+            return "Dataset5dstem(freed)"
+        sharded = ", sharded" if self.is_sharded else ""
+        return (f"Dataset5dstem(shape={shp}, {self.series_type} series, "
+                f"dtype={self.dtype}{sharded}, name={self.name!r})")
