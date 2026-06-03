@@ -25,6 +25,15 @@ div.cell_output,
   max-width: 100%;
 }
 
+/* The ipywidgets embed manager wraps each widget in a light box (.widget-subarea).
+   In dark mode let the page theme show through so the area around the widget
+   matches; the widget itself already follows the page theme via theme.ts. */
+html[data-theme="dark"] .widget-subarea,
+html[data-theme="dark"] .jp-OutputArea-output,
+html[data-theme="dark"] .jupyter-widgets-output-area {
+  background: transparent !important;
+}
+
 /* Left navigation: narrow and sticky, so widgets get the rest of the width and
    the nav stays put while scrolling a long page. */
 .bd-sidebar-primary {
