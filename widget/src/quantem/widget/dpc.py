@@ -203,25 +203,28 @@ def dpc(data, scan_shape=None, *, rotation_angle_deg=None, rotation_steps=180,
 
 
 class CoM:
-    """Center-of-mass vector field: ``.x`` (horizontal) and ``.y`` (vertical)
-    deflection maps, each a 2D ``(scan_row, scan_col)`` image for ``Show2D``."""
+    """Center-of-mass vector field: ``.row`` (vertical) and ``.col`` (horizontal)
+    deflection maps, each a 2D ``(scan_row, scan_col)`` image for ``Show2D``.
+
+    ``row``/``col`` match the rest of the API (``ds.center`` is ``(row, col)``),
+    so the detector-axis convention is the same everywhere - no ``x``/``y``."""
 
     def __init__(self, com_row: np.ndarray, com_col: np.ndarray):
         self._row, self._col = com_row, com_col
 
     @property
-    def x(self) -> np.ndarray:
-        """Horizontal CoM (detector-column deflection, "CoMx")."""
-        return self._col
+    def row(self) -> np.ndarray:
+        """Vertical CoM (detector-row deflection)."""
+        return self._row
 
     @property
-    def y(self) -> np.ndarray:
-        """Vertical CoM (detector-row deflection, "CoMy")."""
-        return self._row
+    def col(self) -> np.ndarray:
+        """Horizontal CoM (detector-column deflection)."""
+        return self._col
 
 
 def com(data, **kwargs) -> CoM:
-    """Center-of-mass vector field of ``data``: use ``.x`` / ``.y``."""
+    """Center-of-mass vector field of ``data``: use ``.row`` / ``.col``."""
     com_row, com_col = center_of_mass(data, **kwargs)
     return CoM(com_row, com_col)
 

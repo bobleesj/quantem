@@ -10,7 +10,7 @@ user code never branches on hardware:
     Show4DSTEM(ds)                               # raw 4D viewer
     Show2D(ds.bf())                               # bright field (cached, auto probe)
     Show2D(ds.adf(inner=50, outer=180))          # annular dark field, mrad
-    Show2D(ds.com.x)                              # CoMx  (also ds.com.y)
+    Show2D(ds.com.col)                            # horizontal CoM (also ds.com.row)
     Show2D(ds.idpc())                             # iDPC phase (CoM -> rotation -> integrate)
 
 It is deliberately NOT ``quantem.core.Dataset4dstem`` (torch-only, can't hold Metal
@@ -159,7 +159,7 @@ class Dataset4dstemGPU:
 
     @property
     def com(self):
-        """Center-of-mass vector field (cached): ``ds.com.x`` / ``ds.com.y``."""
+        """Center-of-mass vector field (cached): ``ds.com.row`` / ``ds.com.col``."""
         accessor = self.__dict__.get("_com_result")
         if accessor is None:
             from quantem.widget.dpc import com

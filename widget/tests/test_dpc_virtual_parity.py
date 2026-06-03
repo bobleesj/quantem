@@ -71,5 +71,5 @@ def test_dataset_container_roundtrip(gold):
     np.testing.assert_array_equal(ds.idpc(), ref.phase)
     assert abs(ds.rotation_deg - ref.rotation_deg) < 1e-6
     assert ds.idpc() is ds.idpc()                       # iDPC cached
-    np.testing.assert_array_equal(ds.com.x, ref.com_col)  # CoMx == com_col
-    np.testing.assert_array_equal(ds.com.y, ref.com_row)  # CoMy == com_row
+    np.testing.assert_array_equal(ds.com.col, ref.com_col)  # horizontal == com_col
+    np.testing.assert_array_equal(ds.com.row, ref.com_row)  # vertical == com_row
