@@ -550,12 +550,17 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Invalidate precomputed virtual image caches when calibration changes
         self.observe(self._on_calibration_change, names=["center_row", "center_col", "bf_radius"])
 
-        # Initialize default ROI at BF center — batch to avoid redundant observer callbacks
+        # Default the ROI to the bright-field disk (circle at the detected center,
+        # radius = BF radius) so the FIRST render shows a real virtual image. The
+        # point-detector default (roi_mode="point") is a single detector pixel and
+        # paints near-black until the user picks a preset — not a useful first view.
+        # Batch the writes to avoid redundant observer callbacks.
         with self.hold_trait_notifications():
+            self.roi_mode = "circle"
             self.roi_center_col = self.center_col
             self.roi_center_row = self.center_row
             self.roi_center = [self.center_row, self.center_col]
-            self.roi_radius = self.bf_radius * 0.5  # Start with half BF radius
+            self.roi_radius = float(max(1.0, self.bf_radius))
             self.roi_active = True
 
         # Compute initial virtual image and frame (once, after all ROI traits are set)
@@ -602,13 +607,28 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         if _verbose:
             shape = "x".join(str(s) for s in self._data.shape)
-            # name the COMPUTE device, not the torch-coord-tensor device. Metal
-            # compute reports "mps" even though tiny coord helpers live on cpu;
-            # printing self._device there says "cpu" and reads wrong.
-            label = {"TorchCompute": str(self._device), "MetalCompute": "mps (Metal)",
-                     "CudaKernelCompute": "cuda (cupy)"}.get(
-                self._compute.__class__.__name__, str(self._device))
-            print(f"Show4DSTEM: {shape} on {label}, {time.perf_counter() - _t0:.2f}s total")
+            # Spell out the backend, device, and WHERE the data physically lives,
+            # so it's obvious whether a NumPy input went to the GPU. Key off the
+            # compute class first (raw Metal / cupy), else the torch device.
+            cls = self._compute.__class__.__name__
+            backend, where = {
+                "MetalCompute": ("Apple GPU (raw Metal)", "Apple unified memory"),
+                "CudaKernelCompute": ("NVIDIA GPU (CUDA, cupy)", "GPU VRAM"),
+            }.get(cls, (None, None))
+            if backend is None:  # TorchCompute — backend depends on the torch device
+                dev = str(self._device)
+                if "cuda" in dev:
+                    backend, where = "NVIDIA GPU (CUDA, torch)", "GPU VRAM"
+                elif "mps" in dev:
+                    backend, where = "Apple GPU (Metal, torch)", "Apple unified memory"
+                else:
+                    backend, where = "CPU (torch)", "system RAM"
+            src = ("NumPy input uploaded to device"
+                   if data_np is not None else "kept on input device (no copy)")
+            print(f"Show4DSTEM ready in {time.perf_counter() - _t0:.2f}s")
+            print(f"  shape   : {shape}")
+            print(f"  backend : {backend}   device={self._device}")
+            print(f"  data in : {where}   ({src})")
 
     def __repr__(self) -> str:
         shape = (
