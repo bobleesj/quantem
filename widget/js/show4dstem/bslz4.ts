@@ -128,8 +128,12 @@ export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint
   const stackWords = u8 ? Math.ceil(totalElems / 4) : totalElems / 2;  // packed output u32 count
   const interBytes = totalBlocks * blockBytes;
 
-  const rawBuf = device.createBuffer({ size: Math.ceil(compressed.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(rawBuf, 0, compressed.buffer as ArrayBuffer, compressed.byteOffset, compressed.byteLength);
+  // writeBuffer requires a multiple-of-4 size; pad the compressed bytes if the
+  // companion isn't 4-aligned (robust to any chunk file).
+  const rawPad = compressed.byteLength % 4 === 0 ? compressed
+    : (() => { const p = new Uint8Array(Math.ceil(compressed.byteLength / 4) * 4); p.set(compressed); return p; })();
+  const rawBuf = device.createBuffer({ size: rawPad.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(rawBuf, 0, rawPad.buffer as ArrayBuffer, rawPad.byteOffset, rawPad.byteLength);
   const interBuf = device.createBuffer({ size: interBytes, usage: GPUBufferUsage.STORAGE });
   const metaBuf = device.createBuffer({ size: blockMeta.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(metaBuf, 0, blockMeta.buffer as ArrayBuffer, blockMeta.byteOffset, blockMeta.byteLength);

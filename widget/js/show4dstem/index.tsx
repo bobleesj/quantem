@@ -1230,29 +1230,39 @@ function Show4DSTEM() {
       const gunzip = async (b: Uint8Array) => new Uint8Array(await new Response(new Blob([b as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
       let compute: Show4DSTEMCompute | null;
       let cpuStack: Uint8Array | null = null;  // full decompressed stack for the per-frame probe (single-chunk only)
+      // Multi-VOLUME (5D): several datasets each decoded into VRAM (binned so they
+      // all fit), kept resident -> the frame slider switches between them instantly.
+      let computes: Show4DSTEMCompute[] = [];
       if (bslz4Meta) {
         // bslz4 mode: ship native HDF5 bitshuffle+LZ4 bytes (~6x smaller than uint16),
-        // decompress on the GPU into a uint8 stack. The meta JSON is either single
-        // ({blockMeta,...} + _offline_url) or chunked ({base, chunks:[{bin,meta,...}]})
-        // so a full 512x512x192x192 (9.6 GB) lives across N GPU buffers.
+        // decompress on the GPU into a uint8 stack. The meta JSON is single
+        // (chunked: {base, chunks}), or multi-volume ({volumes:[{base,chunks,badPx}]}).
         const m = JSON.parse(bslz4Meta) as any;
         const fetchU8 = async (u: string) => new Uint8Array(await (await fetch(u)).arrayBuffer());
         const fetchU32 = async (u: string) => new Uint32Array(await (await fetch(u)).arrayBuffer());
-        if (Array.isArray(m.chunks)) {
+        const decodeVol = async (base: string, chunks: any[]) => {
           const specs = [];
-          for (const c of m.chunks) {
-            specs.push({ compressed: await fetchU8(m.base + c.bin), blockMeta: await fetchU32(m.base + c.meta),
-              nFrames: c.nScan, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems,
-              detSize: detR * detC, startScan: c.startScan, nScan: c.nScan });
+          for (const c of chunks) specs.push({ compressed: await fetchU8(base + c.bin), blockMeta: await fetchU32(base + c.meta),
+            nFrames: c.nScan, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems,
+            detSize: detR * detC, startScan: c.startScan, nScan: c.nScan });
+          return Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+        };
+        if (Array.isArray(m.volumes)) {
+          for (const v of m.volumes) {
+            const c = await decodeVol(v.base, v.chunks);
+            if (c && v.badPx) c.badPx = new Uint32Array(v.badPx);
+            if (c) computes.push(c);
           }
-          compute = await Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+        } else if (Array.isArray(m.chunks)) {
+          const c = await decodeVol(m.base, m.chunks);
+          if (c) computes.push(c);
         } else {
           const raw = await fetchU8(offlineUrl!);
-          compute = await Show4DSTEMCompute.createFromBslz4({
-            compressed: raw, blockMeta: new Uint32Array(m.blockMeta), nFrames: m.nFrames,
-            nBlocksPerFrame: m.nBlocksPerFrame, blockElems: m.blockElems, detSize: detR * detC,
-          }, "uint8");
+          const c = await Show4DSTEMCompute.createFromBslz4({ compressed: raw, blockMeta: new Uint32Array(m.blockMeta),
+            nFrames: m.nFrames, nBlocksPerFrame: m.nBlocksPerFrame, blockElems: m.blockElems, detSize: detR * detC }, "uint8");
+          if (c) computes.push(c);
         }
+        compute = computes[0] ?? null;
       } else if (chunksMeta && offlineUrl) {
         // Chunked companion: one gzip blob with N chunks; stream each into its own
         // GPU buffer (handles stacks far bigger than one buffer / one ArrayBuffer).
@@ -1290,7 +1300,7 @@ function Show4DSTEM() {
       const recomputeDP = async () => {
         const mode = model.get("vi_roi_mode");
         if (!mode || mode === "off") { model.set("vi_roi_dp_bytes", new DataView(new ArrayBuffer(0))); return; }
-        const dp = await compute.reduceFrames(buildScanMask(model, scanRows, scanCols), model.get("vi_roi_reduce") !== "sum");
+        const dp = await compute!.reduceFrames(buildScanMask(model, scanRows, scanCols), model.get("vi_roi_reduce") !== "sum");
         model.set("vi_roi_dp_bytes", new DataView(dp.buffer));
       };
       // Pointing at a scan position normally asks the kernel for that position's raw
@@ -1311,6 +1321,14 @@ function Show4DSTEM() {
       const onVI = () => { void recomputeVI(); };
       const onDP = () => { void recomputeDP(); };
       const onPos = () => { void recomputeFrame(); };
+      // 5D multi-volume: the frame slider picks which resident dataset is active.
+      const onFrame = () => {
+        if (computes.length <= 1) return;
+        const v = Math.max(0, Math.min(computes.length - 1, model.get("frame_idx") | 0));
+        compute = computes[v];
+        void recomputeVI(); void recomputeDP(); void recomputeFrame();
+      };
+      if (computes.length > 1) model.on("change:frame_idx", onFrame);
       void recomputeFrame();  // initial DP at mount (so the panel isn't blank)
       // BF/ABF/ADF/HAADF presets normally route through the Python kernel
       // (_preset_request -> apply_preset). With no kernel we translate them into
@@ -1361,7 +1379,8 @@ function Show4DSTEM() {
         model.off("change:_preset_request", onPreset);
         model.off("change:pos_row", onPos);
         model.off("change:pos_col", onPos);
-        compute.dispose();
+        model.off("change:frame_idx", onFrame);
+        computes.forEach((c) => c.dispose());   // free EVERY resident volume's VRAM
       };
       await recomputeVI();  // initial virtual image, no interaction needed
     })();
