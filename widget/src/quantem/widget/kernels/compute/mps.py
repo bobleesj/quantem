@@ -176,12 +176,20 @@ class MetalVirtualImage:
             lib.newFunctionWithName_("radial_cumsum_dual_prefix_u16"), None)
         self._radial_dual_prefix_tg_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
             lib.newFunctionWithName_("radial_cumsum_dual_prefix_tg_u16"), None)
+        self._com_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
+            lib.newFunctionWithName_("com_u16"), None)
         # one int32 output buffer per chunk (reused every recompute)
         self._out_mtls = [_mps._metal_buffer_alloc(int(c.shape[0]) * 4)
                           for c in chunks]
         self._out_nps = [_mps._numpy_view(self._out_mtls[i], np.int32,
                                           int(c.shape[0]))
                          for i, c in enumerate(chunks)]
+        # CoM output: float2 (CoMx, CoMy) per frame per chunk (8 bytes/frame)
+        self._com_out_mtls = [_mps._metal_buffer_alloc(int(c.shape[0]) * 8)
+                              for c in chunks]
+        self._com_out_nps = [_mps._numpy_view(self._com_out_mtls[i], np.float32,
+                                              int(c.shape[0]) * 2)
+                             for i, c in enumerate(chunks)]
         # constant buffers: ndet (shared) + per-chunk nframes
         self._ndet_mtl = _mps._metal_buffer_alloc(4)
         _mps._numpy_view(self._ndet_mtl, np.uint32, 1)[0] = self.ndet
@@ -341,6 +349,48 @@ class MetalVirtualImage:
         for ci in range(len(chunks)):
             self._full[self._offsets[ci]:self._offsets[ci + 1]] = self._out_nps[ci]
         return self._full
+
+    def center_of_mass(self, mask2d: np.ndarray | None = None):
+        """Per-scan-position center of mass over the masked detector, raw Metal.
+
+        Returns ``(com_col, com_row)`` each ``(N,)`` float32 in ABSOLUTE detector
+        coordinates (col = Sum col*I / Sum I, row = Sum row*I / Sum I) - the DPC
+        vector field before mean-subtraction / rotation. ``mask2d`` None means the
+        full detector. Reads uint16 chunks in place with int64 accumulators in the
+        kernel - no float32 copy of the data, so it fits no-bin in 24 GB. One
+        streaming pass; each frame's CoM is fully within its chunk (no cross-chunk
+        accumulation). Matches engine.dpc.compute_center_of_mass.
+        """
+        Metal = self._Metal
+        if mask2d is None:
+            self._mask_np[:] = 1
+        else:
+            self._mask_np[:] = np.asarray(mask2d, dtype=bool).reshape(-1).astype(np.uint8)
+        chunks, pipe = self.chunks, self._com_pipe
+        cmds = []
+        for group in _chunk_groups(chunks):
+            cmd = self._mps._queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipe)
+            for ci in group:
+                nf = int(chunks[ci].shape[0])
+                enc.setBuffer_offset_atIndex_(chunks[ci]._mtl, 0, 0)
+                enc.setBuffer_offset_atIndex_(self._mask_mtl, 0, 1)
+                enc.setBuffer_offset_atIndex_(self._com_out_mtls[ci], 0, 2)
+                enc.setBuffer_offset_atIndex_(self._ndet_mtl, 0, 3)
+                enc.setBuffer_offset_atIndex_(self._detcols_mtl, 0, 4)
+                enc.setBuffer_offset_atIndex_(self._nf_mtls[ci], 0, 5)
+                enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                    Metal.MTLSizeMake((nf + 255) // 256, 1, 1),
+                    Metal.MTLSizeMake(256, 1, 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmds.append(cmd)
+        cmds[-1].waitUntilCompleted()
+        com = np.empty((self.n, 2), dtype=np.float32)
+        for ci in range(len(chunks)):
+            com[self._offsets[ci]:self._offsets[ci + 1]] = self._com_out_nps[ci].reshape(-1, 2)
+        return com[:, 0].copy(), com[:, 1].copy()  # com_col, com_row
 
     def _masked_sum_raw_spans(
         self,

@@ -408,3 +408,32 @@ kernel void radial_cumsum_dual_prefix_tg_u16(
         }
     }
 }
+
+// Center-of-mass per scan position: CoMx, CoMy = (Sum col*I, Sum row*I) / Sum I,
+// over masked detector pixels. uint16 read in place (no float cast of the data),
+// long accumulators (Sum I ~2.4e9 and Sum col*I ~4.6e11 overflow int32), one
+// float2 per frame out. Powers DPC / iCoM / iDPC without binning. col/row come
+// from the linear detector index (col = i % detcols, row = i / detcols).
+kernel void com_u16(
+    device const ushort* data    [[buffer(0)]],   // (nframes, ndet) uint16, flat
+    device const uchar*  mask    [[buffer(1)]],   // (ndet,) 0/1
+    device float2*       out     [[buffer(2)]],   // (nframes,) (CoMx, CoMy)
+    constant uint&       ndet    [[buffer(3)]],
+    constant uint&       detcols [[buffer(4)]],   // detector width
+    constant uint&       nframes [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= nframes) return;
+    device const ushort* frame = data + (ulong)gid * ndet;
+    long sI = 0, sx = 0, sy = 0;
+    for (uint i = 0; i < ndet; i++) {
+        if (mask[i]) {
+            long v = (long)frame[i];
+            sI += v;
+            sx += v * (long)(i % detcols);
+            sy += v * (long)(i / detcols);
+        }
+    }
+    float invI = sI > 0 ? 1.0f / (float)sI : 0.0f;
+    out[gid] = float2((float)sx * invI, (float)sy * invI);
+}
