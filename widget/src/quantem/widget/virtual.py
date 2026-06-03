@@ -82,20 +82,23 @@ def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
     return (dist >= lo) & (dist <= hi)
 
 
-class VirtualImageAccessor:
-    """``ds.virtual_image.bf()`` / ``.adf()`` / ``.df()`` - cached virtual images.
+class VirtualDetector:
+    """``ds.detector.bf()`` / ``.adf()`` / ``.df()`` - place a virtual detector,
+    get its (cached) image.
 
-    The probe (bright-disk center + radius) is auto-fit once from the mean
-    diffraction pattern, so ``inner`` / ``outer`` are in **BF-radius units**
-    (``1.0`` = the bright-disk edge) and need no calibration. Every result is
-    cached by ``(detector, center, radius, inner, outer)``; a repeat call is
-    instant. Override the probe with ``.center`` / ``.bf_radius`` (clears the
-    cache), or the default band with ``.adf_inner`` / ``.adf_outer`` / ``.df_inner``.
+    bf / adf / df are virtual-detector geometries; each call integrates that
+    geometry over every scan position and returns the 2D image. The probe
+    (bright-disk center + radius) is auto-fit once from the mean diffraction
+    pattern, so ``inner`` / ``outer`` are in **BF-radius units** (``1.0`` =
+    the bright-disk edge) and need no calibration. Every result is cached by
+    ``(detector, center, radius, inner, outer)``; a repeat call is instant.
+    Override the probe with ``.center`` / ``.bf_radius`` (clears the cache),
+    or the default band with ``.adf_inner`` / ``.adf_outer`` / ``.df_inner``.
 
-        ds.virtual_image.bf()                  # bright field, disk <= r
-        ds.virtual_image.adf()                 # annular dark field, r .. 2r
-        ds.virtual_image.adf(inner=1.5, outer=6)
-        ds.virtual_image.df()                  # all dark field, > r
+        ds.detector.bf()                  # bright field, disk <= r
+        ds.detector.adf()                 # annular dark field, r .. 2r
+        ds.detector.adf(inner=1.5, outer=6)
+        ds.detector.df()                  # all dark field, > r
     """
 
     def __init__(self, data):

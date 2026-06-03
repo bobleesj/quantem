@@ -8,8 +8,8 @@ user code never branches on hardware:
     from quantem.widget import load, Dataset4dstemGPU, Show4DSTEM, Show2D
     ds = Dataset4dstemGPU(load("master.h5"))   # torch on CUDA, Metal chunks on Mac
     Show4DSTEM(ds)                               # raw 4D viewer
-    Show2D(ds.virtual_image.bf())                # bright field (cached, auto probe)
-    Show2D(ds.virtual_image.adf())               # annular dark field
+    Show2D(ds.detector.bf())                      # bright field (cached, auto probe)
+    Show2D(ds.detector.adf())                     # annular dark field
     Show2D(ds.dpc().phase)                       # CoM -> rotation -> iDPC (cached)
 
 It is deliberately NOT ``quantem.core.Dataset4dstem`` (torch-only, can't hold Metal
@@ -86,17 +86,17 @@ class Dataset4dstemGPU:
 
     # --- derived properties (the friendly API) ---
     @property
-    def virtual_image(self):
-        """Cached virtual-image detectors: ``.bf()`` / ``.adf()`` / ``.df()``.
+    def detector(self):
+        """Virtual detectors: ``.bf()`` / ``.adf()`` / ``.df()`` (cached images).
 
-        See :class:`quantem.widget.virtual.VirtualImageAccessor`. Built once per
+        See :class:`quantem.widget.virtual.VirtualDetector`. Built once per
         dataset; the probe auto-fits and every detector result is memoized.
         """
-        accessor = self.__dict__.get("_virtual_image")
+        accessor = self.__dict__.get("_detector")
         if accessor is None:
-            from quantem.widget.virtual import VirtualImageAccessor
-            accessor = VirtualImageAccessor(self)
-            self.__dict__["_virtual_image"] = accessor
+            from quantem.widget.virtual import VirtualDetector
+            accessor = VirtualDetector(self)
+            self.__dict__["_detector"] = accessor
         return accessor
 
     def center_of_mass(self, mask=None):
