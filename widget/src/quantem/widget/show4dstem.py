@@ -737,15 +737,16 @@ class Show4DSTEM(anywidget.AnyWidget):
             offline = n_bytes <= budget
         if not offline:
             return
+        # bslz4 codec: ship native bitshuffle+LZ4 bytes (~6x smaller than uint16),
+        # decompress on the GPU to uint8. CHUNKED into <=1 GB GPU buffers, so it is
+        # NOT budget-limited - a full 512x512x192x192 (9.6 GB uint8) streams fine.
+        # Needs a companion directory (data_url).
+        if data_url and getattr(self, "_offline_codec", "gzip") == "bslz4":
+            self._pack_offline_bslz4(data_url)
+            return
         if n_bytes > budget:
             print(f"  offline browser mode skipped: stack is {n_bytes / 1e6:.0f} MB > "
                   f"{budget / 1e6:.0f} MB budget; the kernel still works")
-            return
-        # bslz4 codec: ship native-style bitshuffle+LZ4 bytes (~6x smaller than the
-        # uint16 stack), decompress on the GPU to uint8. Needs a companion file
-        # (data_url) - the compressed bytes are fetched binary, decoded in WebGPU.
-        if data_url and getattr(self, "_offline_codec", "gzip") == "bslz4":
-            self._pack_offline_bslz4(data_url)
             return
         # Direct clip to [0, 255] - NOT global-linear scaling. Detector counts are
         # mostly 0-~100, so the uint8 value IS the raw count: pixels <=255 are
@@ -799,57 +800,76 @@ class Show4DSTEM(anywidget.AnyWidget):
         return str(out)
 
     def _pack_offline_bslz4(self, data_url: str) -> None:
-        """Forward-encode the 4D stack to bitshuffle+LZ4 (bslz4) per frame and write
-        the compressed companion file + per-(frame,block) [coff,clen] meta. The
-        browser decodes it on the GPU to a uint8 stack (bit-exact to the uint8 clip).
+        """One-call bslz4 offline pack: encode the 4D stack to native bitshuffle+LZ4
+        (the Arina/HDF5 codec) and write a CHUNKED companion folder the browser
+        decompresses on the GPU into a uint8 stack (~6x smaller than uint16, near-CUDA
+        decode, bit-exact). Large stacks (full 512x512x192x192 = 9.6 GB uint8) split
+        into scan-row chunks, each <= one 1 GB GPU buffer.
 
-        Why: bslz4 is ~6x smaller than the uint16 stack and ~2x smaller than uint8
-        gzip, so the download shrinks while the decode stays on the GPU at near-CUDA
-        speed. Block size 1024 elements (vs the 4096 HDF5 default) gives ~2x decode
-        throughput on a real GPU (more parallel work units), at a small ratio cost.
+        Fast path: write the stack to a temp HDF5 with the bitshuffle-lz4 filter (C
+        speed) and read the raw chunks back - this produces the exact native format
+        the WGSL decoder reads, far faster than a per-block Python encode.
+
+        ``data_url`` is a DIRECTORY; chunk_NN.bin + chunk_NN.meta + index.json land
+        there, and the browser fetches them relative to the exported HTML.
         """
-        import json, pathlib, struct
-        import lz4.block as _lz4
-        data = np.ascontiguousarray(
-            self._data.detach().to("cpu").numpy().reshape(-1, self.det_rows * self.det_cols)
-        )
-        n_frames, det_size = data.shape
-        # Auto-detect hot/dead pixels (saturated, or mean far above the robust scale)
-        # so the offline VI/DP are filtered automatically - matches CUDA apply_mask.
-        col_max = data.max(axis=0); col_mean = data.mean(axis=0, dtype=np.float64)
+        import json, pathlib, struct, tempfile, os
+        import hdf5plugin, h5py
+        data = self._data.detach().to("cpu").numpy().reshape(-1, self.det_rows, self.det_cols)
+        n_frames = data.shape[0]
+        det_size = self.det_rows * self.det_cols
+        scan_cols = self.shape_cols
+        block_elems = next((b for b in (1024, 512, 256) if det_size % b == 0), det_size)
+        n_blocks = det_size // block_elems
+        # Auto-detect hot/dead pixels (saturated or robust-outlier) -> filtered on the
+        # GPU, matching CUDA apply_mask, so no saturated pixel dominates the VI/DP.
+        flat = data.reshape(n_frames, -1)
+        col_max = flat.max(axis=0); col_mean = flat.mean(axis=0, dtype=np.float64)
         med = np.median(col_mean); mad = np.median(np.abs(col_mean - med)) + 1e-9
         bad = np.where((col_max >= 65535) | (col_mean > med + 50.0 * mad))[0]
         self._offline_bad_px = json.dumps(bad.astype(int).tolist())
         if getattr(self, "_verbose", True) and len(bad):
             print(f"  offline auto-filter: {len(bad)} hot/dead px masked")
-        block_elems = next((b for b in (1024, 512, 256) if det_size % b == 0), det_size)
-        n_blocks = det_size // block_elems
-        plane_shift = np.arange(16, dtype=np.uint32)
-        raw, meta = bytearray(), []
-        for frame in data:
-            raw += struct.pack(">Q", det_size * 2) + struct.pack(">I", block_elems * 2)
-            for b in range(n_blocks):
-                block = frame[b * block_elems:(b + 1) * block_elems].astype(np.uint16)
-                bits = ((block[:, None].astype(np.uint32) >> plane_shift) & 1).astype(np.uint8)
-                planes = np.concatenate([
-                    np.packbits(bits[:, p].reshape(-1, 8), axis=1, bitorder="little").ravel()
-                    for p in range(16)
-                ]).tobytes()
-                comp = _lz4.compress(planes, store_size=False, mode="high_compression")
-                meta += [len(raw) + 4, len(comp)]  # coff (past the 4B length), clen
-                raw += struct.pack(">I", len(comp)) + comp
-            raw += b"\x00" * ((-len(raw)) % 4)
-        out = pathlib.Path(data_url); out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(bytes(raw))
+        # Encode once via HDF5 bitshuffle-lz4 (C, fast), then read native chunks back.
+        tmp_h5 = tempfile.mktemp(suffix=".h5")
+        with h5py.File(tmp_h5, "w") as hf:
+            hf.create_dataset("d", data=data.astype(np.uint16), chunks=(1, self.det_rows, self.det_cols),
+                              **hdf5plugin.Bitshuffle(nelems=block_elems, cname="lz4"))
+        out = pathlib.Path(data_url); out.mkdir(parents=True, exist_ok=True)
+        # scan-row chunks so each decoded uint8 buffer stays <= ~0.95 GB (1 GB cap).
+        rows_per = max(1, min(self.shape_rows, (950 * 1024 * 1024) // max(1, scan_cols * det_size)))
+        index, total = [], 0
+        try:
+            hf = h5py.File(tmp_h5, "r"); ds = hf["d"]
+            cidx = 0
+            for r0 in range(0, self.shape_rows, rows_per):
+                r1 = min(self.shape_rows, r0 + rows_per)
+                f_lo, f_hi = r0 * scan_cols, r1 * scan_cols
+                raw, meta = bytearray(), []
+                for gf in range(f_lo, f_hi):
+                    _, chunk = ds.id.read_direct_chunk((gf, 0, 0))
+                    base = len(raw); pos = 12
+                    for b in range(n_blocks):
+                        clen = struct.unpack(">I", chunk[pos:pos + 4])[0]
+                        meta += [base + pos + 4, clen]
+                        pos += 4 + clen
+                    raw += chunk + b"\x00" * ((-len(raw)) % 4)
+                (out / f"chunk_{cidx:02d}.bin").write_bytes(bytes(raw))
+                np.array(meta, dtype=np.uint32).tofile(out / f"chunk_{cidx:02d}.meta")
+                index.append({"bin": f"chunk_{cidx:02d}.bin", "meta": f"chunk_{cidx:02d}.meta",
+                              "startScan": f_lo, "nScan": f_hi - f_lo,
+                              "nBlocksPerFrame": n_blocks, "blockElems": block_elems})
+                total += len(raw); cidx += 1
+            hf.close()
+        finally:
+            os.unlink(tmp_h5)
+        (out / "index.json").write_text(json.dumps({"chunks": index, "nFrames": n_frames}))
         self.offline = True
-        self._offline_url = data_url
-        self._offline_bslz4 = json.dumps({
-            "blockMeta": meta, "nFrames": n_frames,
-            "nBlocksPerFrame": n_blocks, "blockElems": block_elems,
-        })
+        self._offline_url = ""
+        self._offline_bslz4 = json.dumps({"base": out.name + "/", "chunks": index, "nFrames": n_frames})
         if getattr(self, "_verbose", True):
-            ratio = (n_frames * det_size * 2) / max(1, len(raw))
-            print(f"  offline bslz4 companion: {out} {len(raw)/1e6:.0f} MB "
+            ratio = (n_frames * det_size * 2) / max(1, total)
+            print(f"  offline bslz4 (chunked): {out}/ {total/1e6:.0f} MB "
                   f"({ratio:.1f}x vs uint16), {n_blocks} blocks/frame, GPU-decoded to uint8")
 
     def __repr__(self) -> str:
