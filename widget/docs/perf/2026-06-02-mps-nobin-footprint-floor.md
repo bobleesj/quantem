@@ -66,3 +66,32 @@ chasing phantom memory.
 `src/quantem/widget/kernels/io/mps.py` — `load_mps_4dstem`: `fast_det_bin`
 default `2 → None`; always `clear_mps_cache()` after a load so a later
 `del result` releases the data instead of the cached decompressor pinning it.
+
+## Follow-up: the viewer scrub sidecar — bin4 fits 24 GB AND is 16× faster
+
+The viewer recomputes a BF/ADF virtual image (a detector masked-sum) on every
+ROI-drag frame; that per-frame latency IS the scrub FPS. The fast path uses a
+detector-binned sidecar so each sum touches fewer pixels. The old default was
+bin2 (96², 4.8 GB) — but 19.33 + 4.8 = 24.1 GB does NOT fit a 24 GB Mac (the
+viewer would freeze the same way the eager-sidecar load did). Switched the
+default to a memory-aware **bin4** sidecar (`default_fast_bin()`: bin4 on
+≤32 GB unified memory, bin2 above), built IN PLACE from the resident no-bin
+chunks (`MetalVirtualImage.bin_chunks`, a general f×f Metal kernel) — no disk
+re-decode, no decompress scratch, so the only new memory is the 1.2 GB sidecar.
+
+Measured on phil (M5, 24 GB), no-bin logic_013, BF mask:
+
+| sidecar | det | ms/frame | FPS | extra mem | total phys |
+|---|---|---|---|---|---|
+| full-res (no sidecar) | 192² | 78.5 | 12.7 | 0 | 19.3 GB |
+| bin2 | 96² | (4.8 GB) | — | 4.8 GB | **24.1 GB — does not fit** |
+| **bin4 (new default)** | 48² | **4.8** | **207.6** | 1.21 GB | **20.5 GB (peak 21.2)** |
+
+bin4 is strictly better on a 24 GB Mac: 16× faster scrub than full-res (207 vs
+12.7 FPS, well past the 60 FPS bar) AND it fits with 2.7 GB headroom. The
+coarser 48² detector mask is plenty for a BF/ADF scrub preview; precise virtual
+detectors still use the full-res `vi`. Files: `reductions.msl`
+(`bin_detector_u16` general kernel), `kernels/compute/mps.py`
+(`bin_chunks`/`_bin_mask`/`_upsample_bin_dp`/`default_fast_bin`,
+`ensure_fast_interaction` now in-place), `show4dstem_mps.py` (call sites use
+`data.fast_bin`).

@@ -19,8 +19,8 @@ from quantem.widget.kernels.compute.mps import (
     MetalVirtualImage,
     MultiChunkedFrames,
     _DEFAULT_COMPACT_TARGET_BYTES,
-    _bin2_mask,
-    _upsample_bin2_dp,
+    _bin_mask,
+    _upsample_bin_dp,
 )
 from quantem.widget.kernels.io.mps import (
     load_mps_4dstem,
@@ -125,14 +125,16 @@ class Show4DSTEMMPS(Show4DSTEM):
             det_bin = int(getattr(self._data, "det_bin", 1)) if isinstance(
                 self._data, ChunkedFrames
             ) else 1
+            fb = int(getattr(self._data, "fast_bin", 2)) if isinstance(
+                self._data, ChunkedFrames) else 2
             mode = (
                 f"fast detector-bin{det_bin}"
                 if det_bin > 1 else
                 "full 192x192 exact row-prefix"
                 if full_resolution_interaction else
-                "fast bin2 ready" if fast_interaction and self.fast_interaction_ready else
-                "fast bin2 async" if fast_interaction and fast_interaction_async else
-                "fast bin2" if fast_interaction else "full 192x192 exact"
+                f"fast bin{fb} ready" if fast_interaction and self.fast_interaction_ready else
+                f"fast bin{fb} async" if fast_interaction and fast_interaction_async else
+                f"fast bin{fb}" if fast_interaction else "full 192x192 exact"
             )
             shape = f"{self.shape_rows}x{self.shape_cols}x{self.det_rows}x{self.det_cols}"
             print(
@@ -250,7 +252,7 @@ class Show4DSTEMMPS(Show4DSTEM):
         mask_np = mask.detach().cpu().numpy() if hasattr(mask, "detach") else np.asarray(mask)
         if self.fast_interaction and self.fast_interaction_ready and data.fast_vi is not None:
             self._ensure_fast_interaction_ready()
-            vi = data.fast_vi.masked_sum(_bin2_mask(mask_np))
+            vi = data.fast_vi.masked_sum(_bin_mask(mask_np, data.fast_bin))
         else:
             vi = data.vi.masked_sum(mask_np)  # (N,) int32, raw Metal
         return torch.from_numpy(vi.astype(np.float32, copy=False)).reshape(self._scan_shape)
@@ -416,7 +418,7 @@ class Show4DSTEMMPS(Show4DSTEM):
             mask = self._preset_mask_np(name)
             if mask is None:
                 continue
-            vi = data.fast_vi.masked_sum(_bin2_mask(mask))
+            vi = data.fast_vi.masked_sum(_bin_mask(mask, data.fast_bin))
             arr = np.asarray(vi).reshape(self._scan_shape)
             arr = np.asarray(arr, dtype=np.float32, order="C")
             setattr(self, attr, arr.tobytes())
@@ -600,7 +602,7 @@ class Show4DSTEMMPS(Show4DSTEM):
 
         if self.fast_interaction and self.fast_interaction_ready and data.fast_vi is not None:
             self._ensure_fast_interaction_ready()
-            vi = data.fast_vi.masked_sum(_bin2_mask(mask))
+            vi = data.fast_vi.masked_sum(_bin_mask(mask, data.fast_bin))
         else:
             vi = data.vi.masked_sum(mask)
         self._set_virtual_image_bytes_np(vi)
@@ -670,7 +672,7 @@ class Show4DSTEMMPS(Show4DSTEM):
         if self.fast_interaction and self.fast_interaction_ready and data.fast_vi is not None:
             self._ensure_fast_interaction_ready()
             dp = data.fast_vi.mean_frames(indices)
-            dp = _upsample_bin2_dp(dp, (self.det_rows, self.det_cols))
+            dp = _upsample_bin_dp(dp, (self.det_rows, self.det_cols), data.fast_bin)
         else:
             dp = data.vi.mean_frames(indices)
 
@@ -697,7 +699,7 @@ class Show4DSTEMMPS(Show4DSTEM):
                 dp = data.fast_vi.mean_frames(indices)
                 if reduce == "sum":
                     dp = dp * float(n_positions)
-                dp = _upsample_bin2_dp(dp, (self.det_rows, self.det_cols))
+                dp = _upsample_bin_dp(dp, (self.det_rows, self.det_cols), data.fast_bin)
             else:
                 dp = data.vi.mean_frames(indices)
                 if reduce == "sum":

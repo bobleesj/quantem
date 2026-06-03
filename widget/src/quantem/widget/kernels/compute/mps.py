@@ -101,19 +101,57 @@ def _format_seconds(seconds: float) -> str:
     return f"{minutes}m {rem:02d}s"
 
 
-def _bin2_mask(mask: np.ndarray) -> np.ndarray:
-    """Downsample a full detector mask to the bin2 sidecar grid."""
+def _bin_mask(mask: np.ndarray, binf: int = 2) -> np.ndarray:
+    """Downsample a full detector mask to the binf sidecar grid.
+
+    A binned detector pixel is "in the mask" if ANY of its binf*binf raw pixels
+    are, so a virtual-detector edge never disappears at coarser bin factors.
+    """
     mask = np.asarray(mask, dtype=bool)
-    rows = mask.shape[-2] // 2
-    cols = mask.shape[-1] // 2
-    return mask[: rows * 2, : cols * 2].reshape(rows, 2, cols, 2).any(axis=(1, 3))
+    binf = int(binf)
+    rows = mask.shape[-2] // binf
+    cols = mask.shape[-1] // binf
+    return (mask[: rows * binf, : cols * binf]
+            .reshape(rows, binf, cols, binf).any(axis=(1, 3)))
+
+
+def _upsample_bin_dp(dp: np.ndarray, out_shape: tuple[int, int],
+                     binf: int = 2) -> np.ndarray:
+    arr = np.asarray(dp, dtype=np.float32)
+    binf = int(binf)
+    return np.repeat(np.repeat(arr, binf, axis=0), binf, axis=1)[
+        : out_shape[0], : out_shape[1]
+    ]
+
+
+def _bin2_mask(mask: np.ndarray) -> np.ndarray:
+    """Back-compat: bin2 mask downsample (see :func:`_bin_mask`)."""
+    return _bin_mask(mask, 2)
 
 
 def _upsample_bin2_dp(dp: np.ndarray, out_shape: tuple[int, int]) -> np.ndarray:
-    arr = np.asarray(dp, dtype=np.float32)
-    return np.repeat(np.repeat(arr, 2, axis=0), 2, axis=1)[
-        : out_shape[0], : out_shape[1]
-    ]
+    """Back-compat: bin2 DP upsample (see :func:`_upsample_bin_dp`)."""
+    return _upsample_bin_dp(dp, out_shape, 2)
+
+
+def default_fast_bin() -> int:
+    """Scrub-sidecar bin factor that fits the host's unified/GPU memory.
+
+    The bin2 sidecar of a no-bin 512x512x192x192 stack is 4.8 GB on top of the
+    19.3 GB data = 24.1 GB, which does not fit a 24 GB Mac (it swaps and the
+    machine freezes). bin4 is 1.2 GB -> ~20.5 GB total, fits. So: bin4 on Macs
+    with <= ~32 GB unified memory, bin2 on larger boxes where the sharper
+    detector grid is free. Falls back to bin4 (the safe choice) if the memory
+    size can't be read.
+    """
+    try:
+        import subprocess
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                   capture_output=True, text=True,
+                                   timeout=3).stdout.strip())
+        return 2 if total > 32 * 1024**3 else 4
+    except Exception:
+        return 4
 
 
 class MetalVirtualImage:
@@ -154,6 +192,8 @@ class MetalVirtualImage:
             lib.newFunctionWithName_("row_prefix_u16_inplace"), None)
         self._bin2_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
             lib.newFunctionWithName_("bin2_detector_u16"), None)
+        self._bin_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
+            lib.newFunctionWithName_("bin_detector_u16"), None)
         self._mean_dp_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
             lib.newFunctionWithName_("mean_dp_sum_u16"), None)
         self._mean_dp_prefix_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
@@ -253,13 +293,25 @@ class MetalVirtualImage:
         return self._row_prefix
 
     def bin2_chunks(self, *, verbose: bool = True) -> list:
-        """Build a detector-bin2 uint16 sidecar for fast live interaction."""
-        if self.det[0] % 2 or self.det[1] % 2:
-            raise ValueError("bin2 fast interaction requires even detector dimensions")
+        """Back-compat: detector-bin2 sidecar (see :meth:`bin_chunks`)."""
+        return self.bin_chunks(2, verbose=verbose)
+
+    def bin_chunks(self, binf: int = 2, *, verbose: bool = True) -> list:
+        """Build a detector-binf uint16 sidecar for fast live interaction.
+
+        binf*binf raw pixels sum into one sidecar pixel, in place over the
+        resident no-bin chunks (no disk re-decode, no decompress scratch). bin4
+        keeps the sidecar at 1.2 GB so the whole no-bin viewer fits a 24 GB Mac
+        (~20.5 GB); bin2 (4.8 GB) is for boxes with memory to spare.
+        """
+        binf = int(binf)
+        if self.det[0] % binf or self.det[1] % binf:
+            raise ValueError(
+                f"bin{binf} fast interaction requires detector dims divisible by {binf}")
         if verbose:
-            print("Building detector-bin2 virtual-image cache")
+            print(f"Building detector-bin{binf} virtual-image cache")
         t0 = time.perf_counter()
-        out_shape = (self.det[0] // 2, self.det[1] // 2)
+        out_shape = (self.det[0] // binf, self.det[1] // binf)
         outndet = out_shape[0] * out_shape[1]
         out_chunks = []
         from quantem.widget.kernels.io import mps as _mps
@@ -276,13 +328,15 @@ class MetalVirtualImage:
         _mps._numpy_view(outcols_mtl, np.uint32, 1)[0] = out_shape[1]
         outndet_mtl = _mps._metal_buffer_alloc(4)
         _mps._numpy_view(outndet_mtl, np.uint32, 1)[0] = outndet
+        binf_mtl = _mps._metal_buffer_alloc(4)
+        _mps._numpy_view(binf_mtl, np.uint32, 1)[0] = binf
 
         Metal = self._Metal
         cmds = []
         for group in _chunk_groups(self.chunks):
             cmd = self._mps._queue.commandBuffer()
             enc = cmd.computeCommandEncoder()
-            enc.setComputePipelineState_(self._bin2_pipe)
+            enc.setComputePipelineState_(self._bin_pipe)
             for ci in group:
                 nf = int(self.chunks[ci].shape[0])
                 total = nf * outndet
@@ -292,6 +346,7 @@ class MetalVirtualImage:
                 enc.setBuffer_offset_atIndex_(outcols_mtl, 0, 3)
                 enc.setBuffer_offset_atIndex_(outndet_mtl, 0, 4)
                 enc.setBuffer_offset_atIndex_(self._nf_mtls[ci], 0, 5)
+                enc.setBuffer_offset_atIndex_(binf_mtl, 0, 6)
                 enc.dispatchThreadgroups_threadsPerThreadgroup_(
                     Metal.MTLSizeMake((total + 255) // 256, 1, 1),
                     Metal.MTLSizeMake(256, 1, 1))
@@ -301,7 +356,7 @@ class MetalVirtualImage:
         cmds[-1].waitUntilCompleted()
         if verbose:
             print(
-                f"Detector-bin2 virtual-image cache ready in "
+                f"Detector-bin{binf} virtual-image cache ready in "
                 f"{_format_seconds(time.perf_counter() - t0)}"
             )
         return out_chunks
@@ -932,7 +987,10 @@ class ChunkedFrames:
         metadata = {}
         det_bin = 1
         fast_chunks = None
-        fast_det_bin = 2
+        # Scrub sidecar bin factor: bin4 on a 24 GB Mac (fits + ~4x fewer
+        # detector pixels per virtual-image sum = higher scrub FPS), bin2 on
+        # bigger boxes. An explicit fast_det_bin in the load metadata wins.
+        fast_det_bin = default_fast_bin()
         if hasattr(chunks, "chunks"):
             metadata = dict(getattr(chunks, "metadata", {}) or {})
             det_bin = int(
@@ -940,7 +998,8 @@ class ChunkedFrames:
             )
             fast_chunks = getattr(chunks, "fast_chunks", None)
             fast_det_bin = int(
-                getattr(chunks, "fast_det_bin", metadata.get("fast_det_bin", 2)) or 2
+                getattr(chunks, "fast_det_bin",
+                        metadata.get("fast_det_bin", fast_det_bin)) or fast_det_bin
             )
             row_prefix = bool(
                 row_prefix
@@ -1027,7 +1086,14 @@ class ChunkedFrames:
         return out
 
     def ensure_fast_interaction(self, *, verbose: bool = True) -> MetalVirtualImage:
-        """Prepare the detector-bin2 sidecar for fast virtual images."""
+        """Prepare the detector-bin``fast_bin`` sidecar for fast virtual images.
+
+        Built IN PLACE by binning the resident no-bin chunks (``bin_chunks``) -
+        no disk re-decode, no decompress scratch. So the only new memory is the
+        sidecar output itself (1.2 GB at bin4), and the build is a single Metal
+        pass over data already on the GPU. This is what lets the no-bin viewer
+        open + scrub on a 24 GB Mac without a second 19 GB decode spike.
+        """
         if self.det_bin > 1:
             return self.vi
         if self.fast_vi is not None:
@@ -1039,21 +1105,7 @@ class ChunkedFrames:
             )
         _drop_cached_decompressor()
         gc.collect()
-        master_path = self.metadata.get("master_path")
-        if master_path:
-            from quantem.widget.io import load_mps_4dstem
-
-            fast_data = load_mps_4dstem(
-                master_path,
-                scan_shape=self.metadata.get("scan_shape"),
-                apply_mask=True,
-                verbose=verbose,
-                det_bin=2,
-            )
-            self.fast_chunks = fast_data.chunks
-            _drop_cached_decompressor()
-        else:
-            self.fast_chunks = self.vi.bin2_chunks(verbose=verbose)
+        self.fast_chunks = self.vi.bin_chunks(self.fast_bin, verbose=verbose)
         gc.collect()
         self.fast_vi = MetalVirtualImage(self.fast_chunks)
         return self.fast_vi
