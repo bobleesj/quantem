@@ -1912,8 +1912,16 @@ def _browse_dtype_advise_and_cast(data, dtype, verbose):
     sel = (dtype or "").lower()
     if data.dtype != np.uint8 and data.dtype.kind == "u":
         try:
-            mx = int(data.max())
-            pct255 = float((data > 255).mean()) * 100.0
+            # Estimate the count range from a strided ~4M-element SAMPLE, not a
+            # full-block reduction: cupy max()/mean() run at ~3 GB/s on this card
+            # (sm_120), so a full pass over 19 GB adds ~15 s. The sample is plenty
+            # for a recommendation; the dtype='u8' decode-direct path counts the
+            # real clips exactly anyway.
+            flat = data.reshape(-1)
+            step = max(1, int(flat.size) // 4_000_000)
+            sample = flat[::step]
+            mx = int(sample.max())
+            pct255 = float((sample > 255).mean()) * 100.0
         except (RuntimeError, MemoryError, ValueError):
             return data
         want_u8 = sel in ("u8", "uint8") or (sel == "auto" and mx <= 255)
