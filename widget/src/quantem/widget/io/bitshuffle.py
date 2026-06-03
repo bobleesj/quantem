@@ -303,54 +303,68 @@ extern "C" __global__ void shuf_8192_32_batched(
         smem[threadIdx.x][threadIdx.y];
 }
 
-// Optimized unshuffle for uint16 data using shared memory
-// Grid: (n_8kb_blocks, 16, n_frames), Block: (256, 1, 1)
-// Each 8KB block = 4096 uint16 elements, split into 16 groups of 256
-// Each block processes 256 elements with coalesced memory access
+// Optimized unshuffle for uint16 data using shared memory.
+// Grid: (n_8kb_blocks, 1, n_frames), Block: (256, 1, 1)
+// Each 8KB block = 4096 uint16 elements = 16 bitplanes x 512 bytes.
+//
+// Why this layout: the previous version launched the SAME 8 KB block as 16
+// separate CTAs (one per blockIdx.y group) and inside each CTA only 32 of 256
+// threads did the 512-byte smem load while 224 idled at __syncthreads(). That
+// re-fetched every block 16x through L1 (25% hit rate) and bled ~49% of issue
+// cycles to the load-imbalance barrier (ncu, 2026-06-03 profile).
+//
+// Here one CTA owns the whole 8 KB block: all 256 threads cooperatively load
+// it into smem ONCE (coalesced uint32, 8 words/thread), one barrier, then each
+// thread reconstructs 16 output elements (two byte-positions x 8 bits) from the
+// resident block. This collapses the 16x redundant global loads, removes the
+// idle-at-barrier stall (every thread participates in the load), and moves the
+// kernel to the copy-bound roofline. Output layout is unchanged.
 extern "C" __global__ void shuf_8192_16_batched(
     const uint8_t* __restrict__ in, uint16_t* __restrict__ out, const uint32_t frame_bytes
 ) {
     const int frame_id = blockIdx.z;
-    const uint8_t* frame_in = in + frame_id * frame_bytes;
-    uint16_t* frame_out = out + (frame_id * frame_bytes) / 2;
+    const int block_8kb = blockIdx.x;
+    const int tid = threadIdx.x;        // 0-255
 
-    const int block_8kb = blockIdx.x;  // Which 8KB block
-    const int group = blockIdx.y;       // Which group of 256 elements (0-15)
-    const int tid = threadIdx.x;        // Thread within block (0-255)
+    const uint8_t* block_base = in + (size_t)frame_id * frame_bytes + (size_t)block_8kb * 8192;
+    uint16_t* frame_out = out + ((size_t)frame_id * frame_bytes) / 2 + (size_t)block_8kb * 4096;
 
-    // Element index within this 8KB block
-    const int elem_in_block = group * 256 + tid;  // 0-4095
+    __shared__ uint8_t smem[8192];
 
-    // Shared memory: load 32 bytes from each of 16 planes = 512 bytes
-    // Elements in this group span bytes (group*256)/8 to (group*256+255)/8
-    // = group*32 to group*32+31 (32 consecutive bytes per plane)
-    __shared__ uint8_t smem[16][32];
-
-    // Coalesced load: each of first 32 threads loads from all 16 planes
-    if (tid < 32) {
-        const uint8_t* block_base = frame_in + block_8kb * 8192;
-        #pragma unroll 16
-        for (int b = 0; b < 16; b++) {
-            smem[b][tid] = block_base[b * 512 + group * 32 + tid];
-        }
+    // Load the whole 8 KB block coalesced as 2048 uint32 words, 8 per thread.
+    const uint32_t* src32 = reinterpret_cast<const uint32_t*>(block_base);
+    uint32_t* sm32 = reinterpret_cast<uint32_t*>(smem);
+    #pragma unroll 8
+    for (int i = tid; i < 2048; i += 256) {
+        sm32[i] = src32[i];
     }
     __syncthreads();
 
-    // Each thread reconstructs its uint16 element
-    const int byte_in_group = tid / 8;   // 0-31
-    const int bit_in_byte = tid % 8;     // 0-7
-
-    uint16_t result = 0;
-    #pragma unroll 16
-    for (int b = 0; b < 16; b++) {
-        if (smem[b][byte_in_group] & (1U << bit_in_byte)) {
-            result |= (1U << b);
+    // Each thread owns two byte-positions p in {tid, tid+256} (0-511), each of
+    // which transposes the 16 plane-bits at that byte into 8 consecutive output
+    // elements p*8 .. p*8+7. The 8 stores are contiguous and adjacent threads
+    // write the next run of 8, so the global writes coalesce.
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int p = tid + half * 256;
+        uint16_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0;
+        #pragma unroll 16
+        for (int b = 0; b < 16; b++) {
+            const uint8_t byte = smem[b * 512 + p];
+            const uint16_t bb = (uint16_t)1 << b;
+            if (byte & 0x01) r0 |= bb;
+            if (byte & 0x02) r1 |= bb;
+            if (byte & 0x04) r2 |= bb;
+            if (byte & 0x08) r3 |= bb;
+            if (byte & 0x10) r4 |= bb;
+            if (byte & 0x20) r5 |= bb;
+            if (byte & 0x40) r6 |= bb;
+            if (byte & 0x80) r7 |= bb;
         }
+        uint16_t* o = frame_out + p * 8;
+        o[0] = r0; o[1] = r1; o[2] = r2; o[3] = r3;
+        o[4] = r4; o[5] = r5; o[6] = r6; o[7] = r7;
     }
-
-    // Write output
-    const int out_idx = block_8kb * 4096 + elem_in_block;
-    frame_out[out_idx] = result;
 }
 
 // Simple fallback for uint16 (for debugging/verification)

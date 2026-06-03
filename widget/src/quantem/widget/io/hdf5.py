@@ -645,7 +645,7 @@ class GPUDecompressor:
                 byte_offset = start * frame_bytes
                 if n_full_8kb:
                     _bitshuffle_kernel_u16(
-                        (n_full_8kb, 16, batch_n),
+                        (n_full_8kb, 1, batch_n),
                         (256, 1, 1),
                         (
                             self._lz4_output[byte_offset:],
@@ -1255,7 +1255,7 @@ def _decompress_prepared(
         if source_itemsize == 2:
             if n_full_8kb:
                 _bitshuffle_kernel_u16(
-                    (n_full_8kb, 16, batch_n),
+                    (n_full_8kb, 1, batch_n),
                     (256, 1, 1),
                     (
                         lz4_scratch,
@@ -2704,7 +2704,7 @@ def _load_gpu_decompressed(
             byte_offset = start * frame_bytes
             if n_full_8kb:
                 _bitshuffle_kernel_u16(
-                    (n_full_8kb, 16, batch_n),
+                    (n_full_8kb, 1, batch_n),
                     (256, 1, 1),
                     (
                         lz4_output[byte_offset:],
