@@ -1555,7 +1555,7 @@ def load_mps_4dstem(
     compact_target_gb: float = 3.6,
     row_prefix: bool = False,
     det_bin: int = 1,
-    fast_det_bin: int | None = 2,
+    fast_det_bin: int | None = None,
 ) -> MPSChunked4DSTEM:
     """Load full no-bin Arina data as zero-copy MPS chunks for viewing.
 
@@ -1564,6 +1564,14 @@ def load_mps_4dstem(
     unified-memory Metal buffers. Pass the result to
     ``quantem.widget.show4dstem_mps.show_4dstem_mps`` to display it
     without copying.
+
+    ``fast_det_bin`` defaults to ``None`` so a plain no-bin load sits at the
+    theoretical floor — exactly the data (19.3 GB for 512x512x192x192), with no
+    bin2 viewer sidecar. The viewer builds that sidecar itself on first scrub
+    (``ChunkedFrames.ensure_fast_interaction``), so compute paths (dpc/virtual)
+    never pay for it and a 24 GB Mac no longer goes into swap on load. Pass
+    ``fast_det_bin=2`` to eagerly fuse the sidecar in the same decode pass when
+    you know a viewer is about to open and want zero first-scrub latency.
     """
     t0 = time.perf_counter()
     plan = plan_master(master_path)
@@ -1614,15 +1622,21 @@ def load_mps_4dstem(
         else:
             chunks = result
             fast_chunks = None
-    if compact or fast_det_bin:
-        # The returned arrays own their Metal buffers; decoder scratch can go
-        # before the widget opens. For fused fast loads, this also drops the
-        # decoder's pool references to the 24 GB raw+sidecar buffers while the
-        # returned arrays keep the actual Metal buffers alive.
-        clear_mps_cache()
-        import gc
+    # Drop the cached decompressor once the result is built. The returned arrays
+    # each own their Metal output buffer via ``arr._mtl``, so they survive the
+    # clear; only the decoder's reusable scratch (lz4 + compressed staging +
+    # read-ahead) and its pool list lose their Python refs. This lets a later
+    # ``del result`` actually release the data instead of the cached decompressor
+    # pinning it forever, and keeps the no-bin phys_footprint at ~20.2 GB on a
+    # logic_013 512x512x192x192 load (19.3 GB data + ~0.9 GB decode working set).
+    # The headline footprint win is ``fast_det_bin=None`` above (no +4.8 GB bin2
+    # sidecar); the clear is the second-order hygiene that stops the decompressor
+    # from holding a second reference to the whole pool. Only cost: the next load
+    # re-zeroes the 19.3 GB pool (~1.4 s) instead of reusing it.
+    clear_mps_cache()
+    import gc
 
-        gc.collect()
+    gc.collect()
     inferred_scan = scan_shape
     if inferred_scan is None:
         root = int(round(plan.ntrigger ** 0.5))
