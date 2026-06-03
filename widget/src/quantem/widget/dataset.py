@@ -105,7 +105,9 @@ class Dataset4dstemGPU:
             self.__dict__["_detector"] = accessor
         return accessor
 
-    def center_of_mass(self, mask=None):
+    def com(self, mask=None):
+        """Center of mass ``(com_row, com_col)`` per scan position. See
+        :func:`quantem.widget.dpc.center_of_mass`."""
         from quantem.widget.dpc import center_of_mass
         return center_of_mass(self, mask=mask)
 
