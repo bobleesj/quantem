@@ -196,10 +196,10 @@ AGENT.md
 node_modules/
 widget/src/quantem/widget/static/
 
-# widget — local-only (per-developer notebooks, docs scratch, build/test scripts).
-# Track only src/, js/, tests/test_*.py for now.
+# widget — local-only (per-developer notebooks, build/test scripts). The docs
+# site under widget/docs/ IS tracked; its own widget/docs/.gitignore drops the
+# build output and scratch. Track src/, js/, docs/, tests/test_*.py for now.
 widget/.gitignore
-widget/docs/
 widget/notebooks/*
 !widget/notebooks/automation/
 !widget/notebooks/automation/**
