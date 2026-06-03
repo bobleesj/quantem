@@ -190,8 +190,6 @@ class MetalVirtualImage:
             lib.newFunctionWithName_("row_sum_overflow_u16"), None)
         self._row_prefix_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
             lib.newFunctionWithName_("row_prefix_u16_inplace"), None)
-        self._bin2_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
-            lib.newFunctionWithName_("bin2_detector_u16"), None)
         self._bin_pipe, _ = dev.newComputePipelineStateWithFunction_error_(
             lib.newFunctionWithName_("bin_detector_u16"), None)
         self._mean_dp_pipe, _ = dev.newComputePipelineStateWithFunction_error_(

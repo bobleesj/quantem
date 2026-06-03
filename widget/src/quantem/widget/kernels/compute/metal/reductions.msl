@@ -82,28 +82,6 @@ kernel void row_prefix_u16_inplace(
         dst[c] = (ushort)acc;
     }
 }
-kernel void bin2_detector_u16(
-    device const ushort* data    [[buffer(0)]],  // raw (nframes, detrows, detcols)
-    device ushort*       out     [[buffer(1)]],  // bin2 (nframes, detrows/2, detcols/2)
-    constant uint&       detcols [[buffer(2)]],
-    constant uint&       outcols [[buffer(3)]],
-    constant uint&       outndet [[buffer(4)]],
-    constant uint&       nframes [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = nframes * outndet;
-    if (gid >= total) return;
-    uint fr = gid / outndet;
-    uint opix = gid - fr * outndet;
-    uint orow = opix / outcols;
-    uint ocol = opix - orow * outcols;
-    ulong base = (ulong)fr * (outndet * 4) + (ulong)(orow * 2) * detcols + (ocol * 2);
-    uint s = (uint)data[base]
-           + (uint)data[base + 1]
-           + (uint)data[base + detcols]
-           + (uint)data[base + detcols + 1];
-    out[gid] = (ushort)min(s, 65535u);
-}
 kernel void bin_detector_u16(
     device const ushort* data    [[buffer(0)]],  // raw (nframes, detrows, detcols)
     device ushort*       out     [[buffer(1)]],  // binned (nframes, detrows/f, detcols/f)
@@ -115,7 +93,7 @@ kernel void bin_detector_u16(
     uint gid [[thread_position_in_grid]]
 ) {
     // General f x f detector bin. One thread per output pixel sums the f*f raw
-    // pixels under it (clamped to uint16, same convention as bin2_detector_u16),
+    // pixels under it (clamped to uint16),
     // so any even-divisor sidecar (bin2, bin4) reuses one kernel. bin4 keeps the
     // scrub sidecar small enough to fit a 24 GB Mac (1.2 GB vs bin2's 4.8 GB).
     uint total = nframes * outndet;
