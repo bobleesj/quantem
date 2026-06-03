@@ -22,7 +22,7 @@ from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
 from quantem.widget.io import load
 from quantem.widget.dpc import dpc, center_of_mass
 from quantem.widget.info import device_info
-from quantem.widget.virtual import virtual
+from quantem.widget.detector import virtual
 from quantem.widget.dataset import Dataset4dstemGPU
 
 

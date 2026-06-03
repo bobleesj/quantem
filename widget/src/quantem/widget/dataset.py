@@ -39,7 +39,8 @@ class Dataset4dstemGPU:
 
     _qw_dataset = True  # duck-type flag so dpc()/virtual() route via .compute, no import cycle
 
-    def __init__(self, data, *, scan_shape=None, sampling=None, units=None, name=""):
+    def __init__(self, data, *, scan_shape=None, sampling=None, units=None, name="",
+                 semiangle_mrad=None):
         # carry calibration straight off a LoadResult's metadata when present
         if hasattr(data, "_fields") and "metadata" in getattr(data, "_fields", ()):
             meta = data.metadata or {}
@@ -47,12 +48,17 @@ class Dataset4dstemGPU:
                 sampling = meta.get("scan_sampling_A") and (meta["scan_sampling_A"],) * 2
             if name == "":
                 name = meta.get("name", "")
+            if semiangle_mrad is None:
+                # convergence semi-angle: calibrates ds.detector mrad collection
+                # angles. Optional - the automatic bf/adf/df bands work without it.
+                semiangle_mrad = meta.get("semiangle_mrad") or meta.get("semi_angle_mrad")
         self._compute = _resolve_compute(data)
         self.scan_shape = tuple(scan_shape) if scan_shape is not None else tuple(self._compute.scan_shape)
         self.det_shape = tuple(self._compute.det_shape)
         self.sampling = sampling
         self.units = units
         self.name = name
+        self.semiangle_mrad = float(semiangle_mrad) if semiangle_mrad else None
         self._raw = data  # kept so Show4DSTEM can take the underlying tensor / chunks
 
     # --- backend identity ---
@@ -89,12 +95,12 @@ class Dataset4dstemGPU:
     def detector(self):
         """Virtual detectors: ``.bf()`` / ``.adf()`` / ``.df()`` (cached images).
 
-        See :class:`quantem.widget.virtual.VirtualDetector`. Built once per
+        See :class:`quantem.widget.detector.VirtualDetector`. Built once per
         dataset; the probe auto-fits and every detector result is memoized.
         """
         accessor = self.__dict__.get("_detector")
         if accessor is None:
-            from quantem.widget.virtual import VirtualDetector
+            from quantem.widget.detector import VirtualDetector
             accessor = VirtualDetector(self)
             self.__dict__["_detector"] = accessor
         return accessor

@@ -46,7 +46,7 @@ def test_dpc_phase_matches_quantem_live(gold):
 def test_virtual_matches_manual_masked_sum(gold):
     """virtual(mode) at an explicit probe == a direct masked-sum over that band."""
     from quantem.widget import virtual
-    from quantem.widget.virtual import auto_probe, _detector_mask, _resolve_backend
+    from quantem.widget.detector import auto_probe, _detector_mask, _resolve_backend
     mean_dp = np.asarray(_resolve_backend(gold).mean_dp(), dtype=np.float32)
     center, r = auto_probe(mean_dp)
     for mode in ("BF", "ABF", "ADF", "HAADF", "DF"):
