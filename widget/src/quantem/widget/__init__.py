@@ -20,7 +20,7 @@ from quantem.widget.show3d import Show3D
 from quantem.widget.show3dslices import Show3DSlices
 from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
 from quantem.widget.io import load
-from quantem.widget.dpc import dpc, center_of_mass
+from quantem.widget.dpc import dpc, center_of_mass, idpc, com
 from quantem.widget.info import device_info
 from quantem.widget.detector import virtual, bf, adf, df
 from quantem.widget.dataset import Dataset4dstemGPU
@@ -77,4 +77,4 @@ except PackageNotFoundError:
     # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
     __version__ = "0.0.0+local"
 
-__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "device_info", "virtual", "bf", "adf", "df", "Dataset4dstemGPU"]
+__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "idpc", "com", "device_info", "virtual", "bf", "adf", "df", "Dataset4dstemGPU"]

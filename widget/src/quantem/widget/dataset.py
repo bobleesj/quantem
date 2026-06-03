@@ -10,7 +10,8 @@ user code never branches on hardware:
     Show4DSTEM(ds)                               # raw 4D viewer
     Show2D(ds.bf())                               # bright field (cached, auto probe)
     Show2D(ds.adf(inner=50, outer=180))          # annular dark field, mrad
-    Show2D(ds.dpc().phase)                       # CoM -> rotation -> iDPC (cached)
+    Show2D(ds.com.x)                              # CoMx  (also ds.com.y)
+    Show2D(ds.idpc())                             # iDPC phase (CoM -> rotation -> integrate)
 
 It is deliberately NOT ``quantem.core.Dataset4dstem`` (torch-only, can't hold Metal
 chunks / trips the MPS INT_MAX ceiling on no-bin, and re-adds the quantem dep). This
@@ -147,30 +148,33 @@ class Dataset4dstemGPU:
         from quantem.widget.detector import df
         return df(self, inner, unit)
 
-    def com(self, mask=None):
-        """Center of mass ``(com_row, com_col)`` per scan position. See
-        :func:`quantem.widget.dpc.center_of_mass`."""
-        from quantem.widget.dpc import center_of_mass
-        return center_of_mass(self, mask=mask)
-
-    def dpc(self, **kwargs):
-        """Center-of-mass -> rotation -> iDPC (cached). See :func:`dpc`.
-
-        The CoM pass over the 4D block is the cost; the result is memoized per
-        kwargs so a repeat ``ds.dpc()`` is instant. A custom ``mask=`` array
-        bypasses the cache (arrays aren't hashable, and it's a one-off anyway).
-        """
-        cache = self.__dict__.setdefault("_dpc_cache", {})
-        if "mask" in kwargs and kwargs["mask"] is not None:
-            from quantem.widget.dpc import dpc
-            return dpc(self, **kwargs)
-        key = tuple(sorted((k, v) for k, v in kwargs.items() if k != "mask"))
-        result = cache.get(key)
+    def _dpc(self):
+        """Cached full DPC pipeline (CoM -> auto rotation -> Fourier integrate)."""
+        result = self.__dict__.get("_dpc_result")
         if result is None:
             from quantem.widget.dpc import dpc
-            result = dpc(self, **kwargs)
-            cache[key] = result
+            result = dpc(self)
+            self.__dict__["_dpc_result"] = result
         return result
+
+    @property
+    def com(self):
+        """Center-of-mass vector field (cached): ``ds.com.x`` / ``ds.com.y``."""
+        accessor = self.__dict__.get("_com_result")
+        if accessor is None:
+            from quantem.widget.dpc import com
+            accessor = com(self)
+            self.__dict__["_com_result"] = accessor
+        return accessor
+
+    def idpc(self) -> np.ndarray:
+        """Integrated-DPC phase image (CoM -> auto rotation -> integrate), cached."""
+        return self._dpc().phase
+
+    @property
+    def rotation_deg(self) -> float:
+        """Auto-found scan/detector rotation used by :meth:`idpc` (degrees)."""
+        return self._dpc().rotation_deg
 
     def __repr__(self) -> str:
         s = "x".join(str(x) for x in self.shape)
