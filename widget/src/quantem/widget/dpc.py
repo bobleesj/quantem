@@ -163,7 +163,7 @@ def center_of_mass(data, scan_shape=None, mask=None):
 
 
 def dpc(data, scan_shape=None, *, rotation_angle_deg=None, rotation_steps=180,
-        mask=None, verbose=True) -> DPCResult:
+        mask=None, verbose=False) -> DPCResult:
     """Center-of-mass -> optimal scan/detector rotation -> iDPC phase.
 
     ``data`` is ``load(...)`` output (MPS chunks, cupy, or numpy). The CoM is the
