@@ -135,17 +135,17 @@ class Dataset4dstemGPU:
         from quantem.widget.detector import bf
         return bf(self)
 
-    def adf(self, inner=None, outer=None) -> np.ndarray:
-        """Annular-dark-field image, ``inner``/``outer`` collection angles in mrad
-        (auto band if omitted). See :func:`quantem.widget.detector.adf`."""
+    def adf(self, inner=None, outer=None, unit="mrad") -> np.ndarray:
+        """Annular-dark-field image; ``inner``/``outer`` in mrad (default) or
+        ``unit='px'`` (auto band if omitted). See :func:`quantem.widget.detector.adf`."""
         from quantem.widget.detector import adf
-        return adf(self, inner, outer)
+        return adf(self, inner, outer, unit)
 
-    def df(self, inner=None) -> np.ndarray:
-        """Dark-field image beyond ``inner`` mrad (outside the bright disk if
-        omitted). See :func:`quantem.widget.detector.df`."""
+    def df(self, inner=None, unit="mrad") -> np.ndarray:
+        """Dark-field image beyond ``inner`` mrad (default) or ``unit='px'``
+        (outside the bright disk if omitted). See :func:`quantem.widget.detector.df`."""
         from quantem.widget.detector import df
-        return df(self, inner)
+        return df(self, inner, unit)
 
     def com(self, mask=None):
         """Center of mass ``(com_row, com_col)`` per scan position. See

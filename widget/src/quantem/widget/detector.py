@@ -100,8 +100,21 @@ def _mrad_to_px(ds, mrad: float) -> float:
         raise ValueError(
             "inner / outer are collection angles in mrad, but the convergence "
             "semi-angle is unknown for this dataset. Set it explicitly:\n"
-            "    ds.semiangle_mrad = <convergence semi-angle in mrad>")
+            "    ds.semiangle_mrad = <convergence semi-angle in mrad>\n"
+            "or pass detector pixels instead: ds.adf(inner=..., outer=..., unit='px')")
     return float(mrad) / float(ds.semiangle_mrad) * ds.bf_radius
+
+
+def _to_px(ds, value: float, unit: str) -> float:
+    """A collection-angle radius -> detector pixels. ``unit='mrad'`` (default)
+    converts via the convergence semi-angle; ``unit='px'`` is already pixels
+    (calibration-free, exact)."""
+    unit = str(unit).lower()
+    if unit in ("px", "pixel", "pixels"):
+        return float(value)
+    if unit == "mrad":
+        return _mrad_to_px(ds, value)
+    raise ValueError(f"unit must be 'mrad' or 'px', got {unit!r}")
 
 
 def _detector_image(ds, name: str, lo_px: float, hi_px: float) -> np.ndarray:
@@ -127,21 +140,24 @@ def bf(ds) -> np.ndarray:
     return _detector_image(ds, "bf", 0.0, ds.bf_radius)
 
 
-def adf(ds, inner: float | None = None, outer: float | None = None) -> np.ndarray:
+def adf(ds, inner: float | None = None, outer: float | None = None,
+        unit: str = "mrad") -> np.ndarray:
     """Annular-dark-field image of ``ds``, collected between ``inner`` and
-    ``outer`` **mrad** (needs ``ds.semiangle_mrad``). Omit either for the
-    automatic band: ``inner`` = the bright-disk edge, ``outer`` = twice that."""
+    ``outer``. ``unit='mrad'`` (default, needs ``ds.semiangle_mrad``) or
+    ``unit='px'`` (raw detector pixels). Omit either for the automatic band:
+    ``inner`` = the bright-disk edge, ``outer`` = twice that."""
     radius = ds.bf_radius
-    lo_px = radius if inner is None else _mrad_to_px(ds, inner)
-    hi_px = 2.0 * radius if outer is None else _mrad_to_px(ds, outer)
+    lo_px = radius if inner is None else _to_px(ds, inner, unit)
+    hi_px = 2.0 * radius if outer is None else _to_px(ds, outer, unit)
     return _detector_image(ds, "adf", lo_px, hi_px)
 
 
-def df(ds, inner: float | None = None) -> np.ndarray:
-    """Dark-field image of ``ds``: everything collected beyond ``inner`` **mrad**
-    (needs ``ds.semiangle_mrad``). Omit it for everything outside the bright disk."""
+def df(ds, inner: float | None = None, unit: str = "mrad") -> np.ndarray:
+    """Dark-field image of ``ds``: everything collected beyond ``inner``.
+    ``unit='mrad'`` (default, needs ``ds.semiangle_mrad``) or ``unit='px'``.
+    Omit ``inner`` for everything outside the bright disk."""
     radius = ds.bf_radius
-    lo_px = radius if inner is None else _mrad_to_px(ds, inner)
+    lo_px = radius if inner is None else _to_px(ds, inner, unit)
     return _detector_image(ds, "df", lo_px, np.inf)
 
 
