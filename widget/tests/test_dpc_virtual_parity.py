@@ -33,7 +33,7 @@ def test_center_of_mass_matches_quantem_live(gold):
 
 
 def test_dpc_phase_matches_quantem_live(gold):
-    from quantem.widget import dpc
+    from quantem.widget.dpc import dpc
     from quantem.live import dpc as live_dpc
     w = dpc(gold, verbose=False)
     r = live_dpc(cp.asarray(gold.reshape(-1, *gold.shape[-2:])), scan_shape=(512, 512), verbose=False)
@@ -45,8 +45,7 @@ def test_dpc_phase_matches_quantem_live(gold):
 
 def test_virtual_matches_manual_masked_sum(gold):
     """virtual(mode) at an explicit probe == a direct masked-sum over that band."""
-    from quantem.widget import virtual
-    from quantem.widget.detector import auto_probe, _detector_mask, _resolve_backend
+    from quantem.widget.detector import virtual, auto_probe, _detector_mask, _resolve_backend
     mean_dp = np.asarray(_resolve_backend(gold).mean_dp(), dtype=np.float32)
     center, r = auto_probe(mean_dp)
     for mode in ("BF", "ABF", "ADF", "HAADF", "DF"):
@@ -59,7 +58,9 @@ def test_virtual_matches_manual_masked_sum(gold):
 
 def test_dataset_container_roundtrip(gold):
     """Dataset4dstemGPU.virtual/.dpc == the standalone functions."""
-    from quantem.widget import Dataset4dstemGPU, virtual, dpc
+    from quantem.widget import Dataset4dstemGPU
+    from quantem.widget.detector import virtual
+    from quantem.widget.dpc import dpc
     ds = Dataset4dstemGPU(gold)
     assert ds.shape == (512, 512, 48, 48)
     # ds.adf() defaults to the r..2r band == standalone virtual("ADF")
