@@ -1917,18 +1917,24 @@ def _browse_dtype_advise_and_cast(data, dtype, verbose):
                     (clip.clip(0, 255) if xp != "cupy" else clip.clip(0, 255))).astype(np.uint8)
             if verbose:
                 if pct255 == 0.0:
-                    print(f"  dtype: uint8 (max count {mx} <= 255 -> LOSSLESS, "
-                          f"{data.nbytes/1e9:.1f} GB, half of uint16)")
+                    print(f"  Loaded this in uint8 to save you memory - your brightest pixel is "
+                          f"only {mx} counts, so nothing was lost and you're using "
+                          f"{data.nbytes/1e9:.1f} GB instead of {data.nbytes*2/1e9:.1f} GB.")
                 else:
-                    print(f"  dtype: uint8 clip@255 -> {pct255:.2f}% of pixels clipped "
-                          f"(max was {mx}; the saturated bright tip). recon uses raw uint16.")
+                    print(f"  Loaded this in uint8 for browsing - I clipped {pct255:.2f}% of pixels "
+                          f"at 255 (your saturated bright spot, where counts reach {mx}). That's fine "
+                          f"for looking at the data; reconstruction always uses the raw uint16.")
         elif verbose:
             if mx <= 255:
-                print(f"  dtype advice: max count {mx} <= 255 -> uint8 is LOSSLESS and "
-                      f"halves memory ({data.nbytes/2/1e9:.1f} GB). pass dtype='u8' to browse lighter.")
+                print(f"  Heads up: your brightest pixel is only {mx} counts (well under 255), so you "
+                      f"could browse this in uint8 with zero loss and use half the memory "
+                      f"({data.nbytes/2/1e9:.1f} GB instead of {data.nbytes/1e9:.1f} GB). "
+                      f"Just pass dtype='u8' when you load.")
             else:
-                print(f"  dtype advice: max count {mx} (>255, {pct255:.2f}% of pixels). uint16 is exact; "
-                      f"dtype='u8' halves memory, clipping {pct255:.2f}% of pixels for browsing.")
+                print(f"  Heads up: this dataset has some bright pixels (counts up to {mx}; {pct255:.2f}% "
+                      f"sit above 255). uint16 keeps everything exact. If you want to browse lighter, "
+                      f"dtype='u8' halves the memory and clips only that {pct255:.2f}% - fine for screening, "
+                      f"and reconstruction still uses the raw data.")
     return data
 
 
