@@ -1218,15 +1218,73 @@ function Show4DSTEM() {
     let disposed = false;
     let detach: (() => void) | null = null;
     (async () => {
-      const stackView = model.get("_offline_stack") as DataView | undefined;
-      if (!stackView || stackView.byteLength === 0) return;
       const scanRows = model.get("shape_rows"), scanCols = model.get("shape_cols");
       const detR = model.get("det_rows"), detC = model.get("det_cols");
-      const stack = new Uint16Array(stackView.buffer, stackView.byteOffset, stackView.byteLength / 2);
-      const compute = await Show4DSTEMCompute.create(stack, scanRows * scanCols, detR * detC);
+      // Companion mode: fetch the stack from a sibling file (mount already happened
+      // on the tiny widget-state JSON, and the inline initial virtual image is
+      // already painted - so this runs in the background). Inline mode: read the
+      // embedded bytes. Either way, create() infers uint8 vs uint16 from length.
+      const offlineUrl = model.get("_offline_url") as string | undefined;
+      const chunksMeta = model.get("_offline_chunks") as string | undefined;
+      const bslz4Meta = model.get("_offline_bslz4") as string | undefined;
+      const gunzip = async (b: Uint8Array) => new Uint8Array(await new Response(new Blob([b as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
+      let compute: Show4DSTEMCompute | null;
+      let cpuStack: Uint8Array | null = null;  // full decompressed stack for the per-frame probe (single-chunk only)
+      if (bslz4Meta) {
+        // bslz4 mode: ship native HDF5 bitshuffle+LZ4 bytes (~6x smaller than uint16),
+        // decompress on the GPU into a uint8 stack. The meta JSON is either single
+        // ({blockMeta,...} + _offline_url) or chunked ({base, chunks:[{bin,meta,...}]})
+        // so a full 512x512x192x192 (9.6 GB) lives across N GPU buffers.
+        const m = JSON.parse(bslz4Meta) as any;
+        const fetchU8 = async (u: string) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+        const fetchU32 = async (u: string) => new Uint32Array(await (await fetch(u)).arrayBuffer());
+        if (Array.isArray(m.chunks)) {
+          const specs = [];
+          for (const c of m.chunks) {
+            specs.push({ compressed: await fetchU8(m.base + c.bin), blockMeta: await fetchU32(m.base + c.meta),
+              nFrames: c.nScan, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems,
+              detSize: detR * detC, startScan: c.startScan, nScan: c.nScan });
+          }
+          compute = await Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+        } else {
+          const raw = await fetchU8(offlineUrl!);
+          compute = await Show4DSTEMCompute.createFromBslz4({
+            compressed: raw, blockMeta: new Uint32Array(m.blockMeta), nFrames: m.nFrames,
+            nBlocksPerFrame: m.nBlocksPerFrame, blockElems: m.blockElems, detSize: detR * detC,
+          }, "uint8");
+        }
+      } else if (chunksMeta && offlineUrl) {
+        // Chunked companion: one gzip blob with N chunks; stream each into its own
+        // GPU buffer (handles stacks far bigger than one buffer / one ArrayBuffer).
+        const blob = new Uint8Array(await (await fetch(offlineUrl)).arrayBuffer());
+        const meta = JSON.parse(chunksMeta) as { coff: number; clen: number; startScan: number; nScan: number }[];
+        const specs = [];
+        for (const m of meta) {
+          const bytes = await gunzip(blob.subarray(m.coff, m.coff + m.clen));
+          specs.push({ bytes, startScan: m.startScan, nScan: m.nScan });
+        }
+        compute = await Show4DSTEMCompute.createChunked(specs, scanRows * scanCols, detR * detC);
+      } else {
+        // Single stack: companion fetch or inline, then inflate (gzip, lossless).
+        let stack: Uint8Array;
+        if (offlineUrl) {
+          stack = new Uint8Array(await (await fetch(offlineUrl)).arrayBuffer());
+        } else {
+          const stackView = model.get("_offline_stack") as DataView | undefined;
+          if (!stackView || stackView.byteLength === 0) return;
+          stack = new Uint8Array(stackView.buffer, stackView.byteOffset, stackView.byteLength);
+        }
+        if (model.get("_offline_gzip")) stack = await gunzip(stack);
+        cpuStack = stack;  // keep for the per-frame probe (single-chunk only)
+        compute = await Show4DSTEMCompute.create(stack, scanRows * scanCols, detR * detC);
+      }
       if (!compute || disposed) { compute?.dispose(); return; }
+      // Auto-filter hot/dead detector pixels (from the HDF5 pixel_mask) so the
+      // offline result matches CUDA's apply_mask path - no manual masking needed.
+      const badPxJson = model.get("_offline_bad_px") as string | undefined;
+      if (badPxJson) compute.badPx = new Uint32Array(JSON.parse(badPxJson) as number[]);
       const recomputeVI = async () => {
-        const vi = await compute.maskedSum(buildDetectorMask(model, detR, detC));
+        const vi = await compute!.maskedSum(buildDetectorMask(model, detR, detC));
         model.set("virtual_image_bytes", new DataView(vi.buffer));
       };
       const recomputeDP = async () => {
@@ -1235,8 +1293,25 @@ function Show4DSTEM() {
         const dp = await compute.reduceFrames(buildScanMask(model, scanRows, scanCols), model.get("vi_roi_reduce") !== "sum");
         model.set("vi_roi_dp_bytes", new DataView(dp.buffer));
       };
+      // Pointing at a scan position normally asks the kernel for that position's raw
+      // diffraction pattern (frame_bytes). With no kernel we slice it straight out of
+      // the offline stack, so the DP follows the probe offline too.
+      const detSize = detR * detC;
+      const sample = (gp: number) => compute!.mode === 1 ? cpuStack![gp] : (cpuStack![gp * 2] | (cpuStack![gp * 2 + 1] << 8));
+      const recomputeFrame = async () => {
+        const pr = Math.max(0, Math.min(scanRows - 1, model.get("pos_row") | 0));
+        const pc = Math.max(0, Math.min(scanCols - 1, model.get("pos_col") | 0));
+        const scanIdx = pr * scanCols + pc;
+        // bslz4 / chunked stacks have no CPU copy -> extract the frame on the GPU.
+        const frame = cpuStack
+          ? (() => { const f = new Float32Array(detSize); const base = scanIdx * detSize; for (let k = 0; k < detSize; k++) f[k] = sample(base + k); return f; })()
+          : await compute!.frameAt(scanIdx);
+        model.set("frame_bytes", new DataView(frame.buffer)); model.save_changes();
+      };
       const onVI = () => { void recomputeVI(); };
       const onDP = () => { void recomputeDP(); };
+      const onPos = () => { void recomputeFrame(); };
+      void recomputeFrame();  // initial DP at mount (so the panel isn't blank)
       // BF/ABF/ADF/HAADF presets normally route through the Python kernel
       // (_preset_request -> apply_preset). With no kernel we translate them into
       // the same detector-ROI geometry here so the buttons work offline too.
@@ -1254,15 +1329,38 @@ function Show4DSTEM() {
         model.set("_preset_request", "");  // consume so the same preset can fire again
         void recomputeVI();
       };
-      const viTraits = ["roi_center", "roi_center_row", "roi_center_col", "roi_radius", "roi_radius_inner", "roi_mode", "roi_width", "roi_height"];
-      const dpTraits = ["vi_roi_center", "vi_roi_center_row", "vi_roi_center_col", "vi_roi_radius", "vi_roi_mode", "vi_roi_width", "vi_roi_height", "vi_roi_reduce"];
+      // Dragging the aperture sets the COMPOUND roi_center [row, col]; the kernel
+      // normally splits it into roi_center_row/col. With no kernel we split it
+      // ourselves so the mask sees the dragged center (else only presets/sliders,
+      // which write the scalars directly, would move the detector). Same for the
+      // real-space vi_roi_center drag.
+      const onRoiCenter = () => {
+        const rc = model.get("roi_center");
+        if (Array.isArray(rc) && rc.length === 2) { model.set("roi_center_row", rc[0]); model.set("roi_center_col", rc[1]); }
+        void recomputeVI();
+      };
+      const onViCenter = () => {
+        const rc = model.get("vi_roi_center");
+        if (Array.isArray(rc) && rc.length === 2) { model.set("vi_roi_center_row", rc[0]); model.set("vi_roi_center_col", rc[1]); }
+        void recomputeDP();
+      };
+      const viTraits = ["roi_center_row", "roi_center_col", "roi_radius", "roi_radius_inner", "roi_mode", "roi_width", "roi_height"];
+      const dpTraits = ["vi_roi_center_row", "vi_roi_center_col", "vi_roi_radius", "vi_roi_mode", "vi_roi_width", "vi_roi_height", "vi_roi_reduce"];
       viTraits.forEach((t) => model.on("change:" + t, onVI));
       dpTraits.forEach((t) => model.on("change:" + t, onDP));
+      model.on("change:roi_center", onRoiCenter);
+      model.on("change:vi_roi_center", onViCenter);
       model.on("change:_preset_request", onPreset);
+      model.on("change:pos_row", onPos);
+      model.on("change:pos_col", onPos);
       detach = () => {
         viTraits.forEach((t) => model.off("change:" + t, onVI));
         dpTraits.forEach((t) => model.off("change:" + t, onDP));
+        model.off("change:roi_center", onRoiCenter);
+        model.off("change:vi_roi_center", onViCenter);
         model.off("change:_preset_request", onPreset);
+        model.off("change:pos_row", onPos);
+        model.off("change:pos_col", onPos);
         compute.dispose();
       };
       await recomputeVI();  // initial virtual image, no interaction needed

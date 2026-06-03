@@ -201,6 +201,30 @@ class Show4DSTEM(anywidget.AnyWidget):
     # this widget's torch virtual image.
     offline = traitlets.Bool(False).tag(sync=True)
     _offline_stack = traitlets.Bytes(b"").tag(sync=True)
+    # Companion-file mode: instead of inlining the stack (which blocks mount on a
+    # multi-hundred-MB HTML parse), write it to a sibling .gz and fetch it at
+    # runtime. The widget-state JSON stays tiny -> instant mount + instant paint
+    # from the inline initial virtual image; the big stack streams in the
+    # background. Needs HTTP (fetch is CORS-blocked under file://).
+    _offline_url = traitlets.Unicode("").tag(sync=True)
+    # Chunked companion: JSON list of {coff, clen, startScan, nScan} describing
+    # gzip chunks concatenated in the companion file. Lets a stack bigger than one
+    # GPU buffer (or one JS ArrayBuffer) stream chunk-by-chunk into N GPU buffers.
+    _offline_chunks = traitlets.Unicode("").tag(sync=True)
+    # The stack is gzip-compressed (lossless). JS decompresses with
+    # DecompressionStream before upload. Detector data compresses ~2-3x, so the
+    # base64'd offline payload (and the HTML it sits in) shrinks ~2-3x -> far less
+    # HTML/JSON parse on cold open, especially under file://.
+    _offline_gzip = traitlets.Bool(False).tag(sync=True)
+    # bslz4 mode: ship the native HDF5 bitshuffle+LZ4 bytes in the companion file
+    # (~6x smaller than uint16) and decompress on the GPU into a uint8 stack. This
+    # JSON has {blockMeta:[coff,clen,...], nFrames, nBlocksPerFrame, blockElems}.
+    # The browser decode is bit-exact to the uint8-clipped reference (verified).
+    _offline_bslz4 = traitlets.Unicode("").tag(sync=True)
+    # Hot/dead detector pixel indices (JSON list) auto-applied by the offline WebGPU
+    # compute - mirrors CUDA load(apply_mask=True) so the browser data is filtered
+    # automatically (no saturated pixel dominating the VI/DP).
+    _offline_bad_px = traitlets.Unicode("").tag(sync=True)
 
     # =========================================================================
     # VI ROI (real-space region selection for summed DP)
@@ -324,6 +348,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         frame_labels: list[str] | None = None,
         title: str = "",
         offline: bool | None = False,
+        data_url: str | None = None,
+        offline_codec: str = "gzip",
         show_fft: bool = False,
         fft_window: bool = True,
         show_controls: bool = True,
@@ -610,7 +636,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Re-send the view buffers on the next kernel-IOLoop tick (after the comm +
         # frontend are up) so the initial BF virtual image paints with no interaction.
         self._schedule_initial_view_sync()
-        self._pack_offline(offline)
+        self._offline_codec = offline_codec
+        self._pack_offline(offline, data_url)
 
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
@@ -676,41 +703,154 @@ class Show4DSTEM(anywidget.AnyWidget):
             except Exception:
                 pass
 
-    # Auto-enable browser compute only when the packed stack fits this budget;
-    # above it the HTML/comm payload and the browser's memory blow up, so the
-    # kernel path stays. ~300 MB of uint16 = e.g. 128x128 scan x 96x96 detector.
-    _OFFLINE_BUDGET_BYTES = 300 * 1024 * 1024
+    # Soft guide on the uint8 pack (1 byte/pixel), NOT a hard limit. The true
+    # constraints are client RAM (decoded stack + GPU buffer ~= 2x this) and, for
+    # the inline path, the browser's ~500 MB JS-string parse cap (gzip keeps the
+    # embedded base64 under that). TESTED on phil: full 512x512x48x48 (604 MB)
+    # opens in 3 s; 512x512x96x96 (2.4 GB) inline opens in ~23 s. Bump if the
+    # target machine has the RAM; use companion-fetch for the fast path on big data.
+    _OFFLINE_BUDGET_BYTES = 2000 * 1024 * 1024
 
-    def _pack_offline(self, offline: bool | None) -> None:
-        """Ship the uint16 4D stack to the browser for kernel-less WebGPU compute.
+    def _pack_offline(self, offline: bool | None, data_url: str | None = None) -> None:
+        """Ship the 4D stack to the browser for kernel-less WebGPU compute.
 
-        JS runs the same masked-sum / DP-from-ROI reductions in WebGPU, so a
-        small dataset stays interactive with no Python kernel (live docs, shared
-        offline HTML, Colab without a GPU). Detector counts are integers, so the
-        stack ships as uint16 and the browser accumulates in u32: the virtual
-        image is bit-exact to this widget's torch result, no quantization.
+        JS runs the same masked-sum / DP-from-ROI reductions in WebGPU, so the
+        dataset stays interactive with no Python kernel (live docs, shared offline
+        HTML, Colab without a GPU). We pack the stack as **uint8** (global linear
+        quantization): it halves the payload vs uint16 so a full 512x512 scan
+        fits, and the virtual image is near-lossless anyway - it is a SUM over
+        many detector pixels, so per-pixel 1/256 quantization error averages down
+        far below one count. The colormap auto-scales the result, so the displayed
+        virtual image is visually identical to the kernel's.
 
         ``offline=None`` auto-enables under the byte budget; ``True`` forces it
-        (and warns + skips if the stack is too big); ``False`` does nothing.
-        Time/tilt series (5D) are not supported in browser mode yet.
+        (and warns + skips if too big); ``False`` does nothing. 5D not supported.
         """
         if self._data.ndim != 4:
             return
-        n_bytes = self._data.numel() * 2
+        n_bytes = self._data.numel()  # uint8 pack = 1 byte/pixel
+        # Companion mode bypasses the V8 string wall (data is fetched binary, never
+        # a JS string), so its limit is client RAM (decoded + GPU ~= 2x), not the
+        # ~500 MB inline parse cap. Give it a much higher budget.
+        budget = (4000 * 1024 * 1024) if data_url else self._OFFLINE_BUDGET_BYTES
         if offline is None:
-            offline = n_bytes <= self._OFFLINE_BUDGET_BYTES
+            offline = n_bytes <= budget
         if not offline:
             return
-        if n_bytes > self._OFFLINE_BUDGET_BYTES:
+        if n_bytes > budget:
             print(f"  offline browser mode skipped: stack is {n_bytes / 1e6:.0f} MB > "
-                  f"{self._OFFLINE_BUDGET_BYTES / 1e6:.0f} MB budget; the kernel still works")
+                  f"{budget / 1e6:.0f} MB budget; the kernel still works")
             return
-        counts = self._data.detach().to("cpu").numpy()
-        if np.issubdtype(counts.dtype, np.floating):
-            counts = np.rint(counts)  # detector counts are integers; round float inputs
-        counts = np.clip(counts, 0, 65535).astype(np.uint16)
-        self._offline_stack = np.ascontiguousarray(counts).tobytes()
+        # bslz4 codec: ship native-style bitshuffle+LZ4 bytes (~6x smaller than the
+        # uint16 stack), decompress on the GPU to uint8. Needs a companion file
+        # (data_url) - the compressed bytes are fetched binary, decoded in WebGPU.
+        if data_url and getattr(self, "_offline_codec", "gzip") == "bslz4":
+            self._pack_offline_bslz4(data_url)
+            return
+        # Direct clip to [0, 255] - NOT global-linear scaling. Detector counts are
+        # mostly 0-~100, so the uint8 value IS the raw count: pixels <=255 are
+        # EXACT (verified 99.989% on real gold), only rare saturated/dead pixels
+        # clip to 255. Global scaling instead is set by the brightest (often a
+        # dead 2^32-1 pixel) and crushes all real signal to ~0 - the trap we hit.
+        import gzip, json, pathlib
+        packed = np.clip(self._data.detach().to("cpu").numpy(), 0, 255).astype(np.uint8)
+        packed = np.ascontiguousarray(packed.reshape(self.shape_rows, self.shape_cols, self.det_rows, self.det_cols))
+        self._offline_gzip = True
         self.offline = True
+        scan_cols, det_size = self.shape_cols, self.det_rows * self.det_cols
+        # Chunk by scan-row ranges so each chunk's uint8 stays under one GPU buffer
+        # (~1 GB cap). A stack bigger than one buffer (e.g. 512x512x192x192 = 9.7 GB)
+        # then streams chunk-by-chunk into N buffers. Small stacks = a single chunk.
+        chunk_bytes = 768 * 1024 * 1024
+        rows_per = max(1, chunk_bytes // max(1, scan_cols * det_size))
+        if data_url and packed.size > chunk_bytes:
+            out = pathlib.Path(data_url); out.parent.mkdir(parents=True, exist_ok=True)
+            meta, blob, coff = [], bytearray(), 0
+            for r0 in range(0, self.shape_rows, rows_per):
+                r1 = min(self.shape_rows, r0 + rows_per)
+                cz = gzip.compress(packed[r0:r1].tobytes(), compresslevel=6)
+                meta.append({"coff": coff, "clen": len(cz), "startScan": r0 * scan_cols, "nScan": (r1 - r0) * scan_cols})
+                blob += cz; coff += len(cz)
+            out.write_bytes(blob)
+            self._offline_url = data_url
+            self._offline_chunks = json.dumps(meta)
+            if getattr(self, "_verbose", True):
+                print(f"  offline companion (chunked): {out} {len(blob)/1e6:.0f} MB gzip, {len(meta)} chunks; streams into {len(meta)} GPU buffers")
+        else:
+            gz = gzip.compress(packed.tobytes(), compresslevel=6)
+            if data_url:
+                out = pathlib.Path(data_url); out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(gz); self._offline_url = data_url
+                if getattr(self, "_verbose", True):
+                    print(f"  offline companion: wrote {out} ({len(gz)/1e6:.0f} MB gzip)")
+            else:
+                self._offline_stack = gz  # inline single self-contained file
+
+    def export_html(self, path: str, *, title: str | None = None) -> str:
+        """Write a standalone HTML viewer (anywidget embed). The widget must already
+        be offline (e.g. offline_codec='bslz4', data_url=...); the bslz4/gzip
+        companion file is fetched at view time, so serve the HTML + companion over
+        HTTP from the same directory. Returns the written path."""
+        import pathlib
+        from ipywidgets.embed import dependency_state, embed_minimal_html
+        out = pathlib.Path(path); out.parent.mkdir(parents=True, exist_ok=True)
+        embed_minimal_html(str(out), views=[self], title=title or self.title or "Show4DSTEM",
+                            drop_defaults=False, state=dependency_state([self], drop_defaults=False))
+        return str(out)
+
+    def _pack_offline_bslz4(self, data_url: str) -> None:
+        """Forward-encode the 4D stack to bitshuffle+LZ4 (bslz4) per frame and write
+        the compressed companion file + per-(frame,block) [coff,clen] meta. The
+        browser decodes it on the GPU to a uint8 stack (bit-exact to the uint8 clip).
+
+        Why: bslz4 is ~6x smaller than the uint16 stack and ~2x smaller than uint8
+        gzip, so the download shrinks while the decode stays on the GPU at near-CUDA
+        speed. Block size 1024 elements (vs the 4096 HDF5 default) gives ~2x decode
+        throughput on a real GPU (more parallel work units), at a small ratio cost.
+        """
+        import json, pathlib, struct
+        import lz4.block as _lz4
+        data = np.ascontiguousarray(
+            self._data.detach().to("cpu").numpy().reshape(-1, self.det_rows * self.det_cols)
+        )
+        n_frames, det_size = data.shape
+        # Auto-detect hot/dead pixels (saturated, or mean far above the robust scale)
+        # so the offline VI/DP are filtered automatically - matches CUDA apply_mask.
+        col_max = data.max(axis=0); col_mean = data.mean(axis=0, dtype=np.float64)
+        med = np.median(col_mean); mad = np.median(np.abs(col_mean - med)) + 1e-9
+        bad = np.where((col_max >= 65535) | (col_mean > med + 50.0 * mad))[0]
+        self._offline_bad_px = json.dumps(bad.astype(int).tolist())
+        if getattr(self, "_verbose", True) and len(bad):
+            print(f"  offline auto-filter: {len(bad)} hot/dead px masked")
+        block_elems = next((b for b in (1024, 512, 256) if det_size % b == 0), det_size)
+        n_blocks = det_size // block_elems
+        plane_shift = np.arange(16, dtype=np.uint32)
+        raw, meta = bytearray(), []
+        for frame in data:
+            raw += struct.pack(">Q", det_size * 2) + struct.pack(">I", block_elems * 2)
+            for b in range(n_blocks):
+                block = frame[b * block_elems:(b + 1) * block_elems].astype(np.uint16)
+                bits = ((block[:, None].astype(np.uint32) >> plane_shift) & 1).astype(np.uint8)
+                planes = np.concatenate([
+                    np.packbits(bits[:, p].reshape(-1, 8), axis=1, bitorder="little").ravel()
+                    for p in range(16)
+                ]).tobytes()
+                comp = _lz4.compress(planes, store_size=False, mode="high_compression")
+                meta += [len(raw) + 4, len(comp)]  # coff (past the 4B length), clen
+                raw += struct.pack(">I", len(comp)) + comp
+            raw += b"\x00" * ((-len(raw)) % 4)
+        out = pathlib.Path(data_url); out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(bytes(raw))
+        self.offline = True
+        self._offline_url = data_url
+        self._offline_bslz4 = json.dumps({
+            "blockMeta": meta, "nFrames": n_frames,
+            "nBlocksPerFrame": n_blocks, "blockElems": block_elems,
+        })
+        if getattr(self, "_verbose", True):
+            ratio = (n_frames * det_size * 2) / max(1, len(raw))
+            print(f"  offline bslz4 companion: {out} {len(raw)/1e6:.0f} MB "
+                  f"({ratio:.1f}x vs uint16), {n_blocks} blocks/frame, GPU-decoded to uint8")
 
     def __repr__(self) -> str:
         shape = (
