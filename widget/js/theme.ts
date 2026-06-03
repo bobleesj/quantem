@@ -8,7 +8,7 @@ import { useState, useEffect, useMemo } from "react";
 // ============================================================================
 // Types
 // ============================================================================
-export type Environment = "jupyterlab" | "vscode" | "colab" | "jupyter-classic" | "unknown";
+export type Environment = "jupyterlab" | "vscode" | "colab" | "jupyter-classic" | "docs" | "unknown";
 export type Theme = "light" | "dark";
 
 export interface ThemeInfo {
@@ -105,7 +105,15 @@ export function detectTheme(): ThemeInfo {
     };
   }
 
-  // 5. Fallback: check OS preference, then computed background
+  // 5. Sphinx Book Theme / PyData docs (Jupyter Book) - the light/dark toggle
+  // sets data-theme (or a resolved data-mode) on <html>. Follow it so embedded
+  // widgets match the docs page instead of only the OS preference.
+  const docsTheme = document.documentElement.dataset.mode || document.documentElement.dataset.theme;
+  if (docsTheme === "light" || docsTheme === "dark") {
+    return { environment: "docs", theme: docsTheme };
+  }
+
+  // 6. Fallback: check OS preference, then computed background
   const prefersDark = window.matchMedia?.('(prefers-color-scheme: dark)')?.matches;
   if (prefersDark !== undefined) {
     return {
@@ -135,6 +143,8 @@ export function useTheme(forceLight = false): { themeInfo: ThemeInfo; colors: Th
 
     const observer = new MutationObserver(() => setDetected(detectTheme()));
     observer.observe(document.body, { attributes: true, attributeFilter: ['data-jp-theme-light', 'class'] });
+    // <html> carries the Sphinx/PyData docs light-dark toggle (data-theme / data-mode).
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-mode', 'class'] });
 
     return () => {
       mediaQuery?.removeEventListener?.('change', handleChange);
