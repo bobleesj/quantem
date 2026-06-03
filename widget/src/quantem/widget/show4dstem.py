@@ -595,6 +595,13 @@ class Show4DSTEM(anywidget.AnyWidget):
         ])
         self.observe(self._on_vi_roi_center_change, names=["vi_roi_center"])
 
+        # The frontend can mount a tick AFTER __init__ set virtual_image_bytes /
+        # frame_bytes, missing those initial change events -> the virtual image stays
+        # BLACK (stats 0) until the first ROI/cursor interaction pushes new bytes.
+        # Re-send the view buffers on the next kernel-IOLoop tick (after the comm +
+        # frontend are up) so the initial BF virtual image paints with no interaction.
+        self._schedule_initial_view_sync()
+
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
                 state = unwrap_state_payload(
@@ -629,6 +636,35 @@ class Show4DSTEM(anywidget.AnyWidget):
             print(f"  shape   : {shape}")
             print(f"  backend : {backend}   device={self._device}")
             print(f"  data in : {where}   ({src})")
+
+    def _schedule_initial_view_sync(self):
+        """Re-emit the view byte-buffers after the frontend connects.
+
+        anywidget syncs initial trait state on mount, but a heavy ``Bytes`` trait set
+        during ``__init__`` (virtual_image_bytes, frame_bytes) is missed when the
+        frontend mounts a tick later - the virtual image then stays black (stats 0)
+        until the first interaction re-pushes it. Deferring a re-send to the kernel
+        IOLoop guarantees the initial virtual image + diffraction pattern paint. No-op
+        outside a Jupyter kernel (no running IOLoop).
+        """
+        try:
+            from tornado.ioloop import IOLoop
+            loop = IOLoop.current()
+        except Exception:
+            return
+        def _resend():
+            for name in ("virtual_image_bytes", "frame_bytes"):
+                try:
+                    self.send_state(name)
+                except Exception:
+                    pass
+        # Two delays: 0.3s covers a fast local mount, 1.5s covers a slow mount
+        # (Colab, heavy install) where the frontend connects later.
+        for delay in (0.3, 1.5):
+            try:
+                loop.call_later(delay, _resend)
+            except Exception:
+                pass
 
     def __repr__(self) -> str:
         shape = (
