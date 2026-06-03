@@ -5,10 +5,12 @@ Metal uint16 chunks (MacBook no-bin). It wraps the shared compute backend
 (``MetalCompute`` / ``TorchCompute``) and the scan/detector shape + calibration, so
 user code never branches on hardware:
 
-    from quantem.widget import load, Dataset4dstemGPU, Show2D
+    from quantem.widget import load, Dataset4dstemGPU, Show4DSTEM, Show2D
     ds = Dataset4dstemGPU(load("master.h5"))   # torch on CUDA, Metal chunks on Mac
-    Show2D(ds.virtual("ADF"))                    # auto probe-fit virtual image
-    Show2D(ds.dpc().phase)                       # CoM -> rotation -> iDPC
+    Show4DSTEM(ds)                               # raw 4D viewer
+    Show2D(ds.virtual_image.bf())                # bright field (cached, auto probe)
+    Show2D(ds.virtual_image.adf())               # annular dark field
+    Show2D(ds.dpc().phase)                       # CoM -> rotation -> iDPC (cached)
 
 It is deliberately NOT ``quantem.core.Dataset4dstem`` (torch-only, can't hold Metal
 chunks / trips the MPS INT_MAX ceiling on no-bin, and re-adds the quantem dep). This
@@ -83,24 +85,42 @@ class Dataset4dstemGPU:
         return np.asarray(self._compute.masked_sum(det_mask)).reshape(self.scan_shape)
 
     # --- derived properties (the friendly API) ---
-    def virtual(self, mode: str = "BF", **kwargs) -> np.ndarray:
-        """Auto-probe-fit virtual image (DP/BF/ABF/ADF/HAADF/DF). See :func:`virtual`."""
-        from quantem.widget.virtual import virtual
-        return virtual(self, mode, **kwargs)
+    @property
+    def virtual_image(self):
+        """Cached virtual-image detectors: ``.bf()`` / ``.adf()`` / ``.df()``.
+
+        See :class:`quantem.widget.virtual.VirtualImageAccessor`. Built once per
+        dataset; the probe auto-fits and every detector result is memoized.
+        """
+        accessor = self.__dict__.get("_virtual_image")
+        if accessor is None:
+            from quantem.widget.virtual import VirtualImageAccessor
+            accessor = VirtualImageAccessor(self)
+            self.__dict__["_virtual_image"] = accessor
+        return accessor
 
     def center_of_mass(self, mask=None):
         from quantem.widget.dpc import center_of_mass
         return center_of_mass(self, mask=mask)
 
     def dpc(self, **kwargs):
-        """Center-of-mass -> rotation -> iDPC. See :func:`dpc`."""
-        from quantem.widget.dpc import dpc
-        return dpc(self, **kwargs)
+        """Center-of-mass -> rotation -> iDPC (cached). See :func:`dpc`.
 
-    def show4dstem(self, **kwargs):
-        """Open the raw 4D viewer on the underlying data."""
-        from quantem.widget import Show4DSTEM
-        return Show4DSTEM(self._raw, **kwargs)
+        The CoM pass over the 4D block is the cost; the result is memoized per
+        kwargs so a repeat ``ds.dpc()`` is instant. A custom ``mask=`` array
+        bypasses the cache (arrays aren't hashable, and it's a one-off anyway).
+        """
+        cache = self.__dict__.setdefault("_dpc_cache", {})
+        if "mask" in kwargs and kwargs["mask"] is not None:
+            from quantem.widget.dpc import dpc
+            return dpc(self, **kwargs)
+        key = tuple(sorted((k, v) for k, v in kwargs.items() if k != "mask"))
+        result = cache.get(key)
+        if result is None:
+            from quantem.widget.dpc import dpc
+            result = dpc(self, **kwargs)
+            cache[key] = result
+        return result
 
     def __repr__(self) -> str:
         s = "x".join(str(x) for x in self.shape)

@@ -82,6 +82,100 @@ def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
     return (dist >= lo) & (dist <= hi)
 
 
+class VirtualImageAccessor:
+    """``ds.virtual_image.bf()`` / ``.adf()`` / ``.df()`` - cached virtual images.
+
+    The probe (bright-disk center + radius) is auto-fit once from the mean
+    diffraction pattern, so ``inner`` / ``outer`` are in **BF-radius units**
+    (``1.0`` = the bright-disk edge) and need no calibration. Every result is
+    cached by ``(detector, center, radius, inner, outer)``; a repeat call is
+    instant. Override the probe with ``.center`` / ``.bf_radius`` (clears the
+    cache), or the default band with ``.adf_inner`` / ``.adf_outer`` / ``.df_inner``.
+
+        ds.virtual_image.bf()                  # bright field, disk <= r
+        ds.virtual_image.adf()                 # annular dark field, r .. 2r
+        ds.virtual_image.adf(inner=1.5, outer=6)
+        ds.virtual_image.df()                  # all dark field, > r
+    """
+
+    def __init__(self, data):
+        self._backend = _resolve_backend(data)
+        self._scan_shape = tuple(data.scan_shape) if getattr(data, "_qw_dataset", False) else None
+        self._mean_dp = None
+        self._center = None       # auto-fit lazily; user-set wins
+        self._bf_radius = None
+        self.adf_inner = 1.0      # BF-radius units; default ADF band r .. 2r
+        self.adf_outer = 2.0
+        self.df_inner = 1.0       # default DF: everything beyond the disk
+        self._cache = {}
+
+    @property
+    def mean_dp(self) -> np.ndarray:
+        """Mean diffraction pattern (computed once)."""
+        if self._mean_dp is None:
+            self._mean_dp = np.asarray(self._backend.mean_dp(), dtype=np.float32)
+        return self._mean_dp
+
+    def _probe(self):
+        if self._center is None or self._bf_radius is None:
+            center, radius = auto_probe(self.mean_dp)
+            if self._center is None:
+                self._center = center
+            if self._bf_radius is None:
+                self._bf_radius = radius
+        return self._center, self._bf_radius
+
+    @property
+    def center(self):
+        """Bright-disk center ``(row, col)`` in detector pixels (auto-fit if unset)."""
+        return self._probe()[0]
+
+    @center.setter
+    def center(self, value):
+        self._center = None if value is None else (float(value[0]), float(value[1]))
+        self._cache.clear()
+
+    @property
+    def bf_radius(self):
+        """Bright-disk radius in detector pixels (auto-fit if unset)."""
+        return self._probe()[1]
+
+    @bf_radius.setter
+    def bf_radius(self, value):
+        self._bf_radius = None if value is None else float(value)
+        self._cache.clear()
+
+    def _image(self, name, lo, hi):
+        center, radius = self._probe()
+        key = (name, round(center[0], 3), round(center[1], 3), round(radius, 3),
+               round(float(lo), 4), round(float(hi), 4))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        mask = _detector_mask("ANNULAR", center, radius, self.mean_dp.shape, lo, hi)
+        img = np.asarray(self._backend.masked_sum(mask), dtype=np.float32)
+        self._cache[key] = img
+        return img
+
+    def bf(self) -> np.ndarray:
+        """Bright-field image: detector disk ``<= r`` (the unscattered probe)."""
+        return self._image("bf", 0.0, 1.0)
+
+    def adf(self, inner: float | None = None, outer: float | None = None) -> np.ndarray:
+        """Annular-dark-field image: band ``inner .. outer`` in BF-radius units
+        (default ``r .. 2r``). Override the defaults via ``.adf_inner`` /
+        ``.adf_outer``."""
+        lo = self.adf_inner if inner is None else float(inner)
+        hi = self.adf_outer if outer is None else float(outer)
+        return self._image("adf", lo, hi)
+
+    def df(self, inner: float | None = None) -> np.ndarray:
+        """Dark-field image: everything beyond ``inner`` (BF-radius units, default
+        ``> r``). Override the default via ``.df_inner``."""
+        lo = self.df_inner if inner is None else float(inner)
+        return self._image("df", lo, np.inf)
+
+
 def virtual(data, mode="BF", *, center=None, bf_radius=None, inner=None, outer=None):
     """Virtual image for ``mode`` with automatic probe fitting. See module docstring.
 
