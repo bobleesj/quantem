@@ -1889,7 +1889,71 @@ def _load_view(
     return LoadResult(out, meta)
 
 
-def load(
+def _browse_dtype_advise_and_cast(data, dtype, verbose):
+    """Recommend / apply the smallest lossless integer dtype for BROWSING.
+
+    Browsing is a visual call, and Arina counts are usually low, so uint8 (half
+    the memory) is often lossless. This inspects the real count range and:
+      - always prints a recommendation (verbose),
+      - ``dtype='u8'``: clip at 255 + cast to uint8 (linear, so virtual-image
+        sums stay correct), printing how many pixels clipped,
+      - ``dtype='auto'``: pick uint8 only if it is lossless (max <= 255), else
+        keep the native dtype,
+      - ``dtype='u16'`` / ``None``: keep native (None still prints advice).
+    Raw uint16 stays the source for reconstruction; uint8 is screening-only.
+    """
+    sel = (dtype or "").lower()
+    if data.dtype != np.uint8 and data.dtype.kind == "u":
+        try:
+            mx = int(data.max())
+            pct255 = float((data > 255).mean()) * 100.0
+        except (RuntimeError, MemoryError, ValueError):
+            return data
+        want_u8 = sel in ("u8", "uint8") or (sel == "auto" and mx <= 255)
+        if want_u8 and data.dtype.itemsize > 1:
+            xp = type(data).__module__.split(".")[0]
+            clip = data  # clip at 255 keeps it linear; only the >255 tail is lost
+            data = (data if mx <= 255 else
+                    (clip.clip(0, 255) if xp != "cupy" else clip.clip(0, 255))).astype(np.uint8)
+            if verbose:
+                if pct255 == 0.0:
+                    print(f"  dtype: uint8 (max count {mx} <= 255 -> LOSSLESS, "
+                          f"{data.nbytes/1e9:.1f} GB, half of uint16)")
+                else:
+                    print(f"  dtype: uint8 clip@255 -> {pct255:.2f}% of pixels clipped "
+                          f"(max was {mx}; the saturated bright tip). recon uses raw uint16.")
+        elif verbose:
+            if mx <= 255:
+                print(f"  dtype advice: max count {mx} <= 255 -> uint8 is LOSSLESS and "
+                      f"halves memory ({data.nbytes/2/1e9:.1f} GB). pass dtype='u8' to browse lighter.")
+            else:
+                print(f"  dtype advice: max count {mx} (>255, {pct255:.2f}% of pixels). uint16 is exact; "
+                      f"dtype='u8' halves memory, clipping {pct255:.2f}% of pixels for browsing.")
+    return data
+
+
+def load(filepath, *args, dtype: str | None = None, **kwargs):
+    """Load 4D-STEM data, then recommend / apply the smallest lossless integer
+    dtype for browsing (see :func:`_browse_dtype_advise_and_cast`).
+
+    Thin wrapper over the loader: every backend/path funnels through here, so the
+    dtype advice + optional uint8 browse-cast happen once, regardless of which
+    internal return produced the data. ``dtype=None`` (default) just prints the
+    recommendation; ``dtype='u8'`` clips@255 + casts; ``dtype='auto'`` picks uint8
+    only if lossless. MPS chunk results (no ``.max``) are passed through untouched.
+    """
+    verbose = kwargs.get("verbose", True)
+    result = _load_impl(filepath, *args, **kwargs)
+    data = getattr(result, "data", None)
+    if (data is not None and hasattr(data, "max") and hasattr(data, "dtype")
+            and getattr(data, "ndim", 0) >= 3):
+        new = _browse_dtype_advise_and_cast(data, dtype, verbose)
+        if new is not data:
+            result = LoadResult(new, result.metadata)
+    return result
+
+
+def _load_impl(
     filepath: str | list[str],
     dataset_path: str | None = None,
     apply_mask: bool = True,
@@ -2133,7 +2197,7 @@ def load(
     if device is not None:
         device_idx = int(device.split(":")[1]) if isinstance(device, str) else int(device)
         with cp.cuda.Device(device_idx):
-            return load(
+            return _load_impl(
                 filepath, dataset_path=dataset_path, apply_mask=apply_mask,
                 scan_shape=scan_shape, det_bin=det_bin, verbose=verbose,
                 auto_narrow=auto_narrow, output_dtype=output_dtype,
