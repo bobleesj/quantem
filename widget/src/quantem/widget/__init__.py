@@ -23,6 +23,7 @@ from quantem.widget.io import load
 from quantem.widget.dpc import dpc, center_of_mass
 from quantem.widget.info import device_info
 from quantem.widget.virtual import virtual
+from quantem.widget.dataset import Dataset4dstemGPU
 
 
 def Show4DSTEM(data, **kwargs):
@@ -43,6 +44,9 @@ def Show4DSTEM(data, **kwargs):
       - CUDA / CPU single or many -> the universal torch viewer (a 5D array gives
         an instant dataset slider on big-VRAM boxes).
     """
+    # Dataset4dstemGPU -> open the raw viewer on its underlying tensor / Metal chunks.
+    if getattr(data, "_qw_dataset", False):
+        data = data._raw
     # MacBook lazy multi-dataset handle -> build the viewer + start background fill.
     from quantem.widget.multidataset_mps import LazyMacbookDatasets
     if isinstance(data, LazyMacbookDatasets):
@@ -73,4 +77,4 @@ except PackageNotFoundError:
     # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
     __version__ = "0.0.0+local"
 
-__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "device_info", "virtual"]
+__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "device_info", "virtual", "Dataset4dstemGPU"]

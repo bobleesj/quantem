@@ -27,6 +27,8 @@ import numpy as np
 
 def _resolve_backend(data):
     """Return a compute backend (MetalCompute on MPS chunks, TorchCompute on array)."""
+    if getattr(data, "_qw_dataset", False):  # Dataset4dstemGPU - backend already resolved
+        return data.compute
     if hasattr(data, "_fields") and "data" in getattr(data, "_fields", ()):
         data = data.data
     # raw MPS chunks -> wrap so compute_backend sees a _is_gpu_frames source
