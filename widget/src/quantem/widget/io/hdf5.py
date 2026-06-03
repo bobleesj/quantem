@@ -1097,7 +1097,14 @@ def _decompress_prepared(
 
     # --- Decide final dtype -------------------------------------------------
     if output_dtype is not None:
-        final_dtype = np.dtype(output_dtype)
+        # Honor the project's browse vocabulary: "u8"/"uint8" mean 8-BIT unsigned
+        # (the screening dtype the public load(dtype="u8") advertises). numpy's
+        # np.dtype("u8") is uint64 (8 BYTES) — passing the browse token straight
+        # to np.dtype would silently 8× the output and OOM. Map it explicitly.
+        if isinstance(output_dtype, str) and output_dtype in ("u8", "uint8"):
+            final_dtype = np.dtype(np.uint8)
+        else:
+            final_dtype = np.dtype(output_dtype)
         narrow_mode = False
     else:
         narrow_mode = bool(
