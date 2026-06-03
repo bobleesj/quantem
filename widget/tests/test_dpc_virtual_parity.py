@@ -65,12 +65,10 @@ def test_dataset_container_roundtrip(gold):
     assert ds.shape == (512, 512, 48, 48)
     # ds.adf() defaults to the r..2r band == standalone virtual("ADF")
     np.testing.assert_array_equal(ds.adf(), virtual(gold, "ADF"))
-    # second call is served from cache (same array object), not recomputed
-    assert ds.bf() is ds.bf()
-    # ds.idpc() == standalone dpc().phase; ds.rotation_deg == standalone rotation
+    # stateless: each call recomputes the same result (no cache, no identity)
+    np.testing.assert_array_equal(ds.bf(), ds.bf())
+    # ds.idpc() == standalone dpc().phase; ds.com().row/col == standalone CoM
     ref = dpc(gold, verbose=False)
     np.testing.assert_array_equal(ds.idpc(), ref.phase)
-    assert abs(ds.rotation_deg - ref.rotation_deg) < 1e-6
-    assert ds.idpc() is ds.idpc()                       # iDPC cached
-    np.testing.assert_array_equal(ds.com.col, ref.com_col)  # horizontal == com_col
-    np.testing.assert_array_equal(ds.com.row, ref.com_row)  # vertical == com_row
+    np.testing.assert_array_equal(ds.com().col, ref.com_col)  # horizontal == com_col
+    np.testing.assert_array_equal(ds.com().row, ref.com_row)  # vertical == com_row

@@ -10,7 +10,7 @@ user code never branches on hardware:
     Show4DSTEM(ds)                               # raw 4D viewer
     Show2D(ds.bf())                               # bright field (cached, auto probe)
     Show2D(ds.adf(inner=50, outer=180))          # annular dark field, mrad
-    Show2D(ds.com.col)                            # horizontal CoM (also ds.com.row)
+    Show2D(ds.com().col)                          # horizontal CoM (also ds.com().row)
     Show2D(ds.idpc())                             # iDPC phase (CoM -> rotation -> integrate)
 
 It is deliberately NOT ``quantem.core.Dataset4dstem`` (torch-only, can't hold Metal
@@ -61,12 +61,11 @@ class Dataset4dstemGPU:
         self.name = name
         self.semiangle_mrad = float(semiangle_mrad) if semiangle_mrad else None
         self._raw = data  # kept so Show4DSTEM can take the underlying tensor / chunks
-        # probe (auto-fit lazily; user-set wins) + caches for the derived API
+        # mean DP is memoized (immutable data fact, needed by the probe on every
+        # detector call). Virtual images / CoM / iDPC are NOT cached - each call
+        # recomputes; re-execute to rerun. Caching lives at the edges: the viewer's
+        # bin4 sidecar for live scrub, the browser for render reuse, the caller for batch.
         self._mean_dp_cache = None
-        self._center = None
-        self._bf_radius = None
-        self._detector_cache = {}
-        self._dpc_cache = {}
 
     # --- backend identity ---
     @property
@@ -99,82 +98,48 @@ class Dataset4dstemGPU:
     def masked_sum(self, det_mask) -> np.ndarray:
         return np.asarray(self._compute.masked_sum(det_mask)).reshape(self.scan_shape)
 
-    # --- probe (auto-fit bright disk; override clears the detector cache) ---
-    def _probe(self):
-        if self._center is None or self._bf_radius is None:
-            from quantem.widget.detector import auto_probe
-            center, radius = auto_probe(self.mean_dp())
-            if self._center is None:
-                self._center = center
-            if self._bf_radius is None:
-                self._bf_radius = radius
-        return self._center, self._bf_radius
+    # --- probe: auto-fit the bright disk from the mean DP, or pass center/radius ---
+    def _probe(self, center=None, radius=None):
+        """``(center, radius)`` in detector pixels. Auto-fit from the mean DP unless
+        the caller passes them. Nothing stored - this is cheap arithmetic on the
+        (memoized) mean DP, recomputed per call."""
+        if center is not None and radius is not None:
+            return (float(center[0]), float(center[1])), float(radius)
+        from quantem.widget.detector import auto_probe
+        auto_center, auto_radius = auto_probe(self.mean_dp())
+        center = (float(center[0]), float(center[1])) if center is not None else auto_center
+        radius = float(radius) if radius is not None else auto_radius
+        return center, radius
 
-    @property
-    def center(self):
-        """Bright-disk center ``(row, col)`` in detector pixels (auto-fit if unset)."""
-        return self._probe()[0]
-
-    @center.setter
-    def center(self, value):
-        self._center = None if value is None else (float(value[0]), float(value[1]))
-        self._detector_cache.clear()
-
-    @property
-    def bf_radius(self):
-        """Bright-disk radius in detector pixels (auto-fit if unset)."""
-        return self._probe()[1]
-
-    @bf_radius.setter
-    def bf_radius(self, value):
-        self._bf_radius = None if value is None else float(value)
-        self._detector_cache.clear()
-
-    # --- derived API: virtual detectors + DPC (thin over the compute backend) ---
-    def bf(self) -> np.ndarray:
+    # --- derived API: stateless, recompute each call (cache lives at the edges) ---
+    def bf(self, center=None, radius=None) -> np.ndarray:
         """Bright-field image (the bright disk). See :func:`quantem.widget.detector.bf`."""
         from quantem.widget.detector import bf
-        return bf(self)
+        return bf(self, center=center, radius=radius)
 
-    def adf(self, inner=None, outer=None, unit="mrad") -> np.ndarray:
+    def adf(self, inner=None, outer=None, unit="mrad", center=None, radius=None) -> np.ndarray:
         """Annular-dark-field image; ``inner``/``outer`` in mrad (default) or
         ``unit='px'`` (auto band if omitted). See :func:`quantem.widget.detector.adf`."""
         from quantem.widget.detector import adf
-        return adf(self, inner, outer, unit)
+        return adf(self, inner, outer, unit, center=center, radius=radius)
 
-    def df(self, inner=None, unit="mrad") -> np.ndarray:
+    def df(self, inner=None, unit="mrad", center=None, radius=None) -> np.ndarray:
         """Dark-field image beyond ``inner`` mrad (default) or ``unit='px'``
         (outside the bright disk if omitted). See :func:`quantem.widget.detector.df`."""
         from quantem.widget.detector import df
-        return df(self, inner, unit)
+        return df(self, inner, unit, center=center, radius=radius)
 
-    def _dpc(self):
-        """Cached full DPC pipeline (CoM -> auto rotation -> Fourier integrate)."""
-        result = self.__dict__.get("_dpc_result")
-        if result is None:
-            from quantem.widget.dpc import dpc
-            result = dpc(self)
-            self.__dict__["_dpc_result"] = result
-        return result
-
-    @property
     def com(self):
-        """Center-of-mass vector field (cached): ``ds.com.row`` / ``ds.com.col``."""
-        accessor = self.__dict__.get("_com_result")
-        if accessor is None:
-            from quantem.widget.dpc import com
-            accessor = com(self)
-            self.__dict__["_com_result"] = accessor
-        return accessor
+        """Center-of-mass vector field: ``ds.com().row`` / ``ds.com().col``.
+        Recomputed each call. See :func:`quantem.widget.dpc.com`."""
+        from quantem.widget.dpc import com
+        return com(self)
 
     def idpc(self) -> np.ndarray:
-        """Integrated-DPC phase image (CoM -> auto rotation -> integrate), cached."""
-        return self._dpc().phase
-
-    @property
-    def rotation_deg(self) -> float:
-        """Auto-found scan/detector rotation used by :meth:`idpc` (degrees)."""
-        return self._dpc().rotation_deg
+        """Integrated-DPC phase image (CoM -> auto rotation -> integrate).
+        Recomputed each call. See :func:`quantem.widget.dpc.idpc`."""
+        from quantem.widget.dpc import idpc
+        return idpc(self)
 
     def __repr__(self) -> str:
         s = "x".join(str(x) for x in self.shape)
