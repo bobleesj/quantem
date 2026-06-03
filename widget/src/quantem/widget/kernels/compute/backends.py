@@ -43,19 +43,24 @@ _CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
 def compute_backend(data):
     """Return the compute backend for ``data``, duck-typed on its type.
 
-    torch tensor / Dataset wrapping a tensor -> TorchCompute (any torch device).
+    torch tensor / numpy / Dataset wrapping a tensor -> TorchCompute (any torch
+        device: CUDA / MPS-binned / CPU). This is the GENERAL path.
     ChunkedFrames / anything with ``_is_gpu_frames`` -> MetalCompute (raw Metal).
-    cupy ndarray -> CudaKernelCompute (the web Browse fused kernel).
+        The device-specific path, used ONLY for MPS no-bin (where torch can't hold
+        the >2^31-element stack).
+    cupy ndarray -> converted to a torch CUDA tensor (zero-copy dlpack) and run on
+        TorchCompute. The widget compute path is torch, never cupy - cupy lives only
+        in the io decode + the parity-test reference.
 
-    Why duck-typed, not Protocol: the kernels design keeps backends flexible; a new
-    backend just implements the primitive names. One selection point here means
-    callers (widget + web Browse) never branch on hardware themselves.
+    One selection point here means callers (widget + web Browse) never branch on
+    hardware themselves.
     """
     if getattr(data, "_is_gpu_frames", False):
         return MetalCompute(data)
     cls_name = type(data).__module__.split(".")[0]
     if cls_name == "cupy":
-        return CudaKernelCompute(data)
+        import torch
+        return TorchCompute(torch.from_dlpack(data))  # cupy -> torch CUDA, no cupy compute
     try:
         import torch
         if isinstance(data, torch.Tensor):
