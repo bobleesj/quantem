@@ -1356,11 +1356,18 @@ def _decompress_prepared(
             ).sum(axis=(2, 4))
             if final_dtype == source_dtype:
                 result[start:end] = binned_batch
+            elif final_dtype == np.uint8:
+                # browse uint8: clip@255 per batch into the uint8 output, so the
+                # full uint16 block is never materialized (peak = uint8 out + one
+                # batch + scratch). clip keeps it linear -> virtual-image sums correct.
+                result[start:end] = cp.minimum(binned_batch, 255).astype(cp.uint8)
             else:
                 result[start:end] = binned_batch.astype(final_dtype)
             del binned_batch
         elif final_dtype == source_dtype:
             result[start:end] = batch_view
+        elif final_dtype == np.uint8:
+            result[start:end] = cp.minimum(batch_view, 255).astype(cp.uint8)
         else:
             result[start:end] = batch_view.astype(final_dtype)
 
@@ -1949,6 +1956,18 @@ def load(filepath, *args, dtype: str | None = None, **kwargs):
     only if lossless. MPS chunk results (no ``.max``) are passed through untouched.
     """
     verbose = kwargs.get("verbose", True)
+    sel = (dtype or "").lower()
+    if sel in ("u8", "uint8") and kwargs.get("output_dtype") is None and not isinstance(filepath, (list, tuple)):
+        # decode-DIRECT to uint8: the batched decoder clips@255 into a uint8
+        # output, so the full uint16 block is never materialized (peak ~ uint8
+        # out + one batch + scratch, not uint16+uint8). The laptop browse path.
+        kwargs["output_dtype"] = np.uint8
+        result = _load_impl(filepath, *args, **kwargs)
+        d = getattr(result, "data", None)
+        if verbose and d is not None and hasattr(d, "nbytes"):
+            print(f"  Loaded in uint8 for browsing - using {d.nbytes/1e9:.1f} GB, half of uint16 "
+                  f"(decoded straight to uint8, so peak memory stayed low). Reconstruction uses raw uint16.")
+        return result
     result = _load_impl(filepath, *args, **kwargs)
     data = getattr(result, "data", None)
     if (data is not None and hasattr(data, "max") and hasattr(data, "dtype")
