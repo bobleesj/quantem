@@ -194,6 +194,14 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32 (JS computes stats + range)
 
+    # Offline / browser-compute mode: ship the full uint16 4D stack once so JS
+    # runs the virtual-image and DP-from-ROI reductions in WebGPU with no Python
+    # kernel. Only for SMALL datasets (see _pack_offline budget). Detector counts
+    # are integers, so the browser masked-sum (u32 accumulate) is bit-exact to
+    # this widget's torch virtual image.
+    offline = traitlets.Bool(False).tag(sync=True)
+    _offline_stack = traitlets.Bytes(b"").tag(sync=True)
+
     # =========================================================================
     # VI ROI (real-space region selection for summed DP)
     # =========================================================================
@@ -315,6 +323,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         frame_dim_label: str | None = None,
         frame_labels: list[str] | None = None,
         title: str = "",
+        offline: bool | None = False,
         show_fft: bool = False,
         fft_window: bool = True,
         show_controls: bool = True,
@@ -601,6 +610,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Re-send the view buffers on the next kernel-IOLoop tick (after the comm +
         # frontend are up) so the initial BF virtual image paints with no interaction.
         self._schedule_initial_view_sync()
+        self._pack_offline(offline)
 
         if state is not None:
             if isinstance(state, (str, pathlib.Path)):
@@ -665,6 +675,42 @@ class Show4DSTEM(anywidget.AnyWidget):
                 loop.call_later(delay, _resend)
             except Exception:
                 pass
+
+    # Auto-enable browser compute only when the packed stack fits this budget;
+    # above it the HTML/comm payload and the browser's memory blow up, so the
+    # kernel path stays. ~300 MB of uint16 = e.g. 128x128 scan x 96x96 detector.
+    _OFFLINE_BUDGET_BYTES = 300 * 1024 * 1024
+
+    def _pack_offline(self, offline: bool | None) -> None:
+        """Ship the uint16 4D stack to the browser for kernel-less WebGPU compute.
+
+        JS runs the same masked-sum / DP-from-ROI reductions in WebGPU, so a
+        small dataset stays interactive with no Python kernel (live docs, shared
+        offline HTML, Colab without a GPU). Detector counts are integers, so the
+        stack ships as uint16 and the browser accumulates in u32: the virtual
+        image is bit-exact to this widget's torch result, no quantization.
+
+        ``offline=None`` auto-enables under the byte budget; ``True`` forces it
+        (and warns + skips if the stack is too big); ``False`` does nothing.
+        Time/tilt series (5D) are not supported in browser mode yet.
+        """
+        if self._data.ndim != 4:
+            return
+        n_bytes = self._data.numel() * 2
+        if offline is None:
+            offline = n_bytes <= self._OFFLINE_BUDGET_BYTES
+        if not offline:
+            return
+        if n_bytes > self._OFFLINE_BUDGET_BYTES:
+            print(f"  offline browser mode skipped: stack is {n_bytes / 1e6:.0f} MB > "
+                  f"{self._OFFLINE_BUDGET_BYTES / 1e6:.0f} MB budget; the kernel still works")
+            return
+        counts = self._data.detach().to("cpu").numpy()
+        if np.issubdtype(counts.dtype, np.floating):
+            counts = np.rint(counts)  # detector counts are integers; round float inputs
+        counts = np.clip(counts, 0, 65535).astype(np.uint16)
+        self._offline_stack = np.ascontiguousarray(counts).tobytes()
+        self.offline = True
 
     def __repr__(self) -> str:
         shape = (

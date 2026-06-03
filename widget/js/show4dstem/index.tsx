@@ -21,9 +21,60 @@ import JSZip from "jszip";
 import { useTheme } from "./theme";
 import { COLORMAPS, applyColormap, renderToOffscreen } from "./colormaps";
 import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "./fft";
+import { Show4DSTEMCompute } from "./webgpu-compute";
 import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "./figure";
 import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "./stats";
 import { downloadBlob, formatNumber, downloadDataView } from "./format";
+
+// Detector mask for the offline WebGPU virtual-image sum. Mirrors the Python
+// mask geometry exactly (show4dstem.py _create_*_mask): cx pairs with column,
+// cy with row, so the browser virtual image matches the kernel's pixel-for-pixel.
+function buildDetectorMask(model: any, detRows: number, detCols: number): Uint32Array {
+  const mask = new Uint32Array(detRows * detCols);
+  const cx = model.get("roi_center_col");
+  const cy = model.get("roi_center_row");
+  const mode = model.get("roi_mode") || "circle";
+  const radius = model.get("roi_radius") || 0;
+  const inner = model.get("roi_radius_inner") || 0;
+  const halfW = (model.get("roi_width") || 0) / 2;
+  const halfH = (model.get("roi_height") || 0) / 2;
+  for (let row = 0; row < detRows; row++) {
+    for (let col = 0; col < detCols; col++) {
+      const dx = col - cx, dy = row - cy, d2 = dx * dx + dy * dy;
+      let inside = false;
+      if (mode === "circle") inside = d2 <= radius * radius;
+      else if (mode === "annular") inside = d2 > inner * inner && d2 <= radius * radius;
+      else if (mode === "square") inside = Math.abs(dx) <= radius && Math.abs(dy) <= radius;
+      else if (mode === "rect") inside = Math.abs(dx) <= halfW && Math.abs(dy) <= halfH;
+      else if (mode === "point") inside = Math.round(cx) === col && Math.round(cy) === row;
+      mask[row * detCols + col] = inside ? 1 : 0;
+    }
+  }
+  return mask;
+}
+
+// Scan-ROI mask for the offline DP-from-region reduce (mirrors the vi_roi_mode
+// geometry in show4dstem.py _compute_vi_roi_dp).
+function buildScanMask(model: any, scanRows: number, scanCols: number): Uint32Array {
+  const mask = new Uint32Array(scanRows * scanCols);
+  const cx = model.get("vi_roi_center_col");
+  const cy = model.get("vi_roi_center_row");
+  const mode = model.get("vi_roi_mode") || "circle";
+  const radius = model.get("vi_roi_radius") || 0;
+  const halfW = (model.get("vi_roi_width") || 0) / 2;
+  const halfH = (model.get("vi_roi_height") || 0) / 2;
+  for (let row = 0; row < scanRows; row++) {
+    for (let col = 0; col < scanCols; col++) {
+      const dx = col - cx, dy = row - cy;
+      let inside = false;
+      if (mode === "circle") inside = dx * dx + dy * dy <= radius * radius;
+      else if (mode === "square") inside = Math.abs(dx) <= radius && Math.abs(dy) <= radius;
+      else if (mode === "rect") inside = Math.abs(dx) <= halfW && Math.abs(dy) <= halfH;
+      mask[row * scanCols + col] = inside ? 1 : 0;
+    }
+  }
+  return mask;
+}
 
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 10;
@@ -1153,6 +1204,52 @@ function Show4DSTEM() {
   const [localViRoiCenterCol, setLocalViRoiCenterCol] = React.useState(viRoiCenterCol || 0);
   const [viRoiDpBytes] = useModelState<DataView>("vi_roi_dp_bytes");
   const [viRoiReduce, setViRoiReduce] = useModelState<string>("vi_roi_reduce");
+
+  // ── Offline WebGPU compute backend ──────────────────────────────────────
+  // Small datasets ship the full uint16 stack (the `_offline_stack` trait); we
+  // run the virtual-image and DP-from-ROI reductions in WebGPU right here, with
+  // NO Python kernel. We play Python's role: on any detector/ROI trait change we
+  // recompute and set `virtual_image_bytes` / `vi_roi_dp_bytes` on the model, so
+  // every existing render effect works unchanged. Detector counts are integers,
+  // so the browser masked-sum (u32 accumulate) is bit-exact to the kernel.
+  const [offline] = useModelState<boolean>("offline");
+  React.useEffect(() => {
+    if (!offline) return;
+    let disposed = false;
+    let detach: (() => void) | null = null;
+    (async () => {
+      const stackView = model.get("_offline_stack") as DataView | undefined;
+      if (!stackView || stackView.byteLength === 0) return;
+      const scanRows = model.get("shape_rows"), scanCols = model.get("shape_cols");
+      const detR = model.get("det_rows"), detC = model.get("det_cols");
+      const stack = new Uint16Array(stackView.buffer, stackView.byteOffset, stackView.byteLength / 2);
+      const compute = await Show4DSTEMCompute.create(stack, scanRows * scanCols, detR * detC);
+      if (!compute || disposed) { compute?.dispose(); return; }
+      const recomputeVI = async () => {
+        const vi = await compute.maskedSum(buildDetectorMask(model, detR, detC));
+        model.set("virtual_image_bytes", new DataView(vi.buffer));
+      };
+      const recomputeDP = async () => {
+        const mode = model.get("vi_roi_mode");
+        if (!mode || mode === "off") { model.set("vi_roi_dp_bytes", new DataView(new ArrayBuffer(0))); return; }
+        const dp = await compute.reduceFrames(buildScanMask(model, scanRows, scanCols), model.get("vi_roi_reduce") !== "sum");
+        model.set("vi_roi_dp_bytes", new DataView(dp.buffer));
+      };
+      const onVI = () => { void recomputeVI(); };
+      const onDP = () => { void recomputeDP(); };
+      const viTraits = ["roi_center", "roi_center_row", "roi_center_col", "roi_radius", "roi_radius_inner", "roi_mode", "roi_width", "roi_height"];
+      const dpTraits = ["vi_roi_center", "vi_roi_center_row", "vi_roi_center_col", "vi_roi_radius", "vi_roi_mode", "vi_roi_width", "vi_roi_height", "vi_roi_reduce"];
+      viTraits.forEach((t) => model.on("change:" + t, onVI));
+      dpTraits.forEach((t) => model.on("change:" + t, onDP));
+      detach = () => {
+        viTraits.forEach((t) => model.off("change:" + t, onVI));
+        dpTraits.forEach((t) => model.off("change:" + t, onDP));
+        compute.dispose();
+      };
+      await recomputeVI();  // initial virtual image, no interaction needed
+    })();
+    return () => { disposed = true; detach?.(); };
+  }, [offline]);
   // dp_stats are computed in JS from frameBytes (Python side no longer
   // syncs a dp_stats trait — saves 4 trait sync round-trips per click).
   const [viStats, setViStats] = React.useState<number[]>([0, 0, 0, 0]);
