@@ -153,7 +153,10 @@ def center_of_mass(data, scan_shape=None, mask=None):
         import torch
         if isinstance(data, torch.Tensor):
             data = data.detach().cpu().numpy()
-        data = np.asarray(data)
+        elif type(data).__module__.split(".")[0] != "cupy":
+            # numpy / list -> ndarray. cupy passes through: _com_numpy reduces it
+            # on-device (xp=cp) and returns numpy, so CUDA input works too.
+            data = np.asarray(data)
         if scan_shape is None:
             n = data.shape[0] if data.ndim == 3 else data.shape[0] * data.shape[1]
             sr = int(round(n ** 0.5)); sc = n // sr
