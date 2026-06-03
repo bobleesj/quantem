@@ -908,10 +908,3 @@ def _drop_cached_decompressor():
     from quantem.widget.io import clear_mps_cache
 
     clear_mps_cache()
-
-
-
-# Lazy multi-dataset loader (one viewer, frame-slider across N datasets, background
-# fill). Lives in multidataset_mps; re-exported here so quantem.live resolves it
-# through the same _MPS_WIDGET_EXPORTS dispatch as the single-dataset viewer.
-from quantem.widget.multidataset_mps import load_4dstem_macbook  # noqa: E402,F401

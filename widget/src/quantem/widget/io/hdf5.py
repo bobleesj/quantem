@@ -2086,6 +2086,20 @@ def load(
             raise ValueError(
                 f"device=/devices= multi-GPU requires backend='cuda'; got {backend!r}."
             )
+        # MPS multi-dataset: a 4-5 dataset 5D Metal stack is 12s+ to decode and
+        # may not fit 24 GB unified memory, so eager stacking is the wrong model
+        # on Apple Silicon. Return a lazy handle - dataset 0 decoded now, 1..N
+        # filled in the background once Show4DSTEM(handle) builds the viewer.
+        # (CUDA stacks eagerly below; big VRAM gives instant dataset switch.)
+        if backend == "mps" and (
+            isinstance(filepath, (list, tuple))
+            or (isinstance(filepath, (str, os.PathLike))
+                and os.path.isdir(os.path.expanduser(str(filepath))))
+        ):
+            from quantem.widget.multidataset_mps import load_macbook_datasets
+            return load_macbook_datasets(
+                filepath, det_bin=det_bin, scan_size=None, verbose=verbose,
+            )
         return _load_view(
             filepath, backend, dataset_path=dataset_path, apply_mask=apply_mask,
             scan_shape=scan_shape, det_bin=det_bin, verbose=verbose,
@@ -2238,6 +2252,16 @@ def load(
             )
         if n_loaded < n_files:
             out = out[:n_loaded]
+        # Record the per-dataset names (loaded order, skips dropped) so the viewer
+        # can label the dataset slider with each source file instead of an index.
+        skipped_set = set(skipped)
+        loaded_names = [
+            os.path.basename(str(filepath[i]))[:-len("_master.h5")]
+            if str(filepath[i]).endswith("_master.h5") else os.path.basename(str(filepath[i]))
+            for i in range(n_files) if i not in skipped_set
+        ]
+        meta["file_names"] = loaded_names
+        meta["n_files"] = n_loaded
         if verbose:
             t_multi = time.perf_counter() - t_multi_start
             size_gb = out.nbytes / 1e9 if out is not None else 0

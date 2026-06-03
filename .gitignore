@@ -200,7 +200,9 @@ widget/src/quantem/widget/static/
 # Track only src/, js/, tests/test_*.py for now.
 widget/.gitignore
 widget/docs/
-widget/notebooks/
+widget/notebooks/*
+!widget/notebooks/automation/
+!widget/notebooks/automation/**
 widget/scripts/
 !widget/scripts/build.mjs
 widget/tests/integration/
