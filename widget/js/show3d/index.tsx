@@ -991,9 +991,10 @@ function Show3D() {
   const themedSelect = {
     ...controlPanel.select,
     fontFamily: "inherit",
+    flexShrink: 0,  // never compress a dropdown below its width -> no truncated label
     bgcolor: themeColors.controlBg,
     color: themeColors.text,
-    "& .MuiSelect-select": { py: 0.5, fontFamily: "inherit" },
+    "& .MuiSelect-select": { py: 0.5, fontFamily: "inherit", textOverflow: "clip", overflow: "visible" },
     "& .MuiOutlinedInput-notchedOutline": { borderColor: themeColors.border },
     "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: themeColors.accent },
   };

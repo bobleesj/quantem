@@ -668,7 +668,9 @@ const clickableControlLabel = {
 } as const;
 
 const controlPanel = {
-  select: { minWidth: 90, fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
+  // flexShrink 0 + overflow visible so the view label ("Top"/"Side") is never
+  // compressed below its width and truncated to "S..." in a narrow column.
+  select: { minWidth: 96, flexShrink: 0, fontSize: 11, "& .MuiSelect-select": { py: 0.5, textOverflow: "clip", overflow: "visible" } },
 };
 
 const HTML_EXPORT_OVERHEAD_BYTES = 700_000;
@@ -3589,7 +3591,6 @@ function Show3DSlices() {
 
   // Thin-Z layout: depth axis much smaller than lateral. Show the top panel
   // beside the single oblique depth panel.
-  const thinZ = nz < Math.min(nx, ny) / 4;
   const panelTotalW = (canvasSizes[0]?.w ?? CANVAS_TARGET) + (canvasSizes[1]?.w ?? 0) + SPACING.SM;
   const primaryPanelW = canvasSizes[0]?.w ?? CANVAS_TARGET;
   const compactControlsW = Math.min(primaryPanelW, CANVAS_TARGET);
@@ -4269,12 +4270,8 @@ function Show3DSlices() {
               <Switch checked={smooth} onChange={(e) => setSmooth(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Toggle bilinear smoothing" }} />
             </Box>
             <Box sx={{ ...panelControlRow, width: compactControlsW, maxWidth: compactControlsW, flexWrap: "wrap" }}>
-              {thinZ && (
-                <>
-                  <Typography sx={{ ...controlLabel }} title="Depth-axis display height multiplier (1-50x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch</Typography>
-                  <LiveNumberSlider value={zStretch} min={1} max={50} step={0.5} onLiveChange={handleZStretchChange} onCommit={handleZStretchCommit} sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} ariaLabel="Depth axis display stretch multiplier" />
-                </>
-              )}
+              <Typography sx={{ ...controlLabel }} title="Depth-axis display height multiplier (1-50x). CSS-only stretch; data unchanged. Useful when nz << nxy (e.g. multislice ptycho).">Z stretch</Typography>
+              <LiveNumberSlider value={zStretch} min={1} max={50} step={0.5} onLiveChange={handleZStretchChange} onCommit={handleZStretchCommit} sx={{ ...sliderStyles.small, width: 80, mr: 1, "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" } }} ariaLabel="Depth axis display stretch multiplier" />
               <Typography sx={clickableControlLabel} title="Negate displayed values. Useful when phase sign is inverted." onClick={() => setFlip(!flip)}>Flip</Typography>
               <Switch checked={flip} onChange={(e) => setFlip(e.target.checked)} size="small" sx={switchStyles.small} inputProps={{ "aria-label": "Flip (negate) displayed values" }} />
               <Typography sx={{ ...controlLabel }} title="Log scale (signed log1p). Useful for high-dynamic-range volumes.">Log</Typography>
