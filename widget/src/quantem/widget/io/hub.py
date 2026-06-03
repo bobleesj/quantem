@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from pathlib import Path
 
 DEFAULT_REPO = "bobleesj/quantem-data"
@@ -33,6 +34,11 @@ def _resolve_repo(repo: str | None) -> str:
 
 def _hub():
     """Import huggingface_hub lazily with a clear install hint when missing."""
+    # Our datasets are PUBLIC - no token needed. Silence huggingface_hub's
+    # "HF_TOKEN secret does not exist" nudge (it fires on every download in Colab
+    # and confuses users into thinking auth is required).
+    os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+    warnings.filterwarnings("ignore", message=r".*HF_TOKEN.*")
     try:
         import huggingface_hub  # noqa: PLC0415
     except ImportError as exc:
