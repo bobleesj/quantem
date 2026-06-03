@@ -22,6 +22,7 @@ from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
 from quantem.widget.io import load
 from quantem.widget.dpc import dpc, center_of_mass
 from quantem.widget.info import device_info
+from quantem.widget.virtual import virtual
 
 
 def Show4DSTEM(data, **kwargs):
@@ -72,4 +73,4 @@ except PackageNotFoundError:
     # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
     __version__ = "0.0.0+local"
 
-__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "device_info"]
+__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "dpc", "center_of_mass", "device_info", "virtual"]
