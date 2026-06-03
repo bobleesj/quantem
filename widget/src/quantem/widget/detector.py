@@ -64,13 +64,24 @@ def auto_probe(mean_dp):
     return (cy, cx), radius
 
 
-def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
-    """Boolean ``(det_row, det_col)`` mask for a virtual-detector mode."""
+def detector_mask(center, lo_px, hi_px, det_shape) -> np.ndarray:
+    """THE virtual-detector geometry primitive: boolean ``(det_row, det_col)`` mask
+    of pixels whose distance from ``center`` (row, col) is in ``[lo_px, hi_px]``
+    detector pixels. Every detector everywhere - ``ds.bf/adf/df``, the standalone
+    ``virtual``, and the Show4DSTEM viewer's circle/annular ROIs - builds its mask
+    here, so a viewer ROI and ``ds.adf()`` are pixel-identical by construction."""
     cy, cx = center
-    r = float(max(1.0, bf_radius))
     rows = np.arange(det_shape[0], dtype=np.float32)[:, None]
     cols = np.arange(det_shape[1], dtype=np.float32)[None, :]
     dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
+    return (dist >= lo_px) & (dist <= hi_px)
+
+
+def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
+    """Mode-based mask (BF/ABF/ADF/HAADF/DF, bands in disk-radius units) for the
+    standalone :func:`virtual`. Resolves the band to pixel radii, then defers to
+    :func:`detector_mask` - the one geometry primitive."""
+    r = float(max(1.0, bf_radius))
     bands = {
         "BF": (0.0, r),
         "ABF": (0.5 * r, r),
@@ -82,7 +93,7 @@ def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
         lo, hi = (inner if inner is not None else 0.0) * r, (outer if outer is not None else np.inf) * r
     else:
         lo, hi = bands[mode]
-    return (dist >= lo) & (dist <= hi)
+    return detector_mask(center, lo, hi, det_shape)
 
 
 # --- virtual detectors: thin geometry over the shared compute backend ---
@@ -119,13 +130,9 @@ def _to_px(ds, value: float, unit: str, radius: float) -> float:
 
 def _detector_image(ds, center, lo_px: float, hi_px: float) -> np.ndarray:
     """Masked-sum image over the annulus ``lo_px .. hi_px`` detector pixels.
-    Stateless - builds the mask and runs the shared-backend masked-sum each call."""
-    cy, cx = center
-    mean_dp = ds.mean_dp()
-    rows = np.arange(mean_dp.shape[0], dtype=np.float32)[:, None]
-    cols = np.arange(mean_dp.shape[1], dtype=np.float32)[None, :]
-    dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
-    mask = (dist >= lo_px) & (dist <= hi_px)
+    Stateless - builds the mask via :func:`detector_mask` and runs the
+    shared-backend masked-sum each call."""
+    mask = detector_mask(center, lo_px, hi_px, ds.mean_dp().shape)
     return np.asarray(ds.masked_sum(mask), dtype=np.float32)
 
 

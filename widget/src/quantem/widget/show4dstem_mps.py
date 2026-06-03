@@ -14,6 +14,7 @@ import numpy as np
 import traitlets
 
 from quantem.widget.show4dstem import Show4DSTEM
+from quantem.widget.detector import detector_mask
 from quantem.widget.kernels.compute.mps import (
     ChunkedFrames,
     MetalVirtualImage,
@@ -267,17 +268,17 @@ class Show4DSTEMMPS(Show4DSTEM):
             # single detector pixel under the marker - the one pixel whose cell
             # contains (cx, cy). Without this the virtual image is empty in point mode.
             return (np.abs(cols - cx) < 0.5) & (np.abs(rows - cy) < 0.5)
+        # circle + annular ROIs are virtual detectors: build via the shared
+        # detector_mask primitive so a viewer ROI == ds.bf()/ds.adf() pixel-for-pixel.
         if self.roi_mode == "circle" and self.roi_radius > 0:
-            radius = float(self.roi_radius)
-            return (cols - cx) ** 2 + (rows - cy) ** 2 <= radius ** 2
+            return detector_mask((cy, cx), 0.0, float(self.roi_radius),
+                                 (self.det_rows, self.det_cols))
         if self.roi_mode == "square" and self.roi_radius > 0:
             half_size = float(self.roi_radius)
             return (np.abs(cols - cx) <= half_size) & (np.abs(rows - cy) <= half_size)
         if self.roi_mode == "annular" and self.roi_radius > 0:
-            inner = float(self.roi_radius_inner)
-            outer = float(self.roi_radius)
-            dist_sq = (cols - cx) ** 2 + (rows - cy) ** 2
-            return (dist_sq >= inner ** 2) & (dist_sq <= outer ** 2)
+            return detector_mask((cy, cx), float(self.roi_radius_inner),
+                                 float(self.roi_radius), (self.det_rows, self.det_cols))
         if self.roi_mode == "rect" and self.roi_width > 0 and self.roi_height > 0:
             half_width = float(self.roi_width) / 2.0
             half_height = float(self.roi_height) / 2.0
@@ -383,22 +384,17 @@ class Show4DSTEMMPS(Show4DSTEM):
         return None
 
     def _preset_mask_np(self, name: str) -> np.ndarray | None:
-        rows = self._det_row_coords_np
-        cols = self._det_col_coords_np
-        cx = float(self.center_col)
-        cy = float(self.center_row)
+        # Named-detector bands (in bright-disk-radius units) - the SAME bands as
+        # ds.bf()/ds.adf() (detector._detector_mask), built via the shared
+        # detector_mask primitive, so a viewer preset == the dataset detector.
         bf = float(max(1.0, self.bf_radius))
-        dist_sq = (cols - cx) ** 2 + (rows - cy) ** 2
-        preset = str(name).strip().lower()
-        if preset == "bf":
-            return dist_sq <= bf ** 2
-        if preset == "abf":
-            return (dist_sq >= (bf * 0.5) ** 2) & (dist_sq <= bf ** 2)
-        if preset == "adf":
-            return (dist_sq >= bf ** 2) & (dist_sq <= (bf * 2.0) ** 2)
-        if preset == "haadf":
-            return (dist_sq >= (bf * 2.0) ** 2) & (dist_sq <= (bf * 4.0) ** 2)
-        return None
+        bands = {"bf": (0.0, bf), "abf": (0.5 * bf, bf),
+                 "adf": (bf, 2.0 * bf), "haadf": (2.0 * bf, 4.0 * bf)}
+        band = bands.get(str(name).strip().lower())
+        if band is None:
+            return None
+        return detector_mask((float(self.center_row), float(self.center_col)),
+                             band[0], band[1], (self.det_rows, self.det_cols))
 
     def _cache_fast_presets(self):
         data = self._data
