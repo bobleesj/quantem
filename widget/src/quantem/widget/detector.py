@@ -5,20 +5,23 @@ collection angles in **mrad**::
 
     from quantem.widget import load, Dataset4dstemGPU, Show2D
     ds = Dataset4dstemGPU(load("master.h5"))
-    Show2D(ds.detector.bf())                       # bright field (the bright disk)
-    Show2D(ds.detector.adf())                       # annular dark field (auto band)
-    Show2D(ds.detector.adf(inner=50, outer=180))    # collection angles in mrad
-    Show2D(ds.detector.df())                        # outside the bright disk
+    Show2D(ds.bf())                       # bright field (the bright disk)
+    Show2D(ds.adf())                       # annular dark field (auto band)
+    Show2D(ds.adf(inner=50, outer=180))    # collection angles in mrad
+    Show2D(ds.df())                        # outside the bright disk
 
-The probe (disk center + size) auto-fits from the mean diffraction pattern;
-``semiangle_mrad`` (from the load metadata, or set on the accessor) calibrates
-mrad because the bright disk spans exactly the convergence semi-angle. MacBook
-(MPS) runs the raw-Metal masked-sum over chunked uint16 buffers; CUDA / CPU runs
-torch. **No binning** on either path.
+``ds.bf()`` / ``.adf()`` / ``.df()`` are thin geometry over the shared compute
+backend: they build a boolean detector mask and call the dataset's masked-sum -
+the single fast reduction in ``kernels/compute`` that Show4DSTEM and any GUI also
+use. The probe (disk center + size) auto-fits from the mean diffraction pattern;
+``semiangle_mrad`` (from the load metadata, or ``ds.semiangle_mrad = ...``)
+calibrates mrad because the bright disk spans exactly the convergence semi-angle.
+MacBook (MPS) runs the raw-Metal masked-sum over chunked uint16 buffers; CUDA /
+CPU runs torch. **No binning** on either path.
 
 The lower-level :func:`virtual` function (below) is mode-based
 (DP/BF/ABF/ADF/HAADF/DF, bands measured in the auto-detected disk radius) and is
-mainly the reference path the parity tests pin; ``ds.detector`` is the API to use.
+mainly the reference path the parity tests pin; ``ds.bf()`` etc. are the API.
 """
 from __future__ import annotations
 
@@ -82,128 +85,64 @@ def _detector_mask(mode, center, bf_radius, det_shape, inner, outer):
     return (dist >= lo) & (dist <= hi)
 
 
-class VirtualDetector:
-    """``ds.detector.bf()`` / ``.adf()`` / ``.df()`` - place a virtual detector,
-    get its (cached) image.
+# --- virtual detectors: thin geometry over the shared compute backend ---
+# bf/adf/df build a boolean detector mask, then call the dataset's masked-sum
+# (the single fast reduction in kernels/compute - the same one Show4DSTEM and any
+# GUI use). The dataset holds the probe (center/bf_radius/semiangle_mrad) and the
+# result cache; these functions are stateless and overridable.
 
-    bf / adf / df are virtual-detector geometries; each call integrates that
-    geometry over every scan position and returns the 2D image. Collection
-    angles are in **mrad** - the convergence semi-angle (``semiangle_mrad``,
-    read from the load metadata) calibrates the detector, because the bright
-    disk spans exactly that angle. The probe (disk center + size) auto-fits
-    once from the mean diffraction pattern. Every result is cached; a repeat
-    call is instant. Override the probe with ``.center`` / ``.bf_radius``.
 
-        ds.detector.bf()                       # bright field (the bright disk)
-        ds.detector.adf()                       # annular dark field, automatic band
-        ds.detector.adf(inner=50, outer=180)    # collection angles in mrad
-        ds.detector.df()                        # everything outside the bright disk
-        ds.detector.df(inner=40)                # dark field beyond 40 mrad
-    """
+def _mrad_to_px(ds, mrad: float) -> float:
+    """Collection angle in mrad -> detector pixel radius. The bright disk radius
+    spans ``semiangle_mrad``, so a mrad angle maps to
+    ``mrad / semiangle_mrad * bf_radius_px``."""
+    if not ds.semiangle_mrad:
+        raise ValueError(
+            "inner / outer are collection angles in mrad, but the convergence "
+            "semi-angle is unknown for this dataset. Set it explicitly:\n"
+            "    ds.semiangle_mrad = <convergence semi-angle in mrad>")
+    return float(mrad) / float(ds.semiangle_mrad) * ds.bf_radius
 
-    def __init__(self, data):
-        self._backend = _resolve_backend(data)
-        self._scan_shape = tuple(data.scan_shape) if getattr(data, "_qw_dataset", False) else None
-        # convergence semi-angle in mrad: the bright disk spans exactly this
-        # angle, so it converts every mrad collection angle to a detector pixel
-        # radius. From the load metadata; settable when the file lacks it.
-        self.semiangle_mrad = getattr(data, "semiangle_mrad", None)
-        self._mean_dp = None
-        self._center = None       # auto-fit lazily; user-set wins
-        self._bf_radius = None
-        self._cache = {}
 
-    def _mrad_to_px(self, mrad: float) -> float:
-        """Collection angle in mrad -> detector pixel radius. The bright disk
-        radius in pixels spans ``semiangle_mrad``, so a mrad angle maps to
-        ``mrad / semiangle_mrad * bf_radius_px``."""
-        if not self.semiangle_mrad:
-            raise ValueError(
-                "inner / outer are collection angles in mrad, but the convergence "
-                "semi-angle is unknown for this dataset. Set it explicitly:\n"
-                "    ds.detector.semiangle_mrad = <convergence semi-angle in mrad>")
-        _, bf_radius_px = self._probe()
-        return float(mrad) / float(self.semiangle_mrad) * bf_radius_px
+def _detector_image(ds, name: str, lo_px: float, hi_px: float) -> np.ndarray:
+    """Masked-sum image over the annulus ``lo_px .. hi_px`` detector pixels,
+    cached on the dataset. The masked-sum runs on the shared compute backend."""
+    cy, cx = ds.center
+    key = (name, round(cy, 3), round(cx, 3), round(float(lo_px), 3), round(float(hi_px), 3))
+    cached = ds._detector_cache.get(key)
+    if cached is not None:
+        return cached
+    mean_dp = ds.mean_dp()
+    rows = np.arange(mean_dp.shape[0], dtype=np.float32)[:, None]
+    cols = np.arange(mean_dp.shape[1], dtype=np.float32)[None, :]
+    dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
+    mask = (dist >= lo_px) & (dist <= hi_px)
+    img = np.asarray(ds.masked_sum(mask), dtype=np.float32)
+    ds._detector_cache[key] = img
+    return img
 
-    @property
-    def mean_dp(self) -> np.ndarray:
-        """Mean diffraction pattern (computed once)."""
-        if self._mean_dp is None:
-            self._mean_dp = np.asarray(self._backend.mean_dp(), dtype=np.float32)
-        return self._mean_dp
 
-    def _probe(self):
-        if self._center is None or self._bf_radius is None:
-            center, radius = auto_probe(self.mean_dp)
-            if self._center is None:
-                self._center = center
-            if self._bf_radius is None:
-                self._bf_radius = radius
-        return self._center, self._bf_radius
+def bf(ds) -> np.ndarray:
+    """Bright-field image of ``ds``: the bright disk (the unscattered probe)."""
+    return _detector_image(ds, "bf", 0.0, ds.bf_radius)
 
-    @property
-    def center(self):
-        """Bright-disk center ``(row, col)`` in detector pixels (auto-fit if unset)."""
-        return self._probe()[0]
 
-    @center.setter
-    def center(self, value):
-        self._center = None if value is None else (float(value[0]), float(value[1]))
-        self._cache.clear()
+def adf(ds, inner: float | None = None, outer: float | None = None) -> np.ndarray:
+    """Annular-dark-field image of ``ds``, collected between ``inner`` and
+    ``outer`` **mrad** (needs ``ds.semiangle_mrad``). Omit either for the
+    automatic band: ``inner`` = the bright-disk edge, ``outer`` = twice that."""
+    radius = ds.bf_radius
+    lo_px = radius if inner is None else _mrad_to_px(ds, inner)
+    hi_px = 2.0 * radius if outer is None else _mrad_to_px(ds, outer)
+    return _detector_image(ds, "adf", lo_px, hi_px)
 
-    @property
-    def bf_radius(self):
-        """Bright-disk radius in detector pixels (auto-fit if unset)."""
-        return self._probe()[1]
 
-    @bf_radius.setter
-    def bf_radius(self, value):
-        self._bf_radius = None if value is None else float(value)
-        self._cache.clear()
-
-    def _image(self, name, lo_px, hi_px):
-        """Masked-sum image over the annulus ``lo_px .. hi_px`` detector pixels."""
-        center, _ = self._probe()
-        key = (name, round(center[0], 3), round(center[1], 3),
-               round(float(lo_px), 3), round(float(hi_px), 3))
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        cy, cx = center
-        rows = np.arange(self.mean_dp.shape[0], dtype=np.float32)[:, None]
-        cols = np.arange(self.mean_dp.shape[1], dtype=np.float32)[None, :]
-        dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
-        mask = (dist >= lo_px) & (dist <= hi_px)
-        img = np.asarray(self._backend.masked_sum(mask), dtype=np.float32)
-        self._cache[key] = img
-        return img
-
-    def bf(self) -> np.ndarray:
-        """Bright-field image: the bright disk (the unscattered probe)."""
-        _, radius = self._probe()
-        return self._image("bf", 0.0, radius)
-
-    def adf(self, inner: float | None = None, outer: float | None = None) -> np.ndarray:
-        """Annular-dark-field image collected between ``inner`` and ``outer`` mrad.
-
-        ``inner`` / ``outer`` are collection angles in **mrad** (needs
-        ``semiangle_mrad``). Omit either for the automatic band: ``inner`` =
-        the bright-disk edge, ``outer`` = twice that.
-        """
-        _, radius = self._probe()
-        lo_px = radius if inner is None else self._mrad_to_px(inner)
-        hi_px = 2.0 * radius if outer is None else self._mrad_to_px(outer)
-        return self._image("adf", lo_px, hi_px)
-
-    def df(self, inner: float | None = None) -> np.ndarray:
-        """Dark-field image: everything collected beyond ``inner`` mrad.
-
-        ``inner`` is a collection angle in **mrad** (needs ``semiangle_mrad``).
-        Omit it for the automatic edge: everything outside the bright disk.
-        """
-        _, radius = self._probe()
-        lo_px = radius if inner is None else self._mrad_to_px(inner)
-        return self._image("df", lo_px, np.inf)
+def df(ds, inner: float | None = None) -> np.ndarray:
+    """Dark-field image of ``ds``: everything collected beyond ``inner`` **mrad**
+    (needs ``ds.semiangle_mrad``). Omit it for everything outside the bright disk."""
+    radius = ds.bf_radius
+    lo_px = radius if inner is None else _mrad_to_px(ds, inner)
+    return _detector_image(ds, "df", lo_px, np.inf)
 
 
 def virtual(data, mode="BF", *, center=None, bf_radius=None, inner=None, outer=None):

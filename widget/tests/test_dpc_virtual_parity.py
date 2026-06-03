@@ -62,9 +62,9 @@ def test_dataset_container_roundtrip(gold):
     from quantem.widget import Dataset4dstemGPU, virtual, dpc
     ds = Dataset4dstemGPU(gold)
     assert ds.shape == (512, 512, 48, 48)
-    # ds.detector.adf() defaults to the r..2r band == standalone virtual("ADF")
-    np.testing.assert_array_equal(ds.detector.adf(), virtual(gold, "ADF"))
+    # ds.adf() defaults to the r..2r band == standalone virtual("ADF")
+    np.testing.assert_array_equal(ds.adf(), virtual(gold, "ADF"))
     # second call is served from cache (same array object), not recomputed
-    assert ds.detector.bf() is ds.detector.bf()
+    assert ds.bf() is ds.bf()
     assert abs(ds.dpc(verbose=False).rotation_deg - dpc(gold, verbose=False).rotation_deg) < 1e-6
     assert ds.dpc(verbose=False) is ds.dpc(verbose=False)  # dpc cached
