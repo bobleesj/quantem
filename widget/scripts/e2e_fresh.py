@@ -55,6 +55,16 @@ def main():
     # the public surface is exactly the unified API (no legacy name)
     assert not hasattr(w, "load_4dstem_macbook"), "legacy load_4dstem_macbook still exported"
 
+    # every other shipped widget constructs from the same clean install (synthetic
+    # data — this is a packaging/import smoke, not a render check).
+    import numpy as np
+    from quantem.widget import Show2D, Show3D, Show3DSlices
+    s2 = Show2D(np.random.rand(64, 64), verbose=False)
+    s3 = Show3D(np.random.rand(8, 64, 64))
+    s3s = Show3DSlices(np.random.rand(8, 64, 64))
+    print(f"widgets: Show2D={type(s2).__name__} Show3D={type(s3).__name__} "
+          f"Show3DSlices={type(s3s).__name__}")
+
     print("ALL PASS")
 
 
