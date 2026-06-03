@@ -1,4 +1,19 @@
+import os as _os
+import warnings as _warnings
 from importlib.metadata import PackageNotFoundError, version
+
+# Silence two noisy-but-harmless warnings at import, BEFORE anything imports cupy
+# or huggingface_hub (the (?s) flag is required - both messages start with a
+# newline, so a plain `.*` would not match):
+#   - cupy "multiple CuPy packages" (cuda12x + cuda13x): on a host/Colab runtime
+#     that already shipped a cupy, ours is redundant; we no longer pin one, but a
+#     runtime contaminated by an older release can still have two. The check is
+#     advisory; the working cupy still loads.
+#   - huggingface_hub "HF_TOKEN secret does not exist": our datasets are PUBLIC,
+#     no token needed. The nudge wrongly implies auth is required.
+_os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+_warnings.filterwarnings("ignore", message=r"(?s).*multiple CuPy packages.*")
+_warnings.filterwarnings("ignore", message=r"(?s).*HF_TOKEN.*")
 
 from quantem.widget.show2d import Show2D
 from quantem.widget.show3d import Show3D

@@ -38,7 +38,7 @@ def _hub():
     # "HF_TOKEN secret does not exist" nudge (it fires on every download in Colab
     # and confuses users into thinking auth is required).
     os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    warnings.filterwarnings("ignore", message=r".*HF_TOKEN.*")
+    warnings.filterwarnings("ignore", message=r"(?s).*HF_TOKEN.*")
     try:
         import huggingface_hub  # noqa: PLC0415
     except ImportError as exc:
