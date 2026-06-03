@@ -17,7 +17,12 @@ dependencies = [
     "matplotlib>=3.7.0",
     "Pillow>=10.0.0",
     "numba>=0.60",
+    # Backend deps so `pip install quantem.widget` is ONE line, backend auto-detected,
+    # no user GPU-toolkit awareness: Apple Metal on macOS, cupy CUDA on Linux. The Linux
+    # cupy wheel bundles its own CUDA runtime (cuda13x = the Blackwell/CUDA-13 fleet),
+    # so it works against any sufficiently recent NVIDIA driver without a system toolkit.
     "pyobjc-framework-Metal>=10.0 ; sys_platform == 'darwin'",
+    "cupy-cuda13x>=13.0 ; sys_platform == 'linux'",
 ]
 
 [tool.hatch.build.targets.wheel]
