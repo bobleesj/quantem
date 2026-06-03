@@ -16,12 +16,13 @@ pytest.importorskip("hdf5plugin")
 import lz4.block as _lz4
 
 
-def _inverse_bitshuffle_block(planes, block_elems):
+def _inverse_bitshuffle_block(planes, block_elems, nbits=8):
+    # nbits=8: packer encodes uint8 (8 bit-planes). plane byte = blockElems/8.
     plane_bytes = block_elems // 8
     out = np.zeros(block_elems, dtype=np.uint16)
     for e in range(block_elems):
         v = 0
-        for bit in range(16):
+        for bit in range(nbits):
             v |= ((int(planes[bit * plane_bytes + (e >> 3)]) >> (e & 7)) & 1) << bit
         out[e] = v
     return out
@@ -44,7 +45,7 @@ def test_bslz4_offline_chunked_roundtrip(tmp_path):
             gf = c["startScan"] + lf
             for b in range(nb):
                 coff, clen = int(bm[(lf * nb + b) * 2]), int(bm[(lf * nb + b) * 2 + 1])
-                planes = np.frombuffer(_lz4.decompress(bytes(raw[coff:coff + clen]), uncompressed_size=be * 2), np.uint8)
+                planes = np.frombuffer(_lz4.decompress(bytes(raw[coff:coff + clen]), uncompressed_size=be), np.uint8)  # uint8: be bytes/block
                 decoded[gf, b * be:(b + 1) * be] = _inverse_bitshuffle_block(planes, be)
     expected = np.clip(data.reshape(64, -1), 0, 255).astype(np.uint16)
     np.testing.assert_array_equal(np.clip(decoded, 0, 255), expected)  # GPU-decoder contract: bit-exact uint8

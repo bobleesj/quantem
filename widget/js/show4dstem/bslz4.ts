@@ -101,6 +101,33 @@ fn clip8(v:u32)->u32{return select(v,255u,v>255u);}
   stack[o+1u]=clip8(v4)|(clip8(v5)<<8u)|(clip8(v6)<<16u)|(clip8(v7)<<24u);
 }`;
 
+// Pass2 (uint8 SOURCE): companion encoded from uint8 (typesize 1) -> only 8 bit
+// planes, and the LZ4 block is half the bytes -> ~2x faster than the uint16-source
+// path, BOTH passes. Output is uint8-packed directly (values already <= 255).
+const PASS2_U8SRC_WGSL = `
+@group(0) @binding(0) var<storage,read> inter: array<u32>;
+@group(0) @binding(1) var<storage,read_write> stack: array<u32>;  // uint8-packed (4/u32)
+@group(0) @binding(2) var<uniform> cfg: vec4<u32>;  // nGroups, strideX, blockElems, planeBytes
+fn byteAt(o:u32)->u32{return (inter[o>>2u]>>((o&3u)*8u))&0xffu;}
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid: vec3<u32>){
+  let grp=gid.y*cfg.y + gid.x; if(grp>=cfg.x){return;}
+  let blockElems=cfg.z; let planeBytes=cfg.w; let blockBytes=blockElems;   // uint8: 1 byte/elem
+  let nBlk=__NBLK__; let framePix=__FRAMEPIX__;
+  let e0=grp*8u; let frm=e0/framePix; let inFrame=e0%framePix;
+  let blk=inFrame/blockElems; let groupByte=(inFrame%blockElems)>>3u;
+  let pb=(frm*nBlk+blk)*blockBytes + groupByte;
+  var v0:u32=0u; var v1:u32=0u; var v2:u32=0u; var v3:u32=0u; var v4:u32=0u; var v5:u32=0u; var v6:u32=0u; var v7:u32=0u;
+  for(var b:u32=0u;b<8u;b=b+1u){
+    let byte=byteAt(pb+b*planeBytes); let bit=1u<<b;
+    if((byte&1u)!=0u){v0=v0|bit;} if((byte&2u)!=0u){v1=v1|bit;}
+    if((byte&4u)!=0u){v2=v2|bit;} if((byte&8u)!=0u){v3=v3|bit;}
+    if((byte&16u)!=0u){v4=v4|bit;} if((byte&32u)!=0u){v5=v5|bit;}
+    if((byte&64u)!=0u){v6=v6|bit;} if((byte&128u)!=0u){v7=v7|bit;}
+  }
+  let o=grp*2u;
+  stack[o]=v0|(v1<<8u)|(v2<<16u)|(v3<<24u); stack[o+1u]=v4|(v5<<8u)|(v6<<16u)|(v7<<24u);
+}`;
+
 const MAX_WG = 65535;
 
 export interface Bslz4Spec {
@@ -116,15 +143,16 @@ export interface Bslz4Spec {
 // (clip 0-255, 4 px/u32, offline default - half the memory) or "uint16" (lossless,
 // 2 px/u32). Layout matches Show4DSTEMCompute.sample() for that mode exactly.
 // Returns null if WebGPU is unavailable. Throws (validation) only on misuse.
-export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8"): Promise<{ device: GPUDevice; buffer: GPUBuffer; mode: number } | null> {
+export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" = "uint16"): Promise<{ device: GPUDevice; buffer: GPUBuffer; mode: number } | null> {
   const device = await getGPUDevice();
   if (!device) return null;
   const { compressed, blockMeta, nFrames, nBlocksPerFrame, blockElems, detSize } = spec;
-  const blockBytes = blockElems * 2;            // bitshuffled uint16 planes
+  const srcBytes = srcDtype === "uint8" ? 1 : 2;   // companion encoded from uint8 (8 planes) or uint16 (16)
+  const blockBytes = blockElems * srcBytes;        // bitshuffled block bytes
   const planeBytes = blockElems / 8;
   const totalBlocks = nFrames * nBlocksPerFrame;
   const totalElems = nFrames * detSize;
-  const u8 = dtype === "uint8";
+  const u8 = dtype === "uint8" || srcDtype === "uint8";   // uint8 source always outputs uint8
   const stackWords = u8 ? Math.ceil(totalElems / 4) : totalElems / 2;  // packed output u32 count
   const interBytes = totalBlocks * blockBytes;
 
@@ -144,7 +172,9 @@ export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint
   const p2wg = Math.ceil(nGroups / 64), gx = Math.min(p2wg, MAX_WG), gy = Math.ceil(p2wg / MAX_WG);
   const cfg2 = uniform(device, [nGroups, gx * 64, blockElems, planeBytes]);
 
-  const pass2 = (u8 ? PASS2_U8_WGSL : PASS2_WGSL).replace("__NBLK__", `${nBlocksPerFrame}u`).replace("__FRAMEPIX__", `${detSize}u`);
+  // uint8 source -> 8-plane fast path (output uint8); else uint16 source -> uint8(clip) or uint16.
+  const pass2tpl = srcDtype === "uint8" ? PASS2_U8SRC_WGSL : (u8 ? PASS2_U8_WGSL : PASS2_WGSL);
+  const pass2 = pass2tpl.replace("__NBLK__", `${nBlocksPerFrame}u`).replace("__FRAMEPIX__", `${detSize}u`);
   const p1 = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: PASS1_WGSL }), entryPoint: "main" } });
   const p2 = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: pass2 }), entryPoint: "main" } });
   const bg1 = device.createBindGroup({ layout: p1.getBindGroupLayout(0), entries: [

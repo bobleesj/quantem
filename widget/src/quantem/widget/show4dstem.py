@@ -821,19 +821,23 @@ class Show4DSTEM(anywidget.AnyWidget):
         scan_cols = self.shape_cols
         block_elems = next((b for b in (1024, 512, 256) if det_size % b == 0), det_size)
         n_blocks = det_size // block_elems
-        # Auto-detect hot/dead pixels (saturated or robust-outlier) -> filtered on the
-        # GPU, matching CUDA apply_mask, so no saturated pixel dominates the VI/DP.
+        # Auto-detect dead/hot pixels = SATURATED only (max hits the dtype ceiling),
+        # matching the HDF5 pixel_mask / CUDA apply_mask. NOT a mean-outlier test -
+        # that wrongly flags the bright BF disk (real signal) as "outliers".
         flat = data.reshape(n_frames, -1)
-        col_max = flat.max(axis=0); col_mean = flat.mean(axis=0, dtype=np.float64)
-        med = np.median(col_mean); mad = np.median(np.abs(col_mean - med)) + 1e-9
-        bad = np.where((col_max >= 65535) | (col_mean > med + 50.0 * mad))[0]
+        sat = 65535 if flat.dtype == np.uint16 else 255
+        bad = np.where(flat.max(axis=0) >= sat)[0]
         self._offline_bad_px = json.dumps(bad.astype(int).tolist())
         if getattr(self, "_verbose", True) and len(bad):
             print(f"  offline auto-filter: {len(bad)} hot/dead px masked")
         # Encode once via HDF5 bitshuffle-lz4 (C, fast), then read native chunks back.
         tmp_h5 = tempfile.mktemp(suffix=".h5")
         with h5py.File(tmp_h5, "w") as hf:
-            hf.create_dataset("d", data=data.astype(np.uint16), chunks=(1, self.det_rows, self.det_cols),
+            # Encode UINT8 (clip 0-255): the offline display is uint8 anyway, and an
+            # 8-bit-plane companion decodes ~2x faster on the GPU than uint16 (16
+            # planes) at the SAME size (uint16's all-zero high byte was free). Dead
+            # px are auto-filtered; real counts <=255 -> near-lossless for signal.
+            hf.create_dataset("d", data=np.clip(data, 0, 255).astype(np.uint8), chunks=(1, self.det_rows, self.det_cols),
                               **hdf5plugin.Bitshuffle(nelems=block_elems, cname="lz4"))
         out = pathlib.Path(data_url); out.mkdir(parents=True, exist_ok=True)
         # scan-row chunks so each decoded uint8 buffer stays <= ~0.95 GB (1 GB cap).
@@ -866,7 +870,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         (out / "index.json").write_text(json.dumps({"chunks": index, "nFrames": n_frames}))
         self.offline = True
         self._offline_url = ""
-        self._offline_bslz4 = json.dumps({"base": out.name + "/", "chunks": index, "nFrames": n_frames})
+        self._offline_bslz4 = json.dumps({"base": out.name + "/", "chunks": index, "nFrames": n_frames, "srcDtype": "uint8"})
         if getattr(self, "_verbose", True):
             ratio = (n_frames * det_size * 2) / max(1, total)
             print(f"  offline bslz4 (chunked): {out}/ {total/1e6:.0f} MB "

@@ -1244,6 +1244,7 @@ function Show4DSTEM() {
         // decompress on the GPU into a uint8 stack. The meta JSON is single
         // (chunked: {base, chunks}), or multi-volume ({volumes:[{base,chunks,badPx}]}).
         const m = JSON.parse(bslz4Meta) as any;
+        const srcDtype = (m.srcDtype === "uint8" ? "uint8" : "uint16") as "uint8" | "uint16";  // 8-plane fast path if uint8-encoded
         const fetchU8 = async (u: string) => new Uint8Array(await (await fetch(u)).arrayBuffer());
         const fetchU32 = async (u: string) => new Uint32Array(await (await fetch(u)).arrayBuffer());
         const decodeVol = async (v: any) => {
@@ -1251,7 +1252,7 @@ function Show4DSTEM() {
           for (const c of v.chunks) specs.push({ compressed: await fetchU8(v.base + c.bin), blockMeta: await fetchU32(v.base + c.meta),
             nFrames: c.nScan, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems,
             detSize: detR * detC, startScan: c.startScan, nScan: c.nScan });
-          const cc = await Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+          const cc = await Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8", srcDtype);
           if (cc && v.badPx) cc.badPx = new Uint32Array(v.badPx);
           return cc;
         };

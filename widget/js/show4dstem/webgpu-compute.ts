@@ -124,8 +124,8 @@ export class Show4DSTEMCompute {
   // 0-255, half memory) or "uint16" (lossless). The decoded buffer is packed in
   // [scanPos][detPixel] order matching sample() for that mode, so masked_sum /
   // reduceFrames run on it unchanged.
-  static async createFromBslz4(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8"): Promise<Show4DSTEMCompute | null> {
-    const decoded = await decodeBslz4ToStack(spec, dtype);
+  static async createFromBslz4(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" = "uint16"): Promise<Show4DSTEMCompute | null> {
+    const decoded = await decodeBslz4ToStack(spec, dtype, srcDtype);
     if (!decoded) return null;
     const chunks: Chunk[] = [{ buffer: decoded.buffer, startScan: 0, nScan: spec.nFrames }];
     return new Show4DSTEMCompute(decoded.device, chunks, spec.nFrames, spec.detSize, decoded.mode);
@@ -138,12 +138,13 @@ export class Show4DSTEMCompute {
   static async createFromBslz4Chunked(
     chunkSpecs: (Bslz4Spec & { startScan: number; nScan: number })[],
     scanCount: number, detSize: number, dtype: "uint8" | "uint16" = "uint8",
+    srcDtype: "uint8" | "uint16" = "uint16",
   ): Promise<Show4DSTEMCompute | null> {
     let device: GPUDevice | null = null;
     let mode = dtype === "uint8" ? 1 : 0;
     const chunks: Chunk[] = [];
     for (const spec of chunkSpecs) {
-      const decoded = await decodeBslz4ToStack(spec, dtype);
+      const decoded = await decodeBslz4ToStack(spec, dtype, srcDtype);
       if (!decoded) return null;
       device = decoded.device; mode = decoded.mode;
       chunks.push({ buffer: decoded.buffer, startScan: spec.startScan, nScan: spec.nScan });
