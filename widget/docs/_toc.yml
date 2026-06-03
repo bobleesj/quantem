@@ -25,3 +25,4 @@ parts:
   - caption: Performance
     chapters:
       - file: perf/index
+      - file: perf/offline-embedding
