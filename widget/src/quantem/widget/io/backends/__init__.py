@@ -20,8 +20,21 @@ imported lazily by ``load()`` once a backend is resolved.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 
 _VALID = ("cuda", "mps", "cpu")
+
+
+def _nvidia_gpu_present() -> bool:
+    """True on a Linux box with an NVIDIA GPU, regardless of whether cupy imports.
+
+    Import-light (a device-node stat, no torch/cupy), so detection can tell a
+    real CUDA box apart from a GPU-less one even when cupy is missing — that
+    distinction is what lets us REFUSE a silent CPU fallback on a CUDA box.
+    """
+    return sys.platform.startswith("linux") and os.path.exists("/dev/nvidia0")
 
 
 # Hardware detection lives in quantem.widget.kernels (single source of truth).
@@ -34,12 +47,21 @@ from quantem.widget.kernels import _has_cuda, _has_mps  # noqa: E402
 def detect_backend() -> str:
     """Pick the best available backend. Order: cuda > mps > cpu.
 
-    Unlike ``kernels.detect()`` (which errors when no GPU is found — GPU-only by
-    design), this keeps a cpu fallback for the parity-test / no-GPU path. cpu is
-    always valid (h5py + hdf5plugin are core deps), so this never fails.
+    A CUDA box NEVER silently decodes on CPU: if an NVIDIA GPU is present but
+    cupy is missing/broken, raise with the install fix instead of falling back to
+    the ~20x-slower CPU path (the user would never want CPU on a GPU box). cpu is
+    only ever chosen on a genuinely GPU-less machine.
     """
     if _has_cuda():
         return "cuda"
+    if _nvidia_gpu_present():
+        raise RuntimeError(
+            "NVIDIA GPU detected but the cupy CUDA backend is unavailable, so "
+            "load() would fall back to slow CPU decode — refusing. Install cupy:\n"
+            "  conda: mamba install -c conda-forge cupy\n"
+            "  pip:   pip install cupy-cuda13x   (or cupy-cuda12x for CUDA 12)\n"
+            "Then retry. To force CPU anyway, pass backend='cpu' explicitly."
+        )
     if _has_mps():
         return "mps"
     return "cpu"

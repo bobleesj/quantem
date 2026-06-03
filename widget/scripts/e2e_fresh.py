@@ -29,6 +29,13 @@ def main():
     from quantem.widget.io import detect_backend
     backend = detect_backend()
     print(f"backend: {backend}")
+    # A CUDA box must NEVER decode on CPU. If an NVIDIA GPU is present, the chosen
+    # backend has to be cuda (cupy installed) — a cpu pick here is a broken install.
+    if os.path.exists("/dev/nvidia0") and sys.platform.startswith("linux"):
+        assert backend == "cuda", (
+            f"NVIDIA GPU present but backend={backend!r} — cupy missing, the CUDA "
+            f"decode path is not active. Install cupy from conda-forge."
+        )
 
     masters = sorted(glob.glob(f"{DATA}/*master.h5"))
     assert masters, f"no masters under {DATA}"
