@@ -64,3 +64,39 @@ software thread-tuning is done. Cold read speed now is a **hardware + architectu
 faster/striped drives (Gen5 nvme0 is idle), GPUDirect Storage for CPU-free NVMe→VRAM, and
 stream-overlap so the read hides behind GPU compute. The last one is the path to "disk as a
 memory tier for reconstruction."
+
+## Exploration: is the read strategy optimal? (2026-06-03, exhaustive sweep)
+
+Swept every software knob on the WD Gen4 to confirm the loader's read can't be tuned faster.
+Single 7 GB master + 5-dataset (30 GB) workload, cold (DONTNEED evict), raw-byte reads.
+
+Single master (7 GB):
+| axis | result |
+|---|---|
+| block size 256 KB → 64 MB | flat 5.6-5.8 GB/s — irrelevant (64 MB slightly worse) |
+| threads 4 / 8 / 12 / **16** / 24 / 32 | 5.52 / 5.79 / 5.81 / **5.96** / 5.71 / 5.62 — 16 is the sweet spot |
+| readahead fadvise SEQ+WILLNEED | +6% (5.81 vs 5.49 off) — keep it |
+| O_DIRECT | 6.05 vs 5.82 buffered (~4% cold) BUT kills warm cache |
+| **warm (page cache)** | **36 GB/s — 6× cold** |
+
+5 datasets (30 GB, 135 files), cold:
+| strategy | GB/s |
+|---|---|
+| A sequential per-dataset, 16 thr | 5.97 |
+| **B unified pool, 16 thr, buffered** | **6.00** (best) |
+| B 24 / 32 thr | 5.83 / 5.41 (thread overhead) |
+| C O_DIRECT 16 / 24 thr | 5.67 / 5.43 (worse at 30 GB scale) |
+
+**Verdict: cold single-Gen4-drive read is saturated at ~6 GB/s. No software knob moves it** —
+block size, thread count beyond 16, O_DIRECT, read pattern all flat or worse. The loader's
+12-16-thread buffered+fadvise approach is already optimal. Read-loop tuning is DONE.
+
+Best config for reading N Arina datasets on one drive: **unified thread pool over ALL files,
+16 threads, buffered, posix_fadvise(SEQUENTIAL|WILLNEED), 4 MB blocks.**
+
+The only ways past ~6 GB/s (all already filed):
+- **warm/RAM cache = 36 GB/s (6×)** for RE-reads → pin hot datasets in page cache (#760 family);
+  iterative time-series on the same datasets is warm after first touch — essentially free 6×.
+- **Gen5 drive #761** (~14, 2×) · **multi-disc→multi-GPU #762** (N×) · **overlap read w/ compute #760**.
+- **io_uring** (no python binding in env): same queue depth with 1-2 threads, lower CPU — a
+  CPU-efficiency win, NOT a raw-BW win (drive is the wall). Future, needs a C binding.
