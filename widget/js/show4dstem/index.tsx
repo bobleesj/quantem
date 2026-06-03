@@ -1230,9 +1230,15 @@ function Show4DSTEM() {
       const gunzip = async (b: Uint8Array) => new Uint8Array(await new Response(new Blob([b as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
       let compute: Show4DSTEMCompute | null;
       let cpuStack: Uint8Array | null = null;  // full decompressed stack for the per-frame probe (single-chunk only)
-      // Multi-VOLUME (5D): several datasets each decoded into VRAM (binned so they
-      // all fit), kept resident -> the frame slider switches between them instantly.
-      let computes: Show4DSTEMCompute[] = [];
+      // Multi-VOLUME (5D): several datasets, decoded LAZILY (decode-on-scrub) with a
+      // small LRU of resident volumes. Only the viewed dataset (plus a few recent)
+      // lives in VRAM, so it runs on a laptop regardless of how many h5 files - and
+      // first paint is one decode, not N. The frame slider picks the active dataset.
+      let computes: Show4DSTEMCompute[] = [];   // resident set for single / non-lazy paths
+      let volMetas: any[] = [];                  // multi-volume descriptors (lazy)
+      const volCache = new Map<number, Show4DSTEMCompute>();   // LRU: idx -> decoded volume
+      const MAX_RESIDENT = 3;                    // recent volumes kept hot for instant back-scrub
+      let getVol: ((idx: number) => Promise<Show4DSTEMCompute | null>) | null = null;
       if (bslz4Meta) {
         // bslz4 mode: ship native HDF5 bitshuffle+LZ4 bytes (~6x smaller than uint16),
         // decompress on the GPU into a uint8 stack. The meta JSON is single
@@ -1240,29 +1246,39 @@ function Show4DSTEM() {
         const m = JSON.parse(bslz4Meta) as any;
         const fetchU8 = async (u: string) => new Uint8Array(await (await fetch(u)).arrayBuffer());
         const fetchU32 = async (u: string) => new Uint32Array(await (await fetch(u)).arrayBuffer());
-        const decodeVol = async (base: string, chunks: any[]) => {
+        const decodeVol = async (v: any) => {
           const specs = [];
-          for (const c of chunks) specs.push({ compressed: await fetchU8(base + c.bin), blockMeta: await fetchU32(base + c.meta),
+          for (const c of v.chunks) specs.push({ compressed: await fetchU8(v.base + c.bin), blockMeta: await fetchU32(v.base + c.meta),
             nFrames: c.nScan, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems,
             detSize: detR * detC, startScan: c.startScan, nScan: c.nScan });
-          return Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+          const cc = await Show4DSTEMCompute.createFromBslz4Chunked(specs, scanRows * scanCols, detR * detC, "uint8");
+          if (cc && v.badPx) cc.badPx = new Uint32Array(v.badPx);
+          return cc;
         };
         if (Array.isArray(m.volumes)) {
-          for (const v of m.volumes) {
-            const c = await decodeVol(v.base, v.chunks);
-            if (c && v.badPx) c.badPx = new Uint32Array(v.badPx);
-            if (c) computes.push(c);
-          }
+          volMetas = m.volumes;
+          getVol = async (idx: number) => {
+            if (volCache.has(idx)) return volCache.get(idx)!;
+            const cc = await decodeVol(volMetas[idx]);
+            if (cc) {
+              volCache.set(idx, cc);
+              while (volCache.size > MAX_RESIDENT) {           // evict the oldest non-active volume
+                const old = [...volCache.keys()].find((k) => k !== idx);
+                if (old === undefined) break;
+                volCache.get(old)!.dispose(); volCache.delete(old);
+              }
+            }
+            return cc;
+          };
+          compute = await getVol(Math.max(0, Math.min(volMetas.length - 1, model.get("frame_idx") | 0)));
         } else if (Array.isArray(m.chunks)) {
-          const c = await decodeVol(m.base, m.chunks);
-          if (c) computes.push(c);
+          const c = await decodeVol(m); if (c) computes.push(c); compute = c;
         } else {
           const raw = await fetchU8(offlineUrl!);
-          const c = await Show4DSTEMCompute.createFromBslz4({ compressed: raw, blockMeta: new Uint32Array(m.blockMeta),
+          compute = await Show4DSTEMCompute.createFromBslz4({ compressed: raw, blockMeta: new Uint32Array(m.blockMeta),
             nFrames: m.nFrames, nBlocksPerFrame: m.nBlocksPerFrame, blockElems: m.blockElems, detSize: detR * detC }, "uint8");
-          if (c) computes.push(c);
+          if (compute) computes.push(compute);
         }
-        compute = computes[0] ?? null;
       } else if (chunksMeta && offlineUrl) {
         // Chunked companion: one gzip blob with N chunks; stream each into its own
         // GPU buffer (handles stacks far bigger than one buffer / one ArrayBuffer).
@@ -1321,14 +1337,18 @@ function Show4DSTEM() {
       const onVI = () => { void recomputeVI(); };
       const onDP = () => { void recomputeDP(); };
       const onPos = () => { void recomputeFrame(); };
-      // 5D multi-volume: the frame slider picks which resident dataset is active.
-      const onFrame = () => {
-        if (computes.length <= 1) return;
-        const v = Math.max(0, Math.min(computes.length - 1, model.get("frame_idx") | 0));
-        compute = computes[v];
+      // 5D multi-volume: the slider picks the active dataset; decode-on-scrub (LRU).
+      let frameGen = 0;
+      const onFrame = async () => {
+        if (!getVol) return;
+        const v = Math.max(0, Math.min(volMetas.length - 1, model.get("frame_idx") | 0));
+        const gen = ++frameGen;                  // ignore a stale decode if the user keeps scrubbing
+        const cc = await getVol(v);
+        if (gen !== frameGen || !cc) return;      // a newer scroll superseded this one
+        compute = cc;
         void recomputeVI(); void recomputeDP(); void recomputeFrame();
       };
-      if (computes.length > 1) model.on("change:frame_idx", onFrame);
+      if (getVol) model.on("change:frame_idx", onFrame);
       void recomputeFrame();  // initial DP at mount (so the panel isn't blank)
       // BF/ABF/ADF/HAADF presets normally route through the Python kernel
       // (_preset_request -> apply_preset). With no kernel we translate them into
@@ -1380,7 +1400,8 @@ function Show4DSTEM() {
         model.off("change:pos_row", onPos);
         model.off("change:pos_col", onPos);
         model.off("change:frame_idx", onFrame);
-        computes.forEach((c) => c.dispose());   // free EVERY resident volume's VRAM
+        computes.forEach((c) => c.dispose());          // single / non-lazy resident set
+        volCache.forEach((c) => c.dispose()); volCache.clear();  // every cached lazy volume
       };
       await recomputeVI();  // initial virtual image, no interaction needed
     })();
