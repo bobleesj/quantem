@@ -12,7 +12,7 @@
 //
 // Stack ships as uint8 (clip(0,255): real detector counts are 0-~200, so the
 // value IS the count, near-lossless) or uint16; dtype inferred from byte length.
-import { getGPUDevice } from "./fft";
+import { getGPUDevice } from "./device";
 import { decodeBslz4ToStack, type Bslz4Spec } from "./bslz4";
 
 // `mode`: 0 = uint16 (2 samples/u32), 1 = uint8 (4/u32). `sample(gp)` reads a

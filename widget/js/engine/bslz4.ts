@@ -15,7 +15,7 @@
 //   block decompresses to blockElemBytes = blockElems * elemBytes, holds
 //   nbits = elemBytes*8 bit-planes of planeBytes = blockElems/8 each.
 
-import { getGPUDevice } from "./fft";
+import { getGPUDevice } from "./device";
 
 // Pass1: one thread per block, LZ4-decode into the `inter` (bitshuffled) buffer.
 // Blocks are independent -> embarrassingly parallel. Byte-addressed RMW because

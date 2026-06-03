@@ -21,7 +21,7 @@ import JSZip from "jszip";
 import { useTheme } from "./theme";
 import { COLORMAPS, applyColormap, renderToOffscreen } from "./colormaps";
 import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "./fft";
-import { Show4DSTEMCompute } from "./webgpu-compute";
+import { Show4DSTEMCompute } from "../engine/compute";
 import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "./figure";
 import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "./stats";
 import { downloadBlob, formatNumber, downloadDataView } from "./format";

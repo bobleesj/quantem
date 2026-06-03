@@ -1,4 +1,5 @@
 /// <reference types="@webgpu/types" />
+import { getGPUDevice, getGPUInfo, onGPULost } from "../engine/device";
 
 /**
  * WebGPU FFT — shared 2D FFT with GPU acceleration and CPU fallback.
@@ -438,50 +439,12 @@ export function autoEnhanceFFT(
 // Singleton
 // ============================================================================
 
+// The GPU device is owned by the shared engine (one source). Re-export here so
+// existing widget importers (`from "./fft"`) keep working; drop the FFT cache on
+// device loss via the engine's onGPULost hook.
 let gpuFFT: WebGPUFFT | null = null;
-let gpuDevice: GPUDevice | null = null;
-let gpuInfo = "GPU";
-
-export async function getGPUDevice(): Promise<GPUDevice | null> {
-  if (gpuDevice) return gpuDevice;
-  if (!navigator.gpu) return null;
-  try {
-    // Prefer discrete GPU on hybrid systems (NVIDIA Optimus / AMD hybrid).
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) return null;
-    try {
-      // @ts-ignore - requestAdapterInfo is not yet in all type definitions
-      const info = await adapter.requestAdapterInfo?.();
-      if (info) {
-        gpuInfo = info.description || `${info.vendor} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
-      }
-    } catch (_e) { /* adapter info not available */ }
-    const requiredLimits: Record<string, number> = {};
-    const maxBufferSize = adapter.limits.maxBufferSize || 0;
-    const maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize || 0;
-    if (maxBufferSize > 0) {
-      requiredLimits.maxBufferSize = maxBufferSize;
-    }
-    if (maxStorageBufferBindingSize > 0) {
-      requiredLimits.maxStorageBufferBindingSize = maxStorageBufferBindingSize;
-    }
-    // Raise the texture-dimension cap to the adapter's max. The DEVICE default is
-    // 8192 even when the adapter supports more (16384 on Apple/Metal), and that
-    // default applies to OffscreenCanvas swapchain textures. A multi-panel stack
-    // wider than 8192 (e.g. 9 panels x 1024 = 9216) then fails swapchain-texture
-    // creation, which silently invalidates the whole command submit -> black
-    // canvas + unwritten rgba buffer. Requesting the adapter max keeps the GPU
-    // colormap path valid for wide concatenated panels. (D6/D7, verified phil.)
-    const maxTextureDimension2D = adapter.limits.maxTextureDimension2D || 0;
-    if (maxTextureDimension2D > 0) {
-      requiredLimits.maxTextureDimension2D = maxTextureDimension2D;
-    }
-    gpuDevice = await adapter.requestDevice({ requiredFeatures: [], requiredLimits });
-    // Re-acquire if GPU process crashes (Linux NVIDIA hiccups, Electron tab suspend).
-    gpuDevice.lost.then(() => { gpuDevice = null; gpuFFT = null; });
-    return gpuDevice;
-  } catch { return null; }
-}
+onGPULost(() => { gpuFFT = null; });
+export { getGPUDevice, getGPUInfo };
 
 export async function getWebGPUFFT(): Promise<WebGPUFFT | null> {
   if (gpuFFT) return gpuFFT;
@@ -494,4 +457,3 @@ export async function getWebGPUFFT(): Promise<WebGPUFFT | null> {
   } catch (e) { console.warn('WebGPU init failed:', e); return null; }
 }
 
-export function getGPUInfo(): string { return gpuInfo; }
