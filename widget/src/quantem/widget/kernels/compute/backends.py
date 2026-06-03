@@ -155,10 +155,22 @@ class TorchCompute:
 class MetalCompute:
     """Metal backend - wraps the existing `MetalVirtualImage` over `ChunkedFrames`.
 
-    Preserves the MacBook fast paths untouched: the bin2 sidecar (`fast_vi`), the
-    row-prefix exact reductions, and the lazy multi-dataset container. The base
-    primitives use full-resolution `vi`; the widget keeps reaching for `fast_vi`
-    via `fast` for real-time interaction.
+    VIRTUAL-IMAGE BINNING CONTRACT (MPS) — the design, stated plainly:
+      - det_bin == 1 (NO-BIN): detector stays full-res (e.g. 192x192) so a single
+        diffraction frame (CBED) keeps full angular resolution. The VIRTUAL IMAGE
+        is a masked_sum over ALL frames; at full-res that is bandwidth-bound
+        (~40 GB/s scattered uint16 -> ~8-10 fps). So we AUTO-build a bin2 (96x96)
+        copy of the frames in the background -- `fast_vi`, a.k.a. the "sidecar" --
+        and compute the virtual image on it: 4x fewer pixels to read => real-time.
+        Full-res `vi` is still used for the single-frame CBED. The bin2 buffer is
+        NOT optional for speed: binning the mask alone still reads all 192x192; the
+        speedup comes only from reading the 4x-smaller bin2 buffer.
+      - det_bin >= 2: loaded data is ALREADY binned (e.g. 96x96), so the VI
+        masked_sum is fast directly and NO sidecar is built (`_auto_fast` is gated
+        on det_bin == 1). Simpler path: bin at load = fast VI + no extra buffer, at
+        the cost of CBED angular detail.
+    Net: no-bin auto-bins by 2 for the VIRTUAL IMAGE only; det_bin=2 needs none.
+    (Also preserves row-prefix exact reductions + the lazy multi-dataset container.)
     """
 
     def __init__(self, frames):
