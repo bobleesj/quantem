@@ -1237,13 +1237,32 @@ function Show4DSTEM() {
       };
       const onVI = () => { void recomputeVI(); };
       const onDP = () => { void recomputeDP(); };
+      // BF/ABF/ADF/HAADF presets normally route through the Python kernel
+      // (_preset_request -> apply_preset). With no kernel we translate them into
+      // the same detector-ROI geometry here so the buttons work offline too.
+      const onPreset = () => {
+        const name = String(model.get("_preset_request") || "").toLowerCase();
+        if (!name) return;
+        const bf = model.get("bf_radius") || 1;
+        model.set("roi_active", true);
+        model.set("roi_center_row", model.get("center_row"));
+        model.set("roi_center_col", model.get("center_col"));
+        if (name === "bf") { model.set("roi_mode", "circle"); model.set("roi_radius", Math.max(1, bf)); }
+        else if (name === "abf") { model.set("roi_mode", "annular"); model.set("roi_radius_inner", Math.max(0.5, bf * 0.5)); model.set("roi_radius", Math.max(1, bf)); }
+        else if (name === "adf") { model.set("roi_mode", "annular"); model.set("roi_radius_inner", bf); model.set("roi_radius", bf * 2); }
+        else if (name === "haadf") { model.set("roi_mode", "annular"); model.set("roi_radius_inner", bf * 2); model.set("roi_radius", bf * 4); }
+        model.set("_preset_request", "");  // consume so the same preset can fire again
+        void recomputeVI();
+      };
       const viTraits = ["roi_center", "roi_center_row", "roi_center_col", "roi_radius", "roi_radius_inner", "roi_mode", "roi_width", "roi_height"];
       const dpTraits = ["vi_roi_center", "vi_roi_center_row", "vi_roi_center_col", "vi_roi_radius", "vi_roi_mode", "vi_roi_width", "vi_roi_height", "vi_roi_reduce"];
       viTraits.forEach((t) => model.on("change:" + t, onVI));
       dpTraits.forEach((t) => model.on("change:" + t, onDP));
+      model.on("change:_preset_request", onPreset);
       detach = () => {
         viTraits.forEach((t) => model.off("change:" + t, onVI));
         dpTraits.forEach((t) => model.off("change:" + t, onDP));
+        model.off("change:_preset_request", onPreset);
         compute.dispose();
       };
       await recomputeVI();  // initial virtual image, no interaction needed
