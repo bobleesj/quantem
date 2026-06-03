@@ -203,6 +203,8 @@ widget/docs/
 widget/notebooks/*
 !widget/notebooks/automation/
 !widget/notebooks/automation/**
+!widget/notebooks/tutorials/
+!widget/notebooks/tutorials/**
 widget/scripts/*
 !widget/scripts/build.mjs
 !widget/scripts/e2e_fresh.py
