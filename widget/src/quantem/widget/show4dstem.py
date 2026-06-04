@@ -419,6 +419,10 @@ class Show4DSTEM(anywidget.AnyWidget):
         # chunked-load (MPSChunked4DSTEM) for the Metal compute path.
         if hasattr(data, "_fields") and "data" in getattr(data, "_fields", ()):
             data = data.data
+        # Dataset5dstem (the 5D series wrapper) -> its 5D torch tensor on GPU (no copy
+        # for a single-device series). The frame slider then scrubs the tilt/time axis.
+        if type(data).__name__ == "Dataset5dstem" and hasattr(data, "tensor"):
+            data = data.tensor
         if hasattr(data, "chunks") and not getattr(data, "_is_gpu_frames", False):
             from quantem.widget.kernels.compute.mps import ChunkedFrames
             data = ChunkedFrames(data, row_prefix=bool(getattr(data, "row_prefix", False)))

@@ -164,6 +164,21 @@ class Dataset5dstem:
         return len(self.shape)  # 5
 
     @property
+    def tensor(self) -> "torch.Tensor":
+        """The 5D ``(N, scan, scan, k, k)`` torch tensor on GPU — for viewers/solvers.
+
+        Single-device series return the compact stacked tensor as-is (no copy).
+        A multi-device (sharded) series is stacked onto its first frame's device
+        (a copy) so the result is one contiguous 5D tensor.
+        """
+        if self._tensor is not None:
+            return self._tensor
+        if self._frames is None:
+            raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
+        dev = self._frames[0].device
+        return torch.stack([f.to(dev) for f in self._frames])
+
+    @property
     def dtype(self):
         return self._frames[0].dtype if self._frames is not None else self._tensor.dtype
 
