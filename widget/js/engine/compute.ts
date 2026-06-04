@@ -24,20 +24,29 @@ fn sample(gp: u32, mode: u32) -> u32 {
   return select(w >> 16u, w & 0xffffu, (gp & 1u) == 0u);
 }`;
 
-// One thread per scan position IN THIS CHUNK. Writes the VI at the global scan
-// offset, so chunks write disjoint VI slices (no accumulation needed).
+// One WORKGROUP per scan position; its 64 threads COOPERATIVELY sum the aperture pixels, then
+// a shared-memory tree reduction writes one VI value. The old "one thread per scan position"
+// kernel was uncoalesced: thread sl read data[sl*detSize + idx[j]], so a warp's 64 threads
+// touched 64 addresses detSize apart = 64 cache lines per access = ~1/64 of memory bandwidth
+// (180-300 ms for a BF drag). Here consecutive threads read consecutive idx entries (idx is
+// row-major sorted) -> consecutive detector pixels -> COALESCED, so the drag hits the memory
+// floor. 2D dispatch (gridX in u2.x) because a single-buffer stack can exceed 65535 scans.
 const MASKED_SUM_WGSL = `
 @group(0) @binding(0) var<storage,read> data: array<u32>;
 @group(0) @binding(1) var<storage,read> idx: array<u32>;   // ACTIVE detector pixel indices only
 @group(0) @binding(2) var<storage,read_write> vi: array<f32>;
 @group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
+@group(0) @binding(4) var<uniform> u2: vec4<u32>;  // gridX, 0, 0, 0
 ${SAMPLE}
+var<workgroup> part: array<u32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let sl = gid.x; if (sl >= u.y) { return; }
-  let base = sl * u.z; let n = arrayLength(&idx); var sum: u32 = 0u;
-  for (var j: u32 = 0u; j < n; j = j + 1u) { sum = sum + sample(base + idx[j], u.w); }  // only in-aperture px
-  vi[u.x + sl] = f32(sum);
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let sl = wid.y * u2.x + wid.x; let tid = lid.x;
+  let n = arrayLength(&idx); let base = sl * u.z; var sum: u32 = 0u;
+  if (sl < u.y) { for (var j = tid; j < n; j = j + 64u) { sum = sum + sample(base + idx[j], u.w); } }  // in-aperture px, coalesced
+  part[tid] = sum; workgroupBarrier();
+  for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (tid < s) { part[tid] = part[tid] + part[tid + s]; } workgroupBarrier(); }
+  if (tid == 0u && sl < u.y) { vi[u.x + sl] = f32(part[0]); }
 }`;
 
 // One thread per detector pixel; ACCUMULATES this chunk's in-ROI scan positions
@@ -84,26 +93,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // One thread per scan position: intensity-weighted centroid (center of mass) of the
 // detector over the active mask pixels. Output is the per-position CoM in detector px:
 // comY at [gi], comX at [scanCount+gi]. Drives CoMx/CoMy/CoMmag/iCoM (DPC).
+// One WORKGROUP per scan position (same coalescing fix as MASKED_SUM): 64 threads cooperatively
+// accumulate the intensity-weighted centroid over the aperture, three shared-memory reductions
+// (weight, y*weight, x*weight). gridX in u2.z for the 2D dispatch.
 const MASKED_COM_WGSL = `
 @group(0) @binding(0) var<storage,read> data: array<u32>;
 @group(0) @binding(1) var<storage,read> idx: array<u32>;   // ACTIVE detector pixel indices
 @group(0) @binding(2) var<storage,read_write> com: array<f32>;  // 2*scanCount: [gi]=comY, [scanCount+gi]=comX
 @group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
-@group(0) @binding(4) var<uniform> u2: vec4<u32>;  // detCols, scanCount, 0, 0
+@group(0) @binding(4) var<uniform> u2: vec4<u32>;  // detCols, scanCount, gridX, 0
 ${SAMPLE}
+var<workgroup> pw: array<f32, 64>;
+var<workgroup> py: array<f32, 64>;
+var<workgroup> px: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let sl = gid.x; if (sl >= u.y) { return; }
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let sl = wid.y * u2.z + wid.x; let tid = lid.x;
   let base = sl * u.z; let n = arrayLength(&idx); let detCols = u2.x;
   var wsum: f32 = 0.0; var ysum: f32 = 0.0; var xsum: f32 = 0.0;
-  for (var j: u32 = 0u; j < n; j = j + 1u) {
+  if (sl < u.y) { for (var j: u32 = tid; j < n; j = j + 64u) {
     let p = idx[j]; let v = f32(sample(base + p, u.w));
     wsum = wsum + v; ysum = ysum + f32(p / detCols) * v; xsum = xsum + f32(p % detCols) * v;
+  } }
+  pw[tid] = wsum; py[tid] = ysum; px[tid] = xsum; workgroupBarrier();
+  for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { pw[tid] = pw[tid] + pw[tid + s]; py[tid] = py[tid] + py[tid + s]; px[tid] = px[tid] + px[tid + s]; }
+    workgroupBarrier();
   }
-  let gi = u.x + sl;
-  if (wsum > 0.0) { com[gi] = ysum / wsum; com[u2.y + gi] = xsum / wsum; }
-  else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
+  if (tid == 0u && sl < u.y) {
+    let gi = u.x + sl;
+    if (pw[0] > 0.0) { com[gi] = py[0] / pw[0]; com[u2.y + gi] = px[0] / pw[0]; }
+    else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
+  }
 }`;
+
+const MAX_WG = 65535;   // max workgroups per dispatch dimension; >this needs a 2D grid
 
 interface Chunk { buffer: GPUBuffer; startScan: number; nScan: number; }
 
@@ -159,17 +183,26 @@ export class Show4DSTEMCompute {
     const idx = idxArr.subarray(0, n || 1);
     const idxBuf = this.upload(idx, GPUBufferUsage.STORAGE);
     const com = device.createBuffer({ size: this.scanCount * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(com, 0, new Float32Array(this.scanCount * 2));
     const temps: GPUBuffer[] = [];
+    // One workgroup per scan position (2D grid), all chunks in ONE encoder + submit, readback
+    // folded in. com slices are disjoint per chunk (no accumulation), so no zero-init needed.
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass(); pass.setPipeline(this.maskedComPipe);
     for (const ch of this.chunks) {
+      const gx = Math.min(ch.nScan, MAX_WG), gy = Math.ceil(ch.nScan / MAX_WG);
       const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
-      const dims2 = this.uniform([detCols, this.scanCount, 0, 0]); temps.push(dims2);
+      const dims2 = this.uniform([detCols, this.scanCount, gx, 0]); temps.push(dims2);
       const bind = device.createBindGroup({ layout: this.maskedComPipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: idxBuf } },
         { binding: 2, resource: { buffer: com } }, { binding: 3, resource: { buffer: dims } }, { binding: 4, resource: { buffer: dims2 } } ] });
-      this.dispatch(this.maskedComPipe, bind, Math.ceil(ch.nScan / 64));
+      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(gx, gy);
     }
-    const flat = await this.readF32(com, this.scanCount * 2);
+    pass.end();
+    const rb = device.createBuffer({ size: this.scanCount * 2 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(com, 0, rb, 0, this.scanCount * 2 * 4);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const flat = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy();
     idxBuf.destroy(); com.destroy(); temps.forEach((b) => b.destroy());
     const comY = flat.slice(0, this.scanCount), comX = flat.slice(this.scanCount, this.scanCount * 2);
     if (n === 0) { comY.fill(0); comX.fill(0); }
@@ -246,14 +279,25 @@ export class Show4DSTEMCompute {
     const idxBuf = this.upload(idx, GPUBufferUsage.STORAGE);
     const vi = device.createBuffer({ size: this.scanCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const temps: GPUBuffer[] = [];
+    // One workgroup per scan position (2D grid for >65535), ALL chunks in ONE encoder + submit,
+    // and the readback folded in - so a BF/ADF drag is a single GPU pass + single sync.
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass(); pass.setPipeline(this.maskedSumPipe);
     for (const ch of this.chunks) {
+      const gx = Math.min(ch.nScan, MAX_WG), gy = Math.ceil(ch.nScan / MAX_WG);
       const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
+      const dims2 = this.uniform([gx, 0, 0, 0]); temps.push(dims2);
       const bind = device.createBindGroup({ layout: this.maskedSumPipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: idxBuf } },
-        { binding: 2, resource: { buffer: vi } }, { binding: 3, resource: { buffer: dims } } ] });
-      this.dispatch(this.maskedSumPipe, bind, Math.ceil(ch.nScan / 64));
+        { binding: 2, resource: { buffer: vi } }, { binding: 3, resource: { buffer: dims } }, { binding: 4, resource: { buffer: dims2 } } ] });
+      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(gx, gy);
     }
-    const out = await this.readF32(vi, this.scanCount);  // awaits GPU completion before freeing
+    pass.end();
+    const rb = device.createBuffer({ size: this.scanCount * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(vi, 0, rb, 0, this.scanCount * 4);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy();
     if (n === 0) out.fill(0);   // empty mask -> all zero (idx had a dummy entry)
     idxBuf.destroy(); vi.destroy(); temps.forEach((b) => b.destroy()); return out;
   }
