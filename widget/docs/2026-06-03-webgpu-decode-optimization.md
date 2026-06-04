@@ -78,6 +78,67 @@ a ~100ms kernel is the silx warp-cooperative decode (parallel literal/match copi
 WGSL's u32-only shared memory forces `atomic<u32>` for the byte-strided parallel writes - a
 complex, parity-sensitive rewrite, not yet done.
 
+## meanDP reduce: 460 ms -> 38 ms (one thread/pixel -> frame-parallel + batched submit)
+
+After the full gold04 (uint16) load decoded in ~2.3 s, the post-decode mean-DP reduce was
+taking 190-460 ms - it should be <100 ms (it sums 9.66 GB of uint8 into 36864 floats; the
+1.47 TB/s memory floor is ~7 ms). Three compounding bugs, all measured on real gold04
+(262144 frames, 192x192), bit-exact vs h5py throughout (meanDP sum 147010.5400 == 147010.5401):
+
+| fix | reduce ms | what |
+|---|---|---|
+| baseline | 190-460 | one thread per detector pixel (~37K threads), each looping over ALL 262144 frames |
+| frame-parallel | 175 | 2D grid: gid.y splits frames into 64 strided slices, each thread does one atomicAdd into the integer dp. ~64x more threads -> saturates the GPU (was ~12% occupancy, 88% idle) |
+| batched submit | 100-122 | the decode makes ONE GPU buffer per data file (27 files -> 27 chunks); the reduce was 27 separate submits. Record all 27 passes into ONE encoder + ONE submit -> GPU 153 ms -> 55 ms |
+| folded readback | **38-66** | the 147 KB dp readback was a SECOND submit+fence (~30-50 ms of pure mapAsync round-trip latency). Fold the dp->readback copy into the same encoder: one submit, one sync |
+
+Lesson: a memory-bound GPU reduction that runs 50x over its bandwidth floor is almost always
+**under-parallelized** (too few threads to hide latency) and/or **over-submitted** (one
+dispatch+sync per data chunk). Parallelize across the reduced-over axis, batch all chunks into
+one submit, and never pay a second fence for a tiny readback. Integer atomicAdd keeps it
+bit-exact (addition is associative), so parity is free.
+
+## Strategy D (round-based parallel LZ4): parity-exact but a perf regression (rejected)
+
+Built + parity-verified the round-based dataflow decode (`FUSED_D_WGSL`, `verifyFusedD`,
+toggle `globalThis.__BSLZ4_PARALLEL`). Idea: all 64 lanes parse the block's token stream
+redundantly, then in repeated rounds each lane writes only the output bytes it owns whose
+LZ4 source is already final (DONE bitmap), self-terminating when a round resolves nothing.
+The LZ4 RLE identity `out[di+k] = out[di-off + (k mod off)]` flattens the period-`off` run so
+each match byte depends only on the `off` bytes BEFORE the match (not on a depth-`ml` chain),
+capping dataflow depth at ~60 on real Arina.
+
+**Parity: bit-exact.** `verifyFusedD` on gold04 (uint16) and gold06 (uint32), full 10k-frame
+files: `nDiff=0, maxDiff=0` vs the serial fused kernel, meanDP identical.
+
+**Perf: 3-5x SLOWER, so kept default-OFF.** Per 10k-frame file (timestamp/wall, Blackwell):
+
+| dtype | serial fused | Strategy D |
+|---|---|---|
+| uint16 (gold04) | **118 ms** | 348-356 ms |
+| uint32 (gold06) | **131-138 ms** | 681-697 ms |
+
+**Why it can't win (the real lesson):** round-based dataflow does **O(maxDepth x blockBytes)**
+work - every round re-scans every match byte - while the serial thread-0 decode is
+**O(blockBytes)**. With maxDepth ~60 that is ~60x more total work; spread over 64 lanes it is
+roughly break-even on raw ops, and the per-round atomics + ~60 `workgroupBarrier`s push it
+3-5x past serial. The serial fused kernel (~118 ms/file) is already at the ~100 ms goal and
+is the right default. The ONLY structurally-faster LZ4 is **warp-cooperative copy inside a
+SINGLE forward pass** (lanes split each match's byte copy as the serial cursor advances),
+which keeps O(blockBytes) total work - a different algorithm, not a tuning of Strategy D.
+
+**WGSL bring-up bugs caught (all silent: a compile error drops the dispatch, leaving Dawn's
+zero-initialized output buffer - looks like "kernel produced nothing", not an error):**
+- `(a >> b & c)` - mixing `>>` and `&` needs parens: `((a >> b) & c)`.
+- `workgroupBarrier()` whose reachability depends on an `atomicLoad` (early `break` on a
+  convergence flag) is rejected ("must be uniform control flow"). Fix: FIXED-count loop, gate
+  only the WORK (a non-uniform branch with NO barrier inside is legal), never the barrier.
+- `active` is a WGSL reserved keyword (use `working`).
+- **A backtick inside a `//` comment in a backtick-template-literal WGSL string silently closes
+  the string** - and vite's `node_modules/.vite` transform cache served the STALE module across
+  rebuilds, so source edits appeared to have no effect. `rm -rf node_modules/.vite` before
+  rebuilding when a symlinked source (`web/src/engine -> ../../js/engine`) edit is ignored.
+
 ## Rejected / dead ends
 
 - **Worker PARSE with buffer transferred IN**: regressed to 7.6s - transferring 7.5 GB to

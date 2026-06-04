@@ -319,6 +319,12 @@ export async function bfGeometry(source: string, date: string, name: string): Pr
   const ds = await ensureLoaded(source, date, name); return ds.bf;
 }
 
+// The cached mean diffraction pattern (uint8-clipped integer sum / nFrames, bad px zeroed) -
+// used for parity checks against an h5py reference.
+export async function datasetMeanDp(source: string, date: string, name: string): Promise<Float32Array> {
+  const ds = await ensureLoaded(source, date, name); return ds.meanDP;
+}
+
 // Virtual image for a detector MODE with alpha-unit ring radii (1 = BF disk edge), like the
 // server's /realspace. BF = disk; ADF/DF = annulus. CoM/iCoM/SSB not yet on the GPU path.
 export async function virtualImage(

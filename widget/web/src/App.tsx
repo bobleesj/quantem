@@ -100,6 +100,35 @@ export default function App() {
         await scanFolder(files);
         setReady(true);
       };
+    // Full-pipeline timing hook: open the first scanned dataset (real worker read + upload +
+    // decode-to-uint8) and return the __perf record { loadDecodeMs, reduceMs, totalMs }.
+    (window as unknown as { __openFirst: () => Promise<unknown> }).__openFirst =
+      async () => {
+        const { getSessions, bfGeometry, datasetMeanDp } = await import("./local/store");
+        const sess = getSessions();
+        const s = sess.find((x) => x.files.length > 0);
+        if (!s) return { error: "no sessions" };
+        const f = s.files[0];
+        const wall0 = performance.now();
+        await bfGeometry(s.source, s.date, f.name);
+        const wallMs = Math.round(performance.now() - wall0);
+        const dp = await datasetMeanDp(s.source, s.date, f.name);
+        let dpSum = 0; for (let i = 0; i < dp.length; i++) dpSum += dp[i];
+        const perf = (window as unknown as { __perf?: unknown[] }).__perf || [];
+        return { dataset: f.name, nFiles: s.files.length, wallMs, dpSum, dpLen: dp.length, perf: perf[perf.length - 1] };
+      };
+    // Parity + kernel-time verify hook: fetch one served data .h5, parse to a Bslz4Spec,
+    // run Strategy D vs the serial Fallback and report byte-exact diff + GPU ms.
+    (window as unknown as { __verifyD: (url: string) => Promise<unknown> }).__verifyD =
+      async (url: string) => {
+        const { readH5Volume } = await import("./engine/h5reader");
+        const { verifyFusedD } = await import("./engine/bslz4");
+        const buf = await (await fetch(url)).arrayBuffer();
+        const vol = readH5Volume(buf, url.split("/").pop()!);
+        if (vol.srcDtype === "uint8") return { error: "uint8 source has no fused-D path" };
+        const r = await verifyFusedD(vol.chunks[0], vol.srcDtype);
+        return { srcDtype: vol.srcDtype, nFrames: vol.nFrames, detSize: vol.detSize, ...r };
+      };
   }, []);
   return (
     <ThemeProvider theme={theme}>

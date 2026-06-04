@@ -44,20 +44,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // into the DP (chunks dispatched serially, so += across chunks is safe). dims:
 // startScan, nScanInChunk, detSize, mode; plus extra: total scanMask is global,
 // indexed by startScan+sl.
+// One thread per (detector pixel, FRAME-BLOCK): the 2D grid parallelizes the reduction over
+// FRAMES too, not just pixels. The old "one thread per pixel, serial loop over all frames"
+// launched only detSize (~37K) threads -> ~12% occupancy on a big GPU (88% idle), so the
+// memory-bound sum ran ~70x over its bandwidth floor. Here gid.y splits the frames into
+// FRAME_BLOCKS strided slices; each thread sums its slice locally (bit-exact integer) then does
+// ONE atomicAdd into dp[k]. ~FRAME_BLOCKS x more threads saturate the GPU; atomic contention is
+// only FRAME_BLOCKS-way per pixel (one add per thread), trivially cheap vs the memory traffic.
+const FRAME_BLOCKS = 64;
 const REDUCE_FRAMES_WGSL = `
 @group(0) @binding(0) var<storage,read> data: array<u32>;
 @group(0) @binding(1) var<storage,read> scanMask: array<u32>;  // GLOBAL scanCount
-@group(0) @binding(2) var<storage,read_write> dp: array<u32>;  // detSize, INTEGER accumulate (exact)
+@group(0) @binding(2) var<storage,read_write> dp: array<atomic<u32>>;  // detSize, INTEGER (exact)
 @group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
 ${SAMPLE}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x; let detSize = u.z; if (k >= detSize) { return; }
   var sum: u32 = 0u;   // integer accumulate: bit-exact, no f32 rounding on large/dead-pixel sums
-  for (var sl: u32 = 0u; sl < u.y; sl = sl + 1u) {
+  for (var sl: u32 = gid.y; sl < u.y; sl = sl + ${FRAME_BLOCKS}u) {   // strided frame slice
     if (scanMask[u.x + sl] != 0u) { sum = sum + sample(sl * detSize + k, u.w); }
   }
-  dp[k] = dp[k] + sum;
+  if (sum != 0u) { atomicAdd(&dp[k], sum); }   // one add per thread; skip empty slices
 }`;
 
 // Extract ONE frame's diffraction pattern (detSize values) from a chunk buffer -
@@ -260,14 +268,29 @@ export class Show4DSTEMCompute {
     const dp = device.createBuffer({ size: this.detSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(dp, 0, new Uint32Array(this.detSize));  // zero-init integer accumulator
     const temps: GPUBuffer[] = [];
+    // Record EVERY chunk's reduce pass into ONE command encoder + ONE submit. Per-chunk submits
+    // (27 buffers for a 27-file dataset) each pay kernel-launch + queue round-trip overhead and
+    // do not overlap; batching lets the GPU run them back-to-back into the shared dp accumulator.
+    const grid = Math.ceil(this.detSize / 64);
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.reduceFramesPipe);
     for (const ch of this.chunks) {
       const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
       const bind = device.createBindGroup({ layout: this.reduceFramesPipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: maskBuf } },
         { binding: 2, resource: { buffer: dp } }, { binding: 3, resource: { buffer: dims } } ] });
-      this.dispatch(this.reduceFramesPipe, bind, Math.ceil(this.detSize / 64));
+      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(grid, FRAME_BLOCKS);
     }
-    const sums = await this.readU32(dp, this.detSize);   // exact integer per-pixel sum
+    pass.end();
+    // Fold the dp -> readback copy into the SAME encoder: one submit, one GPU->CPU sync. A
+    // separate readU32 would submit + fence a second time (~30-50ms of mapAsync round-trip for
+    // a 147 KB buffer - all latency, no bandwidth), doubling the sync cost of a tiny readback.
+    const rb = device.createBuffer({ size: this.detSize * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(dp, 0, rb, 0, this.detSize * 4);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const sums = new Uint32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy();
     temps.forEach((b) => b.destroy());
     const n = mean ? (scanMask.reduce((a, v) => a + (v ? 1 : 0), 0) || 1) : 1;
     const out = new Float32Array(this.detSize);
@@ -284,9 +307,9 @@ export class Show4DSTEMCompute {
     const b = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const a = new Uint32Array(vals); this.device.queue.writeBuffer(b, 0, a.buffer as ArrayBuffer, a.byteOffset, a.byteLength); return b;
   }
-  private dispatch(pipe: GPUComputePipeline, bind: GPUBindGroup, groups: number) {
+  private dispatch(pipe: GPUComputePipeline, bind: GPUBindGroup, groups: number, gy = 1) {
     const enc = this.device.createCommandEncoder(); const pass = enc.beginComputePass();
-    pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(groups); pass.end();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(groups, gy); pass.end();
     this.device.queue.submit([enc.finish()]);
   }
   private async readU32(buf: GPUBuffer, n: number): Promise<Uint32Array> {

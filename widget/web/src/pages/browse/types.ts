@@ -409,7 +409,7 @@ interface PreloadSetResponse {
  *  for scrubbing within ~8-15 s; subsequent indices warm in the background.
  *  Re-calling with the same set is a no-op (each master hits the LRU). */
 export async function preloadSet5D(
-  _s: Session, files: MasterFile[], detBin: DetBin = 1,
+  _s: Session, files: MasterFile[], detBin: DetBin = 1, _dtype: BrowseDtype = "uint8",
 ): Promise<PreloadSetResponse> {
   return { queued: files.length, det_bin: detBin };  // engine decodes lazily on first view
 }

@@ -17,6 +17,11 @@
 
 import { getGPUDevice, onGPULost } from "./device";
 
+// A/B switch for the parallel (Strategy-D, round-based) LZ4 fused kernel vs the serial-thread-0
+// fused kernel. Set globalThis.__BSLZ4_PARALLEL=true in the console to measure on real hardware
+// without a rebuild. Default false until the parallel kernel is parity-verified + benchmarked.
+const BSLZ4_PARALLEL = typeof globalThis !== "undefined" && (globalThis as { __BSLZ4_PARALLEL?: boolean }).__BSLZ4_PARALLEL === true;
+
 // Pass1: one thread per block, LZ4-decode into the `inter` (bitshuffled) buffer.
 // Blocks are independent -> embarrassingly parallel. Byte-addressed RMW because
 // WGSL storage is u32-only.
@@ -205,6 +210,152 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   }
 }`;
 
+// STRATEGY D (parallel LZ4 via round-based dataflow). PARITY-VERIFIED bit-exact vs the serial
+// fused kernel (uint16 AND uint32, nDiff=0 on real gold04/gold06 via verifyFusedD) but it is a
+// PERF REGRESSION, kept default-OFF (BSLZ4_PARALLEL) as a reference + harness for future work.
+// WHY it loses: round-based dataflow does O(maxDepth x blockBytes) work (every round re-scans
+// every match byte) while the serial thread-0 decode is O(blockBytes). With maxDepth ~60 that
+// is ~60x more total work; spread over 64 lanes it is roughly break-even on raw ops, and the
+// per-round atomics + ~60 workgroupBarriers push it 3-5x SLOWER than serial (measured: 348ms/
+// 681ms uint16/uint32 per 10k-frame file vs 118ms/138ms serial). The ONLY structurally-faster
+// LZ4 is warp-cooperative copy inside a SINGLE forward pass (silx-style: lanes split each match's
+// byte copy as the serial cursor advances), which keeps O(blockBytes) total work - a different
+// algorithm than this round-based one, not a tuning of it. Round-based cannot beat serial.
+//
+// All 64 lanes parse the SAME token stream redundantly (parsing is cheap: ~50 tokens/block,
+// pointer chasing in registers) and then cooperate on the byte copies. The LZ4 output is a
+// dataflow DAG: literal bytes have
+// depth 0; a match byte at di+k reads source di-off+(k%off). Because k%off lands in the FIRST
+// `off` bytes of the match's source region (NOT at di+k-off), a period-`off` run does NOT form
+// a depth-ml chain - it flattens. Measured on real Arina uint16+uint32 (thousands of blocks):
+// the longest dependency chain in any 8 KB block is ~60. So repeated rounds, each a full
+// redundant copy of every literal+match byte guarded by "only write a byte whose every source
+// is already final," reach the fixed point. The loop runs until a round resolves no byte (the
+// `progress` atomic is workgroup-uniform after the post-round barrier, so the early break is in
+// UNIFORM control flow) - self-terminating at maxDepth+1 for ANY depth. The per-round
+// workgroupBarrier stays uniform; the trap that blanked the prior attempt (barrier inside the
+// data-dependent token loop) is gone.
+//
+// FINALITY without a second buffer: a byte is "final" once it equals its dataflow value and
+// will never change again. We track that with a per-byte DONE bitmap in shared memory (1 bit
+// per output byte, 8192 bits = 256 u32). Round r: every lane walks the token list; for each
+// match byte di+k it checks DONE[src]; if set, it writes the byte to sh and marks DONE[di+k].
+// Literal bytes are written + marked DONE in round 0 (their source is the compressed input,
+// always available). A byte already DONE is skipped. Once a whole round resolves nothing the
+// fixed point is reached (max depth ~60). Each output byte is written EXACTLY ONCE into its
+// known-zero shared slot via a single atomicOr (OR-with-0 is identity + commutative, so the
+// only lock-free byte write in WGSL's u32-only shared memory); DONE + progress are atomics too.
+//
+// __NPB__ = blockElems/8 = planeBytes = groups/block; __BE__ = blockElems; __MAXROUNDS__ backstop.
+const FUSED_D_WGSL = `
+@group(0) @binding(0) var<storage,read> raw: array<u32>;
+@group(0) @binding(1) var<storage,read> blkMeta: array<u32>;
+@group(0) @binding(2) var<storage,read_write> stack: array<u32>;
+@group(0) @binding(3) var<uniform> cfg: vec4<u32>;   // totalBlocks, gridX, nBlk, framePix
+var<workgroup> sh: array<atomic<u32>, 2048>;   // decoded bytes, atomic (race-free byte writes)
+var<workgroup> done: array<atomic<u32>, 256>;  // 1 bit per output byte: is it final?
+var<workgroup> progress: atomic<u32>;          // did this round resolve any byte? (convergence)
+fn rraw(i:u32)->u32{return (raw[i>>2u]>>((i&3u)*8u))&0xffu;}
+fn rsh(i:u32)->u32{return (atomicLoad(&sh[i>>2u])>>((i&3u)*8u))&0xffu;}
+// each output byte is written EXACTLY once into its KNOWN-ZERO slot via a single atomicOr:
+// OR-with-0 is identity + commutative, so concurrent different-byte-same-word writes are
+// race-free AND order-independent (the only correct lock-free byte write in WGSL).
+fn wsh(i:u32,v:u32){atomicOr(&sh[i>>2u], (v&0xffu)<<((i&3u)*8u));}
+fn isDone(i:u32)->bool{return ((atomicLoad(&done[i>>5u])>>(i&31u))&1u)!=0u;}
+fn setDone(i:u32){atomicOr(&done[i>>5u], 1u<<(i&31u));}
+fn clip8(v:u32)->u32{return select(v,255u,v>255u);}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let g = wid.y*cfg.y + wid.x; let lx = lid.x;
+  let live = g < cfg.x;
+  let coff = select(0u, blkMeta[g*2u], live);
+  let cend = select(0u, coff + blkMeta[g*2u+1u], live);
+  // zero sh (so atomicOr-into-zero is exact) and the DONE bitmap. Uniform counted loops.
+  for(var w=lx; w<2048u; w=w+64u){ atomicStore(&sh[w], 0u); }
+  for(var w=lx; w<256u;  w=w+64u){ atomicStore(&done[w], 0u); }
+  workgroupBarrier();
+  // ---- ROUND 0: write + mark all LITERAL bytes (source = compressed input, always ready).
+  // Owner lane (di+k)&63==lx writes each literal byte exactly once. Match bytes deferred.
+  {
+    var ci=coff; var di=0u;
+    loop{ if(ci>=cend){break;}
+      let tok=rraw(ci); ci=ci+1u; var nlit=tok>>4u;
+      if(nlit==15u){loop{let bb=rraw(ci);ci=ci+1u;nlit=nlit+bb;if(bb!=255u){break;}}}
+      var k=0u; loop{ if(k>=nlit){break;}
+        let o=di+k; if((o&63u)==lx){ wsh(o, rraw(ci+k)); setDone(o); }
+        k=k+1u; }
+      ci=ci+nlit; di=di+nlit;
+      if(ci>=cend){break;}
+      let off=rraw(ci)|(rraw(ci+1u)<<8u); ci=ci+2u; var ml=4u+(tok&0xfu);
+      if((tok&0xfu)==15u){loop{let bb=rraw(ci);ci=ci+1u;ml=ml+bb;if(bb!=255u){break;}}}
+      di=di+ml;   // skip match output this round
+    }
+  }
+  workgroupBarrier();
+  // ---- ROUNDS 1..MAXROUNDS: resolve match bytes whose source is DONE. FIXED trip count so the
+  // two per-round workgroupBarriers sit in UNIFORM control flow (WGSL forbids a barrier whose
+  // reachability depends on a non-uniform value - an atomic load is always deemed non-uniform,
+  // so an early break on progress is illegal). Instead the expensive token walk is gated by
+  // 'active' (a non-uniform branch with NO barrier inside, which IS legal): once a whole round
+  // resolves nothing, progress stays 0 forever (resolution is monotonic), so every later round
+  // is just two cheap barriers. MAXROUNDS bounds the deepest LZ4 chain (~60 on real Arina).
+  var working = 1u;
+  for(var r=0u; r<__MAXROUNDS__; r=r+1u){
+    if(lx==0u){ atomicStore(&progress, 0u); }
+    workgroupBarrier();
+    if(working != 0u){
+      var ci=coff; var di=0u;
+      loop{ if(ci>=cend){break;}
+        let tok=rraw(ci); ci=ci+1u; var nlit=tok>>4u;
+        if(nlit==15u){loop{let bb=rraw(ci);ci=ci+1u;nlit=nlit+bb;if(bb!=255u){break;}}}
+        ci=ci+nlit; di=di+nlit;   // literals already done in round 0
+        if(ci>=cend){break;}
+        let off=rraw(ci)|(rraw(ci+1u)<<8u); ci=ci+2u; var ml=4u+(tok&0xfu);
+        if((tok&0xfu)==15u){loop{let bb=rraw(ci);ci=ci+1u;ml=ml+bb;if(bb!=255u){break;}}}
+        var k=0u; loop{ if(k>=ml){break;}
+          let o=di+k;
+          if((o&63u)==lx && !isDone(o)){
+            let src=di-off+(k%off);
+            if(isDone(src)){ wsh(o, rsh(src)); setDone(o); atomicStore(&progress, 1u); }
+          }
+          k=k+1u; }
+        di=di+ml;
+      }
+    }
+    workgroupBarrier();
+    working = atomicLoad(&progress);   // 0 => converged; gate (not branch-to-barrier) next round
+  }
+  if(!live){return;}
+  // ---- inverse bitshuffle + uint8 pack, identical to FUSED_U16U8 (OR-fold high planes).
+  let frm = g/cfg.z; let blk = g%cfg.z;
+  let pixBase = frm*cfg.w + blk*__BE__;
+  let oBase = (pixBase>>3u)*2u;
+  for(var lg=lx; lg<__NPB__; lg=lg+64u){
+    var hi:u32=0u;
+    for(var b:u32=8u;b<__NBITS__;b=b+1u){ hi = hi | rsh(lg + b*__NPB__); }
+    var v0:u32=0u; var v1:u32=0u; var v2:u32=0u; var v3:u32=0u; var v4:u32=0u; var v5:u32=0u; var v6:u32=0u; var v7:u32=0u;
+    for(var b:u32=0u;b<8u;b=b+1u){
+      let byte=rsh(lg + b*__NPB__); let bit=1u<<b;
+      if((byte&1u)!=0u){v0=v0|bit;} if((byte&2u)!=0u){v1=v1|bit;}
+      if((byte&4u)!=0u){v2=v2|bit;} if((byte&8u)!=0u){v3=v3|bit;}
+      if((byte&16u)!=0u){v4=v4|bit;} if((byte&32u)!=0u){v5=v5|bit;}
+      if((byte&64u)!=0u){v6=v6|bit;} if((byte&128u)!=0u){v7=v7|bit;}
+    }
+    let o=oBase + lg*2u;
+    stack[o]=select(v0,255u,(hi&1u)!=0u)|(select(v1,255u,(hi&2u)!=0u)<<8u)|(select(v2,255u,(hi&4u)!=0u)<<16u)|(select(v3,255u,(hi&8u)!=0u)<<24u);
+    stack[o+1u]=select(v4,255u,(hi&16u)!=0u)|(select(v5,255u,(hi&32u)!=0u)<<8u)|(select(v6,255u,(hi&64u)!=0u)<<16u)|(select(v7,255u,(hi&128u)!=0u)<<24u);
+  }
+}`;
+
+const FUSED_D_PIPE_CACHE = new Map<string, GPUComputePipeline>();
+function getFusedDPipe(device: GPUDevice, blockElems: number, nbits: number): GPUComputePipeline {
+  const npb = blockElems / 8;
+  const code = FUSED_D_WGSL.replace(/__NPB__/g, `${npb}u`).replace(/__BE__/g, `${blockElems}u`).replace(/__NBITS__/g, `${nbits}u`).replace(/__MAXROUNDS__/g, `256u`);
+  let p = FUSED_D_PIPE_CACHE.get(code);
+  if (!p) { p = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } }); FUSED_D_PIPE_CACHE.set(code, p); }
+  return p;
+}
+
 const FUSED_PIPE_CACHE = new Map<string, GPUComputePipeline>();
 function getFusedPipe(device: GPUDevice, blockElems: number, nbits: number): GPUComputePipeline {
   const npb = blockElems / 8;
@@ -245,6 +396,77 @@ function buildFusedJob(device: GPUDevice, spec: Bslz4Spec, srcDtype: "uint16" | 
     record(enc) { const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(gx, gy); pass.end(); },
     releaseTemps() { rawBuf.destroy(); metaBuf.destroy(); cfg.destroy(); },
   };
+}
+
+// Strategy-D fused job: identical I/O contract to buildFusedJob (same bindings, same stack
+// layout, same dispatch grid) but uses the round-based PARALLEL LZ4 kernel. The kernel runs
+// until the per-round `progress` atomic reports no byte resolved (convergence early-exit), so
+// it self-terminates at maxDepth+1 rounds for ANY LZ4 dependency depth. __MAXROUNDS__ (4096) is
+// only a runaway backstop, far above the ~60 worst case on real Arina uint16+uint32 blocks.
+function buildFusedJobD(device: GPUDevice, spec: Bslz4Spec, srcDtype: "uint16" | "uint32", preRaw?: GPUBuffer): DecodeJob {
+  const { compressed, blockMeta, nFrames, nBlocksPerFrame, blockElems, detSize } = spec;
+  const nbits = srcDtype === "uint32" ? 32 : 16;
+  const totalBlocks = nFrames * nBlocksPerFrame;
+  const stackWords = Math.ceil(nFrames * detSize / 4);
+  let rawBuf: GPUBuffer;
+  if (preRaw) { rawBuf = preRaw; }
+  else {
+    const rawSize = Math.ceil(compressed.byteLength / 4) * 4;
+    rawBuf = device.createBuffer({ size: rawSize, usage: GPUBufferUsage.STORAGE, mappedAtCreation: true });
+    copyWide(rawBuf.getMappedRange(), compressed);
+    rawBuf.unmap();
+  }
+  const metaBuf = device.createBuffer({ size: blockMeta.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(metaBuf, 0, blockMeta.buffer as ArrayBuffer, blockMeta.byteOffset, blockMeta.byteLength);
+  const stack = device.createBuffer({ size: stackWords * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const gx = Math.min(totalBlocks, MAX_WG), gy = Math.ceil(totalBlocks / MAX_WG);
+  const cfg = uniform(device, [totalBlocks, gx, nBlocksPerFrame, detSize]);
+  const pipe = getFusedDPipe(device, blockElems, nbits);
+  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: rawBuf } }, { binding: 1, resource: { buffer: metaBuf } },
+    { binding: 2, resource: { buffer: stack } }, { binding: 3, resource: { buffer: cfg } } ] });
+  return {
+    stack, mode: 1,
+    record(enc) { const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(gx, gy); pass.end(); },
+    releaseTemps() { rawBuf.destroy(); metaBuf.destroy(); cfg.destroy(); },
+  };
+}
+
+// Bit-exact parity + GPU-time check for Strategy D vs the serial Fallback, on ONE spec.
+// Runs each kernel in its OWN submit (so the wall time around onSubmittedWorkDone is the
+// isolated kernel cost, upload excluded - raw is pre-uploaded here), reads back both packed
+// uint8 stacks, and reports the exact byte diff. No tolerance: D must be byte-identical to
+// Fallback. Returns null if WebGPU is unavailable. Console-driven verify only.
+export async function verifyFusedD(spec: Bslz4Spec, srcDtype: "uint16" | "uint32"): Promise<{
+  nBytes: number; nDiff: number; maxDiff: number; firstDiffAt: number; meanFrame0: number;
+  fGpuMs: number; dGpuMs: number;
+} | null> {
+  const device = await getGPUDevice();
+  if (!device) return null;
+  const stackWords = Math.ceil(spec.nFrames * spec.detSize / 4);
+  const runReadback = async (job: DecodeJob): Promise<{ data: Uint8Array; ms: number }> => {
+    const warm = device.createCommandEncoder(); job.record(warm); device.queue.submit([warm.finish()]); await device.queue.onSubmittedWorkDone();
+    const enc = device.createCommandEncoder(); job.record(enc);
+    const rb = device.createBuffer({ size: stackWords * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(job.stack, 0, rb, 0, stackWords * 4);
+    const t0 = performance.now(); device.queue.submit([enc.finish()]); await device.queue.onSubmittedWorkDone();
+    const ms = performance.now() - t0;
+    await rb.mapAsync(GPUMapMode.READ);
+    const data = new Uint8Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy();
+    job.releaseTemps(); job.stack.destroy();
+    return { data, ms };
+  };
+  const fRes = await runReadback(buildFusedJob(device, spec, srcDtype));
+  device.pushErrorScope("validation");
+  const dJob = buildFusedJobD(device, spec, srcDtype);
+  const dRes = await runReadback(dJob);
+  const dErr = await device.popErrorScope();
+  const fBytes = fRes.data, dBytes = dRes.data;
+  const n = Math.min(fBytes.length, dBytes.length);
+  let nDiff = 0, maxDiff = 0, firstDiffAt = -1;
+  for (let i = 0; i < n; i++) { const d = Math.abs(fBytes[i] - dBytes[i]); if (d) { nDiff++; if (d > maxDiff) maxDiff = d; if (firstDiffAt < 0) firstDiffAt = i; } }
+  let sum = 0; const f0 = Math.min(spec.detSize, n); for (let i = 0; i < f0; i++) sum += dBytes[i];
+  return { nBytes: n, nDiff, maxDiff, firstDiffAt, meanFrame0: sum / f0, dErr: dErr ? dErr.message : null, fGpuMs: fRes.ms, dGpuMs: dRes.ms };
 }
 
 export interface Bslz4Spec {
@@ -367,7 +589,8 @@ export async function decodeBslz4Batch(specs: Bslz4Spec[], dtype: "uint8" | "uin
     // Fused path uploads through the reused staging pool (no per-load mappedAtCreation alloc);
     // the non-fused path keeps its own mappedAtCreation upload.
     const raws = fused ? await uploadViaStaging(device, groupSpecs) : null;
-    const jobs = groupSpecs.map((s, i) => fused ? buildFusedJob(device, s, srcDtype as "uint16"|"uint32", raws![i]) : buildDecodeJob(device, s, dtype, srcDtype as "uint8"|"uint16"));
+    const fusedBuild = BSLZ4_PARALLEL ? buildFusedJobD : buildFusedJob;
+    const jobs = groupSpecs.map((s, i) => fused ? fusedBuild(device, s, srcDtype as "uint16"|"uint32", raws![i]) : buildDecodeJob(device, s, dtype, srcDtype as "uint8"|"uint16"));
     const enc = device.createCommandEncoder();
     for (const j of jobs) j.record(enc);
     device.queue.submit([enc.finish()]);
@@ -384,7 +607,10 @@ export async function decodeBslz4Batch(specs: Bslz4Spec[], dtype: "uint8" | "uin
 export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" | "uint32" = "uint16"): Promise<{ device: GPUDevice; buffer: GPUBuffer; mode: number } | null> {
   const device = await getGPUDevice();
   if (!device) return null;
-  const job = (dtype === "uint8" && (srcDtype === "uint16" || srcDtype === "uint32")) ? buildFusedJob(device, spec, srcDtype as "uint16"|"uint32") : buildDecodeJob(device, spec, dtype, srcDtype as "uint8"|"uint16");
+  const fusedOk = dtype === "uint8" && (srcDtype === "uint16" || srcDtype === "uint32");
+  const job = fusedOk
+    ? (BSLZ4_PARALLEL ? buildFusedJobD(device, spec, srcDtype as "uint16"|"uint32", undefined) : buildFusedJob(device, spec, srcDtype as "uint16"|"uint32"))
+    : buildDecodeJob(device, spec, dtype, srcDtype as "uint8"|"uint16");
   const enc = device.createCommandEncoder();
   job.record(enc);
   device.queue.submit([enc.finish()]);
