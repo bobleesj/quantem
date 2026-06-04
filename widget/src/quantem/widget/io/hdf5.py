@@ -1960,16 +1960,29 @@ def _browse_dtype_advise_and_cast(data, dtype, verbose):
     return data
 
 
-def load(filepath, *args, dtype: str | None = None, **kwargs):
-    """Load 4D-STEM data, then recommend / apply the smallest lossless integer
-    dtype for browsing (see :func:`_browse_dtype_advise_and_cast`).
+def load(filepath, *args, dtype: str | None = None, gpus=None, stack: bool = True,
+         max_concurrent=None, **kwargs):
+    """Load 4D-STEM data — one master, or many.
 
-    Thin wrapper over the loader: every backend/path funnels through here, so the
-    dtype advice + optional uint8 browse-cast happen once, regardless of which
-    internal return produced the data. ``dtype=None`` (default) just prints the
-    recommendation; ``dtype='u8'`` clips@255 + casts; ``dtype='auto'`` picks uint8
-    only if lossless. MPS chunk results (no ``.max``) are passed through untouched.
+    * ``load(master)`` → one ``LoadResult``.
+    * ``load([masters])`` → the masters **stacked** into one 5D dataset (the
+      series/viewer case).
+    * ``load([masters], gpus=[0, 1])`` (or ``stack=False``) → a **list** of separate
+      ``LoadResult``, **read in parallel across disks** and **placed across GPUs** —
+      the joint-reconstruction path (``gpus``: ``None`` current device / ``int``
+      all-that-GPU / ``list`` per-master round-robin). Decode is serial (concurrent
+      in-process CUDA decode corrupts the device); reads overlap across disks so
+      bandwidth adds.
+
+    Also recommends / applies the smallest lossless browse dtype: ``dtype=None``
+    prints the recommendation; ``dtype='u8'`` clips@255 + casts; ``dtype='auto'``
+    picks uint8 only if lossless.
     """
+    is_seq = isinstance(filepath, (list, tuple))
+    if is_seq and (gpus is not None or not stack):
+        # N separate GPU-placed datasets (parallel read, serial decode).
+        return _load_many_parallel(list(filepath), gpus=gpus, max_concurrent=max_concurrent,
+                                   verbose=kwargs.pop("verbose", False), **kwargs)
     verbose = kwargs.get("verbose", True)
     sel = (dtype or "").lower()
     if sel in ("u8", "uint8") and kwargs.get("output_dtype") is None and not isinstance(filepath, (list, tuple)):
@@ -2024,9 +2037,12 @@ def group_by_disk(paths) -> dict:
     return out
 
 
-def load_parallel(masters, *, gpus=None, max_concurrent=None, verbose=False, **load_kwargs):
+def _load_many_parallel(masters, *, gpus=None, max_concurrent=None, verbose=False, **load_kwargs):
     """Load many masters with concurrent READS + SERIAL GPU decode, placing each
     master on a chosen GPU. The data-feeding path for joint reconstruction.
+
+    Reached via ``load([masters], gpus=...)`` (or ``stack=False``); ``load_parallel``
+    is a thin back-compat alias. See :func:`load`.
 
     A producer pool reads + header-parses masters concurrently (host/IO only, the
     GIL is released during ``os.readv``); a single consumer decodes them one at a
@@ -2128,6 +2144,16 @@ def load_parallel(masters, *, gpus=None, max_concurrent=None, verbose=False, **l
                 data = data.reshape(side, side, *data.shape[1:])
         results[i] = LoadResult(data, get_metadata(masters[i]))
     return results
+
+
+def load_parallel(masters, *, gpus=None, max_concurrent=None, verbose=False, **load_kwargs):
+    """Back-compat alias for ``load(masters, gpus=..., stack=False)``.
+
+    Prefer the single entry point: ``load([masters], gpus=[0, 1])`` returns the same
+    list of GPU-placed datasets. Kept so existing call sites keep working.
+    """
+    return load(list(masters), gpus=gpus, stack=False, max_concurrent=max_concurrent,
+                verbose=verbose, **load_kwargs)
 
 
 def _load_impl(
