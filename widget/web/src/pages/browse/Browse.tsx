@@ -17,6 +17,7 @@ import { useRegisterShortcuts, type Shortcut } from "../../hooks/useKeyboardShor
 import FileTree from "./FileTree";
 import Viewer from "./Viewer";
 import MetaRail from "./MetaRail";
+import { pickFolderAndScan } from "../../local/folderPicker";
 import {
   defaultSelection, fetchSessions, fetchGpuFreeBytes,
   fileKey, findFile, pickAutoBin, preloadSet5D,
@@ -322,6 +323,22 @@ export default function Browse() {
         setLoadError(e.message || "failed to load sessions");
       });
     return () => { alive = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-read the dataset tree whenever a folder is picked (in-page "Choose folder" or a dev hook).
+  // Auto-select the first dataset if nothing is active yet, so picking immediately shows content.
+  useEffect(() => {
+    const onLoaded = () => void fetchSessions().then((rows) => {
+      setSessions(rows);
+      setActiveFile((cur) => {
+        if (cur) return cur;
+        const sel = defaultSelection(rows);
+        if (sel) { setActiveSession(sel.session); return sel.file; }
+        return cur;
+      });
+    });
+    window.addEventListener("quantem-folder-loaded", onLoaded);
+    return () => window.removeEventListener("quantem-folder-loaded", onLoaded);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // URL → selection (Back/Forward / deep links).
@@ -748,6 +765,16 @@ export default function Browse() {
           </Typography>
         </Box>
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 0.5, flexWrap: "wrap" }}>
+          <Box
+            component="button"
+            onClick={() => { void pickFolderAndScan(); }}
+            title="Open a folder of Arina .h5 datasets - decodes on your GPU, nothing leaves this machine"
+            sx={{ px: 1.25, py: 0.5, fontSize: fontSizes.sm, fontWeight: 600, cursor: "pointer",
+                  border: "none", borderRadius: radii.md, color: colors.text.white,
+                  bgcolor: colors.text.primary, "&:hover": { opacity: 0.88 } }}
+          >
+            📂 Choose folder
+          </Box>
           <ToolbarButton
             active={!leftCollapsed}
             onClick={() => setLeftCollapsed(!leftCollapsed)}
@@ -881,7 +908,7 @@ export default function Browse() {
             {loadError
               ? `failed to load sessions: ${loadError}`
               : sessions.length === 0
-                ? "loading sessions…"
+                ? "📂 Choose a folder (top right) to open your 4D-STEM datasets"
                 : "select a master file from the tree"}
           </Box>
         )}

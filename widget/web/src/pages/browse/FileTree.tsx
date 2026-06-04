@@ -467,7 +467,7 @@ export default function FileTree({
       <Box sx={{ flex: 1, overflowY: "auto", pt: 0.5, pb: 18 }}>
         {loading && (
           <Typography sx={{ p: 1.5, fontSize: fontSizes.sm, color: colors.text.muted }}>
-            loading sessions from configured browse roots…
+            loading sessions…
           </Typography>
         )}
         {error && (
@@ -477,7 +477,8 @@ export default function FileTree({
         )}
         {!loading && !error && sessions.length === 0 && (
           <Typography sx={{ p: 1.5, fontSize: fontSizes.sm, color: colors.text.muted }}>
-            no master.h5 files found under configured browse roots
+            Choose a folder of Arina .h5 datasets (button, top right) to begin. Everything decodes on
+            your GPU - nothing leaves this machine.
           </Typography>
         )}
         <MetadataPopover

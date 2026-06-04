@@ -781,6 +781,9 @@ function CanvasCard({
     >
       <Box sx={{ position: "absolute", inset: 0, ...tfStyle,
                  "& canvas": { width: "100%", height: "100%", display: "block",
+                               // preserve scan aspect: a non-square / partial dataset (e.g. only
+                               // the top rows decoded) letterboxes instead of stretching to garbage.
+                               objectFit: "contain",
                                imageRendering: imageRenderingFor(smooth) } }}>
         {children}
       </Box>

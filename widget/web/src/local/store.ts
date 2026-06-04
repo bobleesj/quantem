@@ -52,7 +52,10 @@ interface LoadedDS {
 
 let SESSIONS: Session[] = [];
 const HANDLES = new Map<string, Handles>();          // fileKey -> file handles
-const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Array }>();
+// scanCols = the master's true raster WIDTH (from ntrigger). Needed so a PARTIAL dataset (fewer
+// data files than the full scan) reshapes into the correct-width grid instead of a sqrt() square
+// (which wraps the partial frames at the wrong stride -> diagonal garbage).
+const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Array; scanCols: number }>();
 const LOADED = new Map<string, Promise<LoadedDS>>();  // fileKey -> decoded dataset (LRU)
 const LRU: string[] = [];
 const MAX_RESIDENT = 2;
@@ -110,7 +113,7 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
       name: m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
       size: humanSize(totalBytes || ntrigger * detRows * detCols), loadable: dataFiles.length > 0,
     };
-    GEOM.set(key(source, date, m.name), { detRows, detCols, badPx: new Uint32Array(bad) });
+    GEOM.set(key(source, date, m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
     pushFile(source, date, mf, { master: m, dataFiles });
   }
   // bare .h5 volumes not owned by a master
@@ -127,7 +130,7 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
       name, shape: [side, Math.ceil(head.nFrames / side), head.detRows, head.detCols], cal: "un",
       size: humanSize(head.nFrames * head.detSize), loadable: true,
     };
-    GEOM.set(key(source, date, name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0) });
+    GEOM.set(key(source, date, name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side) });
     pushFile(source, date, mf, { master: null, dataFiles: [file] });
   }
   SESSIONS.sort((a, b) => `${a.source}/${a.date}`.localeCompare(`${b.source}/${b.date}`));
@@ -216,8 +219,11 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
     const meanDP = await compute.reduceFrames(new Uint32Array(startScan).fill(1), true);
     PERF.push({ key: k, loadDecodeMs: Math.round(tC - tA), reduceMs: Math.round(performance.now() - tC), totalMs: Math.round(performance.now() - tA) });
     const bf = fitBfDisk(meanDP, geom.detRows, geom.detCols);
-    const side = Math.round(Math.sqrt(startScan));
-    return { compute, meanDP, scanRows: side, scanCols: Math.ceil(startScan / side),
+    // Reshape with the master's TRUE raster width; rows = actual decoded frames / width (so a
+    // partial dataset shows the rows it has, correctly, instead of a wrong-stride square).
+    const scanCols = geom.scanCols || Math.round(Math.sqrt(startScan));
+    const scanRows = Math.ceil(startScan / scanCols);
+    return { compute, meanDP, scanRows, scanCols,
       detRows: geom.detRows, detCols: geom.detCols, detSize, scanCount: startScan, bf, badPx: geom.badPx };
   })();
   LOADED.set(k, p); LRU.push(k);
