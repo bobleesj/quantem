@@ -65,7 +65,7 @@ _bitshuffle_tail_kernel_u32 = _lazy_kernel("bitshuffle_tail_kernel_u32")
 
 __version__ = "0.0.3"
 __all__ = [
-    "load", "save", "H5Writer", "wait_for_saves", "bin",
+    "load", "load_parallel", "which_disks", "save", "H5Writer", "wait_for_saves", "bin",
     "discover_masters", "is_master_ready", "read_pixel_mask", "__version__",
 ]
 
@@ -1991,6 +1991,60 @@ def load(filepath, *args, dtype: str | None = None, **kwargs):
         if new is not data:
             result = LoadResult(new, result.metadata)
     return result
+
+
+def load_parallel(masters, *, max_concurrent=2, verbose=False, **load_kwargs):
+    """Load multiple master.h5 files with INDEPENDENT, concurrent IO.
+
+    Each master is read + decoded in its own worker thread, so masters that live on
+    DIFFERENT physical disks read in parallel and their disk bandwidth ADDS (two
+    Gen4 NVMe -> ~2x aggregate read). The per-master read already uses a 12-thread
+    pool (GIL released during ``os.readv``), so concurrent loads overlap at the
+    block-device level — independent IO, one pipeline per master.
+
+    Parameters
+    ----------
+    masters : list[str]
+        Master ``.h5`` paths. They MAY live on different disks; that is when this
+        helps. ``which_disks(masters)`` reports the physical device per master.
+    max_concurrent : int
+        Simultaneous loads. GPU-memory peak is ~``max_concurrent`` × one master's
+        output, so bound it to what fits. Default 2 = two independent disk→GPU
+        pipelines. Concurrent loads of masters on the SAME drive give no gain (the
+        disk is the floor) — pin hot datasets to SEPARATE dedicated NVMe.
+
+    Returns
+    -------
+    list[LoadResult]  — one per input master, in order.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    masters = list(masters)
+    results: list = [None] * len(masters)
+
+    def _one(i):
+        results[i] = load(masters[i], verbose=verbose, **load_kwargs)
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_concurrent))) as pool:
+        list(pool.map(_one, range(len(masters))))
+    return results
+
+
+def which_disks(masters):
+    """Map each master to its physical disk id (``st_dev``).
+
+    Use it to check that the masters you want to load in parallel actually live on
+    DIFFERENT disks — only then does :func:`load_parallel` add bandwidth. Returns
+    ``{master_path: st_dev}``; two paths with the same ``st_dev`` share a drive (no
+    aggregate gain), different ``st_dev`` = independent disks (reads overlap).
+    """
+    import os as _os
+    out = {}
+    for m in masters:
+        try:
+            out[str(m)] = _os.stat(str(m)).st_dev
+        except OSError:
+            out[str(m)] = None
+    return out
 
 
 def _load_impl(
