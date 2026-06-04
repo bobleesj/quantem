@@ -7,10 +7,12 @@ JavaScript for instant response. This widget is intentionally focused on
 single-object iterative ptychography volumes; comparison and tomography-specific
 workflows belong in Show3DVolume.
 """
+import base64
 import gc
 import io
 import json
 import math
+import os
 import pathlib
 import tempfile
 import warnings
@@ -1524,3 +1526,49 @@ class Show3DSlices(anywidget.AnyWidget):
         if vmax > vmin:
             return np.clip((slc - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
         return np.zeros(slc.shape, dtype=np.uint8)
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Return widget view + cheap 3-axis montage PNG snapshot.
+
+        Live Jupyter renders the interactive WebGPU slice viewer; the PNG is
+        the fallback for GitHub / nbviewer. Mid-slice on each of the three
+        axes at <=256 px each. Budget <100 ms typical. Opt out with
+        ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
+        """
+        bundle = super()._repr_mimebundle_(**kwargs)
+        if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
+            return bundle
+        if self._data is None:
+            return bundle
+        try:
+            import matplotlib.pyplot as plt
+            vol = self._data  # (Z, Y, X)
+            zc, yc, xc = vol.shape[0] // 2, vol.shape[1] // 2, vol.shape[2] // 2
+            axes_slices = [
+                ("Z", vol[zc, :, :]),
+                ("Y", vol[:, yc, :]),
+                ("X", vol[:, :, xc]),
+            ]
+            max_preview = 256
+            cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
+            fig, axes = plt.subplots(1, 3, figsize=(7.5, 2.5), squeeze=False)
+            for i, (lbl, slc) in enumerate(axes_slices):
+                ax = axes[0][i]
+                h, w = slc.shape
+                if h > max_preview or w > max_preview:
+                    step = max(h // max_preview, w // max_preview, 1)
+                    slc = slc[::step, ::step]
+                ax.imshow(slc, cmap=cmap, origin="upper")
+                ax.set_title(f"{lbl}-axis mid", fontsize=8)
+                ax.axis("off")
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
+            plt.close(fig)
+            data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
+            data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            if isinstance(bundle, tuple):
+                return (data_dict, bundle[1])
+            return data_dict
+        except Exception:
+            return bundle

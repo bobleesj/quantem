@@ -594,29 +594,27 @@ class Show2D(anywidget.AnyWidget):
         return f"Show2D({self.height}×{self.width}, cmap={self.cmap})"
 
     def _repr_mimebundle_(self, **kwargs):
-        """Return widget view + (optionally) static PNG fallback.
+        """Return widget view + cheap static PNG snapshot.
 
-        Live Jupyter renders the interactive widget; the PNG fallback is only
-        consumed by nbsphinx / GitHub / nbviewer when the widget view cannot be
-        rendered.  Building the fallback runs matplotlib over every gallery image
-        (~1.7 s for a 30×512² stack) and that cost pays off only in static builds.
-        Gate it behind ``QUANTEM_WIDGET_STATIC_FALLBACK=1`` so interactive sessions
-        return immediately.
+        Live Jupyter renders the interactive widget; the PNG snapshot is the
+        fallback consumed by GitHub / nbviewer / nbsphinx when JS is blocked.
+        Budget: <200 ms even for 30-image galleries (128 px max, 12 thumbs cap).
+        Opt out with ``QUANTEM_WIDGET_NO_SNAPSHOT=1`` for max-speed live sessions.
         """
         bundle = super()._repr_mimebundle_(**kwargs)
-        if not os.environ.get("QUANTEM_WIDGET_STATIC_FALLBACK"):
+        if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
             return bundle
         data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
-        n = self.n_images
+        n = min(self.n_images, 12)  # cap gallery thumbs at 12
         ncols = min(self.ncols, n)
         nrows = math.ceil(n / ncols)
-        cell = 4
+        cell = 2
         fig, axes = plt.subplots(
             nrows, ncols,
             figsize=(cell * ncols, cell * nrows),
             squeeze=False,
         )
-        max_preview = 256
+        max_preview = 128  # cap pixel dim per thumb
         for i in range(nrows * ncols):
             r, c = divmod(i, ncols)
             ax = axes[r][c]
@@ -627,13 +625,14 @@ class Show2D(anywidget.AnyWidget):
                     step = max(h // max_preview, w // max_preview, 1)
                     img = img[::step, ::step]
                 ax.imshow(img, cmap=self.cmap, origin="upper")
-                ax.set_title(self.labels[i], fontsize=10)
+                ax.set_title(self.labels[i], fontsize=8)
             ax.axis("off")
         if self.title:
-            fig.suptitle(self.title, fontsize=12)
+            extra = f" (+{self.n_images - n} more)" if self.n_images > n else ""
+            fig.suptitle(f"{self.title}{extra}", fontsize=10)
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
         plt.close(fig)
         data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
         if isinstance(bundle, tuple):

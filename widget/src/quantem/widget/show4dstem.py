@@ -11,8 +11,11 @@ To reduce data size, bin k-space at the dataset level before viewing:
     widget = Show4DSTEM(dataset)
 """
 
+import base64
+import io
 import json
 import math
+import os
 import pathlib
 import time
 from typing import TYPE_CHECKING, Any, Self
@@ -2602,4 +2605,53 @@ class Show4DSTEM(anywidget.AnyWidget):
             return
 
         self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(mask))
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Return widget view + cheap virtual-image + CBED PNG snapshot.
+
+        Live Jupyter renders the interactive 4D-STEM widget; the PNG is the
+        fallback for GitHub / nbviewer when JS is blocked. Re-uses already-
+        computed `virtual_image_bytes` (real-space BF/ROI) and `frame_bytes`
+        (current CBED). Budget <100 ms typical. Opt out with
+        ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
+        """
+        bundle = super()._repr_mimebundle_(**kwargs)
+        if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
+            return bundle
+        try:
+            import matplotlib.pyplot as plt
+            max_preview = 256
+            panels = []
+            if self.virtual_image_bytes:
+                vi = np.frombuffer(self.virtual_image_bytes, dtype=np.float32)
+                vi = vi.reshape(self.shape_rows, self.shape_cols)
+                panels.append(("virtual image (real)", vi, "gray"))
+            if self.frame_bytes:
+                fr = np.frombuffer(self.frame_bytes, dtype=np.float32)
+                fr = fr.reshape(self.det_rows, self.det_cols)
+                panels.append(("CBED (diffraction)", fr, "inferno"))
+            if not panels:
+                return bundle
+            ncols = len(panels)
+            fig, axes = plt.subplots(1, ncols, figsize=(2.5 * ncols, 2.5), squeeze=False)
+            for i, (lbl, img, cmap) in enumerate(panels):
+                h, w = img.shape
+                if h > max_preview or w > max_preview:
+                    step = max(h // max_preview, w // max_preview, 1)
+                    img = img[::step, ::step]
+                ax = axes[0][i]
+                ax.imshow(img, cmap=cmap, origin="upper")
+                ax.set_title(lbl, fontsize=8)
+                ax.axis("off")
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
+            plt.close(fig)
+            data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
+            data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            if isinstance(bundle, tuple):
+                return (data_dict, bundle[1])
+            return data_dict
+        except Exception:
+            return bundle
 
