@@ -6,11 +6,37 @@
 
 import { readH5Volume } from "../engine/h5reader";
 import { Show4DSTEMCompute } from "../engine/compute";
-import type { Bslz4Spec } from "../engine/bslz4";
+import { decodeBslz4Batch, type Bslz4Spec } from "../engine/bslz4";
 import type { Session, MasterFile, RawData, DetectorMode, DetShape, ShapeParams } from "../pages/browse/types";
 
 // A picked file, uniform over File System Access handles and <input webkitdirectory>.
-export interface LocalFile { name: string; relPath: string; bytes(): Promise<ArrayBuffer>; }
+// `source` (the File or directory handle) lets a worker read the bytes off the main thread -
+// reading in parallel across worker threads is ~4x the main-thread File.arrayBuffer rate.
+export interface LocalFile { name: string; relPath: string; bytes(): Promise<ArrayBuffer>; source?: File | FileSystemFileHandle; }
+
+interface ParsedSpec { id: number; nFrames: number; nBlocksPerFrame: number; blockElems: number; detSize: number; srcDtype: "uint8" | "uint16" | "uint32"; blockMeta: Uint32Array; buffer: ArrayBuffer; }
+let READERS: Worker[] | null = null;
+function readerPool(): Worker[] {
+  if (!READERS) {
+    const n = Math.min(8, navigator.hardwareConcurrency || 4);
+    READERS = Array.from({ length: n }, () => new Worker(new URL("./readWorker.ts", import.meta.url), { type: "module" }));
+  }
+  return READERS;
+}
+// Read + parse every slab across the worker pool (parallel disk reads ~10 GB/s vs ~2.3 GB/s
+// on the main thread). Calls onReady(id, spec) as each file completes, in arrival order.
+function readParseInWorkers(slabs: LocalFile[], onReady: (s: ParsedSpec) => void): void {
+  const pool = readerPool();
+  let next = 0;
+  const pump = (w: Worker) => {
+    if (next >= slabs.length) return;
+    const id = next++;
+    w.onmessage = (e: MessageEvent<ParsedSpec>) => { onReady(e.data); pump(w); };
+    const src = slabs[id].source!;
+    w.postMessage({ id, name: slabs[id].name, file: src instanceof File ? src : undefined, handle: src instanceof File ? undefined : src });
+  };
+  pool.forEach(pump);
+}
 
 const MASTER_RE = /_master\.h5$/i;
 const DATA_RE = /_data_\d+\.h5$/i;
@@ -85,7 +111,10 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
   // bare .h5 volumes not owned by a master
   for (const file of files) {
     if (claimed.has(file.relPath) || !/\.h5$/i.test(file.name)) continue;
-    const head = readH5Volume(await file.bytes(), file.name);
+    let head: ReturnType<typeof readH5Volume>;
+    try { head = readH5Volume(await file.bytes(), file.name); }
+    catch { continue; }   // not a 4D bslz4 stack (e.g. a Velox virtual-image export) - skip it
+
     const side = Math.round(Math.sqrt(head.nFrames));
     const { source, date } = sessionFor(file.relPath);
     const name = file.name;
@@ -111,18 +140,61 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
   const geom = GEOM.get(k);
   if (!handles || !geom) throw new Error(`unknown dataset ${k}`);
   const p = (async (): Promise<LoadedDS> => {
-    const specs: (Bslz4Spec & { startScan: number; nScan: number })[] = [];
-    let startScan = 0;
+    const PERF = ((window as unknown as { __perf: unknown[] }).__perf ||= []) as Record<string, unknown>[];
+    const tA = performance.now();
     const slabs = handles.master ? handles.dataFiles : handles.dataFiles;
-    for (const df of slabs) {
-      const vol = readH5Volume(await df.bytes(), df.name);
-      for (const c of vol.chunks) { specs.push({ ...c, startScan, nScan: c.nFrames }); startScan += c.nFrames; }
-    }
     const detSize = geom.detRows * geom.detCols;
-    const compute = await Show4DSTEMCompute.createFromBslz4Chunked(specs, startScan, detSize, "uint8", "uint16");
-    if (!compute) throw new Error("WebGPU unavailable");
+    // Pipeline parse and decode in groups: parse a group on the main thread (disk read +
+    // jsfive B-tree walk) while the GPU decodes the previous group, so the wall is ~max(parse,
+    // decode) not their sum. (A worker-pool parse was tried and lost to transfer overhead.)
+    const GROUP = 7;
+    const chunks: { buffer: GPUBuffer; startScan: number; nScan: number }[] = [];
+    let startScan = 0, device: GPUDevice | null = null, mode = 1;
+    let pending: Promise<{ device: GPUDevice; buffers: GPUBuffer[]; mode: number } | null> | null = null;
+    let pendingSpecs: { startScan: number; nScan: number }[] = [];
+    const drain = async () => {
+      if (!pending) return;
+      const r = await pending; if (!r) throw new Error("WebGPU unavailable");
+      device = r.device; mode = r.mode;
+      r.buffers.forEach((buffer, i) => chunks.push({ buffer, startScan: pendingSpecs[i].startScan, nScan: pendingSpecs[i].nScan }));
+      pending = null;
+    };
+    let srcDtype: "uint8" | "uint16" | "uint32" = "uint16";   // detected from the data
+    const useWorkers = slabs.every((s) => s.source);   // picker path -> parallel worker reads
+    // Read + parse all slabs (in workers when we have File/handle sources, else on the main
+    // thread). Collect parsed specs keyed by file index so we can decode in scan order.
+    const parsed: (ParsedSpec | null)[] = new Array(slabs.length).fill(null);
+    const ready: (() => void)[] = []; const readyP = slabs.map((_, i) => new Promise<void>((r) => (ready[i] = r)));
+    if (useWorkers) {
+      readParseInWorkers(slabs, (ps) => { parsed[ps.id] = ps; ready[ps.id](); });
+    } else {
+      (async () => { for (let i = 0; i < slabs.length; i++) {
+        const buf = await slabs[i].bytes(); const vol = readH5Volume(buf, slabs[i].name);
+        const c = vol.chunks[0]; parsed[i] = { id: i, nFrames: c.nFrames, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems, detSize: c.detSize, srcDtype: vol.srcDtype, blockMeta: c.blockMeta, buffer: buf }; ready[i]();
+      } })();
+    }
+    // Decode groups in scan order as their files become available; the worker reads (fast)
+    // overlap the GPU decode of earlier groups.
+    for (let g = 0; g < slabs.length; g += GROUP) {
+      const specs: (Bslz4Spec & { startScan: number; nScan: number })[] = [];
+      for (let i = g; i < Math.min(g + GROUP, slabs.length); i++) {
+        await readyP[i]; const ps = parsed[i]!;
+        srcDtype = ps.srcDtype;
+        specs.push({ compressed: new Uint8Array(ps.buffer), blockMeta: ps.blockMeta, nFrames: ps.nFrames,
+          nBlocksPerFrame: ps.nBlocksPerFrame, blockElems: ps.blockElems, detSize: ps.detSize, startScan, nScan: ps.nFrames });
+        startScan += ps.nFrames;
+      }
+      await drain();
+      pending = decodeBslz4Batch(specs, "uint8", srcDtype, GROUP);
+      pendingSpecs = specs;
+    }
+    await drain();
+    if (!device) throw new Error("WebGPU unavailable");
+    const tC = performance.now();
+    const compute = Show4DSTEMCompute.fromGpuChunks(device, chunks, startScan, detSize, mode);
     compute.badPx = geom.badPx;
     const meanDP = await compute.reduceFrames(new Uint32Array(startScan).fill(1), true);
+    PERF.push({ key: k, loadDecodeMs: Math.round(tC - tA), reduceMs: Math.round(performance.now() - tC), totalMs: Math.round(performance.now() - tA) });
     const bf = fitBfDisk(meanDP, geom.detRows, geom.detCols);
     const side = Math.round(Math.sqrt(startScan));
     return { compute, meanDP, scanRows: side, scanCols: Math.ceil(startScan / side),

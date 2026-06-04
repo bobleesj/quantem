@@ -13,7 +13,7 @@
 // Stack ships as uint8 (clip(0,255): real detector counts are 0-~200, so the
 // value IS the count, near-lossless) or uint16; dtype inferred from byte length.
 import { getGPUDevice } from "./device";
-import { decodeBslz4ToStack, type Bslz4Spec } from "./bslz4";
+import { decodeBslz4ToStack, decodeBslz4Batch, type Bslz4Spec } from "./bslz4";
 
 // `mode`: 0 = uint16 (2 samples/u32), 1 = uint8 (4/u32). `sample(gp)` reads a
 // detector value at a chunk-local global pixel index.
@@ -186,6 +186,13 @@ export class Show4DSTEMCompute {
     return new Show4DSTEMCompute(decoded.device, chunks, spec.nFrames, spec.detSize, decoded.mode);
   }
 
+  // Wrap already-decoded GPU stack buffers as a compute (no decode). Lets a caller pipeline
+  // parse + decode itself (decode group N while parsing group N+1) and hand the finished
+  // chunk buffers here. mode: 1 = uint8, 0 = uint16.
+  static fromGpuChunks(device: GPUDevice, chunks: { buffer: GPUBuffer; startScan: number; nScan: number }[], scanCount: number, detSize: number, mode: number): Show4DSTEMCompute {
+    return new Show4DSTEMCompute(device, chunks, scanCount, detSize, mode);
+  }
+
   // Chunked bslz4: decode each scan-row chunk's compressed bytes into its OWN GPU
   // buffer and hold them all, so a stack far bigger than one 1 GB buffer (full
   // 512x512x192x192 = 9.6 GB uint8) lives across N buffers and masked_sum /
@@ -195,17 +202,12 @@ export class Show4DSTEMCompute {
     scanCount: number, detSize: number, dtype: "uint8" | "uint16" = "uint8",
     srcDtype: "uint8" | "uint16" = "uint16",
   ): Promise<Show4DSTEMCompute | null> {
-    let device: GPUDevice | null = null;
-    let mode = dtype === "uint8" ? 1 : 0;
-    const chunks: Chunk[] = [];
-    for (const spec of chunkSpecs) {
-      const decoded = await decodeBslz4ToStack(spec, dtype, srcDtype);
-      if (!decoded) return null;
-      device = decoded.device; mode = decoded.mode;
-      chunks.push({ buffer: decoded.buffer, startScan: spec.startScan, nScan: spec.nScan });
-    }
-    if (!device) return null;
-    return new Show4DSTEMCompute(device, chunks, scanCount, detSize, mode);
+    // Batch the per-chunk decodes (one submit + await per group) so the GPU overlaps
+    // upload and compute instead of draining after every chunk.
+    const decoded = await decodeBslz4Batch(chunkSpecs, dtype, srcDtype);
+    if (!decoded) return null;
+    const chunks: Chunk[] = decoded.buffers.map((buffer, i) => ({ buffer, startScan: chunkSpecs[i].startScan, nScan: chunkSpecs[i].nScan }));
+    return new Show4DSTEMCompute(decoded.device, chunks, scanCount, detSize, decoded.mode);
   }
 
   // N chunks, each {bytes, startScan, nScan}. Each chunk's bytes hold its scan

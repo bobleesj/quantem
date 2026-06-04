@@ -15,7 +15,7 @@
 //   block decompresses to blockElemBytes = blockElems * elemBytes, holds
 //   nbits = elemBytes*8 bit-planes of planeBytes = blockElems/8 each.
 
-import { getGPUDevice } from "./device";
+import { getGPUDevice, onGPULost } from "./device";
 
 // Pass1: one thread per block, LZ4-decode into the `inter` (bitshuffled) buffer.
 // Blocks are independent -> embarrassingly parallel. Byte-addressed RMW because
@@ -130,6 +130,123 @@ fn byteAt(o:u32)->u32{return (inter[o>>2u]>>((o&3u)*8u))&0xffu;}
 
 const MAX_WG = 65535;
 
+// Copy bytes into a mapped GPU range using the widest aligned element view. V8's
+// Uint8Array.set is byte-granular (~3.75 GB/s); a Float64Array view stores 8 bytes/op and is
+// ~2-3x faster for multi-GB uploads. `src` is a Uint8Array over a whole file ArrayBuffer at
+// byteOffset 0 and the mapped range is a fresh 4-aligned ArrayBuffer, so copy the bulk as
+// f64 and the <8 trailing bytes as u8.
+function copyWide(dst: ArrayBuffer, src: Uint8Array): void {
+  const len = src.byteLength, off = src.byteOffset;
+  if ((off & 7) === 0) {
+    const n8 = len >>> 3;
+    if (n8 > 0) new Float64Array(dst, 0, n8).set(new Float64Array(src.buffer, off, n8));
+    const tail = n8 << 3;
+    if (tail < len) new Uint8Array(dst, tail, len - tail).set(src.subarray(tail));
+    return;
+  }
+  new Uint8Array(dst).set(src);
+}
+
+// FUSED decode (uint16 source -> uint8 output, the offline default): ONE WORKGROUP per
+// block. Thread 0 LZ4-decodes the block's blockBytes into workgroup-SHARED `sh` (byte RMW
+// on shared is ~100x the old global RMW, and there is no interBuf round-trip), barrier,
+// then all 64 threads inverse-bitshuffle the blockElems/8 eight-pixel groups straight from
+// `sh` and write uint8-packed output coalesced to `stack`. Bit-exact with PASS1+PASS2_U8:
+// same LZ4 token loop, same plane addressing (sh[lg + b*planeBytes]), same pack/clip.
+// __NPB__ = blockElems/8 = planeBytes = groups per block; __BE__ = blockElems.
+const FUSED_U16U8_WGSL = `
+@group(0) @binding(0) var<storage,read> raw: array<u32>;
+@group(0) @binding(1) var<storage,read> blkMeta: array<u32>;   // coff,clen per block
+@group(0) @binding(2) var<storage,read_write> stack: array<u32>;  // uint8-packed (4/u32)
+@group(0) @binding(3) var<uniform> cfg: vec4<u32>;   // totalBlocks, gridX, nBlk, framePix
+var<workgroup> sh: array<u32, 2048>;   // up to 8192 decoded (bitshuffled) bytes / block
+fn rraw(i:u32)->u32{return (raw[i>>2u]>>((i&3u)*8u))&0xffu;}
+fn rsh(i:u32)->u32{return (sh[i>>2u]>>((i&3u)*8u))&0xffu;}
+fn wsh(i:u32,v:u32){let w=i>>2u;let s=(i&3u)*8u;sh[w]=(sh[w]&(~(0xffu<<s)))|((v&0xffu)<<s);}
+fn clip8(v:u32)->u32{return select(v,255u,v>255u);}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let g = wid.y*cfg.y + wid.x; let lx = lid.x;
+  if(lx==0u && g<cfg.x){
+    let coff=blkMeta[g*2u]; let cend=coff+blkMeta[g*2u+1u];
+    var ci=coff; var di=0u;
+    loop{ if(ci>=cend){break;}
+      let tok=rraw(ci); ci=ci+1u; var nlit=tok>>4u;
+      if(nlit==15u){loop{let bb=rraw(ci);ci=ci+1u;nlit=nlit+bb;if(bb!=255u){break;}}}
+      var k=0u; loop{if(k>=nlit){break;} wsh(di+k,rraw(ci+k)); k=k+1u;} ci=ci+nlit; di=di+nlit;
+      if(ci>=cend){break;}
+      let off=rraw(ci)|(rraw(ci+1u)<<8u); ci=ci+2u; var ml=4u+(tok&0xfu);
+      if((tok&0xfu)==15u){loop{let bb=rraw(ci);ci=ci+1u;ml=ml+bb;if(bb!=255u){break;}}}
+      var j=0u; loop{if(j>=ml){break;} wsh(di+j,rsh(di+j-off)); j=j+1u;} di=di+ml;
+    }
+  }
+  workgroupBarrier();
+  if(g>=cfg.x){return;}
+  let frm = g/cfg.z; let blk = g%cfg.z;
+  let pixBase = frm*cfg.w + blk*__BE__;   // first detector pixel of this block
+  let oBase = (pixBase>>3u)*2u;            // 2 u32 per 8-pixel group
+  // uint8 output == clip8(value): 255 iff ANY bit >=8 is set, else the low byte. So only the
+  // 8 LOW planes need a bit-transpose; planes 8..nbits-1 collapse to one OR ("any high bit set"
+  // per pixel). Bit-exact for any input, and 2x (uint16) / 4x (uint32) less bitshuffle work.
+  for(var lg=lx; lg<__NPB__; lg=lg+64u){
+    var hi:u32=0u;
+    for(var b:u32=8u;b<__NBITS__;b=b+1u){ hi = hi | rsh(lg + b*__NPB__); }
+    var v0:u32=0u; var v1:u32=0u; var v2:u32=0u; var v3:u32=0u; var v4:u32=0u; var v5:u32=0u; var v6:u32=0u; var v7:u32=0u;
+    for(var b:u32=0u;b<8u;b=b+1u){
+      let byte=rsh(lg + b*__NPB__); let bit=1u<<b;
+      if((byte&1u)!=0u){v0=v0|bit;} if((byte&2u)!=0u){v1=v1|bit;}
+      if((byte&4u)!=0u){v2=v2|bit;} if((byte&8u)!=0u){v3=v3|bit;}
+      if((byte&16u)!=0u){v4=v4|bit;} if((byte&32u)!=0u){v5=v5|bit;}
+      if((byte&64u)!=0u){v6=v6|bit;} if((byte&128u)!=0u){v7=v7|bit;}
+    }
+    let o=oBase + lg*2u;
+    stack[o]=select(v0,255u,(hi&1u)!=0u)|(select(v1,255u,(hi&2u)!=0u)<<8u)|(select(v2,255u,(hi&4u)!=0u)<<16u)|(select(v3,255u,(hi&8u)!=0u)<<24u);
+    stack[o+1u]=select(v4,255u,(hi&16u)!=0u)|(select(v5,255u,(hi&32u)!=0u)<<8u)|(select(v6,255u,(hi&64u)!=0u)<<16u)|(select(v7,255u,(hi&128u)!=0u)<<24u);
+  }
+}`;
+
+const FUSED_PIPE_CACHE = new Map<string, GPUComputePipeline>();
+function getFusedPipe(device: GPUDevice, blockElems: number, nbits: number): GPUComputePipeline {
+  const npb = blockElems / 8;
+  const code = FUSED_U16U8_WGSL.replace(/__NPB__/g, `${npb}u`).replace(/__BE__/g, `${blockElems}u`).replace(/__NBITS__/g, `${nbits}u`);
+  let p = FUSED_PIPE_CACHE.get(code);
+  if (!p) { p = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } }); FUSED_PIPE_CACHE.set(code, p); }
+  return p;
+}
+
+// One fused decode job: upload the raw bytes + block table, dispatch one workgroup per
+// block (2D grid for the >65535 case). No interBuf. uint16-source -> uint8-output only.
+function buildFusedJob(device: GPUDevice, spec: Bslz4Spec, srcDtype: "uint16" | "uint32", preRaw?: GPUBuffer): DecodeJob {
+  const { compressed, blockMeta, nFrames, nBlocksPerFrame, blockElems, detSize } = spec;
+  const nbits = srcDtype === "uint32" ? 32 : 16;
+  const totalBlocks = nFrames * nBlocksPerFrame;
+  const stackWords = Math.ceil(nFrames * detSize / 4);
+  // raw buffer: either pre-uploaded via the staging pool (batch path) or, for the single
+  // decode path, mappedAtCreation here.
+  let rawBuf: GPUBuffer;
+  if (preRaw) { rawBuf = preRaw; }
+  else {
+    const rawSize = Math.ceil(compressed.byteLength / 4) * 4;
+    rawBuf = device.createBuffer({ size: rawSize, usage: GPUBufferUsage.STORAGE, mappedAtCreation: true });
+    copyWide(rawBuf.getMappedRange(), compressed);
+    rawBuf.unmap();
+  }
+  const metaBuf = device.createBuffer({ size: blockMeta.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(metaBuf, 0, blockMeta.buffer as ArrayBuffer, blockMeta.byteOffset, blockMeta.byteLength);
+  const stack = device.createBuffer({ size: stackWords * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const gx = Math.min(totalBlocks, MAX_WG), gy = Math.ceil(totalBlocks / MAX_WG);
+  const cfg = uniform(device, [totalBlocks, gx, nBlocksPerFrame, detSize]);
+  const pipe = getFusedPipe(device, blockElems, nbits);
+  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: rawBuf } }, { binding: 1, resource: { buffer: metaBuf } },
+    { binding: 2, resource: { buffer: stack } }, { binding: 3, resource: { buffer: cfg } } ] });
+  return {
+    stack, mode: 1,
+    record(enc) { const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(gx, gy); pass.end(); },
+    releaseTemps() { rawBuf.destroy(); metaBuf.destroy(); cfg.destroy(); },
+  };
+}
+
 export interface Bslz4Spec {
   compressed: Uint8Array;        // concatenated per-frame bslz4 chunks (frame-padded to 4B)
   blockMeta: Uint32Array;        // [coff,clen] per (frame,block), absolute byte offsets
@@ -139,58 +256,141 @@ export interface Bslz4Spec {
   detSize: number;               // detector pixels per frame (e.g. 192*192)
 }
 
-// Decode a bslz4 stack to a packed GPU buffer ([scanPos][detPixel]). dtype "uint8"
-// (clip 0-255, 4 px/u32, offline default - half the memory) or "uint16" (lossless,
-// 2 px/u32). Layout matches Show4DSTEMCompute.sample() for that mode exactly.
-// Returns null if WebGPU is unavailable. Throws (validation) only on misuse.
-export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" = "uint16"): Promise<{ device: GPUDevice; buffer: GPUBuffer; mode: number } | null> {
-  const device = await getGPUDevice();
-  if (!device) return null;
+// Compute pipelines are independent of the data (only of the pass2 template), so compile
+// them ONCE and reuse across every chunk + dataset - recompiling per chunk was wasteful.
+const PIPE_CACHE = new Map<string, { p1: GPUComputePipeline; p2: GPUComputePipeline }>();
+function getPipes(device: GPUDevice, srcDtype: "uint8" | "uint16", u8: boolean, nBlocksPerFrame: number, detSize: number) {
+  const pass2tpl = srcDtype === "uint8" ? PASS2_U8SRC_WGSL : (u8 ? PASS2_U8_WGSL : PASS2_WGSL);
+  const pass2 = pass2tpl.replace("__NBLK__", `${nBlocksPerFrame}u`).replace("__FRAMEPIX__", `${detSize}u`);
+  let pipes = PIPE_CACHE.get(pass2);
+  if (!pipes) {
+    pipes = {
+      p1: device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: PASS1_WGSL }), entryPoint: "main" } }),
+      p2: device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: pass2 }), entryPoint: "main" } }),
+    };
+    PIPE_CACHE.set(pass2, pipes);
+  }
+  return pipes;
+}
+
+interface DecodeJob { stack: GPUBuffer; mode: number; record(enc: GPUCommandEncoder): void; releaseTemps(): void; }
+
+// Reusable MAP_WRITE staging pool. mappedAtCreation allocates + zero-inits host-visible
+// memory every call (~3.9 GB/s, ~1.7s for a 6.6 GB dataset); a persistent pool pays that
+// once, then map/unmap-reuses, so the per-load upload becomes just the (fast, wide) CPU copy
+// + a GPU-internal copyBufferToBuffer. Cleared on device loss.
+let STAGING: GPUBuffer[] = [];
+let STAGING_BYTES = 0;
+function ensureStaging(device: GPUDevice, count: number, bytes: number): void {
+  if (STAGING.length >= count && STAGING_BYTES >= bytes) return;
+  STAGING.forEach((b) => b.destroy());
+  STAGING_BYTES = Math.max(bytes, STAGING_BYTES);
+  STAGING = Array.from({ length: count }, () => device.createBuffer({ size: STAGING_BYTES, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC }));
+}
+onGPULost(() => { STAGING = []; STAGING_BYTES = 0; });
+
+// Upload each spec's compressed bytes into a plain STORAGE buffer via the staging pool:
+// map a pooled staging buffer (no per-load alloc), wide-copy the bytes in, then a GPU copy
+// to the STORAGE buffer the decoder reads. Returns the raw buffers (caller destroys them).
+async function uploadViaStaging(device: GPUDevice, specs: Bslz4Spec[]): Promise<GPUBuffer[]> {
+  const align4 = (n: number) => Math.ceil(n / 4) * 4;
+  const maxBytes = specs.reduce((m, s) => Math.max(m, align4(s.compressed.byteLength)), 0);
+  ensureStaging(device, specs.length, maxBytes);
+  const rawBufs = specs.map((s) => device.createBuffer({ size: align4(s.compressed.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }));
+  await Promise.all(specs.map(async (s, i) => {
+    const sz = align4(s.compressed.byteLength);
+    await STAGING[i].mapAsync(GPUMapMode.WRITE, 0, sz);   // reused buffer: maps without re-alloc
+    copyWide(STAGING[i].getMappedRange(0, sz), s.compressed);
+    STAGING[i].unmap();
+  }));
+  const enc = device.createCommandEncoder();
+  specs.forEach((s, i) => enc.copyBufferToBuffer(STAGING[i], 0, rawBufs[i], 0, align4(s.compressed.byteLength)));
+  device.queue.submit([enc.finish()]);   // ordered before the decode submit; next group's mapAsync waits on it
+  return rawBufs;
+}
+
+// Build (but don't submit) a decode job: allocates the GPU buffers, uploads the compressed
+// bytes + block table, and returns a recorder that appends the two compute passes to a
+// shared encoder. Batching N jobs into ONE submit + ONE await lets the GPU pipeline the
+// chunks instead of draining between each (the per-chunk await was the decode bottleneck).
+function buildDecodeJob(device: GPUDevice, spec: Bslz4Spec, dtype: "uint8" | "uint16", srcDtype: "uint8" | "uint16"): DecodeJob {
   const { compressed, blockMeta, nFrames, nBlocksPerFrame, blockElems, detSize } = spec;
-  const srcBytes = srcDtype === "uint8" ? 1 : 2;   // companion encoded from uint8 (8 planes) or uint16 (16)
-  const blockBytes = blockElems * srcBytes;        // bitshuffled block bytes
+  const srcBytes = srcDtype === "uint8" ? 1 : 2;
+  const blockBytes = blockElems * srcBytes;
   const planeBytes = blockElems / 8;
   const totalBlocks = nFrames * nBlocksPerFrame;
   const totalElems = nFrames * detSize;
-  const u8 = dtype === "uint8" || srcDtype === "uint8";   // uint8 source always outputs uint8
-  const stackWords = u8 ? Math.ceil(totalElems / 4) : totalElems / 2;  // packed output u32 count
-  const interBytes = totalBlocks * blockBytes;
-
-  // writeBuffer requires a multiple-of-4 size; pad the compressed bytes if the
-  // companion isn't 4-aligned (robust to any chunk file).
-  const rawPad = compressed.byteLength % 4 === 0 ? compressed
-    : (() => { const p = new Uint8Array(Math.ceil(compressed.byteLength / 4) * 4); p.set(compressed); return p; })();
-  const rawBuf = device.createBuffer({ size: rawPad.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(rawBuf, 0, rawPad.buffer as ArrayBuffer, rawPad.byteOffset, rawPad.byteLength);
-  const interBuf = device.createBuffer({ size: interBytes, usage: GPUBufferUsage.STORAGE });
+  const u8 = dtype === "uint8" || srcDtype === "uint8";
+  const stackWords = u8 ? Math.ceil(totalElems / 4) : totalElems / 2;
+  // Upload the compressed bytes via a mapped-at-creation buffer: writing straight into the
+  // GPU-visible mapped range is a single copy, vs writeBuffer's internal CPU staging copy -
+  // roughly 2x the host->device throughput, and uploading 7.5 GB/dataset is the decode floor.
+  const rawSize = Math.ceil(compressed.byteLength / 4) * 4;
+  const rawBuf = device.createBuffer({ size: rawSize, usage: GPUBufferUsage.STORAGE, mappedAtCreation: true });
+  new Uint8Array(rawBuf.getMappedRange()).set(compressed);
+  rawBuf.unmap();
+  const interBuf = device.createBuffer({ size: totalBlocks * blockBytes, usage: GPUBufferUsage.STORAGE });
   const metaBuf = device.createBuffer({ size: blockMeta.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(metaBuf, 0, blockMeta.buffer as ArrayBuffer, blockMeta.byteOffset, blockMeta.byteLength);
   const stack = device.createBuffer({ size: stackWords * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-
   const cfg1 = uniform(device, [totalBlocks, blockBytes, 0, 0]);
-  const nGroups = totalElems / 8;   // pass2: one thread per 8-pixel group
+  const nGroups = totalElems / 8;
   const p2wg = Math.ceil(nGroups / 64), gx = Math.min(p2wg, MAX_WG), gy = Math.ceil(p2wg / MAX_WG);
   const cfg2 = uniform(device, [nGroups, gx * 64, blockElems, planeBytes]);
-
-  // uint8 source -> 8-plane fast path (output uint8); else uint16 source -> uint8(clip) or uint16.
-  const pass2tpl = srcDtype === "uint8" ? PASS2_U8SRC_WGSL : (u8 ? PASS2_U8_WGSL : PASS2_WGSL);
-  const pass2 = pass2tpl.replace("__NBLK__", `${nBlocksPerFrame}u`).replace("__FRAMEPIX__", `${detSize}u`);
-  const p1 = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: PASS1_WGSL }), entryPoint: "main" } });
-  const p2 = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: pass2 }), entryPoint: "main" } });
+  const { p1, p2 } = getPipes(device, srcDtype, u8, nBlocksPerFrame, detSize);
   const bg1 = device.createBindGroup({ layout: p1.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: rawBuf } }, { binding: 1, resource: { buffer: interBuf } },
     { binding: 2, resource: { buffer: metaBuf } }, { binding: 3, resource: { buffer: cfg1 } } ] });
   const bg2 = device.createBindGroup({ layout: p2.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: interBuf } }, { binding: 1, resource: { buffer: stack } },
     { binding: 2, resource: { buffer: cfg2 } } ] });
+  return {
+    stack, mode: u8 ? 1 : 0,
+    record(enc) {
+      const pa = enc.beginComputePass(); pa.setPipeline(p1); pa.setBindGroup(0, bg1); pa.dispatchWorkgroups(Math.ceil(totalBlocks / 64)); pa.end();
+      const pb = enc.beginComputePass(); pb.setPipeline(p2); pb.setBindGroup(0, bg2); pb.dispatchWorkgroups(gx, gy); pb.end();
+    },
+    releaseTemps() { rawBuf.destroy(); interBuf.destroy(); metaBuf.destroy(); cfg1.destroy(); cfg2.destroy(); },
+  };
+}
 
+// Decode N bslz4 specs into N packed GPU stack buffers, batching the GPU work in groups so
+// at most `groupSize` chunks' transient buffers (raw + intermediate) are live at once - one
+// submit + one await per group lets the GPU overlap upload and compute across chunks.
+export async function decodeBslz4Batch(specs: Bslz4Spec[], dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" | "uint32" = "uint16", groupSize = 14): Promise<{ device: GPUDevice; buffers: GPUBuffer[]; mode: number } | null> {
+  const device = await getGPUDevice();
+  if (!device) return null;
+  const fused = dtype === "uint8" && (srcDtype === "uint16" || srcDtype === "uint32");   // uint16/uint32 -> uint8 fast path
+  const buffers: GPUBuffer[] = []; let mode = 0;
+  for (let g = 0; g < specs.length; g += groupSize) {
+    const groupSpecs = specs.slice(g, g + groupSize);
+    // Fused path uploads through the reused staging pool (no per-load mappedAtCreation alloc);
+    // the non-fused path keeps its own mappedAtCreation upload.
+    const raws = fused ? await uploadViaStaging(device, groupSpecs) : null;
+    const jobs = groupSpecs.map((s, i) => fused ? buildFusedJob(device, s, srcDtype as "uint16"|"uint32", raws![i]) : buildDecodeJob(device, s, dtype, srcDtype as "uint8"|"uint16"));
+    const enc = device.createCommandEncoder();
+    for (const j of jobs) j.record(enc);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    for (const j of jobs) { j.releaseTemps(); buffers.push(j.stack); mode = j.mode; }
+  }
+  return { device, buffers, mode };
+}
+
+// Decode a bslz4 stack to a packed GPU buffer ([scanPos][detPixel]). dtype "uint8"
+// (clip 0-255, 4 px/u32, offline default - half the memory) or "uint16" (lossless,
+// 2 px/u32). Layout matches Show4DSTEMCompute.sample() for that mode exactly.
+// Returns null if WebGPU is unavailable. Throws (validation) only on misuse.
+export async function decodeBslz4ToStack(spec: Bslz4Spec, dtype: "uint8" | "uint16" = "uint8", srcDtype: "uint8" | "uint16" | "uint32" = "uint16"): Promise<{ device: GPUDevice; buffer: GPUBuffer; mode: number } | null> {
+  const device = await getGPUDevice();
+  if (!device) return null;
+  const job = (dtype === "uint8" && (srcDtype === "uint16" || srcDtype === "uint32")) ? buildFusedJob(device, spec, srcDtype as "uint16"|"uint32") : buildDecodeJob(device, spec, dtype, srcDtype as "uint8"|"uint16");
   const enc = device.createCommandEncoder();
-  let pa = enc.beginComputePass(); pa.setPipeline(p1); pa.setBindGroup(0, bg1); pa.dispatchWorkgroups(Math.ceil(totalBlocks / 64)); pa.end();
-  let pb = enc.beginComputePass(); pb.setPipeline(p2); pb.setBindGroup(0, bg2); pb.dispatchWorkgroups(gx, gy); pb.end();
+  job.record(enc);
   device.queue.submit([enc.finish()]);
   await device.queue.onSubmittedWorkDone();
-  rawBuf.destroy(); interBuf.destroy(); metaBuf.destroy(); cfg1.destroy(); cfg2.destroy();
-  return { device, buffer: stack, mode: u8 ? 1 : 0 };
+  job.releaseTemps();
+  return { device, buffer: job.stack, mode: job.mode };
 }
 
 function uniform(device: GPUDevice, vals: number[]): GPUBuffer {

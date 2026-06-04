@@ -34,7 +34,9 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
       const v = adapter.limits[key] || 0;
       if (v > 0) requiredLimits[key] = v;
     }
-    gpuDevice = await adapter.requestDevice({ requiredFeatures: [], requiredLimits });
+    const feats: GPUFeatureName[] = [];
+    if (adapter.features.has("timestamp-query")) feats.push("timestamp-query");   // for kernel profiling
+    gpuDevice = await adapter.requestDevice({ requiredFeatures: feats, requiredLimits });
     gpuDevice.lost.then(() => { gpuDevice = null; lostCallbacks.forEach((cb) => cb()); });
     return gpuDevice;
   } catch { return null; }

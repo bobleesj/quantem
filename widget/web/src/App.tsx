@@ -25,7 +25,7 @@ declare module "@mui/material/styles" { interface BreakpointOverrides { nav700: 
 function filesFromInput(list: FileList): LocalFile[] {
   return Array.from(list)
     .filter((f) => /\.h5$/i.test(f.name))
-    .map((f) => ({ name: f.name, relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name, bytes: () => f.arrayBuffer() }));
+    .map((f) => ({ name: f.name, relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name, bytes: () => f.arrayBuffer(), source: f }));
 }
 async function filesFromDirHandle(dir: FileSystemDirectoryHandle, prefix = ""): Promise<LocalFile[]> {
   const out: LocalFile[] = [];
@@ -33,7 +33,7 @@ async function filesFromDirHandle(dir: FileSystemDirectoryHandle, prefix = ""): 
   for await (const [name, handle] of dir.entries()) {
     const rel = prefix ? `${prefix}/${name}` : name;
     if (handle.kind === "file" && /\.h5$/i.test(name)) {
-      out.push({ name, relPath: rel, bytes: async () => (await handle.getFile()).arrayBuffer() });
+      out.push({ name, relPath: rel, bytes: async () => (await handle.getFile()).arrayBuffer(), source: handle as FileSystemFileHandle });
     } else if (handle.kind === "directory") {
       out.push(...await filesFromDirHandle(handle, rel));
     }
@@ -86,6 +86,16 @@ export default function App() {
       async (base: string, paths: string[]) => {
         const files: LocalFile[] = paths.map((p) => ({
           name: p.split("/").pop()!, relPath: p, bytes: async () => (await fetch(base + p)).arrayBuffer(),
+        }));
+        await scanFolder(files);
+        setReady(true);
+      };
+    // Real disk-path hook for measurement: reads File objects (getFile().arrayBuffer()),
+    // exactly what the picker yields - no http. Driven via CDP DOM.setFileInputFiles.
+    (window as unknown as { __loadFileList: (list: FileList) => Promise<void> }).__loadFileList =
+      async (list: FileList) => {
+        const files: LocalFile[] = Array.from(list).filter((f) => /\.h5$/i.test(f.name)).map((f) => ({
+          name: f.name, relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name, bytes: () => f.arrayBuffer(), source: f,
         }));
         await scanFolder(files);
         setReady(true);
