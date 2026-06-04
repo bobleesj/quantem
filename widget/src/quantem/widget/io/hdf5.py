@@ -2025,14 +2025,23 @@ def group_by_disk(paths) -> dict:
 
 
 def load_parallel(masters, *, max_concurrent=None, verbose=False, **load_kwargs):
-    """Load many master.h5 files with INDEPENDENT, concurrent IO — bandwidth adds
-    across disks.
+    """Load many master.h5 files, overlapping their DISK READS across disks while
+    decoding on the GPU SERIALLY.
 
-    Each master reads + decodes in its own worker thread. Masters on DIFFERENT
-    physical disks read in parallel, so their bandwidth ADDS (measured +61% / 2.6×
-    on two Gen4 NVMe). The per-master read already uses a 12-thread pool (GIL
-    released during ``os.readv``), so concurrent loads overlap at the block-device
-    level — one independent disk→GPU pipeline per master.
+    The split is deliberate and is what makes this safe AND fast:
+
+    * **Reads run concurrently** — when masters live on DIFFERENT physical disks,
+      their cold reads overlap and bandwidth ADDS (the per-file read uses ``os.readv``
+      which releases the GIL). This is the win for a joint-reconstruction series.
+    * **GPU decode runs serially** — concurrent in-process CUDA decode shares the
+      CuPy kernel/plan caches and the pinned-buffer pool, which raises
+      ``cudaErrorIllegalAddress``. So masters are decoded one at a time on the GPU.
+
+    Concretely: phase 1 warms the OS page cache for every master's compressed files
+    in parallel (IO only, no GPU) — reads on separate disks overlap; phase 2 calls
+    :func:`load` on each master serially, now reading warm and decoding safely.
+    Same-disk masters skip phase 1 (serial cold read is already the disk floor, so
+    warming would just double-read).
 
     Parameters
     ----------
@@ -2040,41 +2049,56 @@ def load_parallel(masters, *, max_concurrent=None, verbose=False, **load_kwargs)
         Master ``.h5`` paths. The win comes when they span multiple disks — check
         the layout with :func:`group_by_disk`.
     max_concurrent : int, optional
-        Simultaneous loads. **Default (None) = the number of distinct disks the
-        masters span** — one read per disk keeps every drive busy without
-        oversubscribing any single one (the disk-aware sweet spot). Override to cap
-        GPU memory (peak ≈ ``max_concurrent`` × one master's output) or push more
-        readers per disk. Masters are scheduled disk-interleaved so in-flight loads
-        hit different disks first.
+        Parallel READERS in phase 1. **Default (None) = the number of distinct disks
+        the masters span** — one reader per disk saturates each drive without
+        oversubscribing. (GPU decode is always serial regardless.)
 
     Returns
     -------
     list[LoadResult]  — one per input master, in input order.
     """
+    import os
+    import glob as _glob
     from concurrent.futures import ThreadPoolExecutor
     masters = list(masters)
-    n = len(masters)
     disks = [disk_of(m) for m in masters]
+    n_disks = len({d for d in disks if d != "?"})
     if max_concurrent is None:
-        max_concurrent = max(1, len(set(disks)))  # one read per distinct disk
-    # Disk-interleaved order: round-robin the per-disk queues so the first
-    # `max_concurrent` submissions land on distinct disks (peak parallel bandwidth).
-    buckets: dict = {}
-    for idx, dk in enumerate(disks):
-        buckets.setdefault(dk, []).append(idx)
-    order, queues = [], [list(q) for q in buckets.values()]
-    while any(queues):
-        for q in queues:
-            if q:
-                order.append(q.pop(0))
-    results: list = [None] * n
+        max_concurrent = max(1, n_disks)
 
-    def _one(idx):
-        results[idx] = load(masters[idx], verbose=verbose, **load_kwargs)
+    # Phase 1: warm the page cache in parallel, but only when the masters actually
+    # span >1 disk (else a serial cold read is already the floor and warming would
+    # just read everything twice).
+    if max_concurrent > 1 and n_disks > 1:
+        files_by_master = []
+        for m in masters:
+            stem = os.path.basename(m).replace("_master.h5", "")
+            df = _glob.glob(os.path.join(os.path.dirname(m), f"{stem}_data_*.h5"))
+            files_by_master.append(df or [m])
+        # Disk-interleave the masters so the warm-readers hit different disks first.
+        order, queues = [], {}
+        for i, dk in enumerate(disks):
+            queues.setdefault(dk, []).append(i)
+        ql = [list(q) for q in queues.values()]
+        while any(ql):
+            for q in ql:
+                if q:
+                    order.append(q.pop(0))
+        warm_files = [f for i in order for f in files_by_master[i]]
 
-    with ThreadPoolExecutor(max_workers=max(1, int(max_concurrent))) as pool:
-        list(pool.map(_one, order))
-    return results
+        def _warm(path):
+            try:
+                with open(path, "rb", buffering=0) as fh:
+                    while fh.read(1 << 22):  # 4 MB chunks; populates the page cache
+                        pass
+            except OSError:
+                pass
+
+        with ThreadPoolExecutor(max_workers=max(8, max_concurrent * 6)) as pool:
+            list(pool.map(_warm, warm_files))
+
+    # Phase 2: serial load — warm read (fast) + GPU decode one master at a time (safe).
+    return [load(m, verbose=verbose, **load_kwargs) for m in masters]
 
 
 def _load_impl(
