@@ -92,32 +92,37 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
     sess.files.push(mf);
     HANDLES.set(key(source, date, mf.name), h);
   };
-  const masters = files.filter((f) => MASTER_RE.test(f.name));
+  // Skip macOS AppleDouble sidecars (._foo.h5): they match *master*.h5 but are 4 KB resource-fork
+  // junk that jsfive can't parse - and one throw used to kill the whole folder scan.
+  const realFiles = files.filter((f) => !f.name.startsWith("._"));
+  const masters = realFiles.filter((f) => MASTER_RE.test(f.name));
   const claimed = new Set<string>();
   for (const m of masters) {
     const prefix = m.name.replace(MASTER_RE, "");
-    const dataFiles = files.filter((f) => DATA_RE.test(f.name) && f.name.startsWith(prefix))
+    const dataFiles = realFiles.filter((f) => DATA_RE.test(f.name) && f.name.startsWith(prefix))
       .sort((a, b) => a.name.localeCompare(b.name));
     dataFiles.forEach((f) => claimed.add(f.relPath)); claimed.add(m.relPath);
-    const f = new jsfive.File(await m.bytes(), m.name) as { get(p: string): { value: ArrayLike<number>; shape: number[] } };
-    const ntrigger = Number(f.get("entry/instrument/detector/detectorSpecific/ntrigger").value[0]);
-    const pm = f.get("entry/instrument/detector/detectorSpecific/pixel_mask");
-    const detRows = pm.shape[0], detCols = pm.shape[1];
-    const bad: number[] = [];
-    for (let i = 0; i < pm.value.length; i++) if (pm.value[i] !== 0) bad.push(i);
-    const side = Math.round(Math.sqrt(ntrigger));
-    const scanRows = side, scanCols = Math.ceil(ntrigger / side);
-    const totalBytes = dataFiles.reduce((a, _df, i) => a + (files.find((x) => x.relPath === dataFiles[i].relPath) ? 0 : 0), 0);
-    const { source, date } = sessionFor(m.relPath);
-    const mf: MasterFile = {
-      name: m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
-      size: humanSize(totalBytes || ntrigger * detRows * detCols), loadable: dataFiles.length > 0,
-    };
-    GEOM.set(key(source, date, m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
-    pushFile(source, date, mf, { master: m, dataFiles });
+    // A corrupt / truncated / non-HDF5 master must not abort the whole folder - skip it, keep going.
+    try {
+      const f = new jsfive.File(await m.bytes(), m.name) as { get(p: string): { value: ArrayLike<number>; shape: number[] } };
+      const ntrigger = Number(f.get("entry/instrument/detector/detectorSpecific/ntrigger").value[0]);
+      const pm = f.get("entry/instrument/detector/detectorSpecific/pixel_mask");
+      const detRows = pm.shape[0], detCols = pm.shape[1];
+      const bad: number[] = [];
+      for (let i = 0; i < pm.value.length; i++) if (pm.value[i] !== 0) bad.push(i);
+      const side = Math.round(Math.sqrt(ntrigger));
+      const scanRows = side, scanCols = Math.ceil(ntrigger / side);
+      const { source, date } = sessionFor(m.relPath);
+      const mf: MasterFile = {
+        name: m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
+        size: humanSize(ntrigger * detRows * detCols), loadable: dataFiles.length > 0,
+      };
+      GEOM.set(key(source, date, m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
+      pushFile(source, date, mf, { master: m, dataFiles });
+    } catch { /* unreadable master (corrupt/truncated/not HDF5) - skip, scan the rest */ }
   }
   // bare .h5 volumes not owned by a master
-  for (const file of files) {
+  for (const file of realFiles) {
     if (claimed.has(file.relPath) || !/\.h5$/i.test(file.name)) continue;
     let head: ReturnType<typeof readH5Volume>;
     try { head = readH5Volume(await file.bytes(), file.name); }
