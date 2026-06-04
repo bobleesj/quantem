@@ -333,6 +333,37 @@ export class Show4DSTEMCompute {
     idxBuf.destroy(); vi.destroy(); temps.forEach((b) => b.destroy()); return out;
   }
 
+  // GPU-RESIDENT virtual image: identical to maskedSum but returns the vi GPU buffer WITHOUT
+  // the readback. The 60fps drag path feeds this straight into the colormap engine + canvas, so
+  // there is NO GPU->CPU->GPU bounce and NO mapAsync fence (the two fences - maskedSum readback +
+  // colormap rgba readback - were the ~100ms/repaint that capped the drag at ~9fps). Caller owns
+  // the returned buffer (the colormap slot adopts it; freed on the next adopt / dispose).
+  maskedSumBuffer(mask: Uint32Array): { buffer: GPUBuffer; n: number } {
+    const device = this.device;
+    const bad = this.badPx.length ? new Set(this.badPx) : null;
+    const idxArr = new Uint32Array(this.detSize); let n = 0;
+    for (let k = 0; k < this.detSize; k++) if (mask[k] !== 0 && !(bad && bad.has(k))) idxArr[n++] = k;
+    const idx = idxArr.subarray(0, n || 1);
+    const idxBuf = this.upload(idx, GPUBufferUsage.STORAGE);
+    const vi = device.createBuffer({ size: this.scanCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const temps: GPUBuffer[] = [];
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass(); pass.setPipeline(this.maskedSumPipe);
+    for (const ch of this.chunks) {
+      const gx = Math.min(ch.nScan, MAX_WG), gy = Math.ceil(ch.nScan / MAX_WG);
+      const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
+      const dims2 = this.uniform([gx, 0, 0, 0]); temps.push(dims2);
+      const bind = device.createBindGroup({ layout: this.maskedSumPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: idxBuf } },
+        { binding: 2, resource: { buffer: vi } }, { binding: 3, resource: { buffer: dims } }, { binding: 4, resource: { buffer: dims2 } } ] });
+      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(gx, gy);
+    }
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    idxBuf.destroy(); temps.forEach((b) => b.destroy());   // vi handed to caller, NOT destroyed
+    return { buffer: vi, n };
+  }
+
   // DP over a real-space ROI: f32[detSize]. scanMask is GLOBAL; chunks accumulate
   // in INTEGER (u32, bit-exact) - the mean divide happens once in f64 at readback,
   // so the result matches the torch/CUDA integer-sum-then-divide exactly (even on

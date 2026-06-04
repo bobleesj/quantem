@@ -6,7 +6,7 @@ import { useGlobalSmooth, imageRenderingFor } from "../../hooks/useGlobalSmooth"
 import {
   ALPHA_MRAD, COLORMAP_OPTIONS, DETECTOR_MODES, DET_SHAPES,
   fetchBfGeometry, fetchCBED, fetchCBEDRoi, fetchVirtualImage,
-  fetchVirtualImageShape, fileKey, formatMrad,
+  fetchVirtualImageBufferGpu, fetchVirtualImageShape, fileKey, formatMrad,
   type BfGeometry, type BrowseDtype, type ColormapName, type DetBin, type DetShape,
   type DetectorMode, type MasterFile, type MasterLoadStatus, type RawData,
   type Session, type Set5D, type ShapeParams,
@@ -890,6 +890,32 @@ function CanvasCard({
   );
 }
 
+/** GPU-RESIDENT realspace render: colormap a slot straight to a WebGPU canvas via
+ *  `applyToCanvas` - NO rgba readback (the readback fence was ~half the per-frame cost). Source is
+ *  either a CPU Float32Array (committed render) or an adopted GPU buffer (the drag fast-path, where
+ *  the maskedSum result never leaves the GPU). vmin/vmax are passed in (computed once on commit,
+ *  HELD during a drag) so no CPU percentile is needed per frame. Falls back to the 2D path when
+ *  WebGPU is unavailable (headless). Returns true if it painted via WebGPU. */
+async function renderRealspaceGpu(
+  canvas: HTMLCanvasElement | null, slotIdx: number, cmap: string,
+  src: { data: Float32Array } | { gpuBuffer: GPUBuffer }, width: number, height: number,
+  vmin: number, vmax: number,
+): Promise<boolean> {
+  if (!canvas) return false;
+  const engine = await getGPUColormapEngine();
+  let ctx: GPUCanvasContext | null = null;
+  try { ctx = canvas.getContext("webgpu") as GPUCanvasContext | null; } catch { ctx = null; }
+  if (!engine || !ctx) {
+    if ("data" in src) await renderToCanvas(canvas, src.data, width, height, cmap, slotIdx, 0, 1, { vmin, vmax });
+    return false;
+  }
+  engine.uploadLUT(cmap);
+  if ("data" in src) engine.uploadData(slotIdx, src.data, width, height);
+  else engine.adoptBuffer(slotIdx, src.gpuBuffer, width, height);
+  engine.applyToCanvas(slotIdx, vmin, vmax, ctx, canvas, false);
+  return true;
+}
+
 /** Render Float32Array → 2D canvas via WebGPU colormap engine, with CPU
  *  fallback. Mirrors PanelViewer's WebGPU-first pattern but tuned for a
  *  single-slot use case (no FFT, no histogram-on-GPU). */
@@ -1231,6 +1257,10 @@ export default function Viewer(props: Props) {
 
   const realRef = useRef<HTMLCanvasElement>(null);
   const dpRef = useRef<HTMLCanvasElement>(null);
+  // True while an aperture drag owns the realspace canvas via the GPU-resident fast path (so the
+  // slow VI effect skips). viCommitTick is bumped on drag-release to fire the full path once.
+  const draggingRef = useRef(false);
+  const [viCommitTick, setViCommitTick] = useState(0);
   const realFrameRef = useRef<HTMLDivElement>(null);
   const dpFrameRef = useRef<HTMLDivElement>(null);
 
@@ -1433,6 +1463,9 @@ export default function Viewer(props: Props) {
     || (dpShape === "rect" && sR1 > sR0 && sC1 > sC0)
     || dpShape === "point";
   useEffect(() => {
+    // While an aperture drag is active the GPU-resident fast path owns the realspace canvas;
+    // skip the slow CPU-readback fetch (it would fight the fast path + tank the framerate).
+    if (draggingRef.current) return;
     const liveDetectorActive = realData != null;
     if (shapeUsesEndpoint && !shapeParamsReady) {
       vImgPendingFireRef.current = null;
@@ -1541,7 +1574,7 @@ export default function Viewer(props: Props) {
         fire();
       }, throttleMs - elapsed);
     }
-  }, [fileId, mode, ringInner, ringOuter, apCx, apCy, detBin, browseDtype,
+  }, [fileId, mode, ringInner, ringOuter, apCx, apCy, detBin, browseDtype, viCommitTick,
       shapeUsesEndpoint, dpShape,
       sCx, sCy, sR, sHalf, sInner, sOuter,
       sR0, sC0, sR1, sC1, sPx, sPy]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1721,11 +1754,53 @@ export default function Viewer(props: Props) {
     return applyScale(realData.data, imageScale, imagePowerExp);
   }, [realData, imageScale, imagePowerExp]);
 
-  // Paint real-space canvas whenever the data, colormap, scale, or clip range changes.
+  // Last (vmin,vmax) used for the realspace VI - cached so the aperture-drag fast path can HOLD
+  // contrast (no per-frame CPU percentile -> no readback). Refreshed on every committed render.
+  const lastRealClipRef = useRef<{ vmin: number; vmax: number } | null>(null);
+  // ---- 60fps aperture-drag fast path (mirrors Show4DSTEM's direct recompute) ----
+  // During a BF/ADF/DF aperture drag we bypass React entirely: maskedSum stays a GPU buffer (no
+  // readback), colormapped straight to the canvas (applyToCanvas, no readback), contrast HELD.
+  // The slow path (setState -> CPU readback -> percentile -> apply readback -> putImageData, the
+  // ~110ms/frame that capped the drag at ~9fps) is skipped while dragging. Stale-closure-proof:
+  // the latest mode/aperture/cmap live in refs, read at render time.
+  const apertureRef = useRef<{ cx: number; cy: number } | null>(null);
+  const ringRef = useRef<{ inner: number; outer: number }>({ inner: 0, outer: 0 });
+  const dragRafRef = useRef<number | null>(null);
+  const dragAgainRef = useRef(false);
+  apertureRef.current = aperture;
+  ringRef.current = { inner: ringInner, outer: ringOuter };
+  // Coalesced (single in-flight) GPU-resident recompute+paint of the realspace canvas from the
+  // CURRENT aperture. Re-fires if the aperture moved again mid-frame. Read via fastViRef so the
+  // window mousemove handler always calls the freshest closure (no stale session/mode/cmap).
+  const scheduleFastVI = () => {
+    if (dragRafRef.current != null) { dragAgainRef.current = true; return; }
+    dragRafRef.current = requestAnimationFrame(async () => {
+      dragRafRef.current = null;
+      const ap = apertureRef.current;
+      const res = await fetchVirtualImageBufferGpu(session, file, mode, ringRef.current.inner, ringRef.current.outer, ap?.cx ?? null, ap?.cy ?? null);
+      if (res) {
+        const clip = lastRealClipRef.current ?? { vmin: 0, vmax: 1 };
+        await renderRealspaceGpu(realRef.current, SLOT_REAL, cmapImage, { gpuBuffer: res.buffer }, res.width, res.height, clip.vmin, clip.vmax);
+      }
+      if (dragAgainRef.current && draggingRef.current) { dragAgainRef.current = false; scheduleFastVI(); }
+    });
+  };
+  const fastViRef = useRef(scheduleFastVI);
+  fastViRef.current = scheduleFastVI;
+  const endApertureDrag = () => {
+    draggingRef.current = false;
+    if (dragRafRef.current != null) { cancelAnimationFrame(dragRafRef.current); dragRafRef.current = null; }
+    dragAgainRef.current = false;
+    setViCommitTick((t) => t + 1);
+  };
+  // Paint real-space canvas whenever the data, colormap, scale, or clip range changes. Uses the
+  // GPU-resident path (applyToCanvas, no rgba readback). Computes the percentile here so the held
+  // value is available to the drag fast path.
   useEffect(() => {
     if (!realData || !realDisplayData) return;
-    void renderToCanvas(realRef.current, realDisplayData, realData.w, realData.h,
-                        cmapImage, SLOT_REAL, clipLo, clipHi);
+    const { vmin, vmax } = percentileClip(realDisplayData, clipLo * 100, clipHi * 100);
+    lastRealClipRef.current = { vmin, vmax };
+    void renderRealspaceGpu(realRef.current, SLOT_REAL, cmapImage, { data: realDisplayData }, realData.w, realData.h, vmin, vmax);
   }, [realData, realDisplayData, cmapImage, clipLo, clipHi]);
 
   // FFT of the virtual image. Always log-scaled (Bragg-disc patterns span
@@ -2221,6 +2296,7 @@ export default function Viewer(props: Props) {
     // simultaneously near both (rare — rings are at radius>0).
     if (showRing && aperture && apertureHitTest(e.clientX, e.clientY)) {
       e.preventDefault();
+      draggingRef.current = true;   // GPU-resident fast path owns the canvas until mouseup
       setCenterDrag(true);
       return;
     }
@@ -2299,6 +2375,7 @@ export default function Viewer(props: Props) {
       if (hit) {
         e.preventDefault();
         setNearRing(hit.side);
+        draggingRef.current = true;   // GPU-resident fast path owns the canvas until mouseup
         setRingDrag({ which: hit.side });
         return;
       }
@@ -2407,12 +2484,14 @@ export default function Viewer(props: Props) {
       const detY = ((e.clientY - bbox.top - dpTf.ty) / dpTf.scale) * (dpData.h / bbox.height);
       const cx = Math.max(0, Math.min(dpData.w - 1, detX));
       const cy = Math.max(0, Math.min(dpData.h - 1, detY));
+      apertureRef.current = { cx, cy };   // latest center for the fast path (sync, pre-render)
+      fastViRef.current();                // GPU-resident recompute+paint, no React, no readback
       setAperture({ cx, cy });
       // Keep the shape-endpoint params in sync so circle/annulus stay
       // centered on the same point the user is dragging.
       setShapeParams((prev) => ({ ...prev, cx, cy }));
     };
-    const u = () => setCenterDrag(false);
+    const u = () => endApertureDrag();
     window.addEventListener("mousemove", m);
     window.addEventListener("mouseup", u);
     return () => {
@@ -2450,13 +2529,14 @@ export default function Viewer(props: Props) {
       }
       if (which === "inner") {
         const v = Math.max(MIN, Math.min(ringOuter - GAP, alpha));
-        setRingInner(v);
+        ringRef.current = { ...ringRef.current, inner: v }; setRingInner(v);
       } else {
         const v = Math.max(ringInner + GAP, Math.min(MAX, alpha));
-        setRingOuter(v);
+        ringRef.current = { ...ringRef.current, outer: v }; setRingOuter(v);
       }
+      fastViRef.current();   // GPU-resident recompute+paint from the new radius, no React/readback
     };
-    const u = () => setRingDrag(null);
+    const u = () => { endApertureDrag(); setRingDrag(null); };
     window.addEventListener("mousemove", m);
     window.addEventListener("mouseup", u);
     return () => {

@@ -180,6 +180,15 @@ export function fetchVirtualImage(
   return store.virtualImage(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null);
 }
 
+/** GPU-resident virtual image for the aperture-drag fast path: returns the maskedSum GPU buffer
+ *  (no readback) for BF/ADF/DF, or null for CoM modes (caller falls back to fetchVirtualImage). */
+export function fetchVirtualImageBufferGpu(
+  s: Session, f: MasterFile, mode: DetectorMode, inner: number, outer: number,
+  cx: number | null, cy: number | null,
+): Promise<{ buffer: GPUBuffer; width: number; height: number } | null> {
+  return store.virtualImageBufferGpu(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null);
+}
+
 // --- Detector-shape selector (Show4DSTEM-style live shape on the DP) ----
 
 /** The shape the user picked on the DP overlay. Drives the detector mask

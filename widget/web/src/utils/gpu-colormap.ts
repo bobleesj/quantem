@@ -355,6 +355,27 @@ export class GPUColormapEngine {
     this.slots[idx] = { width, height, count, dataBuffer, rgbaBuffer, readBuffer, paramsBuffer, histBinsBuffer, histReadBuffer };
   }
 
+  /** Point a slot at an EXTERNAL GPU float buffer (e.g. the maskedSum virtual-image buffer) with
+   *  NO CPU upload. The slot OWNS `buffer` now (destroyed on the next adopt/upload/dispose), so
+   *  the caller must hand off a fresh buffer each call. `applyToCanvas` then colormaps it straight
+   *  to the canvas with zero readback - the GPU-resident 60fps drag path. The aux buffers (rgba/
+   *  read/hist) are unused here, so they're allocated tiny just to keep the Slot shape uniform. */
+  adoptBuffer(idx: number, buffer: GPUBuffer, width: number, height: number): void {
+    const old = this.slots[idx];
+    if (old) this._retireSlot(old);
+    const displayExisting = this.displayBuffers.get(idx);
+    if (displayExisting && (displayExisting.width !== width || displayExisting.height !== height)) {
+      displayExisting.buf.destroy(); this.displayBuffers.delete(idx);
+    }
+    const tiny = () => this.device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+    this.slots[idx] = {
+      width, height, count: width * height, dataBuffer: buffer,
+      rgbaBuffer: tiny(), readBuffer: this.device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      paramsBuffer: this.device.createBuffer({ size: 24, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+      histBinsBuffer: tiny(), histReadBuffer: this.device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+    };
+  }
+
   private _writeParams(buf: ArrayBuffer, w: number, h: number, vmin: number, vmax: number, logScale: boolean, rowStrideU32 = 0): void {
     const u = new Uint32Array(buf);
     const f = new Float32Array(buf);

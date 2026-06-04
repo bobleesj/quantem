@@ -325,6 +325,24 @@ export async function datasetMeanDp(source: string, date: string, name: string):
   const ds = await ensureLoaded(source, date, name); return ds.meanDP;
 }
 
+// GPU-resident virtual image for the 60fps aperture-drag fast path: returns the maskedSum result
+// as a GPU buffer (NO readback) so the caller colormaps it straight to the canvas. Only the
+// mask modes (BF/ADF/DF) - CoM/iCoM need a CPU post-process (descan, integrate) so they stay on
+// the readback path. Returns null for those (caller falls back to the normal path).
+export async function virtualImageBufferGpu(
+  source: string, date: string, name: string, mode: DetectorMode,
+  inner: number, outer: number, cx: number | null, cy: number | null,
+): Promise<{ buffer: GPUBuffer; width: number; height: number } | null> {
+  const ds = await ensureLoaded(source, date, name);
+  const ccx = cx ?? ds.bf.cx, ccy = cy ?? ds.bf.cy, r = ds.bf.r_bf;
+  let mask: Uint32Array;
+  if (mode === "BF") mask = diskMask(ds.detRows, ds.detCols, ccy, ccx, (outer || 1) * r);
+  else if (mode === "ADF" || mode === "DF") mask = annulusMask(ds.detRows, ds.detCols, ccy, ccx, (inner || 1.2) * r, (outer || 4) * r);
+  else return null;
+  const { buffer } = ds.compute.maskedSumBuffer(mask);
+  return { buffer, width: ds.scanCols, height: ds.scanRows };
+}
+
 // Virtual image for a detector MODE with alpha-unit ring radii (1 = BF disk edge), like the
 // server's /realspace. BF = disk; ADF/DF = annulus. CoM/iCoM/SSB not yet on the GPU path.
 export async function virtualImage(
