@@ -2024,81 +2024,110 @@ def group_by_disk(paths) -> dict:
     return out
 
 
-def load_parallel(masters, *, max_concurrent=None, verbose=False, **load_kwargs):
-    """Load many master.h5 files, overlapping their DISK READS across disks while
-    decoding on the GPU SERIALLY.
+def load_parallel(masters, *, gpus=None, max_concurrent=None, verbose=False, **load_kwargs):
+    """Load many masters with concurrent READS + SERIAL GPU decode, placing each
+    master on a chosen GPU. The data-feeding path for joint reconstruction.
 
-    The split is deliberate and is what makes this safe AND fast:
+    A producer pool reads + header-parses masters concurrently (host/IO only, the
+    GIL is released during ``os.readv``); a single consumer decodes them one at a
+    time on the GPU. This gives two speedups, both safe:
 
-    * **Reads run concurrently** — when masters live on DIFFERENT physical disks,
-      their cold reads overlap and bandwidth ADDS (the per-file read uses ``os.readv``
-      which releases the GIL). This is the win for a joint-reconstruction series.
-    * **GPU decode runs serially** — concurrent in-process CUDA decode shares the
-      CuPy kernel/plan caches and the pinned-buffer pool, which raises
-      ``cudaErrorIllegalAddress``. So masters are decoded one at a time on the GPU.
+    * **cross-disk** — readers on different physical disks overlap, bandwidth ADDS.
+    * **same-disk** — master N+1 is read *while* master N decodes (read-ahead), so
+      the decode hides under the next read.
 
-    Concretely: phase 1 warms the OS page cache for every master's compressed files
-    in parallel (IO only, no GPU) — reads on separate disks overlap; phase 2 calls
-    :func:`load` on each master serially, now reading warm and decoding safely.
-    Same-disk masters skip phase 1 (serial cold read is already the disk floor, so
-    warming would just double-read).
+    GPU decode is SERIAL on purpose: concurrent in-process CUDA decode shares the
+    CuPy kernel/plan caches + pinned pool and raises ``cudaErrorIllegalAddress``.
+    Serial decode is safe on ANY GPU (it is just a normal single decode) and loses
+    no throughput, because one disk feeds slower than one GPU decodes.
 
     Parameters
     ----------
     masters : list[str]
-        Master ``.h5`` paths. The win comes when they span multiple disks — check
-        the layout with :func:`group_by_disk`.
+        Master ``.h5`` paths.
+    gpus : None | int | list[int]
+        Which GPU each master decodes onto. ``None`` = the current device; an ``int``
+        = all masters to that GPU; a ``list`` = per-master (round-robin if shorter),
+        e.g. ``gpus=[0, 1]`` places alternating masters on GPU 0 and GPU 1 — the
+        placement a multi-GPU joint solver wants. (Placement is serial, never
+        concurrent, so it is safe even on a GPU that is also serving the dashboard.)
     max_concurrent : int, optional
-        Parallel READERS in phase 1. **Default (None) = the number of distinct disks
-        the masters span** — one reader per disk saturates each drive without
-        oversubscribing. (GPU decode is always serial regardless.)
+        Parallel READERS. Default = max(2, #distinct disks) so there is always a
+        read in flight to overlap the decode.
 
     Returns
     -------
-    list[LoadResult]  — one per input master, in input order.
+    list[LoadResult]  — one per input master, in input order; each ``.data`` lives
+    on its assigned GPU.
     """
-    import os
-    import glob as _glob
+    import queue
+    import threading
+    from contextlib import nullcontext
     from concurrent.futures import ThreadPoolExecutor
+    import cupy as cp
+
     masters = list(masters)
+    n = len(masters)
+    if gpus is None:
+        dev = [None] * n
+    elif isinstance(gpus, int):
+        dev = [int(gpus)] * n
+    else:
+        gl = [int(g) for g in gpus]
+        dev = [gl[i % len(gl)] for i in range(n)]
+
     disks = [disk_of(m) for m in masters]
     n_disks = len({d for d in disks if d != "?"})
-    if max_concurrent is None:
-        max_concurrent = max(1, n_disks)
+    n_read = int(max_concurrent) if max_concurrent else max(1, n_disks)
+    n_read = max(n_read, 2) if n > 1 else 1  # >=2 so a read is always queued ahead
 
-    # Phase 1: warm the page cache in parallel, but only when the masters actually
-    # span >1 disk (else a serial cold read is already the floor and warming would
-    # just read everything twice).
-    if max_concurrent > 1 and n_disks > 1:
-        files_by_master = []
-        for m in masters:
-            stem = os.path.basename(m).replace("_master.h5", "")
-            df = _glob.glob(os.path.join(os.path.dirname(m), f"{stem}_data_*.h5"))
-            files_by_master.append(df or [m])
-        # Disk-interleave the masters so the warm-readers hit different disks first.
-        order, queues = [], {}
-        for i, dk in enumerate(disks):
-            queues.setdefault(dk, []).append(i)
-        ql = [list(q) for q in queues.values()]
-        while any(ql):
-            for q in ql:
-                if q:
-                    order.append(q.pop(0))
-        warm_files = [f for i in order for f in files_by_master[i]]
+    # Disk-interleaved read order: hit different disks first for peak parallel BW.
+    order, buckets = [], {}
+    for i, dk in enumerate(disks):
+        buckets.setdefault(dk, []).append(i)
+    ql = [list(q) for q in buckets.values()]
+    while any(ql):
+        for q in ql:
+            if q:
+                order.append(q.pop(0))
 
-        def _warm(path):
-            try:
-                with open(path, "rb", buffering=0) as fh:
-                    while fh.read(1 << 22):  # 4 MB chunks; populates the page cache
-                        pass
-            except OSError:
-                pass
+    # Producer: concurrent read+prepare (host) into a bounded queue. The pinned-
+    # buffer pool is lock-guarded, so concurrent reads are thread-safe; the queue
+    # bound caps in-flight host buffers.
+    q: "queue.Queue" = queue.Queue(maxsize=n_read + 1)
+    _SENT = object()
 
-        with ThreadPoolExecutor(max_workers=max(8, max_concurrent * 6)) as pool:
-            list(pool.map(_warm, warm_files))
+    def _producer():
+        def _prep(i):
+            q.put((i, _prepare_master(masters[i], _discover_chunk_names(masters[i]), True)))
+        try:
+            with ThreadPoolExecutor(max_workers=n_read) as pool:
+                list(pool.map(_prep, order))
+        finally:
+            q.put(_SENT)
 
-    # Phase 2: serial load — warm read (fast) + GPU decode one master at a time (safe).
-    return [load(m, verbose=verbose, **load_kwargs) for m in masters]
+    threading.Thread(target=_producer, daemon=True).start()
+
+    # Consumer: serial decode, each master onto its assigned GPU.
+    decode_kw = {k: load_kwargs[k] for k in ("output_dtype", "det_bin", "auto_narrow")
+                 if k in load_kwargs}
+    if decode_kw.get("det_bin", 1) > 1:
+        decode_kw["streaming_bin"] = True
+    results: list = [None] * n
+    while True:
+        item = q.get()
+        if item is _SENT:
+            break
+        i, prepared = item
+        d = dev[i]
+        with (cp.cuda.Device(d) if d is not None else nullcontext()):
+            data = _decompress_prepared(prepared, **decode_kw)
+            nf = int(data.shape[0])
+            side = int(nf ** 0.5)
+            if data.ndim == 3 and side * side == nf:  # (frames,k,k) -> (scan,scan,k,k)
+                data = data.reshape(side, side, *data.shape[1:])
+        results[i] = LoadResult(data, get_metadata(masters[i]))
+    return results
 
 
 def _load_impl(
