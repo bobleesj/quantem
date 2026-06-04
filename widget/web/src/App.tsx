@@ -117,6 +117,14 @@ export default function App() {
         const perf = (window as unknown as { __perf?: unknown[] }).__perf || [];
         return { dataset: f.name, nFiles: s.files.length, wallMs, dpSum, dpLen: dp.length, perf: perf[perf.length - 1] };
       };
+    // CoM/DPC parity probe: open the first scanned dataset and return the raw maskedCoM stats.
+    (window as unknown as { __comStats: () => Promise<unknown> }).__comStats =
+      async () => {
+        const { getSessions, datasetComStats } = await import("./local/store");
+        const s = getSessions().find((x) => x.files.length > 0);
+        if (!s) return { error: "no sessions" };
+        return await datasetComStats(s.source, s.date, s.files[0].name);
+      };
     // Parity + kernel-time verify hook: fetch one served data .h5, parse to a Bslz4Spec,
     // run Strategy D vs the serial Fallback and report byte-exact diff + GPU ms.
     (window as unknown as { __verifyD: (url: string) => Promise<unknown> }).__verifyD =

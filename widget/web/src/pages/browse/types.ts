@@ -421,9 +421,14 @@ interface PreloadSetResponse {
  *  for scrubbing within ~8-15 s; subsequent indices warm in the background.
  *  Re-calling with the same set is a no-op (each master hits the LRU). */
 export async function preloadSet5D(
-  _s: Session, files: MasterFile[], detBin: DetBin = 1, _dtype: BrowseDtype = "uint8",
+  s: Session, files: MasterFile[], detBin: DetBin = 1, _dtype: BrowseDtype = "uint8",
 ): Promise<PreloadSetResponse> {
-  return { queued: files.length, det_bin: detBin };  // engine decodes lazily on first view
+  // Pin every frame of the active 5D series so the LRU never evicts them, then background-warm
+  // them (sequential decode) so the time/tilt scrub is LIVE from the start, all resident on the
+  // GPU. Fire-and-forget - the first frame is usable immediately; the rest warm behind it.
+  store.setPinned5DKeys(files.map((f) => fileKey(s, f)));
+  void store.warmSet5D(files.map((f) => ({ source: s.source, date: s.date, name: f.name })));
+  return { queued: files.length, det_bin: detBin };
 }
 
 /** Fire-and-forget warm-up. Tells the backend to open the master file

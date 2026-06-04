@@ -56,6 +56,11 @@ const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Ar
 const LOADED = new Map<string, Promise<LoadedDS>>();  // fileKey -> decoded dataset (LRU)
 const LRU: string[] = [];
 const MAX_RESIDENT = 2;
+// Keys of the ACTIVE 5D set are PINNED: never evicted, so scrubbing the time/tilt axis stays
+// live (every binned frame resident on the GPU). The set is auto-binned to fit VRAM, so pinning
+// the whole series is safe; a non-5D single dataset just keeps the 2-deep LRU.
+const PINNED = new Set<string>();
+export function setPinned5DKeys(keys: string[]): void { PINNED.clear(); for (const k of keys) PINNED.add(k); }
 
 function key(source: string, date: string, name: string): string { return `${source}/${date}/${name}`; }
 function humanSize(bytes: number): string {
@@ -130,6 +135,19 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
 
 export function getSessions(): Session[] { return SESSIONS; }
 
+// Background-warm a 5D series: decode every frame sequentially (one at a time so the transient
+// decode buffer never OOMs) so the time/tilt scrub is LIVE from the start instead of decoding
+// each frame on its first view. Pinned, so all frames stay resident once warm. Fire-and-forget;
+// errors per frame are swallowed (a bad frame just stays cold). A new warm cancels the old via gen.
+let warmGen = 0;
+export async function warmSet5D(frames: { source: string; date: string; name: string }[]): Promise<void> {
+  const gen = ++warmGen;
+  for (const f of frames) {
+    if (gen !== warmGen) return;   // a newer set superseded this warm-up
+    try { await ensureLoaded(f.source, f.date, f.name); } catch { /* leave this frame cold */ }
+  }
+}
+
 // Decode a dataset's slabs into one chunked GPU compute (LRU, dispose on evict). Computes
 // the mean DP once and auto-fits the bright-field disk to seed the aperture.
 async function ensureLoaded(source: string, date: string, name: string): Promise<LoadedDS> {
@@ -201,8 +219,12 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
       detRows: geom.detRows, detCols: geom.detCols, detSize, scanCount: startScan, bf, badPx: geom.badPx };
   })();
   LOADED.set(k, p); LRU.push(k);
-  while (LRU.length > MAX_RESIDENT) {
-    const ev = LRU.shift()!;
+  // Evict the oldest NON-pinned datasets beyond the resident budget. Pinned = the active 5D
+  // series, which stays fully resident so its scrub is live. The budget counts only unpinned.
+  while (LRU.filter((x) => !PINNED.has(x)).length > MAX_RESIDENT) {
+    const evIdx = LRU.findIndex((x) => !PINNED.has(x));
+    if (evIdx < 0) break;
+    const ev = LRU.splice(evIdx, 1)[0];
     const old = LOADED.get(ev); LOADED.delete(ev);
     old?.then((d) => d.compute.dispose()).catch(() => {});
   }
@@ -369,6 +391,24 @@ export async function virtualImage(
   else if (mode === "iCoM") field = integrateICoM(dx, dy, ds.scanRows, ds.scanCols);
   else return null;
   return reshapeVI(field, ds);
+}
+
+// CoM parity probe: raw per-scan intensity-weighted centroid (comY, comX) over the BF-disk
+// aperture (1.5 x r_bf), BEFORE descan subtraction - the direct maskedCoM output. Returns
+// reduction sums + geometry so a numpy reference can be compared bit-close on real data.
+export async function datasetComStats(source: string, date: string, name: string): Promise<{
+  detRows: number; detCols: number; scanCount: number; cx: number; cy: number; r: number; rad: number;
+  comYsum: number; comXsum: number; comY0: number; comX0: number; nbad: number;
+}> {
+  const ds = await ensureLoaded(source, date, name);
+  const rad = 1.5 * ds.bf.r_bf;
+  const mask = diskMask(ds.detRows, ds.detCols, ds.bf.cy, ds.bf.cx, rad);
+  const { comY, comX } = await ds.compute.maskedCoM(mask, ds.detCols);
+  let comYsum = 0, comXsum = 0;
+  for (let i = 0; i < comY.length; i++) { comYsum += comY[i]; comXsum += comX[i]; }
+  return { detRows: ds.detRows, detCols: ds.detCols, scanCount: ds.scanCount,
+    cx: ds.bf.cx, cy: ds.bf.cy, r: ds.bf.r_bf, rad,
+    comYsum, comXsum, comY0: comY[0], comX0: comX[0], nbad: ds.badPx.length };
 }
 
 // Virtual image for a free-form detector SHAPE (params already in detector px), like the
