@@ -178,7 +178,9 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
       pending = null;
     };
     let srcDtype: "uint8" | "uint16" | "uint32" = "uint16";   // detected from the data
-    const useWorkers = slabs.every((s) => s.source);   // picker path -> parallel worker reads
+    // Picker path -> parallel worker reads. But file:// (the double-click single-HTML artifact)
+    // blocks `new Worker()` (origin "null"), so fall back to the main-thread read there.
+    const useWorkers = slabs.every((s) => s.source) && location.protocol !== "file:";
     // Read + parse all slabs (in workers when we have File/handle sources, else on the main
     // thread). Collect parsed specs keyed by file index so we can decode in scan order.
     const parsed: (ParsedSpec | null)[] = new Array(slabs.length).fill(null);

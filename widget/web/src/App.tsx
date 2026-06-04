@@ -52,7 +52,11 @@ function FolderGate({ onReady }: { onReady: () => void }) {
   const pickInput = () => {
     const input = document.createElement("input");
     input.type = "file"; input.webkitdirectory = true; input.multiple = true;
-    input.onchange = () => input.files && load(filesFromInput(input.files));
+    // Attach to the DOM (hidden) so the change event fires reliably - a detached input can drop
+    // it in some browsers + breaks automation. Removed once the files are read.
+    input.style.display = "none";
+    document.body.appendChild(input);
+    input.onchange = () => { if (input.files) load(filesFromInput(input.files)); input.remove(); };
     input.click();
   };
   const pick = async () => {

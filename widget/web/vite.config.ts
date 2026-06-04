@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { viteSingleFile } from "vite-plugin-singlefile";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -9,8 +10,15 @@ import { dirname, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const widgetRoot = resolve(here, "..");
 
+// `vite build --mode offline` inlines EVERYTHING into one self-contained index.html so the app
+// opens by double-click over file:// (no server) - the real "ship a folder of one HTML + .h5
+// files, click the HTML, pick the folder" path. Data still comes from the local folder picker
+// at runtime; only the app code is inlined. Normal `vite build` keeps the fast multi-file dev/
+// served output. (jsfive is dynamically imported -> inline it too.)
+const offline = process.env.OFFLINE_HTML === "1";
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), ...(offline ? [viteSingleFile()] : [])],
   resolve: {
     alias: {
       // jsfive's bundled dist drops BTreeV1RawDataChunks; the engine needs the
