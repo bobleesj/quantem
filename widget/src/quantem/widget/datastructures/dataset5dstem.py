@@ -362,6 +362,47 @@ class Dataset5dstem:
             self._series = None
         self._reclaim(src)
 
+    # --- auto-swap / out-of-core paging ---
+    def page(self, vram_frames: int, device=0) -> Self:
+        """Enable out-of-core paging: keep at most ``vram_frames`` frames resident in
+        VRAM; the rest live in host RAM and are paged in on access via :meth:`frame`,
+        evicting the least-recently-used VRAM frame when over budget.
+
+        Lets you scrub or jointly reconstruct a series LARGER than VRAM — only the
+        active window sits on the GPU. (RAM tier today; a disk tier for series bigger
+        than RAM is the next step.) Returns self.
+        """
+        self._materialize_frames()
+        self._page_budget = max(1, int(vram_frames))
+        self._page_device = self._as_device(device)
+        self._lru: list[int] = []
+        self.offload()  # start cold — everything in RAM, paged in on demand
+        return self
+
+    def frame(self, i: int) -> "torch.Tensor":
+        """Frame ``i`` as a GPU tensor, AUTO-PAGING when :meth:`page` is enabled:
+        bring ``i`` into VRAM from RAM, and evict the least-recently-used VRAM frame
+        if that exceeds the budget. Without :meth:`page` it is just ``self[i]``.
+        """
+        if getattr(self, "_page_budget", None) is None:
+            return self[i]
+        self._materialize_frames()
+        if self._frames[i].device.type == "cpu":
+            self._frames[i] = self._frames[i].to(self._page_device)
+        self._lru = [x for x in self._lru if x != i] + [i]  # most-recent last
+        resident = [x for x in self._lru if self._frames[x].device.type != "cpu"]
+        while len(resident) > self._page_budget:
+            evict = resident.pop(0)  # least-recently-used
+            self._frames[evict] = self._frames[evict].to("cpu")
+            self._reclaim({self._page_device})
+        return self._frames[i]
+
+    def vram_resident(self) -> list[int]:
+        """Indices of frames currently in VRAM (the rest are paged out to RAM)."""
+        if self._frames is None:
+            return list(range(len(self))) if self._tensor is not None else []
+        return [i for i, f in enumerate(self._frames) if f.device.type != "cpu"]
+
     # --- frame access ---
     def __len__(self) -> int:
         if self._frames is not None:
