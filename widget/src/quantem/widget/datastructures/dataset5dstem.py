@@ -411,6 +411,58 @@ class Dataset5dstem:
             raise RuntimeError("Dataset5dstem has been freed; re-load to use it again.")
         return int(self._tensor.shape[0])
 
+    def minibatch_rounds(self, batch_size: int, *, shuffle: bool = True, seed=None):
+        """Yield synchronized minibatch ROUNDS for data-parallel multi-GPU ptycho.
+
+        For tilt / time-series joint reconstruction across several GPUs. Frames
+        (tilts) are grouped by the device they live on (place them with ``.to([0,1,
+        2,3])`` first). Each round is a LIST of one batch PER device — every batch's
+        DPs are **resident on that device** (a slice, no PCIe transfer), so each GPU
+        works on its local tilts while the solver all-reduces the shared object/probe
+        gradient between rounds.
+
+        Each batch is ``(device, frame_idx, scan_idx, dp_batch)``:
+        ``dp_batch`` = ``(B, k, k)`` DPs on ``device``; ``scan_idx`` their flat scan
+        positions in frame ``frame_idx`` (use to index that tilt's object). Within a
+        frame, scan positions are chunked into ``batch_size``. Rounds run until the
+        device with the MOST batches is exhausted; shorter devices cycle (so every
+        GPU has work every round). One device = ordinary single-GPU minibatch SGD.
+
+        Consume it once per ptycho iteration::
+
+            for it in range(n_iters):
+                for rnd in ds.minibatch_rounds(512):
+                    for dev, fi, sidx, dps in rnd:        # GPUs in parallel
+                        accumulate_grad(obj[fi], probe, dps, sidx)   # on `dev`
+                    all_reduce(probe_grad); step()
+        """
+        import torch
+        self._materialize_frames()
+        gen = torch.Generator()
+        if seed is not None:
+            gen.manual_seed(int(seed))
+        # Per-device list of (frame_idx, scan_idx chunk).
+        by_dev: dict = {}
+        for fi, f in enumerate(self._frames):
+            dev = str(f.device)
+            n_scan = int(f.shape[0]) * int(f.shape[1])
+            order = (torch.randperm(n_scan, generator=gen) if shuffle
+                     else torch.arange(n_scan))
+            for c in range(0, n_scan, batch_size):
+                by_dev.setdefault(dev, []).append((fi, order[c:c + batch_size]))
+        if not by_dev:
+            return
+        n_rounds = max(len(v) for v in by_dev.values())
+        for r in range(n_rounds):
+            rnd = []
+            for dev, batches in by_dev.items():
+                fi, scan_idx = batches[r % len(batches)]
+                f = self._frames[fi]
+                flat = f.reshape(-1, *f.shape[2:])          # (n_scan, k, k)
+                dp = flat[scan_idx.to(f.device)]            # on-device slice, no copy
+                rnd.append((dev, fi, scan_idx, dp))
+            yield rnd
+
     def __getitem__(self, index: int | slice) -> torch.Tensor | Self:
         if isinstance(index, int):
             return self._frames[index] if self._frames is not None else self._tensor[index]
