@@ -36,6 +36,7 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
     }
     const feats: GPUFeatureName[] = [];
     if (adapter.features.has("timestamp-query")) feats.push("timestamp-query");   // for kernel profiling
+    if (adapter.features.has("subgroups")) feats.push("subgroups" as GPUFeatureName);   // warp reduction in maskedSum/CoM
     gpuDevice = await adapter.requestDevice({ requiredFeatures: feats, requiredLimits });
     gpuDevice.lost.then(() => { gpuDevice = null; lostCallbacks.forEach((cb) => cb()); });
     return gpuDevice;

@@ -31,22 +31,42 @@ fn sample(gp: u32, mode: u32) -> u32 {
 // (180-300 ms for a BF drag). Here consecutive threads read consecutive idx entries (idx is
 // row-major sorted) -> consecutive detector pixels -> COALESCED, so the drag hits the memory
 // floor. 2D dispatch (gridX in u2.x) because a single-buffer stack can exceed 65535 scans.
-const MASKED_SUM_WGSL = `
+// `sg` = use subgroup (warp) reduction: one subgroup (32 lanes) per scan, summed with a single
+// `subgroupAdd` - NO shared memory, NO barriers. The shared-memory tree reduction (fallback for
+// GPUs without the subgroups feature) pays 6 workgroupBarriers per scan position x 262144 scans,
+// which dominated the kernel (~45-58ms); subgroupAdd is a register-level warp shuffle. Lanes read
+// consecutive idx entries -> consecutive detector pixels (idx is row-major sorted) -> coalesced.
+// WGSZ threads per scan position so many loads are in flight at once (the kernel is memory-bound
+// on a gather; only 32 lanes left bandwidth at ~4% of peak). Each warp reduces with subgroupAdd,
+// the per-warp partials combine through a tiny shared array (one barrier). Fallback (no subgroups)
+// is the full shared tree reduction.
+const WGSZ = 128;
+const SGSZ = 32;   // subgroup (warp) size on the target GPUs
+const maskedSumSrc = (sg: boolean) => `
+${sg ? "enable subgroups;" : ""}
 @group(0) @binding(0) var<storage,read> data: array<u32>;
 @group(0) @binding(1) var<storage,read> idx: array<u32>;   // ACTIVE detector pixel indices only
 @group(0) @binding(2) var<storage,read_write> vi: array<f32>;
 @group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
 @group(0) @binding(4) var<uniform> u2: vec4<u32>;  // gridX, 0, 0, 0
 ${SAMPLE}
-var<workgroup> part: array<u32, 64>;
-@compute @workgroup_size(64)
+var<workgroup> part: array<u32, ${WGSZ}>;
+@compute @workgroup_size(${WGSZ})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let sl = wid.y * u2.x + wid.x; let tid = lid.x;
   let n = arrayLength(&idx); let base = sl * u.z; var sum: u32 = 0u;
-  if (sl < u.y) { for (var j = tid; j < n; j = j + 64u) { sum = sum + sample(base + idx[j], u.w); } }  // in-aperture px, coalesced
-  part[tid] = sum; workgroupBarrier();
-  for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (tid < s) { part[tid] = part[tid] + part[tid + s]; } workgroupBarrier(); }
-  if (tid == 0u && sl < u.y) { vi[u.x + sl] = f32(part[0]); }
+  if (sl < u.y) { for (var j = tid; j < n; j = j + ${WGSZ}u) { sum = sum + sample(base + idx[j], u.w); } }
+${sg
+  ? `  sum = subgroupAdd(sum);                       // per-warp partial
+  if (subgroupElect()) { part[tid / ${SGSZ}u] = sum; }   // one slot per warp
+  workgroupBarrier();
+  if (tid == 0u && sl < u.y) {
+    var total = 0u; for (var w = 0u; w < ${WGSZ / SGSZ}u; w = w + 1u) { total = total + part[w]; }
+    vi[u.x + sl] = f32(total);
+  }`
+  : `  part[tid] = sum; workgroupBarrier();
+  for (var s: u32 = ${WGSZ / 2}u; s > 0u; s = s >> 1u) { if (tid < s) { part[tid] = part[tid] + part[tid + s]; } workgroupBarrier(); }
+  if (tid == 0u && sl < u.y) { vi[u.x + sl] = f32(part[0]); }`}
 }`;
 
 // One thread per detector pixel; ACCUMULATES this chunk's in-ROI scan positions
@@ -96,35 +116,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // One WORKGROUP per scan position (same coalescing fix as MASKED_SUM): 64 threads cooperatively
 // accumulate the intensity-weighted centroid over the aperture, three shared-memory reductions
 // (weight, y*weight, x*weight). gridX in u2.z for the 2D dispatch.
-const MASKED_COM_WGSL = `
+const maskedComSrc = (sg: boolean) => `
+${sg ? "enable subgroups;" : ""}
 @group(0) @binding(0) var<storage,read> data: array<u32>;
 @group(0) @binding(1) var<storage,read> idx: array<u32>;   // ACTIVE detector pixel indices
 @group(0) @binding(2) var<storage,read_write> com: array<f32>;  // 2*scanCount: [gi]=comY, [scanCount+gi]=comX
 @group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
 @group(0) @binding(4) var<uniform> u2: vec4<u32>;  // detCols, scanCount, gridX, 0
 ${SAMPLE}
-var<workgroup> pw: array<f32, 64>;
-var<workgroup> py: array<f32, 64>;
-var<workgroup> px: array<f32, 64>;
-@compute @workgroup_size(64)
+var<workgroup> pw: array<f32, ${WGSZ}>;
+var<workgroup> py: array<f32, ${WGSZ}>;
+var<workgroup> px: array<f32, ${WGSZ}>;
+@compute @workgroup_size(${WGSZ})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let sl = wid.y * u2.z + wid.x; let tid = lid.x;
   let base = sl * u.z; let n = arrayLength(&idx); let detCols = u2.x;
   var wsum: f32 = 0.0; var ysum: f32 = 0.0; var xsum: f32 = 0.0;
-  if (sl < u.y) { for (var j: u32 = tid; j < n; j = j + 64u) {
+  if (sl < u.y) { for (var j: u32 = tid; j < n; j = j + ${WGSZ}u) {
     let p = idx[j]; let v = f32(sample(base + p, u.w));
     wsum = wsum + v; ysum = ysum + f32(p / detCols) * v; xsum = xsum + f32(p % detCols) * v;
   } }
-  pw[tid] = wsum; py[tid] = ysum; px[tid] = xsum; workgroupBarrier();
-  for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+${sg
+  ? `  wsum = subgroupAdd(wsum); ysum = subgroupAdd(ysum); xsum = subgroupAdd(xsum);
+  if (subgroupElect()) { let w = tid / ${SGSZ}u; pw[w] = wsum; py[w] = ysum; px[w] = xsum; }
+  workgroupBarrier();
+  if (tid == 0u && sl < u.y) {
+    var w = 0.0; var y = 0.0; var x = 0.0;
+    for (var k = 0u; k < ${WGSZ / SGSZ}u; k = k + 1u) { w = w + pw[k]; y = y + py[k]; x = x + px[k]; }
+    let gi = u.x + sl;
+    if (w > 0.0) { com[gi] = y / w; com[u2.y + gi] = x / w; } else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
+  }`
+  : `  pw[tid] = wsum; py[tid] = ysum; px[tid] = xsum; workgroupBarrier();
+  for (var s: u32 = ${WGSZ / 2}u; s > 0u; s = s >> 1u) {
     if (tid < s) { pw[tid] = pw[tid] + pw[tid + s]; py[tid] = py[tid] + py[tid + s]; px[tid] = px[tid] + px[tid + s]; }
     workgroupBarrier();
   }
   if (tid == 0u && sl < u.y) {
     let gi = u.x + sl;
-    if (pw[0] > 0.0) { com[gi] = py[0] / pw[0]; com[u2.y + gi] = px[0] / pw[0]; }
-    else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
-  }
+    if (pw[0] > 0.0) { com[gi] = py[0] / pw[0]; com[u2.y + gi] = px[0] / pw[0]; } else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
+  }`}
 }`;
 
 const MAX_WG = 65535;   // max workgroups per dispatch dimension; >this needs a 2D grid
@@ -148,10 +178,11 @@ export class Show4DSTEMCompute {
 
   private constructor(device: GPUDevice, chunks: Chunk[], scanCount: number, detSize: number, mode: number) {
     this.device = device; this.chunks = chunks; this.scanCount = scanCount; this.detSize = detSize; this.mode = mode;
-    const ms = device.createShaderModule({ code: MASKED_SUM_WGSL });
+    const sg = device.features.has("subgroups");   // warp reduction in maskedSum/CoM when available
+    const ms = device.createShaderModule({ code: maskedSumSrc(sg) });
     const rf = device.createShaderModule({ code: REDUCE_FRAMES_WGSL });
     this.maskedSumPipe = device.createComputePipeline({ layout: "auto", compute: { module: ms, entryPoint: "main" } });
-    this.maskedComPipe = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: MASKED_COM_WGSL }), entryPoint: "main" } });
+    this.maskedComPipe = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: maskedComSrc(sg) }), entryPoint: "main" } });
     this.reduceFramesPipe = device.createComputePipeline({ layout: "auto", compute: { module: rf, entryPoint: "main" } });
     this.frameAtPipe = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: FRAME_WGSL }), entryPoint: "main" } });
   }
