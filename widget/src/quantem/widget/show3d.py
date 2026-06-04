@@ -3499,61 +3499,33 @@ class Show3D(anywidget.AnyWidget):
         return self._sample_profile_on(self._get_display_frame(), row0, col0, row1, col1)
 
     def _repr_mimebundle_(self, **kwargs):
-        """Return widget view + cheap static PNG snapshot.
+        """Return widget view + widget-faithful PNG snapshot.
 
-        Live Jupyter renders the interactive WebGPU widget; the PNG snapshot is
-        the fallback consumed by GitHub / nbviewer when JS is blocked. Renders
-        the mid-slice of every panel at <=256 px each. Budget <50 ms typical.
+        Static PNG mirrors the WebGPU canvas mid-slice: same cmap, same
+        log/contrast, same per-panel normalize. Image-only (no axes/titles).
         Opt out with ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
         """
         bundle = super()._repr_mimebundle_(**kwargs)
         if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
             return bundle
         try:
-            import matplotlib.pyplot as plt
+            from quantem.widget._snapshot import render_image_png, render_panels_png
             mid = int(self.n_slices) // 2 if self.n_slices > 1 else 0
             frame = self._get_display_frame(mid)
             n_pan = int(self.n_panels) if int(self.n_panels) > 1 else 1
+            cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
+            log = bool(getattr(self, "log_scale", False))
             if n_pan > 1:
                 w_pan = frame.shape[1] // n_pan
                 panels = [frame[:, i * w_pan:(i + 1) * w_pan] for i in range(n_pan)]
+                png = render_panels_png(
+                    panels, cmaps=cmap, ncols=min(n_pan, 3),
+                    max_px_per_panel=256, log=log,
+                )
             else:
-                panels = [frame]
-            max_preview = 256
-            ncols = min(n_pan, 3)
-            nrows = math.ceil(n_pan / ncols)
-            cell = 2.5
-            fig, axes = plt.subplots(
-                nrows, ncols,
-                figsize=(cell * ncols, cell * nrows),
-                squeeze=False,
-            )
-            cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
-            titles = list(self.panel_titles) if self.panel_titles else [
-                f"Panel {i+1}" for i in range(n_pan)
-            ]
-            for i in range(nrows * ncols):
-                r, c = divmod(i, ncols)
-                ax = axes[r][c]
-                if i < n_pan:
-                    img = panels[i]
-                    h, w = img.shape
-                    if h > max_preview or w > max_preview:
-                        step = max(h // max_preview, w // max_preview, 1)
-                        img = img[::step, ::step]
-                    ax.imshow(img, cmap=cmap, origin="upper")
-                    ax.set_title(titles[i] if i < len(titles) else f"Panel {i+1}",
-                                 fontsize=8)
-                ax.axis("off")
-            suptitle = f"slice {mid+1}/{self.n_slices}" if self.n_slices > 1 else ""
-            if suptitle:
-                fig.suptitle(suptitle, fontsize=9)
-            fig.tight_layout()
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
-            plt.close(fig)
+                png = render_image_png(frame, cmap=cmap, log=log, max_px=512)
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
-            data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            data_dict["image/png"] = base64.b64encode(png).decode("ascii")
             if isinstance(bundle, tuple):
                 return (data_dict, bundle[1])
             return data_dict

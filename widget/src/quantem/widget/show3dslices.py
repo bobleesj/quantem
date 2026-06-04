@@ -1528,12 +1528,14 @@ class Show3DSlices(anywidget.AnyWidget):
         return np.zeros(slc.shape, dtype=np.uint8)
 
     def _repr_mimebundle_(self, **kwargs):
-        """Return widget view + cheap 3-axis montage PNG snapshot.
+        """Return widget view + widget-faithful PNG snapshot.
 
-        Live Jupyter renders the interactive WebGPU slice viewer; the PNG is
-        the fallback for GitHub / nbviewer. Mid-slice on each of the three
-        axes at <=256 px each. Budget <100 ms typical. Opt out with
-        ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
+        Layout adapts to volume shape:
+        * Thin Z (Z <= 16, e.g. ptycho phase): grid of ALL Z slices through
+          depth — what the operator scrolls through in the widget.
+        * Cubic Z (Z > 16): 3-axis orthogonal mid views (Z/Y/X).
+        Same cmap, log, per-panel normalize as widget. Image-only. Opt out
+        with ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
         """
         bundle = super()._repr_mimebundle_(**kwargs)
         if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
@@ -1541,32 +1543,30 @@ class Show3DSlices(anywidget.AnyWidget):
         if self._data is None:
             return bundle
         try:
-            import matplotlib.pyplot as plt
+            from quantem.widget._snapshot import render_panels_png
             vol = self._data  # (Z, Y, X)
-            zc, yc, xc = vol.shape[0] // 2, vol.shape[1] // 2, vol.shape[2] // 2
-            axes_slices = [
-                ("Z", vol[zc, :, :]),
-                ("Y", vol[:, yc, :]),
-                ("X", vol[:, :, xc]),
-            ]
-            max_preview = 256
+            Z, Y, X = vol.shape
             cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
-            fig, axes = plt.subplots(1, 3, figsize=(7.5, 2.5), squeeze=False)
-            for i, (lbl, slc) in enumerate(axes_slices):
-                ax = axes[0][i]
-                h, w = slc.shape
-                if h > max_preview or w > max_preview:
-                    step = max(h // max_preview, w // max_preview, 1)
-                    slc = slc[::step, ::step]
-                ax.imshow(slc, cmap=cmap, origin="upper")
-                ax.set_title(f"{lbl}-axis mid", fontsize=8)
-                ax.axis("off")
-            fig.tight_layout()
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
-            plt.close(fig)
+            log = bool(getattr(self, "log_scale", False))
+            if Z <= 16:
+                # ptycho-style: depth slices laid out as grid of all Z planes
+                panels = [vol[z, :, :] for z in range(Z)]
+                ncols = min(Z, 4)
+                max_px = 256 if Z <= 4 else 192 if Z <= 9 else 160
+                png = render_panels_png(
+                    panels, cmaps=cmap, ncols=ncols,
+                    max_px_per_panel=max_px, log=log,
+                )
+            else:
+                # tomography-style: 3-axis ortho mid slices
+                zc, yc, xc = Z // 2, Y // 2, X // 2
+                panels = [vol[zc, :, :], vol[:, yc, :], vol[:, :, xc]]
+                png = render_panels_png(
+                    panels, cmaps=cmap, ncols=3,
+                    max_px_per_panel=256, log=log,
+                )
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
-            data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            data_dict["image/png"] = base64.b64encode(png).decode("ascii")
             if isinstance(bundle, tuple):
                 return (data_dict, bundle[1])
             return data_dict

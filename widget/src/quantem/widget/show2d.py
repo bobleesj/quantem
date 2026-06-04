@@ -594,50 +594,42 @@ class Show2D(anywidget.AnyWidget):
         return f"Show2D({self.height}×{self.width}, cmap={self.cmap})"
 
     def _repr_mimebundle_(self, **kwargs):
-        """Return widget view + cheap static PNG snapshot.
+        """Return widget view + widget-faithful PNG snapshot.
 
-        Live Jupyter renders the interactive widget; the PNG snapshot is the
-        fallback consumed by GitHub / nbviewer / nbsphinx when JS is blocked.
-        Budget: <200 ms even for 30-image galleries (128 px max, 12 thumbs cap).
-        Opt out with ``QUANTEM_WIDGET_NO_SNAPSHOT=1`` for max-speed live sessions.
+        Static PNG mirrors the WebGPU canvas: same cmap, same log/auto-contrast,
+        same per-image normalize. Image-only output (no axes/titles). Consumed
+        by GitHub / nbviewer when JS is blocked; live Jupyter mounts the
+        interactive widget instead. Opt out with ``QUANTEM_WIDGET_NO_SNAPSHOT=1``.
         """
         bundle = super()._repr_mimebundle_(**kwargs)
         if os.environ.get("QUANTEM_WIDGET_NO_SNAPSHOT"):
             return bundle
-        data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
-        n = min(self.n_images, 12)  # cap gallery thumbs at 12
-        ncols = min(self.ncols, n)
-        nrows = math.ceil(n / ncols)
-        cell = 2
-        fig, axes = plt.subplots(
-            nrows, ncols,
-            figsize=(cell * ncols, cell * nrows),
-            squeeze=False,
-        )
-        max_preview = 128  # cap pixel dim per thumb
-        for i in range(nrows * ncols):
-            r, c = divmod(i, ncols)
-            ax = axes[r][c]
-            if i < n:
-                img = self._data[i]
-                h, w = img.shape
-                if h > max_preview or w > max_preview:
-                    step = max(h // max_preview, w // max_preview, 1)
-                    img = img[::step, ::step]
-                ax.imshow(img, cmap=self.cmap, origin="upper")
-                ax.set_title(self.labels[i], fontsize=8)
-            ax.axis("off")
-        if self.title:
-            extra = f" (+{self.n_images - n} more)" if self.n_images > n else ""
-            fig.suptitle(f"{self.title}{extra}", fontsize=10)
-        fig.tight_layout()
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
-        plt.close(fig)
-        data_dict["image/png"] = base64.b64encode(buf.getvalue()).decode("ascii")
-        if isinstance(bundle, tuple):
-            return (data_dict, bundle[1])
-        return data_dict
+        try:
+            from quantem.widget._snapshot import render_image_png, render_panels_png
+            cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
+            log = bool(getattr(self, "log_scale", False))
+            vmin = getattr(self, "vmin", None)
+            vmax = getattr(self, "vmax", None)
+            if self.n_images == 1:
+                png = render_image_png(
+                    self._data[0], cmap=cmap, vmin=vmin, vmax=vmax,
+                    log=log, max_px=512,
+                )
+            else:
+                n = min(self.n_images, 12)
+                ncols = max(1, min(int(self.ncols), n))
+                panels = [self._data[i] for i in range(n)]
+                png = render_panels_png(
+                    panels, cmaps=cmap, ncols=ncols,
+                    max_px_per_panel=192, vmin=vmin, vmax=vmax, log=log,
+                )
+            data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
+            data_dict["image/png"] = base64.b64encode(png).decode("ascii")
+            if isinstance(bundle, tuple):
+                return (data_dict, bundle[1])
+            return data_dict
+        except Exception:
+            return bundle
 
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         if self.log_scale:
