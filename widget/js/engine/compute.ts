@@ -346,22 +346,32 @@ export class Show4DSTEMCompute {
     const idx = idxArr.subarray(0, n || 1);
     const idxBuf = this.upload(idx, GPUBufferUsage.STORAGE);
     const vi = device.createBuffer({ size: this.scanCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const temps: GPUBuffer[] = [];
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass(); pass.setPipeline(this.maskedSumPipe);
-    for (const ch of this.chunks) {
-      const gx = Math.min(ch.nScan, MAX_WG), gy = Math.ceil(ch.nScan / MAX_WG);
-      const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
-      const dims2 = this.uniform([gx, 0, 0, 0]); temps.push(dims2);
+    for (const cd of this.sumDims()) {   // per-chunk dims are constant -> built once, reused every drag frame
       const bind = device.createBindGroup({ layout: this.maskedSumPipe.getBindGroupLayout(0), entries: [
-        { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: idxBuf } },
-        { binding: 2, resource: { buffer: vi } }, { binding: 3, resource: { buffer: dims } }, { binding: 4, resource: { buffer: dims2 } } ] });
-      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(gx, gy);
+        { binding: 0, resource: { buffer: cd.chunk } }, { binding: 1, resource: { buffer: idxBuf } },
+        { binding: 2, resource: { buffer: vi } }, { binding: 3, resource: { buffer: cd.dims } }, { binding: 4, resource: { buffer: cd.dims2 } } ] });
+      pass.setBindGroup(0, bind); pass.dispatchWorkgroups(cd.gx, cd.gy);
     }
     pass.end();
     device.queue.submit([enc.finish()]);
-    idxBuf.destroy(); temps.forEach((b) => b.destroy());   // vi handed to caller, NOT destroyed
+    idxBuf.destroy();   // vi handed to caller; dims are cached + reused, NOT destroyed
     return { buffer: vi, n };
+  }
+
+  // Per-chunk maskedSum dispatch params (chunk buffer, dims uniforms, 2D grid). These never change
+  // for a dataset, so build them ONCE and reuse across every drag frame instead of allocating +
+  // destroying ~2 uniform buffers per chunk per frame (~3300 buffer creates/s during a drag).
+  private sumDimsCache: { chunk: GPUBuffer; dims: GPUBuffer; dims2: GPUBuffer; gx: number; gy: number }[] | null = null;
+  private sumDims() {
+    if (!this.sumDimsCache) {
+      this.sumDimsCache = this.chunks.map((ch) => {
+        const gx = Math.min(ch.nScan, MAX_WG), gy = Math.ceil(ch.nScan / MAX_WG);
+        return { chunk: ch.buffer, dims: this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]), dims2: this.uniform([gx, 0, 0, 0]), gx, gy };
+      });
+    }
+    return this.sumDimsCache;
   }
 
   // DP over a real-space ROI: f32[detSize]. scanMask is GLOBAL; chunks accumulate
@@ -429,5 +439,8 @@ export class Show4DSTEMCompute {
     await rb.mapAsync(GPUMapMode.READ); const out = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy(); return out;
   }
 
-  dispose() { for (const c of this.chunks) c.buffer.destroy(); }
+  dispose() {
+    for (const c of this.chunks) c.buffer.destroy();
+    if (this.sumDimsCache) { for (const cd of this.sumDimsCache) { cd.dims.destroy(); cd.dims2.destroy(); } this.sumDimsCache = null; }
+  }
 }
