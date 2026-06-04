@@ -439,7 +439,7 @@ function buildFusedJobD(device: GPUDevice, spec: Bslz4Spec, srcDtype: "uint16" |
 // Fallback. Returns null if WebGPU is unavailable. Console-driven verify only.
 export async function verifyFusedD(spec: Bslz4Spec, srcDtype: "uint16" | "uint32"): Promise<{
   nBytes: number; nDiff: number; maxDiff: number; firstDiffAt: number; meanFrame0: number;
-  fGpuMs: number; dGpuMs: number;
+  dErr: string | null; fGpuMs: number; dGpuMs: number;
 } | null> {
   const device = await getGPUDevice();
   if (!device) return null;

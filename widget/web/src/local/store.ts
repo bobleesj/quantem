@@ -338,7 +338,6 @@ export async function virtualImage(
     return reshapeVI(await ds.compute.maskedSum(mask), ds); }
   if (mode === "ADF" || mode === "DF") { mask = annulusMask(ds.detRows, ds.detCols, ccy, ccx, (inner || 1.2) * r, (outer || 4) * r);
     return reshapeVI(await ds.compute.maskedSum(mask), ds); }
-  if (mode === "SSB") return null;   // SSB is full ptychography, not in the standalone path
   // CoM / iCoM (DPC): intensity-weighted centroid over the BF disk per scan position.
   const comMask = diskMask(ds.detRows, ds.detCols, ccy, ccx, 1.5 * r);
   const { comY, comX } = await ds.compute.maskedCoM(comMask, ds.detCols);

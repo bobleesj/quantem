@@ -67,7 +67,10 @@ export interface Session {
   files: MasterFile[];
 }
 
-export const DETECTOR_MODES = ["BF", "ADF", "DF", "CoMmag", "CoMy", "CoMx", "iCoM", "SSB"] as const;
+// No SSB for the local browser app: SSB is an iterative phase reconstruction, not a per-frame
+// virtual image, so it only ever showed a precomputed Screen sidecar (has_ssb) which loose local
+// .h5 files never have. Omitted here; it lives in the Screening surface, not local browse.
+export const DETECTOR_MODES = ["BF", "ADF", "DF", "CoMmag", "CoMy", "CoMx", "iCoM"] as const;
 export type DetectorMode = typeof DETECTOR_MODES[number];
 
 export const COLORMAP_OPTIONS = ["viridis", "inferno", "magma", "plasma", "gray", "hot", "cividis"] as const;

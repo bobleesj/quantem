@@ -29,7 +29,6 @@ const DETECTOR_MODE_LABELS: Record<DetectorMode, string> = {
   CoMy: "CoM row",
   CoMx: "CoM col",
   iCoM: "iCoM",
-  SSB: "SSB",
 };
 
 function detectorModeLabel(mode: DetectorMode): string {
@@ -2867,7 +2866,6 @@ export default function Viewer(props: Props) {
                 m === "BF" ? "Bright field: central disk, 0-1 x BF radius"
                 : m === "DF" ? "Dark field: annulus, 1-2 x BF radius"
                 : m === "ADF" ? "Annular dark field: annulus, 1-3 x BF radius"
-                : m === "SSB" && !file.has_ssb ? "Show Screen SSB sidecar when it exists"
                 : detectorModeLabel(m)
               }
               sx={{ px: compact ? 0.75 : 1, py: compact ? 0.25 : 0.5,
