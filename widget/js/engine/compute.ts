@@ -73,11 +73,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   frame[k] = f32(sample(u.x + k, u.z));
 }`;
 
+// One thread per scan position: intensity-weighted centroid (center of mass) of the
+// detector over the active mask pixels. Output is the per-position CoM in detector px:
+// comY at [gi], comX at [scanCount+gi]. Drives CoMx/CoMy/CoMmag/iCoM (DPC).
+const MASKED_COM_WGSL = `
+@group(0) @binding(0) var<storage,read> data: array<u32>;
+@group(0) @binding(1) var<storage,read> idx: array<u32>;   // ACTIVE detector pixel indices
+@group(0) @binding(2) var<storage,read_write> com: array<f32>;  // 2*scanCount: [gi]=comY, [scanCount+gi]=comX
+@group(0) @binding(3) var<uniform> u: vec4<u32>;   // startScan, nScanInChunk, detSize, mode
+@group(0) @binding(4) var<uniform> u2: vec4<u32>;  // detCols, scanCount, 0, 0
+${SAMPLE}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let sl = gid.x; if (sl >= u.y) { return; }
+  let base = sl * u.z; let n = arrayLength(&idx); let detCols = u2.x;
+  var wsum: f32 = 0.0; var ysum: f32 = 0.0; var xsum: f32 = 0.0;
+  for (var j: u32 = 0u; j < n; j = j + 1u) {
+    let p = idx[j]; let v = f32(sample(base + p, u.w));
+    wsum = wsum + v; ysum = ysum + f32(p / detCols) * v; xsum = xsum + f32(p % detCols) * v;
+  }
+  let gi = u.x + sl;
+  if (wsum > 0.0) { com[gi] = ysum / wsum; com[u2.y + gi] = xsum / wsum; }
+  else { com[gi] = 0.0; com[u2.y + gi] = 0.0; }
+}`;
+
 interface Chunk { buffer: GPUBuffer; startScan: number; nScan: number; }
 
 export class Show4DSTEMCompute {
   private device: GPUDevice;
   private maskedSumPipe: GPUComputePipeline;
+  private maskedComPipe: GPUComputePipeline;
   private reduceFramesPipe: GPUComputePipeline;
   private frameAtPipe: GPUComputePipeline;
   private chunks: Chunk[];
@@ -94,6 +119,7 @@ export class Show4DSTEMCompute {
     const ms = device.createShaderModule({ code: MASKED_SUM_WGSL });
     const rf = device.createShaderModule({ code: REDUCE_FRAMES_WGSL });
     this.maskedSumPipe = device.createComputePipeline({ layout: "auto", compute: { module: ms, entryPoint: "main" } });
+    this.maskedComPipe = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: MASKED_COM_WGSL }), entryPoint: "main" } });
     this.reduceFramesPipe = device.createComputePipeline({ layout: "auto", compute: { module: rf, entryPoint: "main" } });
     this.frameAtPipe = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: FRAME_WGSL }), entryPoint: "main" } });
   }
@@ -111,6 +137,35 @@ export class Show4DSTEMCompute {
     const frame = await this.readF32(out, this.detSize);
     for (const bp of this.badPx) frame[bp] = 0;   // auto-filter hot px in the diffraction pattern
     out.destroy(); dims.destroy(); return frame;
+  }
+
+  // Per-scan-position center of mass (intensity-weighted detector centroid) over the
+  // active mask. Returns {comY, comX} in detector px (length scanCount each). Drives DPC
+  // (CoMx/CoMy/CoMmag/iCoM). detCols unravels the flat pixel index to (row,col); badPx
+  // are excluded from the mask, matching every other reduction.
+  async maskedCoM(mask: Uint32Array, detCols: number): Promise<{ comY: Float32Array; comX: Float32Array }> {
+    const device = this.device;
+    const bad = this.badPx.length ? new Set(this.badPx) : null;
+    const idxArr = new Uint32Array(this.detSize); let n = 0;
+    for (let k = 0; k < this.detSize; k++) if (mask[k] !== 0 && !(bad && bad.has(k))) idxArr[n++] = k;
+    const idx = idxArr.subarray(0, n || 1);
+    const idxBuf = this.upload(idx, GPUBufferUsage.STORAGE);
+    const com = device.createBuffer({ size: this.scanCount * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(com, 0, new Float32Array(this.scanCount * 2));
+    const temps: GPUBuffer[] = [];
+    for (const ch of this.chunks) {
+      const dims = this.uniform([ch.startScan, ch.nScan, this.detSize, this.mode]); temps.push(dims);
+      const dims2 = this.uniform([detCols, this.scanCount, 0, 0]); temps.push(dims2);
+      const bind = device.createBindGroup({ layout: this.maskedComPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: ch.buffer } }, { binding: 1, resource: { buffer: idxBuf } },
+        { binding: 2, resource: { buffer: com } }, { binding: 3, resource: { buffer: dims } }, { binding: 4, resource: { buffer: dims2 } } ] });
+      this.dispatch(this.maskedComPipe, bind, Math.ceil(ch.nScan / 64));
+    }
+    const flat = await this.readF32(com, this.scanCount * 2);
+    idxBuf.destroy(); com.destroy(); temps.forEach((b) => b.destroy());
+    const comY = flat.slice(0, this.scanCount), comX = flat.slice(this.scanCount, this.scanCount * 2);
+    if (n === 0) { comY.fill(0); comX.fill(0); }
+    return { comY, comX };
   }
 
   // Single decompressed stack -> one chunk (the common, fits-in-one-buffer case).

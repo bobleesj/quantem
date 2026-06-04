@@ -18,10 +18,12 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return null;
     try {
-      // @ts-ignore - requestAdapterInfo is not in all type definitions
-      const info = await adapter.requestAdapterInfo?.();
+      // Newer Chrome exposes the sync `adapter.info`; older builds used the async
+      // requestAdapterInfo(). Prefer the sync one, fall back to async.
+      // @ts-ignore - info / requestAdapterInfo are not in all type definitions
+      const info = adapter.info || (await adapter.requestAdapterInfo?.());
       if (info) {
-        gpuInfo = info.description || `${info.vendor} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
+        gpuInfo = info.description || `${info.vendor || ""} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
       }
     } catch (_e) { /* adapter info not available */ }
     // Raise device limits to the adapter max. Defaults are conservative
