@@ -610,18 +610,33 @@ class Show2D(anywidget.AnyWidget):
             log = bool(getattr(self, "log_scale", False))
             vmin = getattr(self, "vmin", None)
             vmax = getattr(self, "vmax", None)
+            title = self.title or None
+            # Convert pixel_size + unit to A/px for the scale bar overlay.
+            sampling_A: float | None = None
+            if self.pixel_size and self.pixel_unit not in ("pixels", ""):
+                u = self.pixel_unit.lower()
+                if u in ("a", "Å", "ang", "ångström", "angstrom"):
+                    sampling_A = float(self.pixel_size)
+                elif u == "nm":
+                    sampling_A = float(self.pixel_size) * 10.0
+                elif u in ("um", "µm", "micron"):
+                    sampling_A = float(self.pixel_size) * 10_000.0
             if self.n_images == 1:
                 png = render_image_png(
                     self._data[0], cmap=cmap, vmin=vmin, vmax=vmax,
-                    log=log, max_px=512,
+                    log=log, max_px=512, title=title,
+                    sampling_A_per_px=sampling_A,
                 )
             else:
                 n = min(self.n_images, 12)
                 ncols = max(1, min(int(self.ncols), n))
                 panels = [self._data[i] for i in range(n)]
+                labels = list(self.labels)[:n] if self.labels else None
                 png = render_panels_png(
                     panels, cmaps=cmap, ncols=ncols,
                     max_px_per_panel=192, vmin=vmin, vmax=vmax, log=log,
+                    labels=labels, title=title,
+                    sampling_A_per_px=sampling_A,
                 )
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
             data_dict["image/png"] = base64.b64encode(png).decode("ascii")
@@ -823,6 +838,36 @@ class Show2D(anywidget.AnyWidget):
 
     def save(self, path: str):
         save_state_file(path, "Show2D", self.state_dict())
+
+    def export_html(self, path: str | pathlib.Path,
+                    *, title: str | None = None) -> pathlib.Path:
+        """Write a standalone HTML viewer for this widget.
+
+        The exported file mounts the live anywidget JS bundle with the current
+        widget state (data, labels, cmap, vmin/vmax, log_scale, sampling, ...).
+        Opens in any browser without a Jupyter kernel.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Destination HTML path.
+        title : str, optional
+            Browser page title. Defaults to widget ``title`` or "Show2D".
+        """
+        from ipywidgets.embed import dependency_state, embed_minimal_html
+
+        export_path = pathlib.Path(path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        page_title = title or self.title or "Show2D"
+        state = dependency_state([self], drop_defaults=False)
+        embed_minimal_html(
+            str(export_path),
+            views=[self],
+            title=page_title,
+            drop_defaults=False,
+            state=state,
+        )
+        return export_path
 
     def load_state_dict(self, state):
         for key, val in state.items():
