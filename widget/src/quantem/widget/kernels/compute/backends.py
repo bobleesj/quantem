@@ -1,40 +1,31 @@
-"""UI-agnostic 4D-STEM compute backends (duck-typed, no Protocol).
+"""4D-STEM compute backends — Phil's MacBook (raw Metal) + universal torch.
 
-ONE compute layer consumed by BOTH the Jupyter widget (`show4dstem_base`) AND the
-web Browse (`server/routers/browse.py`). The same masked-sum math is implemented
-three ways across the repo (torch tensordot, raw Metal, CuPy RawKernel); this
-module is the single interface they collapse into.
+ONE compute layer consumed by BOTH the Jupyter widget (``show4dstem``) AND the
+web Browse (``server/routers/browse.py``). The same masked-sum math is
+implemented three ways across the repo (torch tensordot, raw Metal, CuPy
+RawKernel); this module is the single interface they collapse into.
 
-A backend is constructed from a data source and exposes these primitives (every
-backend implements the same names + shapes, so callers never branch on hardware):
+Backends conform to the ``ComputeBackend`` protocol (see ``backend.py``):
 
-    scan_shape -> (rows, cols)
-    det_shape  -> (rows, cols)
-    n_frames   -> int                                      scan rows*cols
-    frame(idx) -> np.ndarray (det_r, det_c)                one diffraction pattern
-    masked_sum(det_mask) -> np.ndarray (scan_r, scan_c) f32   virtual image (BF/DF/ADF)
-    mean_dp() -> np.ndarray (det_r, det_c) f32             mean DP over all scan positions
-    reduce_frames(scan_indices, reduce) -> np.ndarray (det_r, det_c) f32   DP over a scan ROI
+    TorchBackend       — torch tensor on CUDA / MPS / CPU — universal default
+    MetalRawBackend    — ChunkedFrames + MetalVirtualImage — Phil's 19.3 GB
+                         Samsung-class no-bin path where torch.MPS overflows.
+                         Owns fast_vi sidecar, radial cache, multi-dataset
+                         proxy lifecycle (see capabilities tuple).
+    CudaKernelCompute  — placeholder; web Browse RawKernel will collapse here.
 
-`compute_backend(data)` duck-types the data source and returns the right backend.
-The detector-mask geometry (point/circle/square/annular/rect) is UI/geometry that
-produces a `(det, det)` mask any backend consumes - it is NOT part of the backend
-(kept in one shared helper, `detector_mask`).
+``TorchCompute`` / ``MetalCompute`` are kept as aliases for one release.
 
-Backends:
-  - TorchCompute  (torch tensor; cuda / mps / cpu) - universal default
-  - MetalCompute  (ChunkedFrames; mps raw-Metal + bin2 fast mode + lazy multi-dataset)
-  - CudaKernelCompute (cupy; the web Browse fused RawKernel) - future, designed-for
-
-The math is ported faithfully from `show4dstem_base` (torch) and wraps the existing
-`MetalVirtualImage` (Metal), so a backend swap is bit-for-bit on equal inputs
-(verified: tests/kernels/test_masked_sum_parity.py).
+``compute_backend(data)`` duck-types the data source and returns the right
+backend so callers (widget + web Browse) never branch on hardware themselves.
 """
 from __future__ import annotations
 
 import threading
 
 import numpy as np
+
+from quantem.widget.kernels.compute.backend import ComputeBackend  # noqa: F401
 
 # Cap transient float32 memory per reduction chunk (matches the widget budget).
 _CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
@@ -43,46 +34,51 @@ _CHUNK_BYTE_BUDGET = 600 * 1024 * 1024
 def compute_backend(data):
     """Return the compute backend for ``data``, duck-typed on its type.
 
-    torch tensor / numpy / Dataset wrapping a tensor -> TorchCompute (any torch
-        device: CUDA / MPS-binned / CPU). This is the GENERAL path.
-    ChunkedFrames / anything with ``_is_gpu_frames`` -> MetalCompute (raw Metal).
-        The device-specific path, used ONLY for MPS no-bin (where torch can't hold
-        the >2^31-element stack).
-    cupy ndarray -> converted to a torch CUDA tensor (zero-copy dlpack) and run on
-        TorchCompute. The widget compute path is torch, never cupy - cupy lives only
-        in the io decode + the parity-test reference.
+    torch tensor / numpy / Dataset wrapping a tensor -> TorchBackend (any
+        torch device: CUDA / MPS-binned / CPU). This is the GENERAL path.
+    ChunkedFrames / anything with ``_is_gpu_frames`` -> MetalRawBackend
+        (raw Metal). The device-specific path, used ONLY for MPS no-bin
+        (where torch can't hold the >2^31-element stack).
+    cupy ndarray -> converted to a torch CUDA tensor (zero-copy dlpack) and
+        run on TorchBackend. The widget compute path is torch, never cupy;
+        cupy lives only in the io decode + the parity-test reference.
 
-    One selection point here means callers (widget + web Browse) never branch on
-    hardware themselves.
+    One selection point here means callers (widget + web Browse) never branch
+    on hardware themselves.
     """
     if getattr(data, "_is_gpu_frames", False):
-        return MetalCompute(data)
+        return MetalRawBackend(data)
     cls_name = type(data).__module__.split(".")[0]
     if cls_name == "cupy":
         import torch
-        return TorchCompute(torch.from_dlpack(data))  # cupy -> torch CUDA, no cupy compute
+        return TorchBackend(torch.from_dlpack(data))  # cupy -> torch CUDA, no cupy compute
     try:
         import torch
         if isinstance(data, torch.Tensor):
-            return TorchCompute(data)
+            return TorchBackend(data)
     except ImportError:
         pass
-    # Dataset-like: unwrap a torch tensor if present, else hand to TorchCompute to
+    # Dataset-like: unwrap a torch tensor if present, else hand to TorchBackend to
     # numpy-ify (it owns the conversion so the widget doesn't have to).
-    return TorchCompute(data)
+    return TorchBackend(data)
 
 
 # ---
 
 
-class TorchCompute:
+class TorchBackend:
     """Torch backend - one chunked path on CUDA / MPS / CPU.
 
     Ports the widget's `_fast_masked_sum` / `auto_detect_center` / `_compute_vi_roi_dp`
     math verbatim (chunked tensordot, int64 mean-DP, einsum/amax reduce) so the
     universal-device path is identical to today. uint16 stays integer until the
     small reduced output; the per-chunk float32 cast is bounded by the byte budget.
+
+    Conforms to ``ComputeBackend`` protocol. No optional capabilities — torch
+    runs the universal path.
     """
+
+    capabilities: tuple[str, ...] = ()
 
     def __init__(self, data, *, scan_shape=None, det_shape=None, device=None):
         import torch
@@ -190,8 +186,15 @@ class TorchCompute:
 # ---
 
 
-class MetalCompute:
-    """Metal backend - wraps the existing `MetalVirtualImage` over `ChunkedFrames`.
+class MetalRawBackend:
+    """Raw-Metal backend - wraps ``MetalVirtualImage`` over ``ChunkedFrames``.
+
+    Owns the MPS lifecycle hooks that the Show4DSTEMMPS widget subclass used to
+    drive directly. Capabilities: fast_sidecar (bin2 fast_vi), radial_cache
+    (exact no-bin row-prefix BF/ADF), multi_dataset (lazy multi-file proxy).
+    See ``backend.py`` for the protocol; ``Show4DSTEMMPS`` reads
+    ``backend.capabilities`` and calls the corresponding methods only when the
+    feature is supported.
 
     VIRTUAL-IMAGE BINNING CONTRACT (MPS) — the design, stated plainly:
       - det_bin == 1 (NO-BIN): detector stays full-res (e.g. 192x192) so a single
@@ -211,6 +214,27 @@ class MetalCompute:
     (Also preserves row-prefix exact reductions + the lazy multi-dataset container.)
     """
 
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        """Capabilities advertised by this MetalRaw backend.
+
+        - ``fast_sidecar`` always (bin2 sidecar available when det_bin==1, or
+          immediately ready for already-binned data).
+        - ``radial_cache`` only when the underlying ChunkedFrames had row_prefix
+          enabled at load time (``data.vi.row_prefix_enabled``).
+        - ``multi_dataset`` only when the data source is a ``MultiChunkedFrames``
+          proxy (has ``set_active`` + ``on_ready``).
+        """
+        caps = ["fast_sidecar"]
+        if getattr(self._cf, "vi", None) is not None and getattr(
+            self._cf.vi, "row_prefix_enabled", False
+        ):
+            caps.append("radial_cache")
+            caps.append("row_prefix_exact")
+        if hasattr(self._cf, "set_active") and hasattr(self._cf, "on_ready"):
+            caps.append("multi_dataset")
+        return tuple(caps)
+
     def __init__(self, frames):
         self._cf = frames  # ChunkedFrames (or MultiChunkedFrames, duck-types the same)
         det = tuple(int(x) for x in self._cf.vi.det)
@@ -228,6 +252,12 @@ class MetalCompute:
         self._com_cache = None  # full-detector CoM (com_col, com_row), eager-built below
         self._auto_fast = (self.det_bin == 1 and det[0] >= 96
                            and hasattr(self._cf, "ensure_fast_interaction"))
+        # Background radial-cache lifecycle. Only matters when row_prefix is on.
+        self._radial_thread: threading.Thread | None = None
+        self._radial_pending: tuple[float, float] | None = None
+        self._radial_request = 0
+        self._radial_building = False
+        self._radial_error: str | None = None
         if self._auto_fast and getattr(self._cf, "fast_vi", None) is None:
             threading.Thread(target=self._build_fast, daemon=True).start()
 
@@ -299,6 +329,167 @@ class MetalCompute:
             return cc * 2.0, cr * 2.0  # bin2 px -> full-res detector px
         mask = None if det_mask is None else np.ascontiguousarray(det_mask)
         return cf.vi.center_of_mass(mask)
+
+    # ---------------------------------------------------------------- fast_sidecar
+    # bin2 sidecar (``fast_vi``) — accelerates BF/DF/ADF masked_sum 4x by
+    # downsampling the detector once at sidecar-build time, then reading the
+    # 4x-smaller buffer on every reduction. Auto-built for no-bin data; already
+    # ready for det_bin>=2 data. Show4DSTEMMPS used to drive this; now the
+    # backend owns it.
+
+    @property
+    def fast_bin(self) -> int:
+        return int(getattr(self._cf, "fast_bin", 2))
+
+    def ensure_fast_sidecar(self, verbose: bool = False) -> bool:
+        """Block until the bin2 fast_vi sidecar is ready. Returns True if
+        ready or no sidecar is needed (already-binned data)."""
+        cf = self._cf
+        if int(getattr(cf, "det_bin", 1)) > 1:
+            return True  # already binned at load — no sidecar needed
+        if not hasattr(cf, "ensure_fast_interaction"):
+            return False
+        cf.ensure_fast_interaction(verbose=verbose)
+        return getattr(cf, "fast_vi", None) is not None
+
+    def cache_fast_presets(self, masks: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Pre-compute virtual images on the fast sidecar for a dict of named
+        detector masks (typ. {"bf": mask, "abf": mask, ...}). Returns a dict
+        of `(scan_r, scan_c) float32` arrays. Caller stores bytes."""
+        cf = self._cf
+        fv = getattr(cf, "fast_vi", None)
+        if fv is None:
+            return {}
+        from quantem.widget.kernels.compute.mps import _bin_mask
+        out: dict[str, np.ndarray] = {}
+        for name, mask in masks.items():
+            vi = fv.masked_sum(_bin_mask(np.ascontiguousarray(mask), self.fast_bin))
+            out[name] = np.asarray(vi).reshape(self.scan_shape).astype(np.float32, copy=False)
+        return out
+
+    # ---------------------------------------------------------------- radial_cache
+    # Exact no-bin BF/ADF on circular/annular detector masks via row-prefix
+    # cumulative sums. Only available when ChunkedFrames was loaded with
+    # ``row_prefix=True``. Cache is per-(center_row, center_col); building
+    # touches the whole 19 GB stack, so we serialize requests + cancel stale
+    # ones (operator drags the center, we only build for the last position).
+
+    def radial_cache_ready(self, center_row: float, center_col: float) -> bool:
+        vi = getattr(self._cf, "vi", None)
+        if vi is None or not getattr(vi, "row_prefix_enabled", False):
+            return False
+        return vi.radial_cache_ready(float(center_row), float(center_col))
+
+    def radial_masked_sum(
+        self,
+        *,
+        center_row: float,
+        center_col: float,
+        outer_radius: float,
+        inner_radius: float = 0.0,
+        build: bool = False,
+    ) -> np.ndarray | None:
+        """Returns a (scan_r, scan_c) virtual image or None if the cache isn't
+        ready (and ``build`` is False)."""
+        vi = getattr(self._cf, "vi", None)
+        if vi is None or not getattr(vi, "row_prefix_enabled", False):
+            return None
+        return vi.radial_masked_sum(
+            center_row=float(center_row),
+            center_col=float(center_col),
+            outer_radius=float(outer_radius),
+            inner_radius=float(inner_radius),
+            build=bool(build),
+        )
+
+    def ensure_radial_cache(self, center_row: float, center_col: float,
+                            *, idle_delay_s: float = 0.75) -> None:
+        """Schedule a background build of the radial cache at (row, col).
+
+        Cancels any prior pending build for a different center. Cheap if the
+        cache is already ready at this center.
+        """
+        vi = getattr(self._cf, "vi", None)
+        if vi is None or not getattr(vi, "row_prefix_enabled", False):
+            return
+        if vi.radial_cache_ready(float(center_row), float(center_col)):
+            self._radial_pending = None
+            return
+        self._radial_request += 1
+        self._radial_pending = (float(center_row), float(center_col))
+        if self._radial_building:
+            return  # an existing thread will pick up the new pending center
+        self._radial_building = True
+        self._radial_error = None
+        import time as _time
+
+        def _build():
+            try:
+                while True:
+                    request = self._radial_request
+                    center = self._radial_pending
+                    if center is None:
+                        return
+                    _time.sleep(idle_delay_s)
+                    # If the request changed during the idle wait, restart on the new center.
+                    if request != self._radial_request or center != self._radial_pending:
+                        continue
+                    vi._ensure_radial_cache(center[0], center[1])
+                    if request == self._radial_request and center == self._radial_pending:
+                        self._radial_pending = None
+                        return
+            except Exception as exc:  # pragma: no cover
+                self._radial_error = repr(exc)
+            finally:
+                self._radial_building = False
+
+        self._radial_thread = threading.Thread(
+            target=_build, name="MetalRawBackend-radial", daemon=True,
+        )
+        self._radial_thread.start()
+
+    @property
+    def radial_building(self) -> bool:
+        return self._radial_building
+
+    @property
+    def radial_error(self) -> str | None:
+        return self._radial_error
+
+    # ---------------------------------------------------------------- multi_dataset
+    # Lazy multi-file proxy (MultiChunkedFrames) — set_active(idx) points the
+    # backend at one of N decoded datasets; on_ready(idx) fires when the
+    # background decoder finishes a dataset. Show4DSTEMMPS uses these to drive
+    # the n_frames slider for time/tilt series.
+
+    def set_active_dataset(self, idx: int) -> None:
+        if hasattr(self._cf, "set_active"):
+            self._cf.set_active(int(idx))
+
+    @property
+    def multi_n_ready(self) -> int:
+        return int(getattr(self._cf, "n_ready", 1))
+
+    @property
+    def multi_names(self) -> list[str]:
+        return list(getattr(self._cf, "names", []) or [])
+
+    @property
+    def multi_active_idx(self) -> int:
+        return int(getattr(self._cf, "active_idx", 0))
+
+    def multi_total(self) -> int:
+        datasets = getattr(self._cf, "datasets", None)
+        return len(datasets) if datasets is not None else 1
+
+    def set_multi_ready_callback(self, cb) -> None:
+        if hasattr(self._cf, "on_ready"):
+            self._cf.on_ready = cb
+
+
+# Back-compat aliases (one-release deprecation).
+TorchCompute = TorchBackend
+MetalCompute = MetalRawBackend
 
 
 # ---
