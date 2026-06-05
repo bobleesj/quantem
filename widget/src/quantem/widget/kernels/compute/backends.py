@@ -153,6 +153,39 @@ class TorchCompute:
             dp = frames.mean(dim=0)
         return dp.cpu().numpy()
 
+    def center_of_mass(self, det_mask: np.ndarray | None = None):
+        """Per-scan-position CoM over the (masked) detector - the DPC vector field.
+
+        Returns ``(com_col, com_row)`` each ``(N,)`` float32 in absolute detector
+        coordinates (col = Sum col*I / Sum I, row = Sum row*I / Sum I), matching
+        ``MetalVirtualImage.center_of_mass`` so DPC is single-source across
+        CUDA / MPS / CPU. ``det_mask`` None means the full detector. Chunked by the
+        same byte budget as ``masked_sum``; integer frames stay int until the small
+        per-chunk float reduce.
+        """
+        torch = self.torch
+        mask = None
+        if det_mask is not None:
+            mask = torch.as_tensor(np.ascontiguousarray(det_mask), device=self.device).float()
+        com_col = torch.zeros(self.n_frames, dtype=torch.float32, device=self.device)
+        com_row = torch.zeros(self.n_frames, dtype=torch.float32, device=self.device)
+        sc = self.scan_shape[1]
+        step = self._chunk_rows()
+        for i in range(0, self.scan_shape[0], step):
+            chunk = self._4d[i:i + step]
+            if not torch.is_floating_point(chunk):
+                chunk = chunk.float()
+            if mask is not None:
+                chunk = chunk * mask
+            denom = chunk.sum(dim=(2, 3))
+            sum_row = (chunk * self._row).sum(dim=(2, 3))
+            sum_col = (chunk * self._col).sum(dim=(2, 3))
+            safe = denom.clamp(min=1e-12)  # empty / masked-out frames -> CoM 0, no div0
+            lo = i * sc
+            com_row[lo:lo + sum_row.numel()] = (sum_row / safe).reshape(-1)
+            com_col[lo:lo + sum_col.numel()] = (sum_col / safe).reshape(-1)
+        return com_col.cpu().numpy(), com_row.cpu().numpy()
+
 
 # ---
 
@@ -238,6 +271,16 @@ class MetalCompute:
             f = np.asarray(self._cf.frame(int(i)), dtype=np.float32)
             dp = f if dp is None else np.maximum(dp, f)
         return dp if dp is not None else np.zeros(self.det_shape, dtype=np.float32)
+
+    def center_of_mass(self, det_mask: np.ndarray | None = None):
+        """Per-scan-position CoM (DPC vector field) on the raw Metal kernel.
+
+        Delegates to the full-res ``MetalVirtualImage`` (no-bin int64 accumulators,
+        fits in 24 GB). Returns ``(com_col, com_row)`` flat ``(N,)`` float32 - the
+        same contract as ``TorchCompute`` so DPC is single-source across backends.
+        """
+        mask = None if det_mask is None else np.ascontiguousarray(det_mask)
+        return self._cf.vi.center_of_mass(mask)
 
 
 # ---
