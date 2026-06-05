@@ -367,18 +367,17 @@ class Show4DSTEM(anywidget.AnyWidget):
     ):
         super().__init__(**kwargs)
         self.widget_version = resolve_widget_version()
-        # Opt-in backend override (Phase 2 work in progress). Today only
-        # auto-detect is wired; explicit 'webgpu' raises because the JS-side
-        # online-channel.ts is not yet implemented. Reserved for the JS-side
-        # follow-up; the API is fixed so callers can write against it now.
+        # Backend selector — maps to the four Show4DSTEM compute options:
+        #   None / 'torch' / 'metal' -> Python compute via TorchBackend or
+        #       MetalRawBackend (auto-picked from data type; explicit values
+        #       reserved for future device-specific testing).
+        #   'webgpu' -> kernel ships uint8-packed stack to browser via
+        #       `_offline_stack` trait; JS `Show4DSTEMCompute` does all
+        #       reductions in WebGPU. Kernel stays alive. Identical runtime
+        #       behavior to `offline=True`; this is the named alias.
         if backend == "webgpu":
-            raise NotImplementedError(
-                "backend='webgpu' awaits the JS-side online-channel.ts. Track in "
-                "the Phase 2 design doc at docs/refactor/2026-06-05-show4dstem-backends.md. "
-                "For now Show4DSTEM auto-picks TorchBackend or MetalRawBackend "
-                "based on the input data type."
-            )
-        if backend is not None and backend not in ("torch", "metal"):
+            offline = True  # routes the rest of __init__ through the offline pack path
+        if backend is not None and backend not in ("torch", "metal", "webgpu"):
             raise ValueError(
                 f"backend must be one of 'torch' / 'metal' / 'webgpu' / None, "
                 f"got {backend!r}"

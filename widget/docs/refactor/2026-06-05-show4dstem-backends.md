@@ -146,86 +146,57 @@ sibling-.h5 alternative would have the HTML fetch the .h5 via `fetch()` +
 do bslz4 decode in the browser. That's a future optimization; not needed
 to call Phase 3 "shipped".
 
-## Phase 2 — Backendless / Online (designed, not implemented)
+## Phase 2 — Backendless / Online (ALREADY SHIPPED via `offline=True`)
 
-The future addition. Goal: Python kernel HOLDS the raw 4D stack (any data
-type), but the BROWSER does all reductions via WebGPU.
+**Realization 2026-06-05: Phase 2 is already done.** The widget's
+existing ``offline=True`` knob does exactly this — kernel ships a uint8-
+packed 4D stack via the ``_offline_stack`` trait, JS mounts
+``Show4DSTEMCompute``, all subsequent reductions (ROI drag, frame
+scrub, ADF change) happen in the browser GPU via the same WGSL shaders
+used by ``export_html``. The kernel stays alive but isn't used for
+compute. "Offline" here means "compute offline from Python" not "kernel
+offline."
 
-**Broader framing than just Mac-no-MPS.** WebGPU runs on ANY modern GPU —
-NVIDIA, AMD, Apple M-series, Intel Arc. So Phase 2 is the **universal
-GPU compute backend**: any user with a browser + GPU gets fast reductions
-without needing a working CUDA/torch.MPS install on the kernel side. Pairs
-well with the laptop-first roadmap (#725, #740) and the cross-platform
-adoption goal.
+**API:** ``Show4DSTEM(data, backend='webgpu')`` (added 2026-06-05) maps
+to ``offline=True`` for a clearer name. Same runtime behavior.
 
-### Protocol changes
+**Verified end-to-end** on Samsung Logic-013 (det_bin=8):
+``backend='webgpu'`` → 92 MB ``_offline_stack`` packed → JS receives the
+trait → mounts WebGPU pipeline → all UI compute runs browser-side.
 
-Add a new backend that implements the required surface BUT delegates
-each compute call to a JS Comm channel:
+**Universal GPU access** (any modern GPU + browser):
+- NVIDIA / AMD / Intel users without a CUDA-built torch
+- Apple M-series Mac users without working torch.MPS
+- Laptop-first adopters without Python GPU drivers
+- Anyone whose data exceeds torch.MPS's >2^31 ceiling
+
+The earlier ``WebGPUOnlineBackend`` Python skeleton (committed in
+bcac8e7f) duplicated this. Removed 2026-06-05 — the existing
+``_offline_stack`` + ``Show4DSTEMCompute`` flow IS the online backend.
+
+### How it works (no new code paths)
 
 ```python
-class WebGPUOnlineBackend:
-    capabilities = ()  # JS lifecycle has its own model
-
-    def __init__(self, widget):
-        self._widget = widget                       # weak ref
-        self._pending: dict[int, asyncio.Future] = {}
-
-    def masked_sum(self, det_mask):
-        req_id = self._next_req()
-        self._widget.send({"op": "masked_sum", "req_id": req_id,
-                           "mask_bytes": det_mask.tobytes()})
-        return self._await(req_id)  # blocks Python until JS replies
+Show4DSTEM(data, backend='webgpu')      # alias of offline=True
+Show4DSTEM(data, offline=True)          # original knob, equivalent
 ```
 
-### JS side
+Both routes call ``_pack_offline(offline)`` which:
+1. Clips ``data`` to uint8 (lossless for counts <=255).
+2. Stores the packed bytes in the ``_offline_stack`` traitlets.Bytes.
+3. Sets ``self.offline = True``.
 
-Browser holds the stack as a single WebGPU storage buffer (chunked if >2
-GB to dodge per-buffer caps). Mounts on first request via `widget.recv`:
+JS side reads ``_offline_stack`` on mount and calls
+``Show4DSTEMCompute.create(stack, scanCount, detSize)`` — the same
+shaders ``export_html`` uses. Every subsequent ROI drag / scrub /
+ADF change runs on the browser GPU.
 
-```typescript
-model.on("msg:custom", async (msg) => {
-  if (msg.op === "masked_sum") {
-    const vi = compute.maskedSum(stackBuffer, msg.mask_bytes, scanShape);
-    model.send({req_id: msg.req_id, result_bytes: vi.buffer});
-  }
-});
-```
+### Future v2 — bslz4 streaming for >2 GB stacks
 
-### Streaming protocol
-
-For large stacks, kernel ships chunks lazily — JS requests block N, kernel
-ships, JS caches in GPU buffer with LRU eviction. Reuse the existing
-`_offline_bslz4` chunk metadata format so the JS decode path is shared.
-
-### Estimated effort
-
-~1-2 weeks. Touches:
-- `kernels/compute/webgpu_online.py` (new, ~200 LOC) — Python side
-- `js/engine/online-channel.ts` (new, ~300 LOC) — JS Comm + buffer cache
-- `show4dstem.py` — accept `backend='webgpu'` and route compute calls
-  through the async backend
-- Comm protocol + serialization tests
-
-### Who benefits
-
-- Mac users with Apple M-series GPU (WebGPU via Metal); covers all the
-  scenarios where torch.MPS is unavailable, too slow, or overflows.
-- Linux / Windows users WITHOUT a CUDA-built torch (saves a 2 GB install).
-- AMD GPU users — WebGPU via Vulkan unlocks a path that has no Python
-  reduction backend today.
-- Intel Arc / iGPU users — same story.
-- Any laptop-first adoption flow where the operator hasn't set up Python
-  GPU drivers but has a modern browser.
-
-### When to build
-
-Phase 2 specifically helps when: Python kernel HOLDS the data (because it
-came from disk via Python), but Python can't do reductions efficiently
-(no CUDA, no Metal, torch.MPS overflows). Today's path either uses
-TorchBackend('cpu') (slow) or fails. WebGPUOnlineBackend would solve this
-by deferring to the browser GPU — which today's offline export already
-does, but only for one-shot read-only artifacts.
+Already implemented via ``offline_codec='bslz4'`` + a companion
+``data_url`` directory. The ``_pack_offline_bslz4`` path chunks the
+stack so it doesn't have to fit in one Comm message. Documented in
+``show4dstem.py:827`` (``_pack_offline_bslz4``).
 
 ## Follow-ups (post-Phase-1)
 
