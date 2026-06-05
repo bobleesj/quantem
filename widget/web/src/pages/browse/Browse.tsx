@@ -19,7 +19,7 @@ import Viewer from "./Viewer";
 import MetaRail from "./MetaRail";
 import { pickFolderAndScan } from "../../local/folderPicker";
 import {
-  defaultSelection, fetchSessions, fetchGpuFreeBytes,
+  defaultSelection, fetchSessions, fetchGpuFreeBytes, lastScanSkipped,
   fileKey, findFile, pickAutoBin, preloadSet5D,
   type BrowseDtype, type ColormapName, type DetBin, type DetBinSetting, type DetectorMode,
   type DetShape, type MasterFile, type Session, type Set5D, type ShapeParams,
@@ -304,6 +304,7 @@ export default function Browse() {
   const [activeSession, setActiveSession] = useState<Session | null>(null);
   const [activeFile, setActiveFile] = useState<MasterFile | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [scanNotice, setScanNotice] = useState("");   // transient "skipped N bad files" banner
 
   // Cold-load sessions once.
   useEffect(() => {
@@ -330,6 +331,8 @@ export default function Browse() {
   useEffect(() => {
     const onLoaded = () => void fetchSessions().then((rows) => {
       setSessions(rows);
+      const n = lastScanSkipped();
+      if (n > 0) { setScanNotice(`Skipped ${n} unreadable file${n > 1 ? "s" : ""} (corrupt / not 4D-STEM).`); window.setTimeout(() => setScanNotice(""), 7000); }
       setActiveFile((cur) => {
         if (cur) return cur;
         const sel = defaultSelection(rows);
@@ -763,6 +766,11 @@ export default function Browse() {
             Open any master.h5, scrub the scan, generate virtual images on the fly. Hand off to
             Screening, SSB, or Ptychography in one click.
           </Typography>
+          {scanNotice && (
+            <Typography sx={{ mt: 0.5, fontSize: fontSizes.xs, fontWeight: 600, color: colors.warning.text }}>
+              ⚠ {scanNotice}
+            </Typography>
+          )}
         </Box>
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 0.5, flexWrap: "wrap" }}>
           <Box

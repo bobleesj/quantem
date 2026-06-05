@@ -60,6 +60,16 @@ export default function App() {
         const perf = (window as unknown as { __perf?: unknown[] }).__perf || [];
         return { dataset: f.name, nFiles: s.files.length, wallMs, dpSum, dpLen: dp.length, perf: perf[perf.length - 1] };
       };
+    // Per-dataset decode-timing probe: force-load one dataset, return wall + __perf record.
+    (window as unknown as { __timeDataset: (s: string, d: string, n: string) => Promise<unknown> }).__timeDataset =
+      async (source: string, date: string, name: string) => {
+        const { bfGeometry } = await import("./local/store");
+        const t0 = performance.now();
+        try { await bfGeometry(source, date, name); } catch (e) { return { error: String(e).slice(0, 120) }; }
+        const wall = Math.round(performance.now() - t0);
+        const perf = (window as unknown as { __perf?: { key: string; loadDecodeMs: number }[] }).__perf || [];
+        return { wall, perf: perf[perf.length - 1] };
+      };
     // CoM/DPC parity probe.
     (window as unknown as { __comStats: () => Promise<unknown> }).__comStats =
       async () => {

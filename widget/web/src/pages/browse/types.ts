@@ -132,6 +132,9 @@ export async function fetchSessions(): Promise<Session[]> {
   return store.getSessions();
 }
 
+/** # of files the last folder scan skipped (corrupt / truncated / junk). */
+export function lastScanSkipped(): number { return store.lastScanSkipped(); }
+
 export interface RawData {
   data: Float32Array;
   width: number;

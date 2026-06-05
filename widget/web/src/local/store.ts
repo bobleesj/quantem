@@ -64,6 +64,9 @@ const MAX_RESIDENT = 2;
 // the whole series is safe; a non-5D single dataset just keeps the 2-deep LRU.
 const PINNED = new Set<string>();
 export function setPinned5DKeys(keys: string[]): void { PINNED.clear(); for (const k of keys) PINNED.add(k); }
+// # of files the last scan skipped (unreadable / corrupt / truncated / junk) - surfaced to the user.
+let LAST_SCAN_SKIPPED = 0;
+export function lastScanSkipped(): number { return LAST_SCAN_SKIPPED; }
 
 function key(source: string, date: string, name: string): string { return `${source}/${date}/${name}`; }
 function humanSize(bytes: number): string {
@@ -95,50 +98,67 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
   // Skip macOS AppleDouble sidecars (._foo.h5): they match *master*.h5 but are 4 KB resource-fork
   // junk that jsfive can't parse - and one throw used to kill the whole folder scan.
   const realFiles = files.filter((f) => !f.name.startsWith("._"));
+  let skipped = 0;
+  // Claim each master's data-file siblings up front (filename-only, no IO).
   const masters = realFiles.filter((f) => MASTER_RE.test(f.name));
   const claimed = new Set<string>();
-  for (const m of masters) {
+  const masterPlan = masters.map((m) => {
     const prefix = m.name.replace(MASTER_RE, "");
     const dataFiles = realFiles.filter((f) => DATA_RE.test(f.name) && f.name.startsWith(prefix))
       .sort((a, b) => a.name.localeCompare(b.name));
     dataFiles.forEach((f) => claimed.add(f.relPath)); claimed.add(m.relPath);
-    // A corrupt / truncated / non-HDF5 master must not abort the whole folder - skip it, keep going.
+    return { m, dataFiles };
+  });
+  // Read ALL master headers in PARALLEL (the scan bottleneck was serial reads - tens of seconds
+  // over a slow link). A corrupt / truncated / non-HDF5 master must not abort the rest - skip it.
+  const masterBytes = await Promise.all(masterPlan.map((p) => p.m.bytes().catch(() => null)));
+  masterPlan.forEach((p, i) => {
+    const bytes = masterBytes[i];
+    if (!bytes) { skipped++; return; }
     try {
-      const f = new jsfive.File(await m.bytes(), m.name) as { get(p: string): { value: ArrayLike<number>; shape: number[] } };
+      const f = new jsfive.File(bytes, p.m.name) as { get(path: string): { value: ArrayLike<number>; shape: number[] } };
       const ntrigger = Number(f.get("entry/instrument/detector/detectorSpecific/ntrigger").value[0]);
       const pm = f.get("entry/instrument/detector/detectorSpecific/pixel_mask");
       const detRows = pm.shape[0], detCols = pm.shape[1];
+      // jsfive's .value is a lazy getter that re-decodes the whole dataset on EVERY access. Read it
+      // ONCE - the old loop touched pm.value in both the test and the body per pixel = 262k decodes
+      // per master = 21s each (the entire folder-scan bottleneck). Hoisting drops it to ~1ms.
+      const maskVals = pm.value;
       const bad: number[] = [];
-      for (let i = 0; i < pm.value.length; i++) if (pm.value[i] !== 0) bad.push(i);
+      for (let k = 0; k < maskVals.length; k++) if (maskVals[k] !== 0) bad.push(k);
       const side = Math.round(Math.sqrt(ntrigger));
       const scanRows = side, scanCols = Math.ceil(ntrigger / side);
-      const { source, date } = sessionFor(m.relPath);
+      const { source, date } = sessionFor(p.m.relPath);
       const mf: MasterFile = {
-        name: m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
-        size: humanSize(ntrigger * detRows * detCols), loadable: dataFiles.length > 0,
+        name: p.m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
+        size: humanSize(ntrigger * detRows * detCols), loadable: p.dataFiles.length > 0,
       };
-      GEOM.set(key(source, date, m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
-      pushFile(source, date, mf, { master: m, dataFiles });
-    } catch { /* unreadable master (corrupt/truncated/not HDF5) - skip, scan the rest */ }
-  }
-  // bare .h5 volumes not owned by a master
-  for (const file of realFiles) {
-    if (claimed.has(file.relPath) || !/\.h5$/i.test(file.name)) continue;
+      GEOM.set(key(source, date, p.m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
+      pushFile(source, date, mf, { master: p.m, dataFiles: p.dataFiles });
+    } catch { skipped++; }   // unreadable master (corrupt/truncated/not HDF5)
+  });
+  // Bare .h5 volumes not owned by a master, also read in parallel. Exclude orphan _data_NNNNNN.h5
+  // files: a data shard whose master is missing/corrupt can't decode standalone, and full-reading
+  // gigabytes of frame shards during a folder scan is the scan-bottleneck bug (was 110s on big trees).
+  const bare = realFiles.filter((f) => !claimed.has(f.relPath) && /\.h5$/i.test(f.name) && !DATA_RE.test(f.name));
+  const bareBytes = await Promise.all(bare.map((f) => f.bytes().catch(() => null)));
+  bare.forEach((file, i) => {
+    const bytes = bareBytes[i];
+    if (!bytes) { skipped++; return; }
     let head: ReturnType<typeof readH5Volume>;
-    try { head = readH5Volume(await file.bytes(), file.name); }
-    catch { continue; }   // not a 4D bslz4 stack (e.g. a Velox virtual-image export) - skip it
-
+    try { head = readH5Volume(bytes, file.name); }
+    catch { return; }   // not a 4D bslz4 stack (e.g. a Velox virtual-image export) - silently ignore
     const side = Math.round(Math.sqrt(head.nFrames));
     const { source, date } = sessionFor(file.relPath);
-    const name = file.name;
     const mf: MasterFile = {
-      name, shape: [side, Math.ceil(head.nFrames / side), head.detRows, head.detCols], cal: "un",
+      name: file.name, shape: [side, Math.ceil(head.nFrames / side), head.detRows, head.detCols], cal: "un",
       size: humanSize(head.nFrames * head.detSize), loadable: true,
     };
-    GEOM.set(key(source, date, name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side) });
+    GEOM.set(key(source, date, file.name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side) });
     pushFile(source, date, mf, { master: null, dataFiles: [file] });
-  }
+  });
   SESSIONS.sort((a, b) => `${a.source}/${a.date}`.localeCompare(`${b.source}/${b.date}`));
+  LAST_SCAN_SKIPPED = skipped;
 }
 
 export function getSessions(): Session[] { return SESSIONS; }
