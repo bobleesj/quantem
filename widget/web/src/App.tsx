@@ -78,6 +78,28 @@ export default function App() {
         if (!s) return { error: "no sessions" };
         return await datasetComStats(s.source, s.date, s.files[0].name);
       };
+    // WGSL compute parity hook: run maskedSum (BF/DF) + maskedCoM on a DETERMINISTIC
+    // index-function fixture (value = (s*31 + d*17) % 251) so a numpy reference reproduces
+    // it bit-for-bit. tests/test_wgsl_parity.py drives this over CDP on a real GPU and asserts
+    // the WGSL output matches numpy - the automated gate that the widget's WebGPU BF/DF/CoM
+    // compute stays correct (the Python torch path already has test_dpc_virtual_parity.py).
+    (window as unknown as { __wgslParity: (sc: number, dr: number, dc: number) => Promise<unknown> }).__wgslParity =
+      async (scanCount: number, detRows: number, detCols: number) => {
+        const { Show4DSTEMCompute } = await import("./engine/compute");
+        const detSize = detRows * detCols;
+        const stack = new Uint8Array(scanCount * detSize);
+        for (let s = 0; s < scanCount; s++) for (let d = 0; d < detSize; d++) stack[s * detSize + d] = (s * 31 + d * 17) % 251;
+        const cy = (detRows - 1) / 2, cx = (detCols - 1) / 2, radius = Math.min(detRows, detCols) * 0.25;
+        const mask = new Uint32Array(detSize);
+        for (let row = 0; row < detRows; row++) for (let col = 0; col < detCols; col++) {
+          const dy = row - cy, dx = col - cx; mask[row * detCols + col] = dy * dy + dx * dx <= radius * radius ? 1 : 0;
+        }
+        const compute = await Show4DSTEMCompute.create(stack, scanCount, detSize);
+        if (!compute) return { error: "no WebGPU device" };
+        const vi = await compute.maskedSum(mask);
+        const com = await compute.maskedCoM(mask, detCols);
+        return { virtual: Array.from(vi), comY: Array.from(com.comY), comX: Array.from(com.comX), scanCount, detRows, detCols };
+      };
     // bslz4 Strategy-D parity + kernel-time verify hook.
     (window as unknown as { __verifyD: (url: string) => Promise<unknown> }).__verifyD =
       async (url: string) => {
