@@ -367,20 +367,20 @@ class Show4DSTEM(anywidget.AnyWidget):
     ):
         super().__init__(**kwargs)
         self.widget_version = resolve_widget_version()
-        # Backend selector — maps to the four Show4DSTEM compute options:
-        #   None / 'torch' / 'metal' -> Python compute via TorchBackend or
-        #       MetalRawBackend (auto-picked from data type; explicit values
-        #       reserved for future device-specific testing).
-        #   'webgpu' -> kernel ships uint8-packed stack to browser via
-        #       `_offline_stack` trait; JS `Show4DSTEMCompute` does all
-        #       reductions in WebGPU. Kernel stays alive. Identical runtime
-        #       behavior to `offline=True`; this is the named alias.
+        # Backend selector. ONLY two values:
+        #   None     -> auto-pick Python compute (TorchBackend on torch
+        #               tensors, MetalRawBackend on ChunkedFrames). Default.
+        #   'webgpu' -> kernel ships uint8-packed stack via _offline_stack
+        #               trait; JS Show4DSTEMCompute does all reductions in
+        #               WebGPU. Kernel stays alive.
+        # Legacy: ``offline=True`` is an alias for backend='webgpu'.
         if backend == "webgpu":
             offline = True  # routes the rest of __init__ through the offline pack path
-        if backend is not None and backend not in ("torch", "metal", "webgpu"):
+        elif backend is not None:
             raise ValueError(
-                f"backend must be one of 'torch' / 'metal' / 'webgpu' / None, "
-                f"got {backend!r}"
+                f"backend must be 'webgpu' or None, got {backend!r}. "
+                f"Python compute backend is auto-selected from the data type "
+                f"(torch tensor -> TorchBackend; ChunkedFrames -> MetalRawBackend)."
             )
         self._backend_choice = backend
         _t0 = time.perf_counter()

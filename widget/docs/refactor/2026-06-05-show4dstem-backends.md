@@ -3,6 +3,35 @@
 Architecture ledger for the phased refactor that landed on
 `widget-show3d-show4dstem-kernels` 2026-06-05.
 
+## Canonical operator API (after this refactor)
+
+```python
+from quantem.widget import Show4DSTEM
+from quantem.live import load
+
+# Auto-pick Python compute (CUDA / MPS / CPU based on data type).
+w = Show4DSTEM(load(path))
+
+# Browser compute (kernel still alive, but all reductions run in WebGPU).
+# Works on ANY GPU: NVIDIA, AMD, Apple, Intel.
+w = Show4DSTEM(load(path), backend='webgpu')
+
+# Standalone HTML — no kernel needed after export.
+Show4DSTEM(load(path)).export_html('/tmp/share.html')
+```
+
+Three lines, four backend options. `backend=` is the only widget-level
+switch: `None` (default; auto) or `'webgpu'`. Python compute backend is
+picked from the data type — operator never has to think about
+`TorchBackend` vs `MetalRawBackend`.
+
+### Legacy aliases (still work, soft-deprecated)
+
+- `offline=True` ≡ `backend='webgpu'`
+- `Show4DSTEM_MACBOOK(load(path, backend='mps'), ...)` — explicit
+  Mac sampling helper. `Show4DSTEM(load(path, backend='mps'))` is
+  the canonical short form.
+
 ## Why
 
 Show4DSTEM had grown two divergent classes (~3.6k LOC total) — `Show4DSTEM`
