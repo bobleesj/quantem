@@ -368,20 +368,20 @@ class Show4DSTEM(anywidget.AnyWidget):
         super().__init__(**kwargs)
         self.widget_version = resolve_widget_version()
         # Backend selector. ONLY two values:
-        #   None      -> auto-pick Python compute (TorchBackend on torch
-        #                tensors, MetalRawBackend on ChunkedFrames). Default.
-        #   'browser' -> kernel ships uint8-packed stack via _offline_stack
-        #                trait; JS Show4DSTEMCompute does all reductions in
-        #                browser WebGPU. Kernel stays alive. Universal GPU
-        #                compute (any modern GPU).
+        #   None  -> auto-pick Python compute (TorchBackend on torch
+        #            tensors, MetalRawBackend on ChunkedFrames). Default.
+        #   'web' -> kernel ships uint8-packed stack via _offline_stack
+        #            trait; JS Show4DSTEMCompute does all reductions in
+        #            browser WebGPU. Kernel stays alive. Universal GPU
+        #            compute (any modern GPU).
         # Legacy aliases (kept for one release):
-        #   - 'webgpu'  -> same as 'browser'
-        #   - offline=True -> same as backend='browser'
-        if backend in ("browser", "webgpu"):
+        #   - 'browser' / 'webgpu' -> same as 'web'
+        #   - offline=True          -> same as backend='web'
+        if backend in ("web", "browser", "webgpu"):
             offline = True  # routes the rest of __init__ through the offline pack path
         elif backend is not None:
             raise ValueError(
-                f"backend must be 'browser' or None, got {backend!r}. "
+                f"backend must be 'web' or None, got {backend!r}. "
                 f"Python compute backend is auto-selected from the data type "
                 f"(torch tensor -> TorchBackend; ChunkedFrames -> MetalRawBackend)."
             )
