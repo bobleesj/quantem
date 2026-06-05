@@ -1548,22 +1548,26 @@ class Show3DSlices(anywidget.AnyWidget):
             Z, Y, X = vol.shape
             cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
             log = bool(getattr(self, "log_scale", False))
+            title = (self.title or None) if getattr(self, "title", "") else None
+            sampling_A = float(self.pixel_size) if getattr(self, "pixel_size", 0) else None
             if Z <= 16:
-                # ptycho-style: depth slices laid out as grid of all Z planes
                 panels = [vol[z, :, :] for z in range(Z)]
                 ncols = min(Z, 4)
                 max_px = 256 if Z <= 4 else 192 if Z <= 9 else 160
+                labels = [f"slice {z+1}/{Z}" for z in range(Z)]
                 png = render_panels_png(
                     panels, cmaps=cmap, ncols=ncols,
                     max_px_per_panel=max_px, log=log,
+                    labels=labels, title=title, sampling_A_per_px=sampling_A,
                 )
             else:
-                # tomography-style: 3-axis ortho mid slices
                 zc, yc, xc = Z // 2, Y // 2, X // 2
                 panels = [vol[zc, :, :], vol[:, yc, :], vol[:, :, xc]]
+                labels = [f"Z mid ({zc+1}/{Z})", f"Y mid ({yc+1}/{Y})", f"X mid ({xc+1}/{X})"]
                 png = render_panels_png(
                     panels, cmaps=cmap, ncols=3,
                     max_px_per_panel=256, log=log,
+                    labels=labels, title=title, sampling_A_per_px=sampling_A,
                 )
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
             data_dict["image/png"] = base64.b64encode(png).decode("ascii")

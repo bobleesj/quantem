@@ -3515,15 +3515,26 @@ class Show3D(anywidget.AnyWidget):
             n_pan = int(self.n_panels) if int(self.n_panels) > 1 else 1
             cmap = self.cmap if isinstance(self.cmap, str) else str(self.cmap)
             log = bool(getattr(self, "log_scale", False))
+            title = (self.title or None) if hasattr(self, "title") else None
+            slice_lbl = f"slice {mid+1}/{self.n_slices}" if self.n_slices > 1 else ""
+            sampling_A = float(self.pixel_size) if getattr(self, "pixel_size", 0) else None
             if n_pan > 1:
                 w_pan = frame.shape[1] // n_pan
                 panels = [frame[:, i * w_pan:(i + 1) * w_pan] for i in range(n_pan)]
+                panel_titles = list(self.panel_titles) if self.panel_titles else [
+                    f"Panel {i+1}" for i in range(n_pan)
+                ]
+                labels = [f"{pt} — {slice_lbl}" if slice_lbl else pt for pt in panel_titles]
                 png = render_panels_png(
                     panels, cmaps=cmap, ncols=min(n_pan, 3),
                     max_px_per_panel=256, log=log,
+                    labels=labels, title=title, sampling_A_per_px=sampling_A,
                 )
             else:
-                png = render_image_png(frame, cmap=cmap, log=log, max_px=512)
+                png = render_image_png(
+                    frame, cmap=cmap, log=log, max_px=512,
+                    title=title, label=slice_lbl, sampling_A_per_px=sampling_A,
+                )
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
             data_dict["image/png"] = base64.b64encode(png).decode("ascii")
             if isinstance(bundle, tuple):

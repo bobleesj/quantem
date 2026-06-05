@@ -2620,19 +2620,29 @@ class Show4DSTEM(anywidget.AnyWidget):
             from quantem.widget._snapshot import render_panels_png
             panels: list[np.ndarray] = []
             cmaps: list[str] = []
+            labels: list[str] = []
             if self.virtual_image_bytes:
                 vi = np.frombuffer(self.virtual_image_bytes, dtype=np.float32)
                 panels.append(vi.reshape(self.shape_rows, self.shape_cols))
                 cmaps.append("gray")
+                labels.append("virtual image (real)")
             if self.frame_bytes:
                 fr = np.frombuffer(self.frame_bytes, dtype=np.float32)
                 panels.append(fr.reshape(self.det_rows, self.det_cols))
                 cmaps.append("inferno")
+                labels.append(f"CBED @ scan ({self.pos_row},{self.pos_col})")
             if not panels:
                 return bundle
+            title = (self.title or None) if self.title else None
+            # pixel_size in A by widget convention; only the real-space panel uses it.
+            # render_panels_png applies sampling per-panel via native widths; mixing
+            # real-space + diffraction means we'd add a misleading bar on CBED.
+            # Skip sampling bar in 4DSTEM compose to avoid this; real-space scale bar
+            # is best shown in the dedicated Show2D virtual-image cell.
             png = render_panels_png(
                 panels, cmaps=cmaps, ncols=len(panels),
                 max_px_per_panel=256, log=False,
+                labels=labels, title=title,
             )
             data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
             data_dict["image/png"] = base64.b64encode(png).decode("ascii")
