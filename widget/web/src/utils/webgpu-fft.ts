@@ -3,6 +3,7 @@
  * WebGPU FFT — GPU-accelerated 2D FFT for real-time ROI analysis.
  * Ported from quantem.widget/js/webgpu-fft.ts
  */
+import { getGPUDevice as engineGetGPUDevice, onGPULost } from "../engine/device";
 
 function nextPow2(n: number): number { return Math.pow(2, Math.ceil(Math.log2(n))); }
 type WebGPUFftOptions = {
@@ -182,10 +183,15 @@ export class WebGPUFFT {
   }
 }
 
-// Singleton GPU device + FFT instance
-let _gpuDevice: GPUDevice | null = null;
+// Singleton FFT instance. The GPU DEVICE is owned by engine/device.ts - this module
+// must NOT create its own. Decode/compute (engine), colormap, and FFT have to share
+// ONE device, or a buffer/bind-group from one device submitted on another throws
+// "BindGroupLayout is associated with [Device], cannot be used with [Device]" and
+// crashes the tab GPU process. So getGPUDevice here just delegates to the engine.
 let _gpuFFT: WebGPUFFT | null = null;
 let _gpuUnavailableReason = "WebGPU has not been checked yet.";
+// Drop the FFT pipeline cache when the shared device is lost so it rebuilds on the new one.
+onGPULost(() => { _gpuFFT = null; });
 // Module-scope warm-up promise. Shared across every component that needs FFT
 // so shader compile (50-500 ms) happens at most ONCE per app-load, not
 // per-component-mount. Per-CLAUDE.md: "GPU pipelines must be pre-warmed."
@@ -195,31 +201,11 @@ export function getGPUUnavailableReason(): string {
   return _gpuUnavailableReason;
 }
 
-/** Shared singleton GPU device. Used by both WebGPU FFT and colormap engine. */
+/** Shared singleton GPU device - delegates to engine/device.ts (the one device for everything). */
 export async function getGPUDevice(): Promise<GPUDevice | null> {
-  if (_gpuDevice) return _gpuDevice;
-  if (!navigator.gpu) {
-    _gpuUnavailableReason = "navigator.gpu is missing; this browser did not enable WebGPU.";
-    return null;
-  }
-  try {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) {
-      _gpuUnavailableReason = "navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }) returned null.";
-      return null;
-    }
-    _gpuDevice = await adapter.requestDevice();
-    _gpuUnavailableReason = "";
-    _gpuDevice.lost.then((info) => {
-      _gpuUnavailableReason = info?.message || "The WebGPU device was lost.";
-      _gpuDevice = null;
-      _gpuFFT = null;
-    });
-    return _gpuDevice;
-  } catch (err) {
-    _gpuUnavailableReason = err instanceof Error ? err.message : String(err);
-    return null;
-  }
+  const device = await engineGetGPUDevice();
+  _gpuUnavailableReason = device ? "" : "WebGPU unavailable (no adapter / requestDevice failed / not enabled).";
+  return device;
 }
 
 export async function getWebGPUFFT(): Promise<WebGPUFFT | null> {

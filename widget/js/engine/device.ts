@@ -4,6 +4,7 @@
 // offline browser app, FFT). Keeps no UI deps so the engine is framework-agnostic.
 
 let gpuDevice: GPUDevice | null = null;
+let devicePromise: Promise<GPUDevice | null> | null = null;
 let gpuInfo = "GPU";
 const lostCallbacks: Array<() => void> = [];
 
@@ -11,8 +12,18 @@ const lostCallbacks: Array<() => void> = [];
 // Consumers (e.g. the FFT cache) use this to drop their device-bound state.
 export function onGPULost(cb: () => void): void { lostCallbacks.push(cb); }
 
-export async function getGPUDevice(): Promise<GPUDevice | null> {
-  if (gpuDevice) return gpuDevice;
+// Memoize the in-flight requestDevice so concurrent first callers share ONE device.
+// Without this guard, decode + colormap + FFT + render all call getGPUDevice() before
+// gpuDevice is assigned, each runs requestDevice(), and pipelines/bind-groups built on
+// the loser device get submitted on the winner -> "BindGroupLayout is associated with
+// [Device], cannot be used with [Device]" -> device lost -> tab GPU process crash.
+export function getGPUDevice(): Promise<GPUDevice | null> {
+  if (gpuDevice) return Promise.resolve(gpuDevice);
+  if (!devicePromise) devicePromise = createGPUDevice();
+  return devicePromise;
+}
+
+async function createGPUDevice(): Promise<GPUDevice | null> {
   if (!navigator.gpu) return null;
   try {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
@@ -38,9 +49,11 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
     if (adapter.features.has("timestamp-query")) feats.push("timestamp-query");   // for kernel profiling
     if (adapter.features.has("subgroups")) feats.push("subgroups" as GPUFeatureName);   // warp reduction in maskedSum/CoM
     gpuDevice = await adapter.requestDevice({ requiredFeatures: feats, requiredLimits });
-    gpuDevice.lost.then(() => { gpuDevice = null; lostCallbacks.forEach((cb) => cb()); });
+    // On loss, drop BOTH the device and the memoized promise so the next getGPUDevice()
+    // rebuilds a fresh device (and consumers re-create their device-bound pipelines via onGPULost).
+    gpuDevice.lost.then(() => { gpuDevice = null; devicePromise = null; lostCallbacks.forEach((cb) => cb()); });
     return gpuDevice;
-  } catch { return null; }
+  } catch { devicePromise = null; return null; }
 }
 
 export function getGPUInfo(): string { return gpuInfo; }
