@@ -126,8 +126,8 @@ class TorchCompute:
         step = self._chunk_rows()
         for i in range(0, self.scan_shape[0], step):
             chunk = self._4d[i:i + step]
-            if not torch.is_floating_point(chunk):
-                chunk = chunk.float()
+            if chunk.dtype != torch.float32:
+                chunk = chunk.float()   # int OR float64 -> float32; never compute in 64-bit (mask is float32)
             out[i:i + step] = torch.tensordot(chunk, mask, dims=([2, 3], [0, 1]))
         return out.cpu().numpy()
 
@@ -173,8 +173,8 @@ class TorchCompute:
         step = self._chunk_rows()
         for i in range(0, self.scan_shape[0], step):
             chunk = self._4d[i:i + step]
-            if not torch.is_floating_point(chunk):
-                chunk = chunk.float()
+            if chunk.dtype != torch.float32:
+                chunk = chunk.float()   # int OR float64 -> float32; never compute in 64-bit (mask is float32)
             if mask is not None:
                 chunk = chunk * mask
             denom = chunk.sum(dim=(2, 3))
