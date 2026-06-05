@@ -47,7 +47,7 @@ _HUB_EXPORTS = {
 _SURVEY_EXPORTS = {"survey"}
 
 # 2D image reader (Velox EMD HAADF / .npy) - separate from the 4D-STEM loader.
-_IMAGE_EXPORTS = {"read_image"}
+_IMAGE_EXPORTS = {"read_image", "read_image_stack"}
 
 # Memory profiler (disk staging + RAM + per-GPU VRAM).
 _MEMORY_EXPORTS = {"memory"}
@@ -84,6 +84,7 @@ __all__ = [
     "resolve_backend",
     "read_emd_metadata",
     "read_image",
+    "read_image_stack",
     "read_pixel_mask",
     "save",
     "status",
