@@ -362,10 +362,28 @@ class Show4DSTEM(anywidget.AnyWidget):
         vi_vmax: float | None = None,
         verbose: bool = True,
         state=None,
+        backend: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.widget_version = resolve_widget_version()
+        # Opt-in backend override (Phase 2 work in progress). Today only
+        # auto-detect is wired; explicit 'webgpu' raises because the JS-side
+        # online-channel.ts is not yet implemented. Reserved for the JS-side
+        # follow-up; the API is fixed so callers can write against it now.
+        if backend == "webgpu":
+            raise NotImplementedError(
+                "backend='webgpu' awaits the JS-side online-channel.ts. Track in "
+                "the Phase 2 design doc at docs/refactor/2026-06-05-show4dstem-backends.md. "
+                "For now Show4DSTEM auto-picks TorchBackend or MetalRawBackend "
+                "based on the input data type."
+            )
+        if backend is not None and backend not in ("torch", "metal"):
+            raise ValueError(
+                f"backend must be one of 'torch' / 'metal' / 'webgpu' / None, "
+                f"got {backend!r}"
+            )
+        self._backend_choice = backend
         _t0 = time.perf_counter()
         _verbose = verbose
 
@@ -1092,10 +1110,16 @@ class Show4DSTEM(anywidget.AnyWidget):
     @property
     def _compute(self):
         """UI-agnostic compute backend for the CURRENT frame's data, rebuilt when
-        the frame changes. TorchCompute for a torch tensor (cuda/mps/cpu),
-        MetalCompute for chunk-backed Metal frames. One layer for masked_sum /
-        mean_dp / reduce_frames, shared with the web Browse (see
-        kernels/compute/backends.py). Construction is cheap (views, no copy)."""
+        the frame changes. Three families:
+
+        * ``TorchBackend`` — torch tensor on CUDA / MPS / CPU (universal default).
+        * ``MetalRawBackend`` — chunk-backed Metal frames (Phil's 19 GB no-bin).
+        * ``WebGPUOnlineBackend`` — opt-in via ``backend='webgpu'``; defers all
+          reductions to the browser via Comm RPC (any GPU + browser).
+
+        Construction is cheap (views / no copy / Comm setup) so the backend
+        rebuilds when ``_frame_data`` changes (5D time-series scrub).
+        """
         fd = self._frame_data
         if getattr(self, "_compute_for", None) is not fd:
             from quantem.widget.kernels.compute.backends import compute_backend

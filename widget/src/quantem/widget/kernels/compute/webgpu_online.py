@@ -150,19 +150,21 @@ class WebGPUOnlineBackend:
         return np.frombuffer(buffers[0], dtype=np.float32)
 
     def _init_stack(self, arr: Any) -> None:
-        """Ship the full 4D stack to JS. For now: single-shot upload via Bytes
-        buffer. Phase 2.1 will add chunked streaming for stacks > 2 GB."""
+        """Notify JS that a new stack is available. Fire-and-forget — JS may
+        not be wired yet, and the message just primes the buffer. First
+        compute call blocks until JS finishes setup."""
         # TODO(Phase 2): chunk if arr.nbytes > 2 GB (per-buffer WebGPU cap)
         flat = np.ascontiguousarray(arr).reshape(self.n_frames, *self.det_shape)
-        payload = {
-            "op": "init_stack",
-            "scan_shape": list(self.scan_shape),
-            "det_shape": list(self.det_shape),
-            "n_frames": self.n_frames,
-            "dtype": str(flat.dtype),
-        }
-        # one-shot upload
-        self._rpc("init_stack", expect_array=False, **payload)
+        self._widget.send(
+            {
+                "op": "init_stack",
+                "req_id": 0,  # special sentinel — no response expected
+                "scan_shape": list(self.scan_shape),
+                "det_shape": list(self.det_shape),
+                "n_frames": self.n_frames,
+                "dtype": str(flat.dtype),
+            }
+        )
         self._stack_initialized = True
 
     # ------------------------------------------------------------------ ComputeBackend
