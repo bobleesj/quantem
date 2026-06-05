@@ -57,6 +57,9 @@ def Show4DSTEM(data, **kwargs):
     is_loadresult = hasattr(data, "_fields") and "data" in getattr(data, "_fields", ())
     payload = data.data if is_loadresult else data
     if getattr(payload, "_is_gpu_frames", False) or hasattr(payload, "chunks"):
+        # Show4DSTEM_MACBOOK = sampling-aware MPS viewer factory. The factory
+        # itself doesn't warn (it's the natural API for Mac users); only direct
+        # imports of show_4dstem_mps / load_4dstem_mps warn.
         from quantem.widget.show4dstem_mps import Show4DSTEM_MACBOOK
         return Show4DSTEM_MACBOOK(payload, **kwargs)
     # CUDA/CPU multi-dataset stack (a list load gives a 5D array): label the slider

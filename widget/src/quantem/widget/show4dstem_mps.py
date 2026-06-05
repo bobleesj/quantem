@@ -642,7 +642,13 @@ def load_4dstem_mps(
     initial_preset: str | None = "BF",
     **kwargs,
 ):
-    """Load full no-bin DP display plus the supported fast VI path."""
+    """Deprecated combo loader+viewer. Use ``Show4DSTEM(load(path, backend='mps'))``."""
+    import warnings as _w
+    _w.warn(
+        "load_4dstem_mps is deprecated. Use "
+        "Show4DSTEM(load(path, backend='mps', det_bin=...)) instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     verbose = kwargs.pop("verbose", True)
     if full_resolution_interaction:
         raise ValueError(
@@ -659,7 +665,7 @@ def load_4dstem_mps(
         compact_target_gb=compact_target_gb,
         det_bin=det_bin,
     )
-    return show_4dstem_mps(
+    return _build_mps_viewer(
         data,
         scan_shape=scan_shape,
         fast_interaction=fast_interaction,
@@ -673,7 +679,7 @@ def load_4dstem_mps(
     )
 
 
-def show_4dstem_mps(
+def _build_mps_viewer(
     data,
     *,
     scan_shape=None,
@@ -686,7 +692,9 @@ def show_4dstem_mps(
     verbose: bool = True,
     **kwargs,
 ):
-    """Wrap preloaded MPS chunks in the no-copy raw-Metal viewer."""
+    """Internal MPS viewer builder. Public callers should use
+    ``Show4DSTEM(load(path, backend='mps'))`` — this function is used by the
+    quantem.widget.__init__ factory + the legacy show_4dstem_mps shim."""
     if full_resolution_interaction:
         raise ValueError(
             "full_resolution_interaction has been disabled. Use load(...) and "
@@ -716,6 +724,18 @@ def show_4dstem_mps(
         verbose=verbose,
         **kwargs,
     )
+
+
+def show_4dstem_mps(*args, **kwargs):
+    """Deprecated. Use ``Show4DSTEM(load(path, backend='mps'))`` —
+    the unified factory auto-detects ChunkedFrames and routes to MetalRawBackend."""
+    import warnings as _w
+    _w.warn(
+        "show_4dstem_mps is deprecated. Use "
+        "Show4DSTEM(load(path, backend='mps')) instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+    return _build_mps_viewer(*args, **kwargs)
 
 
 def _meta_number(meta: dict, *keys: str):
@@ -773,7 +793,7 @@ def Show4DSTEM_MACBOOK(
             "mrad" if det_sampling_mrad_per_px is not None else "pixels",
         )
     verbose = bool(kwargs.get("verbose", True))
-    viewer = show_4dstem_mps(data, sampling=sampling, units=units, **kwargs)
+    viewer = _build_mps_viewer(data, sampling=sampling, units=units, **kwargs)
     inferred_det_sampling = False
     if det_sampling_mrad_per_px is None and semiangle_mrad is not None:
         bf_radius = float(getattr(viewer, "bf_radius", 0) or 0)
