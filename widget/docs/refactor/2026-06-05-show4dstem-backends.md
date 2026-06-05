@@ -57,8 +57,8 @@ time-series binned), #754 (backendless HTML with sibling .h5),
 |---|---|---|---|
 | **Backend / Torch** | Python torch.Tensor on CUDA / MPS / CPU | Python via torch | shipped (`TorchBackend`) |
 | **Backend / MetalRaw** | Python `MPSChunked4DSTEM` (Metal unified-memory chunks) | Python via raw Metal kernels (`MetalVirtualImage`) | shipped (`MetalRawBackend`) |
-| **Backendless / Offline** | Browser, embedded in `<script>` block of standalone HTML | Browser WebGPU (`js/engine/compute.ts`) | shipped — `widget.export_html()` + `_pack_offline_bslz4()` |
-| **Backendless / Online** | Browser WebGPU GPU buffer (kernel streams chunks) | Browser WebGPU | designed, not implemented |
+| **Backendless / Web (live kernel)** | Browser GPU buffer; kernel ships uint8-packed stack via `_offline_stack` trait | Browser WebGPU (`js/engine/compute.ts`) | shipped — `Show4DSTEM(data, backend='web')` ≡ `offline=True` |
+| **Backendless / HTML (no kernel)** | Browser, embedded in `<script>` block of standalone HTML | Browser WebGPU (`js/engine/compute.ts`) | shipped — `widget.export_html()` + `_pack_offline_bslz4()` |
 
 ## Phase 1 — Shipped 2026-06-05
 
@@ -176,7 +176,16 @@ sibling-.h5 alternative would have the HTML fetch the .h5 via `fetch()` +
 do bslz4 decode in the browser. That's a future optimization; not needed
 to call Phase 3 "shipped".
 
-## Phase 2 — Backendless / Online (ALREADY SHIPPED via `offline=True`)
+## Phase 2 — superseded — collapsed into `backend='web'`
+
+The original Phase 2 sketch proposed a custom Comm RPC backend
+(`WebGPUOnlineBackend`) that would push per-call masked_sum / frame /
+reduce_frames requests to JS. After examining the existing offline path
+we realized the same JS WebGPU shaders + `_offline_stack` trait already
+deliver the full online backendless experience with a live kernel; no
+Comm RPC needed. The dropped `WebGPUOnlineBackend` Python skeleton (in
+bcac8e7f) was deleted in e0b92af2. The operator-facing alias for this
+mode is now `backend='web'` (e.g. `Show4DSTEM(data, backend='web')`).
 
 **Realization 2026-06-05: Phase 2 is already done.** The widget's
 existing ``offline=True`` knob does exactly this — kernel ships a uint8-

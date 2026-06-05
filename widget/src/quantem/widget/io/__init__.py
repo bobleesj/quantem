@@ -56,9 +56,10 @@ _MEMORY_EXPORTS = {"memory"}
 # to ask "which backend would load() pick here?" without loading any kernel.
 _BACKEND_EXPORTS = {"detect_backend", "resolve_backend"}
 
-# Apple-Silicon explicit no-bin IO path. Kept separate from the generic
-# ``load(backend="mps")`` path because it returns a zero-copy chunked object for
-# the raw-Metal viewer instead of a torch tensor or contiguous numpy stack.
+# Apple-Silicon MPS path. ``load(path)`` auto-detects mps on Mac and returns a
+# LoadResult wrapping MPSChunked4DSTEM — no need to call load_mps_4dstem directly.
+# load_mps_4dstem stays accessible for power users bypassing the unified loader
+# but is intentionally NOT in __all__ (removed from public surface).
 _MPS_EXPORTS = {"MPSChunked4DSTEM", "load_mps_4dstem", "clear_mps_cache"}
 
 __all__ = [
@@ -79,7 +80,6 @@ __all__ = [
     "load_parallel",
     "disk_of",
     "group_by_disk",
-    "load_mps_4dstem",
     "memory",
     "resolve_backend",
     "read_emd_metadata",

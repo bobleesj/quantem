@@ -1111,16 +1111,21 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     @property
     def _compute(self):
-        """UI-agnostic compute backend for the CURRENT frame's data, rebuilt when
-        the frame changes. Three families:
+        """UI-agnostic Python compute backend for the CURRENT frame's data,
+        rebuilt when the frame changes. Two families:
 
         * ``TorchBackend`` — torch tensor on CUDA / MPS / CPU (universal default).
-        * ``MetalRawBackend`` — chunk-backed Metal frames (Phil's 19 GB no-bin).
-        * ``WebGPUOnlineBackend`` — opt-in via ``backend='webgpu'``; defers all
-          reductions to the browser via Comm RPC (any GPU + browser).
+        * ``MetalRawBackend`` — chunk-backed Metal frames (Phil's 19 GB no-bin
+          stack where torch.MPS overflows).
 
-        Construction is cheap (views / no copy / Comm setup) so the backend
-        rebuilds when ``_frame_data`` changes (5D time-series scrub).
+        ``backend='web'`` does NOT install a third Python backend; it sets
+        ``offline=True`` so the kernel ships a uint8-packed stack to the browser
+        and the JS ``Show4DSTEMCompute`` does all reductions in WebGPU. The
+        Python ``_compute`` stays a Torch/MetalRaw backend for any kernel-side
+        fallbacks (e.g. ``_pack_offline`` initial compute, snapshot PNG).
+
+        Construction is cheap (views, no copy) so the backend rebuilds when
+        ``_frame_data`` changes (5D time-series scrub).
         """
         fd = self._frame_data
         if getattr(self, "_compute_for", None) is not fd:
