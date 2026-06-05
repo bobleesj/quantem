@@ -148,10 +148,15 @@ to call Phase 3 "shipped".
 
 ## Phase 2 — Backendless / Online (designed, not implemented)
 
-The future addition. Goal: Python kernel HOLDS the raw 4D stack
-(any data type), but the BROWSER does all reductions via WebGPU. Useful
-for cross-platform Mac users where torch.MPS isn't viable and the data
-is too big to bake into an offline HTML.
+The future addition. Goal: Python kernel HOLDS the raw 4D stack (any data
+type), but the BROWSER does all reductions via WebGPU.
+
+**Broader framing than just Mac-no-MPS.** WebGPU runs on ANY modern GPU —
+NVIDIA, AMD, Apple M-series, Intel Arc. So Phase 2 is the **universal
+GPU compute backend**: any user with a browser + GPU gets fast reductions
+without needing a working CUDA/torch.MPS install on the kernel side. Pairs
+well with the laptop-first roadmap (#725, #740) and the cross-platform
+adoption goal.
 
 ### Protocol changes
 
@@ -202,19 +207,25 @@ ships, JS caches in GPU buffer with LRU eviction. Reuse the existing
   through the async backend
 - Comm protocol + serialization tests
 
-### When to build
+### Who benefits
 
-Triggers:
-- Mac user without working torch.MPS (or stack > torch.MPS limit) and the
-  data is too big for offline HTML (>500 MB after uint8 quantization)
-- Cross-platform browser-first deployment (no Jupyter kernel needed for
-  most operations — wait, that's Phase 3 territory)
+- Mac users with Apple M-series GPU (WebGPU via Metal); covers all the
+  scenarios where torch.MPS is unavailable, too slow, or overflows.
+- Linux / Windows users WITHOUT a CUDA-built torch (saves a 2 GB install).
+- AMD GPU users — WebGPU via Vulkan unlocks a path that has no Python
+  reduction backend today.
+- Intel Arc / iGPU users — same story.
+- Any laptop-first adoption flow where the operator hasn't set up Python
+  GPU drivers but has a modern browser.
+
+### When to build
 
 Phase 2 specifically helps when: Python kernel HOLDS the data (because it
 came from disk via Python), but Python can't do reductions efficiently
 (no CUDA, no Metal, torch.MPS overflows). Today's path either uses
 TorchBackend('cpu') (slow) or fails. WebGPUOnlineBackend would solve this
-by deferring to the browser GPU.
+by deferring to the browser GPU — which today's offline export already
+does, but only for one-shot read-only artifacts.
 
 ## Follow-ups (post-Phase-1)
 
