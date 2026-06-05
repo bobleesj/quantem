@@ -225,6 +225,7 @@ class MetalCompute:
         # (40 GB/s scattered uint16). Build a bin2 sidecar (96x96) in the background
         # so interaction jumps to real-time once ready; serve full-res until then.
         # Already-binned data (det_bin>1) is small enough - no sidecar.
+        self._com_cache = None  # full-detector CoM (com_col, com_row), eager-built below
         self._auto_fast = (self.det_bin == 1 and det[0] >= 96
                            and hasattr(self._cf, "ensure_fast_interaction"))
         if self._auto_fast and getattr(self._cf, "fast_vi", None) is None:
@@ -233,6 +234,9 @@ class MetalCompute:
     def _build_fast(self):
         try:
             self._cf.ensure_fast_interaction(verbose=False)
+            # Eager-cache the full-detector CoM on the bin2 sidecar so the FIRST DPC
+            # click is instant (cached), the same way BF rides the prebuilt sidecar.
+            self._com_cache = self.center_of_mass()
         except Exception:
             pass  # fall back to full-res; interaction just stays at the no-bin rate
 
@@ -275,12 +279,26 @@ class MetalCompute:
     def center_of_mass(self, det_mask: np.ndarray | None = None):
         """Per-scan-position CoM (DPC vector field) on the raw Metal kernel.
 
-        Delegates to the full-res ``MetalVirtualImage`` (no-bin int64 accumulators,
-        fits in 24 GB). Returns ``(com_col, com_row)`` flat ``(N,)`` float32 - the
+        Uses the bin2 sidecar (``fast_vi``) when ready - same fast path as
+        ``masked_sum`` - so no-bin DPC is real-time instead of an ~8 s full-res 192^2
+        pass; result is eager-cached in ``_build_fast`` so the first DPC click is
+        instant. The bin2 detector halves the CoM coordinate scale, so multiply by 2
+        to return absolute full-res detector px; the constant half-pixel bin offset
+        cancels under the DPC zero-mean. Falls back to full-res ``vi`` until the
+        sidecar builds. Returns ``(com_col, com_row)`` flat ``(N,)`` float32 - the
         same contract as ``TorchCompute`` so DPC is single-source across backends.
         """
+        if det_mask is None and self._com_cache is not None:
+            return self._com_cache  # eager-built in _build_fast -> instant DPC
+        cf = self._cf
+        fv = getattr(cf, "fast_vi", None)
+        if self._auto_fast and fv is not None:
+            from quantem.widget.kernels.compute.mps import _bin2_mask
+            m = None if det_mask is None else _bin2_mask(np.ascontiguousarray(det_mask))
+            cc, cr = fv.center_of_mass(m)
+            return cc * 2.0, cr * 2.0  # bin2 px -> full-res detector px
         mask = None if det_mask is None else np.ascontiguousarray(det_mask)
-        return self._cf.vi.center_of_mass(mask)
+        return cf.vi.center_of_mass(mask)
 
 
 # ---

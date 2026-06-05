@@ -1101,6 +1101,7 @@ class ChunkedFrames:
                 "fast_interaction requires raw MPS chunks; load without "
                 "row_prefix=True."
             )
+        from quantem.widget.show4dstem_mps import _drop_cached_decompressor  # lazy: avoids circular import
         _drop_cached_decompressor()
         gc.collect()
         self.fast_chunks = self.vi.bin_chunks(self.fast_bin, verbose=verbose)
