@@ -12,22 +12,24 @@ from quantem.live import load
 # Auto-pick Python compute (CUDA / MPS / CPU based on data type).
 w = Show4DSTEM(load(path))
 
-# Browser compute (kernel still alive, but all reductions run in WebGPU).
+# Browser compute (kernel still alive, but all reductions run in browser GPU).
 # Works on ANY GPU: NVIDIA, AMD, Apple, Intel.
-w = Show4DSTEM(load(path), backend='webgpu')
+w = Show4DSTEM(load(path), backend='browser')
 
 # Standalone HTML — no kernel needed after export.
 Show4DSTEM(load(path)).export_html('/tmp/share.html')
 ```
 
 Three lines, four backend options. `backend=` is the only widget-level
-switch: `None` (default; auto) or `'webgpu'`. Python compute backend is
+switch: `None` (default; auto) or `'browser'`. Python compute backend is
 picked from the data type — operator never has to think about
 `TorchBackend` vs `MetalRawBackend`.
 
 ### Legacy aliases (still work, soft-deprecated)
 
-- `offline=True` ≡ `backend='webgpu'`
+- `backend='webgpu'` ≡ `backend='browser'` (renamed; WebGPU is the
+  underlying tech but 'browser' reads clearer to microscopists)
+- `offline=True` ≡ `backend='browser'`
 - `Show4DSTEM_MACBOOK(load(path, backend='mps'), ...)` — explicit
   Mac sampling helper. `Show4DSTEM(load(path, backend='mps'))` is
   the canonical short form.
