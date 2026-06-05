@@ -18,13 +18,13 @@ import StopIcon from "@mui/icons-material/Stop";
 import FastRewindIcon from "@mui/icons-material/FastRewind";
 import FastForwardIcon from "@mui/icons-material/FastForward";
 import JSZip from "jszip";
-import { useTheme } from "./theme";
-import { COLORMAPS, applyColormap, renderToOffscreen } from "./colormaps";
-import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "./fft";
+import { useTheme } from "../theme";
+import { COLORMAPS, applyColormap, renderToOffscreen } from "../colormaps";
+import { WebGPUFFT, getWebGPUFFT, fft2d, fftshift, autoEnhanceFFT, nextPow2, applyHannWindow2D } from "../fft";
 import { Show4DSTEMCompute } from "../engine/compute";
-import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "./figure";
-import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "./stats";
-import { downloadBlob, formatNumber, downloadDataView } from "./format";
+import { drawScaleBarHiDPI, drawColorbar, roundToNiceValue, exportFigure, canvasToPDF } from "../figure";
+import { findDataRange, sliderRange, computeStats, applyLogScale, computeHistogramFromBytes, percentileClip } from "../stats";
+import { downloadBlob, formatNumber, downloadDataView } from "../format";
 
 // Detector mask for the offline WebGPU virtual-image sum. Mirrors the Python
 // mask geometry exactly (show4dstem.py _create_*_mask): cx pairs with column,
