@@ -20,30 +20,25 @@ HTML - is slow and deploy-hostile:
 
 ```
 detector counts (uint16)
-  → uint8 quantize (global linear)        # 2x smaller, near-lossless for the VI
+  → uint8 clip to [0, 255]                # exact for common low-count pixels
   → gzip (lossless)                        # ~2-3x smaller again
   → [inline base64]  or  [companion .gz]   # two delivery modes (below)
   → DecompressionStream('gzip')            # native, off the parse path, lossless
   → WebGPU storage buffer                  # masked_sum / reduce_frames in WGSL
 ```
 
-**Why uint8 is fine for bright-field.** The virtual image is a *sum* over many
-detector pixels. For a large, bright detector (BF) where each pixel carries many
-quantization levels, the per-pixel rounding error is ~zero-mean and averages down
-by ~1/sqrt(N) across the aperture, so the summed image is visually identical to
-the kernel result; the colormap auto-scales. The raw counts stay uint16 in the
-live kernel path - quantization is only the offline display pack.
+**Why uint8 clipping is acceptable for the browser viewer.** Most browse-mode
+detector counts in these datasets are well below 255, so the stored uint8 value
+is the raw detector count, not a rescaled approximation. Saturated/hot pixels are
+tracked separately and masked in the browser path so they do not dominate the
+virtual image. The raw reconstruction path remains uint16; uint8 clipping is only
+the browser display/interaction pack.
 
 ```{warning}
-This is **only safe for bright, large virtual detectors (BF)**. The quantization
-is **global-linear** - one 8-bit scale set by the brightest pixel (the central
-disk). For **HAADF / ADF, point detectors, or DPC/center-of-mass** the faint
-high-angle counts fall below one uint8 level and truncate to **zero** before the
-sum - a coherent bias that does *not* average out (the 1/sqrt(N) argument fails
-when per-pixel signal < 1 level). For dark-field or few-pixel detectors, apply a
-**log/gamma transform before quantizing**, or keep uint16. The three rows in the
-table below are bit-identical *to each other* (same uint8 source); they are not
-bit-identical to the uint16 kernel, only visually identical for bright detectors.
+This is a display/interactivity path, not the reconstruction data path. Counts
+above 255 clip, so use the live CUDA/MPS uint16 path for quantitative work where
+high-count saturation matters. The browser path is designed for responsive
+inspection: virtual detector drag, probe-frame scrub, FFT, and exported review.
 ```
 
 **Why gzip.** `DecompressionStream('gzip')` is native (Baseline since May 2023:
@@ -73,6 +68,34 @@ quantization is the shared uint16→uint8 step (see the bright-field warning abo
 
 Both share the same gzip + `DecompressionStream` + WebGPU code; only the *source
 of bytes* differs (a `fetch()` vs an inline base64 trait).
+
+## Full no-bin and multi-dataset exports
+
+Large no-bin 4D-STEM stacks use the bslz4 companion path instead of one huge
+self-contained HTML file:
+
+```python
+w = Show4DSTEM(data, backend="web", offline_codec="bslz4", data_url="show4dstem-data")
+w.export_html("show4dstem.html")
+```
+
+For a full `512 x 512 x 192 x 192` stack, the HTML remains small and the data
+lands in a sibling directory of bslz4 chunks. Serve the HTML and companion
+directory over HTTP from the same parent directory; a browser cannot fetch
+sibling files from `file://`.
+
+5D stacks are exported as lazy browser volumes:
+
+```python
+w = Show4DSTEM(stack5d, backend="web", offline_codec="bslz4", data_url="stack-data")
+```
+
+The exported metadata is `{volumes:[...]}`. The Dataset/frame slider decodes the
+selected volume on demand and keeps a small browser-side LRU, so multiple full
+no-bin datasets do not have to be resident in WebGPU memory at once.
+
+Signoff point: `show4dstem-migration-signoff-2026-06-05` verified CUDA, Phil
+MPS, WebGPU live/browser compute, exported WebGPU, and lazy multi-volume WebGPU.
 
 ## Going faster still (roadmap)
 

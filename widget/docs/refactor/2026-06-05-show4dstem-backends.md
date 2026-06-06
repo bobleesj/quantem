@@ -243,6 +243,35 @@ stack so it doesn't have to fit in one Comm message. Documented in
   becomes a `from quantem.widget.show4dstem import Show4DSTEM` re-export.
   Gated on this commit landing in widget upstream + live notebooks getting
   re-pointed. ~1 hour work, separate commit.
+
+## Migration signoff (2026-06-05)
+
+Signoff tag: `show4dstem-migration-signoff-2026-06-05`.
+
+Verified paths:
+
+- **CUDA / mjgoat:** full no-bin `_29` (`512 x 512 x 192 x 192`) loads and the
+  widget constructs; multi-dataset CUDA works for full no-bin and binned stacks.
+- **MPS / Phil:** gold full no-bin (`256 x 256 x 192 x 192`) opens through the
+  raw-Metal viewer, the async fast sidecar becomes ready, real browser drag
+  changes the view, and the browser rAF probe measured about 120 FPS.
+- **WebGPU live/browser compute:** `backend="web"` runs reductions in the
+  browser WebGPU path with `navigator.gpu == true`.
+- **WebGPU exported HTML:** full no-bin uses HTML plus bslz4 companion chunks.
+  A true single self-contained HTML file is intentionally not the large-data
+  path; it is only appropriate for small inline exports.
+- **WebGPU multi-dataset:** 5D stacks export as lazy bslz4 volumes. The
+  Dataset slider fetches/decodes the selected volume on demand and avoids
+  keeping every full no-bin dataset resident at once.
+
+The Python API for the large-data browser path is:
+
+```python
+w = Show4DSTEM(data_or_stack5d, backend="web", offline_codec="bslz4", data_url="show4dstem-data")
+w.export_html("show4dstem.html")
+```
+
+Serve `show4dstem.html` and `show4dstem-data/` from the same HTTP directory.
 - Capability `'fft'` — `MetalRawBackend` could implement FFT via
   `MetalVirtualImage`'s row-prefix engine for exact mode. Today FFT is
   CPU-side numpy in Python (`np.fft.fft2`). Worth measuring.
