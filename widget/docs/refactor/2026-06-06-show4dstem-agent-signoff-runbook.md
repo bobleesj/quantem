@@ -105,8 +105,47 @@ or kernels running.
 Purpose: prove `backend="web"` routes reductions through browser WebGPU while a
 live kernel exists.
 
-Use a bounded crop for live browser interaction; reserve full no-bin for the
-export path below.
+Run the opt-in JupyterLab browser smoke first. By default it uses a small
+synthetic two-frame stack so it exercises the live widget, Dataset/frame slider,
+FFT toggle, ROI/scan drag, `navigator.gpu`, and rAF FPS without stressing Phil
+or mjgoat.
+
+```bash
+QT_RUN_JUPYTER_WEBGPU_TESTS=1 python -m pytest -q tests/test_show4dstem_webgpu_live_jupyter.py
+```
+
+For a bounded real-data mjgoat run, point the test at Samsung data and keep the
+crop enabled:
+
+```bash
+QT_RUN_JUPYTER_WEBGPU_TESTS=1 \
+QT_WEBGPU_LIVE_MASTER=/home/owner/ssd/data/samsung/20260512_dram/Samsung_3.6Mx_21.4mrad_185mmcl_20pA_29_master.h5 \
+QT_WEBGPU_LIVE_DET_BIN=4 \
+QT_WEBGPU_LIVE_DTYPE=u8 \
+QT_WEBGPU_LIVE_CROP=96:160,96:160 \
+python -m pytest -q tests/test_show4dstem_webgpu_live_jupyter.py
+```
+
+Only use full live data when explicitly requested and when GPU/browser memory is
+available:
+
+```bash
+QT_RUN_JUPYTER_WEBGPU_TESTS=1 \
+QT_WEBGPU_LIVE_MASTER=/home/owner/ssd/data/samsung/20260512_dram/Samsung_3.6Mx_21.4mrad_185mmcl_20pA_29_master.h5 \
+QT_WEBGPU_LIVE_DET_BIN=1 \
+QT_WEBGPU_LIVE_DTYPE=u8 \
+QT_WEBGPU_LIVE_FULL=1 \
+QT_WEBGPU_REQUIRE_FRAME_SLIDER=0 \
+python -m pytest -q tests/test_show4dstem_webgpu_live_jupyter.py
+```
+
+Pass signals: `navigator.gpu == true`, at least four canvases, Dataset/frame
+slider found and moved for bounded/default 5D cases, FFT toggle clicked,
+screenshot changes after drag, and rAF FPS is at least 30. The test prints a
+JSON summary with canvas count, frame-slider status, screenshot-change status,
+and measured FPS.
+
+Manual bounded crop equivalent, if the automated test needs debugging:
 
 ```python
 from quantem.widget import load, Show4DSTEM
