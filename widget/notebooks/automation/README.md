@@ -13,6 +13,12 @@ Show4DSTEM(load([m0, m1, ...], det_bin=4))     # many (Dataset slider)
 `Show4DSTEM` dispatches to the right viewer. The cell code is identical across
 boxes; only the data path differs.
 
+For autonomous four-path migration signoff, use
+`docs/refactor/2026-06-06-show4dstem-agent-signoff-runbook.md` before opening
+these notebooks. It covers CUDA, Phil MPS, WebGPU live/browser compute, exported
+WebGPU HTML + bslz4 companion chunks, and required cleanup of temporary
+JupyterLab, Chrome/Playwright, HTTP servers, and export directories.
+
 ## `linux/` - Linux CUDA (mjgoat), data `/home/owner/data/samsung/20260512_dram/`
 
 | Notebook | Case |
