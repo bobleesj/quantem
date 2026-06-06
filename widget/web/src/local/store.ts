@@ -7,7 +7,7 @@
 import { readH5Volume } from "../engine/h5reader";
 import { Show4DSTEMCompute } from "../engine/compute";
 import { decodeBslz4Batch, type Bslz4Spec } from "../engine/bslz4";
-import type { Session, MasterFile, RawData, DetectorMode, DetShape, ShapeParams } from "../pages/browse/types";
+import type { Session, MasterFile, RawData, DetectorMode, DetShape, ShapeParams, DetBin, BrowseDtype } from "../pages/browse/types";
 
 // A picked file, uniform over File System Access handles and <input webkitdirectory>.
 // `source` (the File or directory handle) lets a worker read the bytes off the main thread -
@@ -69,6 +69,9 @@ let LAST_SCAN_SKIPPED = 0;
 export function lastScanSkipped(): number { return LAST_SCAN_SKIPPED; }
 
 function key(source: string, date: string, name: string): string { return `${source}/${date}/${name}`; }
+function loadKey(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): string {
+  return `${key(source, date, name)}|b${detBin}|${dtype}`;
+}
 function humanSize(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
@@ -77,6 +80,116 @@ function humanSize(bytes: number): string {
 
 function safeResidentBudgetBytes(): number {
   return Math.max(256 * 1024 * 1024, Math.min(freeVramBytes() * 0.4, 3 * 1024 * 1024 * 1024));
+}
+
+function binnedDim(n: number, bin: DetBin): number { return Math.max(1, Math.floor(n / bin)); }
+
+function binBadPx(badPx: Uint32Array, detRows: number, detCols: number, bin: DetBin): Uint32Array {
+  if (bin === 1 || badPx.length === 0) return badPx;
+  const outCols = binnedDim(detCols, bin);
+  const outRows = binnedDim(detRows, bin);
+  const set = new Set<number>();
+  for (const p of badPx) {
+    const row = Math.floor(Math.floor(p / detCols) / bin);
+    const col = Math.floor((p % detCols) / bin);
+    if (row < outRows && col < outCols) set.add(row * outCols + col);
+  }
+  return new Uint32Array(Array.from(set).sort((a, b) => a - b));
+}
+
+const BIN_U8_WGSL = `
+@group(0) @binding(0) var<storage,read> src: array<u32>;
+@group(0) @binding(1) var<storage,read_write> dst: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> u: vec4<u32>;   // nScan, inRows, inCols, bin
+@group(0) @binding(3) var<uniform> u2: vec4<u32>;  // outRows, outCols, outDetSize, srcMode
+@group(0) @binding(4) var<uniform> u3: vec4<u32>;  // outMode, 0, 0, 0
+fn sample(gp: u32, mode: u32) -> u32 {
+  if (mode == 1u) { let w = src[gp >> 2u]; return (w >> ((gp & 3u) * 8u)) & 0xffu; }
+  let w = src[gp >> 1u];
+  return select(w >> 16u, w & 0xffffu, (gp & 1u) == 0u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let outPx = gid.x;
+  let scan = gid.y;
+  if (scan >= u.x || outPx >= u2.z) { return; }
+  let outRow = outPx / u2.y;
+  let outCol = outPx % u2.y;
+  var sum: u32 = 0u;
+  for (var br = 0u; br < u.w; br = br + 1u) {
+    for (var bc = 0u; bc < u.w; bc = bc + 1u) {
+      let inRow = outRow * u.w + br;
+      let inCol = outCol * u.w + bc;
+      if (inRow < u.y && inCol < u.z) {
+        let gp = scan * u.y * u.z + inRow * u.z + inCol;
+        sum = sum + sample(gp, u2.w);
+      }
+    }
+  }
+  let outGp = scan * u2.z + outPx;
+  if (u3.x == 1u) {
+    let v = min(sum, 255u);
+    let word = outGp >> 2u;
+    let shift = (outGp & 3u) * 8u;
+    atomicOr(&dst[word], v << shift);
+  } else {
+    let v = min(sum, 65535u);
+    let word = outGp >> 1u;
+    let shift = (outGp & 1u) * 16u;
+    atomicOr(&dst[word], v << shift);
+  }
+}`;
+
+const binPipes = new WeakMap<GPUDevice, GPUComputePipeline>();
+function binPipeline(device: GPUDevice): GPUComputePipeline {
+  let pipe = binPipes.get(device);
+  if (!pipe) {
+    pipe = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: device.createShaderModule({ code: BIN_U8_WGSL }), entryPoint: "main" },
+    });
+    binPipes.set(device, pipe);
+  }
+  return pipe;
+}
+
+function uniform(device: GPUDevice, vals: number[]): GPUBuffer {
+  const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(b, 0, new Uint32Array(vals).buffer);
+  return b;
+}
+
+async function binDecodedBufferU8(
+  device: GPUDevice, buffer: GPUBuffer, nScan: number, detRows: number, detCols: number, mode: number, bin: DetBin, dtype: BrowseDtype,
+): Promise<{ buffer: GPUBuffer; detRows: number; detCols: number; detSize: number; mode: number }> {
+  if (bin === 1) return { buffer, detRows, detCols, detSize: detRows * detCols, mode };
+  const outRows = binnedDim(detRows, bin);
+  const outCols = binnedDim(detCols, bin);
+  const outDetSize = outRows * outCols;
+  const outMode = dtype === "uint8" ? 1 : 0;
+  const outBytes = Math.ceil((nScan * outDetSize * (outMode === 1 ? 1 : 2)) / 4) * 4;
+  const out = device.createBuffer({ size: Math.max(4, outBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const u = uniform(device, [nScan, detRows, detCols, bin]);
+  const u2 = uniform(device, [outRows, outCols, outDetSize, mode]);
+  const u3 = uniform(device, [outMode, 0, 0, 0]);
+  const pipe = binPipeline(device);
+  const bind = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer } },
+    { binding: 1, resource: { buffer: out } },
+    { binding: 2, resource: { buffer: u } },
+    { binding: 3, resource: { buffer: u2 } },
+    { binding: 4, resource: { buffer: u3 } },
+  ] });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipe);
+  pass.setBindGroup(0, bind);
+  pass.dispatchWorkgroups(Math.ceil(outDetSize / 64), nScan);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  buffer.destroy(); u.destroy(); u2.destroy(); u3.destroy();
+  return { buffer: out, detRows: outRows, detCols: outCols, detSize: outDetSize, mode: outMode };
 }
 
 // Scan a picked folder into Session[]. A *_master.h5 + its *_data_*.h5 siblings is one
@@ -172,24 +285,27 @@ export function getSessions(): Session[] { return SESSIONS; }
 // each frame on its first view. Pinned, so all frames stay resident once warm. Fire-and-forget;
 // errors per frame are swallowed (a bad frame just stays cold). A new warm cancels the old via gen.
 let warmGen = 0;
-export async function warmSet5D(frames: { source: string; date: string; name: string }[]): Promise<void> {
+export async function warmSet5D(frames: { source: string; date: string; name: string; detBin?: DetBin; dtype?: BrowseDtype }[]): Promise<void> {
   const gen = ++warmGen;
   for (const f of frames) {
     if (gen !== warmGen) return;   // a newer set superseded this warm-up
-    try { await ensureLoaded(f.source, f.date, f.name); } catch { /* leave this frame cold */ }
+    try { await ensureLoaded(f.source, f.date, f.name, f.detBin ?? 1, f.dtype ?? "uint8"); } catch { /* leave this frame cold */ }
   }
 }
 
 // Decode a dataset's slabs into one chunked GPU compute (LRU, dispose on evict). Computes
 // the mean DP once and auto-fits the bright-field disk to seed the aperture.
-async function ensureLoaded(source: string, date: string, name: string): Promise<LoadedDS> {
-  const k = key(source, date, name);
+async function ensureLoaded(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): Promise<LoadedDS> {
+  const k = loadKey(source, date, name, detBin, dtype);
   const hit = LOADED.get(k);
   if (hit) { const i = LRU.indexOf(k); if (i >= 0) { LRU.splice(i, 1); LRU.push(k); } return hit; }
-  const handles = HANDLES.get(k);
-  const geom = GEOM.get(k);
+  const baseK = key(source, date, name);
+  const handles = HANDLES.get(baseK);
+  const geom = GEOM.get(baseK);
   if (!handles || !geom) throw new Error(`unknown dataset ${k}`);
-  const residentBytes = geom.scanCount * geom.detRows * geom.detCols;
+  const outDetRows = binnedDim(geom.detRows, detBin);
+  const outDetCols = binnedDim(geom.detCols, detBin);
+  const residentBytes = geom.scanCount * outDetRows * outDetCols * (dtype === "uint8" ? 1 : 2);
   const budgetBytes = safeResidentBudgetBytes();
   if (residentBytes > budgetBytes) {
     throw new Error(
@@ -202,6 +318,10 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
     const tA = performance.now();
     const slabs = handles.master ? handles.dataFiles : handles.dataFiles;
     const detSize = geom.detRows * geom.detCols;
+    let residentDetRows = geom.detRows;
+    let residentDetCols = geom.detCols;
+    let residentDetSize = detSize;
+    let residentMode = dtype === "uint8" ? 1 : 0;
     // Pipeline parse and decode in groups: parse a group on the main thread (disk read +
     // jsfive B-tree walk) while the GPU decodes the previous group, so the wall is ~max(parse,
     // decode) not their sum. (A worker-pool parse was tried and lost to transfer overhead.)
@@ -214,7 +334,14 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
       if (!pending) return;
       const r = await pending; if (!r) throw new Error("WebGPU unavailable");
       device = r.device; mode = r.mode;
-      r.buffers.forEach((buffer, i) => chunks.push({ buffer, startScan: pendingSpecs[i].startScan, nScan: pendingSpecs[i].nScan }));
+      for (let i = 0; i < r.buffers.length; i++) {
+        const binned = await binDecodedBufferU8(r.device, r.buffers[i], pendingSpecs[i].nScan, geom.detRows, geom.detCols, r.mode, detBin, dtype);
+        residentDetRows = binned.detRows;
+        residentDetCols = binned.detCols;
+        residentDetSize = binned.detSize;
+        residentMode = binned.mode;
+        chunks.push({ buffer: binned.buffer, startScan: pendingSpecs[i].startScan, nScan: pendingSpecs[i].nScan });
+      }
       pending = null;
     };
     let srcDtype: "uint8" | "uint16" | "uint32" = "uint16";   // detected from the data
@@ -245,23 +372,23 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
         startScan += ps.nFrames;
       }
       await drain();
-      pending = decodeBslz4Batch(specs, "uint8", srcDtype, GROUP);
+      pending = decodeBslz4Batch(specs, dtype, srcDtype, GROUP);
       pendingSpecs = specs;
     }
     await drain();
     if (!device) throw new Error("WebGPU unavailable");
     const tC = performance.now();
-    const compute = Show4DSTEMCompute.fromGpuChunks(device, chunks, startScan, detSize, mode);
-    compute.badPx = geom.badPx;
+    const compute = Show4DSTEMCompute.fromGpuChunks(device, chunks, startScan, residentDetSize, residentMode);
+    compute.badPx = binBadPx(geom.badPx, geom.detRows, geom.detCols, detBin);
     const meanDP = await compute.reduceFrames(new Uint32Array(startScan).fill(1), true);
     PERF.push({ key: k, loadDecodeMs: Math.round(tC - tA), reduceMs: Math.round(performance.now() - tC), totalMs: Math.round(performance.now() - tA) });
-    const bf = fitBfDisk(meanDP, geom.detRows, geom.detCols);
+    const bf = fitBfDisk(meanDP, residentDetRows, residentDetCols);
     // Reshape with the master's TRUE raster width; rows = actual decoded frames / width (so a
     // partial dataset shows the rows it has, correctly, instead of a wrong-stride square).
     const scanCols = geom.scanCols || Math.round(Math.sqrt(startScan));
     const scanRows = Math.ceil(startScan / scanCols);
     return { compute, meanDP, scanRows, scanCols,
-      detRows: geom.detRows, detCols: geom.detCols, detSize, scanCount: startScan, bf, badPx: geom.badPx };
+      detRows: residentDetRows, detCols: residentDetCols, detSize: residentDetSize, scanCount: startScan, bf, badPx: compute.badPx };
   })();
   LOADED.set(k, p); LRU.push(k);
   // Evict the oldest NON-pinned datasets beyond the resident budget. Pinned = the active 5D
@@ -382,14 +509,14 @@ function reshapeVI(vi: Float32Array, ds: LoadedDS): RawData { return { data: vi,
 function reshapeDP(dp: Float32Array, ds: LoadedDS): RawData { return { data: dp, width: ds.detCols, height: ds.detRows }; }
 
 // --- public image ops (called by the rewritten fetch* in types.ts) -------
-export async function bfGeometry(source: string, date: string, name: string): Promise<{ cy: number; cx: number; r_bf: number }> {
-  const ds = await ensureLoaded(source, date, name); return ds.bf;
+export async function bfGeometry(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): Promise<{ cy: number; cx: number; r_bf: number }> {
+  const ds = await ensureLoaded(source, date, name, detBin, dtype); return ds.bf;
 }
 
 // The cached mean diffraction pattern (uint8-clipped integer sum / nFrames, bad px zeroed) -
 // used for parity checks against an h5py reference.
-export async function datasetMeanDp(source: string, date: string, name: string): Promise<Float32Array> {
-  const ds = await ensureLoaded(source, date, name); return ds.meanDP;
+export async function datasetMeanDp(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): Promise<Float32Array> {
+  const ds = await ensureLoaded(source, date, name, detBin, dtype); return ds.meanDP;
 }
 
 // GPU-resident virtual image for the 60fps aperture-drag fast path: returns the maskedSum result
@@ -398,9 +525,9 @@ export async function datasetMeanDp(source: string, date: string, name: string):
 // the readback path. Returns null for those (caller falls back to the normal path).
 export async function virtualImageBufferGpu(
   source: string, date: string, name: string, mode: DetectorMode,
-  inner: number, outer: number, cx: number | null, cy: number | null,
+  inner: number, outer: number, cx: number | null, cy: number | null, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<{ buffer: GPUBuffer; width: number; height: number } | null> {
-  const ds = await ensureLoaded(source, date, name);
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const ccx = cx ?? ds.bf.cx, ccy = cy ?? ds.bf.cy, r = ds.bf.r_bf;
   let mask: Uint32Array;
   if (mode === "BF") mask = diskMask(ds.detRows, ds.detCols, ccy, ccx, (outer || 1) * r);
@@ -414,9 +541,9 @@ export async function virtualImageBufferGpu(
 // server's /realspace. BF = disk; ADF/DF = annulus. CoM/iCoM/SSB not yet on the GPU path.
 export async function virtualImage(
   source: string, date: string, name: string, mode: DetectorMode,
-  inner: number, outer: number, cx: number | null, cy: number | null,
+  inner: number, outer: number, cx: number | null, cy: number | null, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  const ds = await ensureLoaded(source, date, name);
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const ccx = cx ?? ds.bf.cx, ccy = cy ?? ds.bf.cy, r = ds.bf.r_bf;
   let mask: Uint32Array;
   if (mode === "BF") { mask = diskMask(ds.detRows, ds.detCols, ccy, ccx, (outer || 1) * r);
@@ -441,11 +568,11 @@ export async function virtualImage(
 // CoM parity probe: raw per-scan intensity-weighted centroid (comY, comX) over the BF-disk
 // aperture (1.5 x r_bf), BEFORE descan subtraction - the direct maskedCoM output. Returns
 // reduction sums + geometry so a numpy reference can be compared bit-close on real data.
-export async function datasetComStats(source: string, date: string, name: string): Promise<{
+export async function datasetComStats(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): Promise<{
   detRows: number; detCols: number; scanCount: number; cx: number; cy: number; r: number; rad: number;
   comYsum: number; comXsum: number; comY0: number; comX0: number; nbad: number;
 }> {
-  const ds = await ensureLoaded(source, date, name);
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const rad = 1.5 * ds.bf.r_bf;
   const mask = diskMask(ds.detRows, ds.detCols, ds.bf.cy, ds.bf.cx, rad);
   const { comY, comX } = await ds.compute.maskedCoM(mask, ds.detCols);
@@ -459,9 +586,9 @@ export async function datasetComStats(source: string, date: string, name: string
 // Virtual image for a free-form detector SHAPE (params already in detector px), like the
 // server's /realspace-shape. Drives the live detector drag in the Viewer.
 export async function virtualImageShape(
-  source: string, date: string, name: string, shape: DetShape, p: ShapeParams,
+  source: string, date: string, name: string, shape: DetShape, p: ShapeParams, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  const ds = await ensureLoaded(source, date, name);
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const { detRows, detCols } = ds;
   let mask: Uint32Array;
   if (shape === "circle") mask = diskMask(detRows, detCols, p.cy, p.cx, p.r);
@@ -483,17 +610,17 @@ export async function virtualImageShape(
 }
 
 // One CBED frame at scan position (sx=col, sy=row).
-export async function cbedFrame(source: string, date: string, name: string, sx: number, sy: number): Promise<RawData | null> {
-  const ds = await ensureLoaded(source, date, name);
+export async function cbedFrame(source: string, date: string, name: string, sx: number, sy: number, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): Promise<RawData | null> {
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const frame = await ds.compute.frameAt(sy * ds.scanCols + sx);
   return reshapeDP(frame, ds);
 }
 
 // Summed CBED over a rectangular scan ROI.
 export async function cbedRoi(
-  source: string, date: string, name: string, row0: number, col0: number, row1: number, col1: number,
+  source: string, date: string, name: string, row0: number, col0: number, row1: number, col1: number, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  const ds = await ensureLoaded(source, date, name);
+  const ds = await ensureLoaded(source, date, name, detBin, dtype);
   const mask = new Uint32Array(ds.scanCount);
   const r0 = Math.max(0, Math.min(row0, row1)), r1 = Math.min(ds.scanRows - 1, Math.max(row0, row1));
   const c0 = Math.max(0, Math.min(col0, col1)), c1 = Math.min(ds.scanCols - 1, Math.max(col0, col1));

@@ -271,24 +271,24 @@ const SLOT_FFT = allocateSlot();
 const CBED_CACHE_MAX = 256;
 const CBED_CACHE = new Map<string, RawData>();
 
-function cbedKey(s: Session, f: MasterFile, ix: number, iy: number, detBin: DetBin): string {
-  return `${fileKey(s, f)}|b${detBin}|${ix},${iy}`;
+function cbedKey(s: Session, f: MasterFile, ix: number, iy: number, detBin: DetBin, dtype: BrowseDtype): string {
+  return `${fileKey(s, f)}|b${detBin}|${dtype}|${ix},${iy}`;
 }
 
 /** Cache-fronted CBED fetch. Re-insertion on hit moves the key to the end
  *  of the Map so the LRU eviction picks the truly oldest entry. */
 async function fetchCBEDCached(
   s: Session, f: MasterFile, ix: number, iy: number, signal?: AbortSignal,
-  detBin: DetBin = 1,
+  detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  const k = cbedKey(s, f, ix, iy, detBin);
+  const k = cbedKey(s, f, ix, iy, detBin, dtype);
   const hit = CBED_CACHE.get(k);
   if (hit) {
     CBED_CACHE.delete(k);
     CBED_CACHE.set(k, hit);
     return hit;
   }
-  const r = await fetchCBED(s, f, ix, iy, signal, detBin);
+  const r = await fetchCBED(s, f, ix, iy, signal, detBin, dtype);
   if (r) {
     CBED_CACHE.set(k, r);
     if (CBED_CACHE.size > CBED_CACHE_MAX) {
@@ -1360,7 +1360,7 @@ export default function Viewer(props: Props) {
   // so this is fast on revisit. Seeds the aperture state when it arrives.
   useEffect(() => {
     let cancelled = false;
-    fetchBfGeometry(session, file).then((g) => {
+    fetchBfGeometry(session, file, undefined, detBin, browseDtype).then((g) => {
       if (cancelled) return;
       setBfGeom(g);
       if (g) {
@@ -1385,7 +1385,7 @@ export default function Viewer(props: Props) {
       }
     });
     return () => { cancelled = true; };
-  }, [fileId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fileId, detBin, browseDtype]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // BF/ADF/DF mode click → snap shape + params to Show4DSTEM-style defaults
   // for that mode. Mirrors the ringInner/Outer reset in Browse.tsx but in
@@ -1525,7 +1525,7 @@ export default function Viewer(props: Props) {
         }, nextDelay);
       };
       const promise = shapeUsesEndpoint
-        ? fetchVirtualImageShape(session, file, dpShape, shapeParams, signal, detBin)
+        ? fetchVirtualImageShape(session, file, dpShape, shapeParams, signal, detBin, browseDtype)
         : fetchVirtualImage(session, file, mode, ringInner, ringOuter, apCx, apCy, signal, detBin, browseDtype);
       promise
         .then((r) => {
@@ -1640,7 +1640,7 @@ export default function Viewer(props: Props) {
     // server-side LRU + GPU master cache absorb the cost).
     if (roiR0 !== null && roiC0 !== null && roiR1 !== null && roiC1 !== null) {
       if (dpData == null) setDpBusy(true);
-      fetchCBEDRoi(session, file, roiR0, roiC0, roiR1, roiC1, undefined, detBin)
+      fetchCBEDRoi(session, file, roiR0, roiC0, roiR1, roiC1, undefined, detBin, browseDtype)
         .then((r) => {
           if (seq <= lastPaintedSeqRef.current) return;
           lastPaintedSeqRef.current = seq;
@@ -1654,7 +1654,7 @@ export default function Viewer(props: Props) {
     }
     // Synchronous cache peek — if we've fetched (ix, iy) before for this
     // master, paint immediately. No await, no fetch, no busy flicker.
-    const cached = CBED_CACHE.get(cbedKey(session, file, ix, iy, detBin));
+    const cached = CBED_CACHE.get(cbedKey(session, file, ix, iy, detBin, browseDtype));
     if (cached) {
       if (cbedTrailingTimerRef.current !== null) {
         window.clearTimeout(cbedTrailingTimerRef.current);
@@ -1701,7 +1701,7 @@ export default function Viewer(props: Props) {
       // frame feels realtime; "loading..." makes the interaction read as a
       // blocking batch operation.
       if (dpData == null && !scanPointDragActive) setDpBusy(true);
-      fetchCBEDCached(session, file, ix, iy, signal, detBin)
+      fetchCBEDCached(session, file, ix, iy, signal, detBin, browseDtype)
         .then((r) => {
           if (signal?.aborted) { releaseScanFlight(); return; }
           // Paint EVERY response that is newer than what is currently
@@ -1786,7 +1786,7 @@ export default function Viewer(props: Props) {
     dragRafRef.current = requestAnimationFrame(async () => {
       dragRafRef.current = null;
       const ap = apertureRef.current;
-      const res = await fetchVirtualImageBufferGpu(session, file, mode, ringRef.current.inner, ringRef.current.outer, ap?.cx ?? null, ap?.cy ?? null);
+      const res = await fetchVirtualImageBufferGpu(session, file, mode, ringRef.current.inner, ringRef.current.outer, ap?.cx ?? null, ap?.cy ?? null, detBin, browseDtype);
       if (res) {
         const clip = lastRealClipRef.current ?? { vmin: 0, vmax: 1 };
         await renderRealspaceGpu(realRef.current, SLOT_REAL, cmapImage, { gpuBuffer: res.buffer }, res.width, res.height, clip.vmin, clip.vmax);

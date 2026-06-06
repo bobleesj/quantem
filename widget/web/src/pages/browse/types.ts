@@ -146,9 +146,9 @@ export interface RawData {
  *  feeds straight into the WebGPU colormap engine. */
 export function fetchCBED(
   s: Session, f: MasterFile, sx: number, sy: number, _signal?: AbortSignal,
-  _detBin: DetBin = 1,
+  detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  return store.cbedFrame(s.source, s.date, f.name, sx, sy);
+  return store.cbedFrame(s.source, s.date, f.name, sx, sy, detBin, dtype);
 }
 
 /** Fetch a SUMMED CBED frame across the rectangular scan ROI
@@ -160,9 +160,9 @@ export function fetchCBEDRoi(
   s: Session, f: MasterFile,
   row0: number, col0: number, row1: number, col1: number,
   _signal?: AbortSignal,
-  _detBin: DetBin = 1,
+  detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  return store.cbedRoi(s.source, s.date, f.name, row0, col0, row1, col1);
+  return store.cbedRoi(s.source, s.date, f.name, row0, col0, row1, col1, detBin, dtype);
 }
 
 /** Fetch one virtual image (BF / ADF / DF / CoM mag / CoMx / CoMy / iCoM / SSB)
@@ -177,19 +177,19 @@ export function fetchVirtualImage(
   inner: number, outer: number,
   cx?: number | null, cy?: number | null,
   _signal?: AbortSignal,
-  _detBin: DetBin = 1,
-  _dtype: BrowseDtype = "uint8",
+  detBin: DetBin = 1,
+  dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  return store.virtualImage(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null);
+  return store.virtualImage(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null, detBin, dtype);
 }
 
 /** GPU-resident virtual image for the aperture-drag fast path: returns the maskedSum GPU buffer
  *  (no readback) for BF/ADF/DF, or null for CoM modes (caller falls back to fetchVirtualImage). */
 export function fetchVirtualImageBufferGpu(
   s: Session, f: MasterFile, mode: DetectorMode, inner: number, outer: number,
-  cx: number | null, cy: number | null,
+  cx: number | null, cy: number | null, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<{ buffer: GPUBuffer; width: number; height: number } | null> {
-  return store.virtualImageBufferGpu(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null);
+  return store.virtualImageBufferGpu(s.source, s.date, f.name, mode, inner, outer, cx ?? null, cy ?? null, detBin, dtype);
 }
 
 // --- Detector-shape selector (Show4DSTEM-style live shape on the DP) ----
@@ -234,9 +234,9 @@ export interface ShapeParams {
 export function fetchVirtualImageShape(
   s: Session, f: MasterFile, shape: DetShape, p: ShapeParams,
   _signal?: AbortSignal,
-  _detBin: DetBin = 1,
+  detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<RawData | null> {
-  return store.virtualImageShape(s.source, s.date, f.name, shape, p);
+  return store.virtualImageShape(s.source, s.date, f.name, shape, p, detBin, dtype);
 }
 
 /** Auto-fit BF disk geometry for a master (cy, cx, r_bf in detector px).
@@ -245,10 +245,10 @@ export function fetchVirtualImageShape(
 export interface BfGeometry { cy: number; cx: number; r_bf: number }
 
 export async function fetchBfGeometry(
-  s: Session, f: MasterFile, _signal?: AbortSignal,
+  s: Session, f: MasterFile, _signal?: AbortSignal, detBin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): Promise<BfGeometry | null> {
   try {
-    return await store.bfGeometry(s.source, s.date, f.name);
+    return await store.bfGeometry(s.source, s.date, f.name, detBin, dtype);
   } catch {
     return null;
   }
@@ -352,22 +352,23 @@ export interface WarmPlan {
   mode: "all" | "window";
 }
 
-/** Current standalone WebGPU loader persists uint8 full-detector stacks. The UI may show
- *  a requested bin for future/remote parity, but until local binned decode exists the
- *  safety planner must budget against the actual resident format. */
-function htmlResidentBytes(f: MasterFile): number {
-  return masterBytesAtBin(f, 1, "uint8");
+function cacheKeyAtBin(s: Session, f: MasterFile, bin: DetBin, dtype: BrowseDtype): string {
+  return `${fileKey(s, f)}|b${bin}|${dtype}`;
+}
+
+function htmlResidentBytes(f: MasterFile, bin: DetBin, dtype: BrowseDtype): number {
+  return masterBytesAtBin(f, bin, dtype);
 }
 
 export function planWarmSet5D(
-  files: MasterFile[], activeIdx: number, freeBytes: number,
+  files: MasterFile[], activeIdx: number, freeBytes: number, bin: DetBin = 1, dtype: BrowseDtype = "uint8",
 ): WarmPlan {
   const totalFiles = files.length;
   const clamped = Math.max(0, Math.min(totalFiles - 1, activeIdx));
   const reportedBudget = Math.floor(Math.max(0, freeBytes) * 0.4);
   const hardBudget = 3 * 1024 * 1024 * 1024;
   const budgetBytes = Math.max(256 * 1024 * 1024, Math.min(reportedBudget || hardBudget, hardBudget));
-  const allBytes = files.reduce((acc, f) => acc + htmlResidentBytes(f), 0);
+  const allBytes = files.reduce((acc, f) => acc + htmlResidentBytes(f, bin, dtype), 0);
   if (allBytes <= budgetBytes) {
     return { files, activeIdx: clamped, budgetBytes, estimatedBytes: allBytes, totalFiles, mode: "all" };
   }
@@ -376,7 +377,7 @@ export function planWarmSet5D(
   let estimatedBytes = 0;
   const tryAdd = (idx: number): boolean => {
     if (idx < 0 || idx >= totalFiles || chosen.has(idx)) return true;
-    const bytes = htmlResidentBytes(files[idx]);
+    const bytes = htmlResidentBytes(files[idx], bin, dtype);
     if (estimatedBytes + bytes > budgetBytes) return false;
     chosen.add(idx);
     estimatedBytes += bytes;
@@ -484,9 +485,9 @@ export async function preloadSet5D(
   activeIdx = 0, freeBytes = fetchGpuFreeBytes(),
 ): Promise<PreloadSetResponse> {
   const free = typeof freeBytes === "number" ? freeBytes : await freeBytes;
-  const plan = planWarmSet5D(files, activeIdx, free);
-  store.setPinned5DKeys(plan.files.map((f) => fileKey(s, f)));
-  void store.warmSet5D(plan.files.map((f) => ({ source: s.source, date: s.date, name: f.name })));
+  const plan = planWarmSet5D(files, activeIdx, free, detBin, _dtype);
+  store.setPinned5DKeys(plan.files.map((f) => cacheKeyAtBin(s, f, detBin, _dtype)));
+  void store.warmSet5D(plan.files.map((f) => ({ source: s.source, date: s.date, name: f.name, detBin, dtype: _dtype })));
   return { queued: plan.files.length, det_bin: detBin };
 }
 

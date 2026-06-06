@@ -483,7 +483,7 @@ export default function Browse() {
       resolvedBin = setting;
     }
     const activeIdx = Math.max(0, Math.min(orderedFiles.length - 1, initialIdx));
-    const warmPlan = planWarmSet5D(orderedFiles, activeIdx, free);
+    const warmPlan = planWarmSet5D(orderedFiles, activeIdx, free, resolvedBin, browseDtype);
     const next: Set5D = {
       session: sess, files: orderedFiles, activeIdx, detBin: resolvedBin,
       warmCount: warmPlan.files.length, warmTotal: warmPlan.totalFiles, warmMode: warmPlan.mode,
@@ -518,7 +518,7 @@ export default function Browse() {
     } else {
       resolvedBin = pendingDetBin;
     }
-    const warmPlan = planWarmSet5D(orderedFiles, 0, free);
+    const warmPlan = planWarmSet5D(orderedFiles, 0, free, resolvedBin, browseDtype);
     const next: Set5D = {
       session: selectionSession,
       files: orderedFiles,
@@ -544,7 +544,7 @@ export default function Browse() {
   const setActiveIdx = (idx: number) => {
     if (!set5D) return;
     const clamped = Math.max(0, Math.min(set5D.files.length - 1, idx));
-    const warmPlan = planWarmSet5D(set5D.files, clamped, gpuFreeBytes);
+    const warmPlan = planWarmSet5D(set5D.files, clamped, gpuFreeBytes, set5D.detBin, browseDtype);
     setSet5D({
       ...set5D,
       activeIdx: clamped,

@@ -61,14 +61,16 @@ export default function App() {
         return { dataset: f.name, nFiles: s.files.length, wallMs, dpSum, dpLen: dp.length, perf: perf[perf.length - 1] };
       };
     // Per-dataset decode-timing probe: force-load one dataset, return wall + __perf record.
-    (window as unknown as { __timeDataset: (s: string, d: string, n: string) => Promise<unknown> }).__timeDataset =
-      async (source: string, date: string, name: string) => {
-        const { bfGeometry } = await import("./local/store");
+    (window as unknown as { __timeDataset: (s: string, d: string, n: string, detBin?: 1 | 2 | 4, dtype?: "uint8" | "uint16") => Promise<unknown> }).__timeDataset =
+      async (source: string, date: string, name: string, detBin: 1 | 2 | 4 = 1, dtype: "uint8" | "uint16" = "uint8") => {
+        const { bfGeometry, datasetMeanDp } = await import("./local/store");
         const t0 = performance.now();
-        try { await bfGeometry(source, date, name); } catch (e) { return { error: String(e).slice(0, 120) }; }
+        try { await bfGeometry(source, date, name, detBin, dtype); } catch (e) { return { error: String(e).slice(0, 120) }; }
         const wall = Math.round(performance.now() - t0);
+        const dp = await datasetMeanDp(source, date, name, detBin, dtype);
+        let dpSum = 0; for (let i = 0; i < dp.length; i++) dpSum += dp[i];
         const perf = (window as unknown as { __perf?: { key: string; loadDecodeMs: number }[] }).__perf || [];
-        return { wall, perf: perf[perf.length - 1] };
+        return { wall, detBin, dtype, dpLen: dp.length, dpSum, perf: perf[perf.length - 1] };
       };
     // CoM/DPC parity probe.
     (window as unknown as { __comStats: () => Promise<unknown> }).__comStats =
