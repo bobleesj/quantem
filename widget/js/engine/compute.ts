@@ -428,11 +428,6 @@ export class Show4DSTEMCompute {
     pass.setPipeline(pipe); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(groups, gy); pass.end();
     this.device.queue.submit([enc.finish()]);
   }
-  private async readU32(buf: GPUBuffer, n: number): Promise<Uint32Array> {
-    const rb = this.device.createBuffer({ size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const enc = this.device.createCommandEncoder(); enc.copyBufferToBuffer(buf, 0, rb, 0, n * 4); this.device.queue.submit([enc.finish()]);
-    await rb.mapAsync(GPUMapMode.READ); const out = new Uint32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy(); return out;
-  }
   private async readF32(buf: GPUBuffer, n: number): Promise<Float32Array> {
     const rb = this.device.createBuffer({ size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = this.device.createCommandEncoder(); enc.copyBufferToBuffer(buf, 0, rb, 0, n * 4); this.device.queue.submit([enc.finish()]);
