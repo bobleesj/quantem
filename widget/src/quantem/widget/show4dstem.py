@@ -197,11 +197,10 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32 (JS computes stats + range)
 
-    # Offline / browser-compute mode: ship the full uint16 4D stack once so JS
-    # runs the virtual-image and DP-from-ROI reductions in WebGPU with no Python
-    # kernel. Only for SMALL datasets (see _pack_offline budget). Detector counts
-    # are integers, so the browser masked-sum (u32 accumulate) is bit-exact to
-    # this widget's torch virtual image.
+    # Offline / browser-compute mode: ship a uint8-clipped 4D stack so JS runs
+    # the virtual-image and DP-from-ROI reductions in WebGPU with no Python
+    # kernel. Inline gzip is only for small datasets; companion bslz4 supports
+    # full no-bin stacks and lazy multi-volume 5D stacks.
     offline = traitlets.Bool(False).tag(sync=True)
     _offline_stack = traitlets.Bytes(b"").tag(sync=True)
     # Companion-file mode: instead of inlining the stack (which blocks mount on a
@@ -219,10 +218,10 @@ class Show4DSTEM(anywidget.AnyWidget):
     # base64'd offline payload (and the HTML it sits in) shrinks ~2-3x -> far less
     # HTML/JSON parse on cold open, especially under file://.
     _offline_gzip = traitlets.Bool(False).tag(sync=True)
-    # bslz4 mode: ship the native HDF5 bitshuffle+LZ4 bytes in the companion file
-    # (~6x smaller than uint16) and decompress on the GPU into a uint8 stack. This
-    # JSON has {blockMeta:[coff,clen,...], nFrames, nBlocksPerFrame, blockElems}.
-    # The browser decode is bit-exact to the uint8-clipped reference (verified).
+    # bslz4 mode: ship HDF5 bitshuffle+LZ4 companion chunks and decompress on the
+    # GPU into uint8. JSON is either a single volume {base,chunks,...} or lazy
+    # multi-volume {volumes:[{base,chunks,badPx}], ...}. The browser decode is
+    # bit-exact to the uint8-clipped reference (verified).
     _offline_bslz4 = traitlets.Unicode("").tag(sync=True)
     # Hot/dead detector pixel indices (JSON list) auto-applied by the offline WebGPU
     # compute - mirrors CUDA load(apply_mask=True) so the browser data is filtered
@@ -742,18 +741,16 @@ class Show4DSTEM(anywidget.AnyWidget):
         """Ship the 4D stack to the browser for kernel-less WebGPU compute.
 
         JS runs the same masked-sum / DP-from-ROI reductions in WebGPU, so the
-        dataset stays interactive with no Python kernel (live docs, shared offline
-        HTML, Colab without a GPU). We pack the stack as **uint8** (global linear
-        quantization): it halves the payload vs uint16 so a full 512x512 scan
-        fits, and the virtual image is near-lossless anyway - it is a SUM over
-        many detector pixels, so per-pixel 1/256 quantization error averages down
-        far below one count. The colormap auto-scales the result, so the displayed
-        virtual image is visually identical to the kernel's.
+        dataset stays interactive with no Python kernel (live docs, shared
+        offline HTML, Colab without a GPU). We pack the stack as **uint8** by
+        clipping detector counts to [0, 255]; common detector counts are exact,
+        and rare saturated/hot pixels are filtered separately.
 
         ``offline=None`` auto-enables under the byte budget; ``True`` forces it
-        (and warns + skips if too big); ``False`` does nothing. 5D not supported.
+        (and warns + skips if too big); ``False`` does nothing. 5D is supported
+        only for bslz4 companion directories.
         """
-        if self._data.ndim != 4:
+        if self._data.ndim not in (4, 5):
             return
         n_bytes = self._data.numel()  # uint8 pack = 1 byte/pixel
         # Companion mode bypasses the V8 string wall (data is fetched binary, never
@@ -769,7 +766,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         # NOT budget-limited - a full 512x512x192x192 (9.6 GB uint8) streams fine.
         # Needs a companion directory (data_url).
         if data_url and getattr(self, "_offline_codec", "gzip") == "bslz4":
-            self._pack_offline_bslz4(data_url)
+            if self._data.ndim == 5:
+                self._pack_offline_bslz4_volumes(data_url)
+            else:
+                self._pack_offline_bslz4(data_url)
+            return
+        if self._data.ndim != 4:
+            print("  offline browser mode skipped: 5D stacks need offline_codec='bslz4' "
+                  "and a companion data_url directory")
             return
         if n_bytes > budget:
             print(f"  offline browser mode skipped: stack is {n_bytes / 1e6:.0f} MB > "
@@ -826,7 +830,7 @@ class Show4DSTEM(anywidget.AnyWidget):
                             drop_defaults=False, state=dependency_state([self], drop_defaults=False))
         return str(out)
 
-    def _pack_offline_bslz4(self, data_url: str) -> None:
+    def _pack_offline_bslz4_volume(self, data, data_url: str) -> tuple[list[dict], list[int], int, int]:
         """One-call bslz4 offline pack: encode the 4D stack to native bitshuffle+LZ4
         (the Arina/HDF5 codec) and write a CHUNKED companion folder the browser
         decompresses on the GPU into a uint8 stack (~6x smaller than uint16, near-CUDA
@@ -842,7 +846,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         """
         import json, pathlib, struct, tempfile, os
         import hdf5plugin, h5py
-        data = self._data.detach().to("cpu").numpy().reshape(-1, self.det_rows, self.det_cols)
+        if hasattr(data, "detach"):
+            data = data.detach().to("cpu").numpy()
+        else:
+            data = np.asarray(data)
+        data = data.reshape(-1, self.det_rows, self.det_cols)
         n_frames = data.shape[0]
         det_size = self.det_rows * self.det_cols
         scan_cols = self.shape_cols
@@ -854,9 +862,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         flat = data.reshape(n_frames, -1)
         sat = 65535 if flat.dtype == np.uint16 else 255
         bad = np.where(flat.max(axis=0) >= sat)[0]
-        self._offline_bad_px = json.dumps(bad.astype(int).tolist())
-        if getattr(self, "_verbose", True) and len(bad):
-            print(f"  offline auto-filter: {len(bad)} hot/dead px masked")
+        bad_list = bad.astype(int).tolist()
         # Encode once via HDF5 bitshuffle-lz4 (C, fast), then read native chunks back.
         tmp_h5 = tempfile.mktemp(suffix=".h5")
         with h5py.File(tmp_h5, "w") as hf:
@@ -895,13 +901,65 @@ class Show4DSTEM(anywidget.AnyWidget):
         finally:
             os.unlink(tmp_h5)
         (out / "index.json").write_text(json.dumps({"chunks": index, "nFrames": n_frames}))
+        return index, bad_list, total, n_blocks
+
+    def _pack_offline_bslz4(self, data_url: str) -> None:
+        import json, pathlib
+        index, bad, total, n_blocks = self._pack_offline_bslz4_volume(self._data, data_url)
+        out = pathlib.Path(data_url)
+        n_frames = self.shape_rows * self.shape_cols
         self.offline = True
         self._offline_url = ""
+        self._offline_stack = b""
+        self._offline_chunks = ""
+        self._offline_bad_px = json.dumps(bad)
         self._offline_bslz4 = json.dumps({"base": out.name + "/", "chunks": index, "nFrames": n_frames, "srcDtype": "uint8"})
+        if getattr(self, "_verbose", True) and len(bad):
+            print(f"  offline auto-filter: {len(bad)} hot/dead px masked")
         if getattr(self, "_verbose", True):
+            det_size = self.det_rows * self.det_cols
             ratio = (n_frames * det_size * 2) / max(1, total)
-            print(f"  offline bslz4 (chunked): {out}/ {total/1e6:.0f} MB "
+            print(f"  offline bslz4 (chunked): {data_url}/ {total/1e6:.0f} MB "
                   f"({ratio:.1f}x vs uint16), {n_blocks} blocks/frame, GPU-decoded to uint8")
+
+    def _pack_offline_bslz4_volumes(self, data_url: str) -> None:
+        """Pack a 5D stack as lazy browser WebGPU volumes.
+
+        The frontend already decodes ``{volumes:[...]}`` lazily through the
+        Dataset/frame slider. This method makes the Python exporter expose that
+        path directly instead of requiring callers to mutate ``self._data`` and
+        call the single-volume private packer repeatedly.
+        """
+        import json, pathlib
+        out = pathlib.Path(data_url)
+        out.mkdir(parents=True, exist_ok=True)
+        volumes = []
+        total = 0
+        n_blocks = 0
+        for idx in range(int(self.n_frames)):
+            vdir = out / f"vol{idx}"
+            index, bad, nbytes, blocks = self._pack_offline_bslz4_volume(
+                self._data[idx], str(vdir)
+            )
+            volumes.append({"base": f"{vdir.name}/", "chunks": index, "badPx": bad})
+            total += nbytes
+            n_blocks = blocks
+            if getattr(self, "_verbose", True):
+                print(f"  offline bslz4 volume {idx}: {nbytes/1e6:.0f} MB, "
+                      f"{len(index)} chunks, {len(bad)} hot/dead px masked")
+        self.offline = True
+        self._offline_url = ""
+        self._offline_stack = b""
+        self._offline_chunks = ""
+        self._offline_bad_px = ""
+        self._offline_bslz4 = json.dumps({"volumes": volumes, "srcDtype": "uint8"})
+        if getattr(self, "_verbose", True):
+            n_frames = int(self.n_frames) * self.shape_rows * self.shape_cols
+            det_size = self.det_rows * self.det_cols
+            ratio = (n_frames * det_size * 2) / max(1, total)
+            print(f"  offline bslz4 volumes: {data_url}/ {total/1e6:.0f} MB "
+                  f"({ratio:.1f}x vs uint16), {n_blocks} blocks/frame, "
+                  "GPU-decoded to uint8")
 
     def __repr__(self) -> str:
         shape = (
@@ -2682,4 +2740,3 @@ class Show4DSTEM(anywidget.AnyWidget):
             return data_dict
         except Exception:
             return bundle
-

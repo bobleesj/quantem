@@ -1848,7 +1848,11 @@ def _load_view(
         if auto_narrow and data.dtype == np.uint32 and int(data.max()) < 65536:
             data = data.astype(np.uint16)
         if output_dtype is not None:
-            data = data.astype(output_dtype)
+            out_dtype = np.dtype(output_dtype)
+            if out_dtype == np.dtype(np.uint8) and data.dtype != np.uint8:
+                data = np.minimum(data, 255).astype(np.uint8)
+            else:
+                data = data.astype(out_dtype)
         data = _apply_scan_shape(data, scan_shape, meta)
         if backend == "mps":
             # Torch MPS tensor is the first-class GPU citizen on Apple, the peer
