@@ -12,7 +12,14 @@ import type { Session, MasterFile, RawData, DetectorMode, DetShape, ShapeParams,
 // A picked file, uniform over File System Access handles and <input webkitdirectory>.
 // `source` (the File or directory handle) lets a worker read the bytes off the main thread -
 // reading in parallel across worker threads is ~4x the main-thread File.arrayBuffer rate.
-export interface LocalFile { name: string; relPath: string; bytes(): Promise<ArrayBuffer>; source?: File | FileSystemFileHandle; }
+export interface LocalFile {
+  name: string;
+  relPath: string;
+  bytes(): Promise<ArrayBuffer>;
+  source?: File | FileSystemFileHandle;
+  size?: number;
+  lastModified?: number;
+}
 
 interface ParsedSpec { id: number; nFrames: number; nBlocksPerFrame: number; blockElems: number; detSize: number; srcDtype: "uint8" | "uint16" | "uint32"; blockMeta: Uint32Array; buffer: ArrayBuffer; }
 let READERS: Worker[] | null = null;
@@ -58,6 +65,7 @@ const HANDLES = new Map<string, Handles>();          // fileKey -> file handles
 const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Array; scanCols: number; scanCount: number }>();
 const LOADED = new Map<string, Promise<LoadedDS>>();  // fileKey -> decoded dataset (LRU)
 const LRU: string[] = [];
+const SIGNATURES = new Map<string, string>();         // base fileKey -> master/data mtime+size
 const MAX_RESIDENT = 2;
 // Keys of the ACTIVE 5D set are PINNED: never evicted, so scrubbing the time/tilt axis stays
 // live (every binned frame resident on the GPU). The set is auto-binned to fit VRAM, so pinning
@@ -71,6 +79,21 @@ export function lastScanSkipped(): number { return LAST_SCAN_SKIPPED; }
 function key(source: string, date: string, name: string): string { return `${source}/${date}/${name}`; }
 function loadKey(source: string, date: string, name: string, detBin: DetBin = 1, dtype: BrowseDtype = "uint8"): string {
   return `${key(source, date, name)}|b${detBin}|${dtype}`;
+}
+function fileSignature(files: LocalFile[]): string {
+  return files.map((f) => `${f.relPath}:${f.size ?? "?"}:${f.lastModified ?? "?"}`).join("|");
+}
+function invalidateLoaded(baseKey: string): void {
+  for (const loadedKey of Array.from(LOADED.keys())) {
+    if (loadedKey === baseKey || loadedKey.startsWith(`${baseKey}|`)) {
+      const old = LOADED.get(loadedKey);
+      LOADED.delete(loadedKey);
+      const i = LRU.indexOf(loadedKey);
+      if (i >= 0) LRU.splice(i, 1);
+      PINNED.delete(loadedKey);
+      old?.then((d) => d.compute.dispose()).catch(() => {});
+    }
+  }
 }
 function humanSize(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -198,6 +221,7 @@ async function binDecodedBufferU8(
 export async function scanFolder(files: LocalFile[]): Promise<void> {
   const jsfive = await import("jsfive/esm/high-level.js") as { File: new (ab: ArrayBuffer, name: string) => unknown };
   SESSIONS = []; HANDLES.clear(); GEOM.clear();
+  const seenDatasetKeys = new Set<string>();
   const byKey = new Map<string, Session>();
   const sessionFor = (relPath: string): { source: string; date: string } => {
     const parts = relPath.split("/").filter(Boolean);
@@ -250,7 +274,12 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
         name: p.m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
         size: humanSize(ntrigger * detRows * detCols), loadable: p.dataFiles.length > 0,
       };
-      GEOM.set(key(source, date, p.m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols, scanCount: ntrigger });
+      const baseKey = key(source, date, p.m.name);
+      const sig = fileSignature([p.m, ...p.dataFiles]);
+      if (SIGNATURES.get(baseKey) !== sig) invalidateLoaded(baseKey);
+      SIGNATURES.set(baseKey, sig);
+      seenDatasetKeys.add(baseKey);
+      GEOM.set(baseKey, { detRows, detCols, badPx: new Uint32Array(bad), scanCols, scanCount: ntrigger });
       pushFile(source, date, mf, { master: p.m, dataFiles: p.dataFiles });
     } catch { skipped++; }   // unreadable master (corrupt/truncated/not HDF5)
   });
@@ -271,9 +300,20 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
       name: file.name, shape: [side, Math.ceil(head.nFrames / side), head.detRows, head.detCols], cal: "un",
       size: humanSize(head.nFrames * head.detSize), loadable: true,
     };
-    GEOM.set(key(source, date, file.name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side), scanCount: head.nFrames });
+    const baseKey = key(source, date, file.name);
+    const sig = fileSignature([file]);
+    if (SIGNATURES.get(baseKey) !== sig) invalidateLoaded(baseKey);
+    SIGNATURES.set(baseKey, sig);
+    seenDatasetKeys.add(baseKey);
+    GEOM.set(baseKey, { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side), scanCount: head.nFrames });
     pushFile(source, date, mf, { master: null, dataFiles: [file] });
   });
+  for (const existingKey of Array.from(SIGNATURES.keys())) {
+    if (!seenDatasetKeys.has(existingKey)) {
+      invalidateLoaded(existingKey);
+      SIGNATURES.delete(existingKey);
+    }
+  }
   SESSIONS.sort((a, b) => `${a.source}/${a.date}`.localeCompare(`${b.source}/${b.date}`));
   LAST_SCAN_SKIPPED = skipped;
 }

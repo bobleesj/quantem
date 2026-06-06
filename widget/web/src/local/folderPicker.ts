@@ -4,6 +4,7 @@
 import { scanFolder, type LocalFile } from "./store";
 
 let pickedFiles = new Map<string, LocalFile>();
+const watchedDirs = new Map<string, FileSystemDirectoryHandle>();
 
 function mergePickedFiles(files: LocalFile[]): LocalFile[] {
   for (const file of files) pickedFiles.set(file.relPath, file);
@@ -19,8 +20,8 @@ function uniqueRootName(root: string): string {
   return `${clean}-${i}`;
 }
 
-function filesUnderRoot(files: LocalFile[], root: string, replaceExistingRoot: boolean): LocalFile[] {
-  const nextRoot = uniqueRootName(root);
+function filesUnderRoot(files: LocalFile[], root: string, replaceExistingRoot: boolean, fixedRoot?: string): LocalFile[] {
+  const nextRoot = fixedRoot ?? uniqueRootName(root);
   return files.map((file) => {
     const parts = file.relPath.split("/").filter(Boolean);
     const relInsideRoot = replaceExistingRoot && parts.length > 1 ? parts.slice(1).join("/") : file.relPath;
@@ -28,10 +29,25 @@ function filesUnderRoot(files: LocalFile[], root: string, replaceExistingRoot: b
   });
 }
 
+function replaceRoot(root: string, files: LocalFile[]): LocalFile[] {
+  for (const relPath of Array.from(pickedFiles.keys())) {
+    if (relPath === root || relPath.startsWith(`${root}/`)) pickedFiles.delete(relPath);
+  }
+  for (const file of files) pickedFiles.set(file.relPath, file);
+  return Array.from(pickedFiles.values());
+}
+
 function filesFromInput(list: FileList): LocalFile[] {
   return Array.from(list)
     .filter((f) => /\.h5$/i.test(f.name))
-    .map((f) => ({ name: f.name, relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name, bytes: () => f.arrayBuffer(), source: f }));
+    .map((f) => ({
+      name: f.name,
+      relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name,
+      bytes: () => f.arrayBuffer(),
+      source: f,
+      size: f.size,
+      lastModified: f.lastModified,
+    }));
 }
 async function filesFromDirHandle(dir: FileSystemDirectoryHandle, prefix = ""): Promise<LocalFile[]> {
   const out: LocalFile[] = [];
@@ -39,7 +55,15 @@ async function filesFromDirHandle(dir: FileSystemDirectoryHandle, prefix = ""): 
   for await (const [name, handle] of dir.entries()) {
     const rel = prefix ? `${prefix}/${name}` : name;
     if (handle.kind === "file" && /\.h5$/i.test(name)) {
-      out.push({ name, relPath: rel, bytes: async () => (await handle.getFile()).arrayBuffer(), source: handle as FileSystemFileHandle });
+      const file = await handle.getFile();
+      out.push({
+        name,
+        relPath: rel,
+        bytes: async () => (await handle.getFile()).arrayBuffer(),
+        source: handle as FileSystemFileHandle,
+        size: file.size,
+        lastModified: file.lastModified,
+      });
     } else if (handle.kind === "directory") {
       out.push(...await filesFromDirHandle(handle, rel));
     }
@@ -65,11 +89,15 @@ function pickViaInput(): Promise<LocalFile[]> {
 export async function pickFolderAndScan(): Promise<number> {
   let files: LocalFile[] = [];
   let inputFallback = false;
+  let pickedRoot: string | null = null;
+  let dirHandle: FileSystemDirectoryHandle | null = null;
   if ("showDirectoryPicker" in window) {
     try {
       // @ts-expect-error - File System Access API
       const dir = await window.showDirectoryPicker();
-      files = filesUnderRoot(await filesFromDirHandle(dir), dir.name, false);
+      dirHandle = dir;
+      pickedRoot = uniqueRootName(dir.name);
+      files = filesUnderRoot(await filesFromDirHandle(dir), dir.name, false, pickedRoot);
     } catch { inputFallback = true; files = await pickViaInput(); }   // unsupported (file://) / cancelled -> input fallback
   } else {
     inputFallback = true;
@@ -77,7 +105,28 @@ export async function pickFolderAndScan(): Promise<number> {
   }
   if (inputFallback && files.length && files[0].relPath.includes("/")) files = filesUnderRoot(files, files[0].relPath.split("/")[0], true);
   if (!files.length) return 0;
+  if (dirHandle && pickedRoot) watchedDirs.set(pickedRoot, dirHandle);
   const allFiles = mergePickedFiles(files);
+  await scanFolder(allFiles);
+  window.dispatchEvent(new Event("quantem-folder-loaded"));
+  return allFiles.length;
+}
+
+export function canRefreshWatchedFolders(): boolean {
+  return watchedDirs.size > 0;
+}
+
+/** Rescan picked File System Access folders. This is a polling-based "watch":
+ *  browsers expose no native directory change events, so new masters/data
+ *  shards appear on the next refresh tick. The webkitdirectory fallback cannot
+ *  refresh because it only provides an immutable FileList snapshot. */
+export async function refreshWatchedFolders(): Promise<number> {
+  if (watchedDirs.size === 0) return 0;
+  for (const [root, dir] of watchedDirs) {
+    const files = filesUnderRoot(await filesFromDirHandle(dir), root, false, root);
+    replaceRoot(root, files);
+  }
+  const allFiles = Array.from(pickedFiles.values());
   await scanFolder(allFiles);
   window.dispatchEvent(new Event("quantem-folder-loaded"));
   return allFiles.length;

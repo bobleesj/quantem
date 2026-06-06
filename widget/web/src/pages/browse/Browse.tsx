@@ -17,7 +17,7 @@ import { useRegisterShortcuts, type Shortcut } from "../../hooks/useKeyboardShor
 import FileTree from "./FileTree";
 import Viewer from "./Viewer";
 import MetaRail from "./MetaRail";
-import { pickFolderAndScan } from "../../local/folderPicker";
+import { canRefreshWatchedFolders, pickFolderAndScan, refreshWatchedFolders } from "../../local/folderPicker";
 import {
   defaultSelection, fetchSessions, fetchGpuFreeBytes, lastScanSkipped,
   fileKey, findFile, pickAutoBin, planWarmSet5D, preloadSet5D,
@@ -306,6 +306,9 @@ export default function Browse() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanNotice, setScanNotice] = useState("");   // transient "skipped N bad files" banner
   const [folderScanBusy, setFolderScanBusy] = useState(false);
+  const [folderWatchEnabled, setFolderWatchEnabled] = useState(false);
+  const [folderCanRefresh, setFolderCanRefresh] = useState(false);
+  const [folderWatchBusy, setFolderWatchBusy] = useState(false);
 
   // Cold-load sessions once.
   useEffect(() => {
@@ -706,10 +709,30 @@ export default function Browse() {
     setFolderScanBusy(true);
     try {
       await pickFolderAndScan();
+      const canRefresh = canRefreshWatchedFolders();
+      setFolderCanRefresh(canRefresh);
+      if (canRefresh) setFolderWatchEnabled(true);
     } finally {
       setFolderScanBusy(false);
     }
   }, [folderScanBusy]);
+
+  const refreshFolder = useCallback(async () => {
+    if (!canRefreshWatchedFolders() || folderWatchBusy) return;
+    setFolderWatchBusy(true);
+    try {
+      await refreshWatchedFolders();
+      setFolderCanRefresh(canRefreshWatchedFolders());
+    } finally {
+      setFolderWatchBusy(false);
+    }
+  }, [folderWatchBusy]);
+
+  useEffect(() => {
+    if (!folderWatchEnabled || !folderCanRefresh) return;
+    const id = window.setInterval(() => { void refreshFolder(); }, 5000);
+    return () => window.clearInterval(id);
+  }, [folderWatchEnabled, folderCanRefresh, refreshFolder]);
 
   const leftCollapsed = leftOverride !== null ? leftOverride : isNarrow;
   const rightCollapsed = rightOverride !== null ? rightOverride : isNarrow;
@@ -811,6 +834,26 @@ export default function Browse() {
           >
             {folderScanBusy ? "Scanning..." : "📂 Choose folder"}
           </Box>
+          {folderCanRefresh && (
+            <ToolbarButton
+              active={folderWatchEnabled}
+              onClick={() => setFolderWatchEnabled((v) => !v)}
+              title={folderWatchEnabled
+                ? "Stop polling the picked folder for new .h5 files"
+                : "Poll the picked folder for new .h5 files"}
+            >
+              {folderWatchEnabled ? "watching" : "watch"}
+            </ToolbarButton>
+          )}
+          {folderCanRefresh && !folderWatchEnabled && (
+            <ToolbarButton
+              active={folderWatchBusy}
+              onClick={() => { void refreshFolder(); }}
+              title="Refresh the picked folder now"
+            >
+              {folderWatchBusy ? "refreshing" : "refresh"}
+            </ToolbarButton>
+          )}
           <ToolbarButton
             active={!leftCollapsed}
             onClick={() => setLeftCollapsed(!leftCollapsed)}
