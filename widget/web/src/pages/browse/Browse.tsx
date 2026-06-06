@@ -305,6 +305,7 @@ export default function Browse() {
   const [activeFile, setActiveFile] = useState<MasterFile | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanNotice, setScanNotice] = useState("");   // transient "skipped N bad files" banner
+  const [folderScanBusy, setFolderScanBusy] = useState(false);
 
   // Cold-load sessions once.
   useEffect(() => {
@@ -684,6 +685,15 @@ export default function Browse() {
       return next;
     });
   };
+  const chooseFolder = useCallback(async () => {
+    if (folderScanBusy) return;
+    setFolderScanBusy(true);
+    try {
+      await pickFolderAndScan();
+    } finally {
+      setFolderScanBusy(false);
+    }
+  }, [folderScanBusy]);
 
   const leftCollapsed = leftOverride !== null ? leftOverride : isNarrow;
   const rightCollapsed = rightOverride !== null ? rightOverride : isNarrow;
@@ -775,13 +785,15 @@ export default function Browse() {
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 0.5, flexWrap: "wrap" }}>
           <Box
             component="button"
-            onClick={() => { void pickFolderAndScan(); }}
+            onClick={() => { void chooseFolder(); }}
+            disabled={folderScanBusy}
             title="Open a folder of Arina .h5 datasets - decodes on your GPU, nothing leaves this machine"
             sx={{ px: 1.25, py: 0.5, fontSize: fontSizes.sm, fontWeight: 600, cursor: "pointer",
                   border: "none", borderRadius: radii.md, color: colors.text.white,
-                  bgcolor: colors.text.primary, "&:hover": { opacity: 0.88 } }}
+                  bgcolor: colors.text.primary, "&:hover": { opacity: 0.88 },
+                  "&:disabled": { cursor: "wait", opacity: 0.66 } }}
           >
-            📂 Choose folder
+            {folderScanBusy ? "Scanning..." : "📂 Choose folder"}
           </Box>
           <ToolbarButton
             active={!leftCollapsed}
