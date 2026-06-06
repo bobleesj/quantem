@@ -26,6 +26,22 @@ def _chrome_executable():
     return None
 
 
+def _click_copy_buttons(page):
+    buttons = page.get_by_role("button", name="COPY")
+    count = buttons.count()
+    assert count >= 2, f"Expected DP and VI COPY buttons, found {count}"
+    for idx in range(2):
+        buttons.nth(idx).click()
+        page.wait_for_timeout(500)
+        types = page.evaluate(
+            """async () => {
+              const items = await navigator.clipboard.read();
+              return items.flatMap(item => item.types);
+            }"""
+        )
+        assert "image/png" in types
+
+
 @pytest.mark.skipif(
     os.environ.get("QT_RUN_BROWSER_TESTS") != "1",
     reason="set QT_RUN_BROWSER_TESTS=1 to run headed WebGPU browser smoke tests",
@@ -83,42 +99,51 @@ def test_webgpu_multi_volume_export_fetches_second_volume(tmp_path):
                     "--no-default-browser-check",
                 ],
             )
-            page = browser.new_page(viewport={"width": 1000, "height": 800})
-            requested = []
-            page.on(
-                "request",
-                lambda request: requested.append(request.url)
-                if ("vol0/" in request.url or "vol1/" in request.url)
-                else None,
+            context = browser.new_context(viewport={"width": 1000, "height": 800})
+            context.grant_permissions(
+                ["clipboard-read", "clipboard-write"],
+                origin=f"http://127.0.0.1:{port}",
             )
-            page.goto(f"http://127.0.0.1:{port}/index.html", wait_until="domcontentloaded")
-            page.wait_for_function(
-                "document.body.innerText.includes('first') && document.querySelectorAll('canvas').length >= 4",
-                timeout=120_000,
-            )
-            page.wait_for_timeout(3000)
-            assert page.evaluate("!!navigator.gpu")
+            try:
+                page = context.new_page()
+                requested = []
+                page.on(
+                    "request",
+                    lambda request: requested.append(request.url)
+                    if ("vol0/" in request.url or "vol1/" in request.url)
+                    else None,
+                )
+                page.goto(f"http://127.0.0.1:{port}/index.html", wait_until="domcontentloaded")
+                page.wait_for_function(
+                    "document.body.innerText.includes('first') && document.querySelectorAll('canvas').length >= 4",
+                    timeout=120_000,
+                )
+                page.wait_for_timeout(3000)
+                assert page.evaluate("!!navigator.gpu")
 
-            dataset_slider = page.evaluate(
-                """() => [...document.querySelectorAll('.MuiSlider-root')]
-                  .map((root, i) => {
-                    const r = root.getBoundingClientRect();
-                    return {i, rect:{x:r.x,y:r.y,w:r.width,h:r.height},
-                      inputs:[...root.querySelectorAll('input')].map(inp => ({min:inp.min,max:inp.max,value:inp.value}))};
-                  })
-                  .find(root => root.inputs.some(inp => inp.min === '0' && inp.max === '1'))"""
-            )
-            assert dataset_slider is not None
-            rect = dataset_slider["rect"]
-            page.mouse.move(rect["x"] + 2, rect["y"] + rect["h"] / 2)
-            page.mouse.down()
-            page.mouse.move(rect["x"] + rect["w"] - 2, rect["y"] + rect["h"] / 2, steps=10)
-            page.mouse.up()
-            page.wait_for_function("document.body.innerText.includes('second')", timeout=60_000)
-            page.wait_for_timeout(3000)
+                dataset_slider = page.evaluate(
+                    """() => [...document.querySelectorAll('.MuiSlider-root')]
+                      .map((root, i) => {
+                        const r = root.getBoundingClientRect();
+                        return {i, rect:{x:r.x,y:r.y,w:r.width,h:r.height},
+                          inputs:[...root.querySelectorAll('input')].map(inp => ({min:inp.min,max:inp.max,value:inp.value}))};
+                      })
+                      .find(root => root.inputs.some(inp => inp.min === '0' && inp.max === '1'))"""
+                )
+                assert dataset_slider is not None
+                rect = dataset_slider["rect"]
+                page.mouse.move(rect["x"] + 2, rect["y"] + rect["h"] / 2)
+                page.mouse.down()
+                page.mouse.move(rect["x"] + rect["w"] - 2, rect["y"] + rect["h"] / 2, steps=10)
+                page.mouse.up()
+                page.wait_for_function("document.body.innerText.includes('second')", timeout=60_000)
+                page.wait_for_timeout(3000)
 
-            assert any("vol0/" in url for url in requested)
-            assert any("vol1/" in url for url in requested)
+                assert any("vol0/" in url for url in requested)
+                assert any("vol1/" in url for url in requested)
+                _click_copy_buttons(page)
+            finally:
+                context.close()
             browser.close()
     finally:
         with suppress(Exception):

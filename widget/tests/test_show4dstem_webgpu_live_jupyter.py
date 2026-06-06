@@ -228,6 +228,25 @@ def _measure_fps(page):
     )
 
 
+def _click_copy_buttons(page):
+    buttons = page.get_by_role("button", name="COPY")
+    count = buttons.count()
+    assert count >= 2, f"Expected DP and VI COPY buttons, found {count}"
+    copied = []
+    for idx in range(2):
+        buttons.nth(idx).click()
+        page.wait_for_timeout(500)
+        types = page.evaluate(
+            """async () => {
+              const items = await navigator.clipboard.read();
+              return items.flatMap(item => item.types);
+            }"""
+        )
+        assert "image/png" in types
+        copied.append(types)
+    return copied
+
+
 @pytest.mark.skipif(
     os.environ.get("QT_RUN_JUPYTER_WEBGPU_TESTS") != "1",
     reason="set QT_RUN_JUPYTER_WEBGPU_TESTS=1 to run headed Jupyter WebGPU smoke tests",
@@ -265,6 +284,10 @@ def test_live_jupyter_webgpu_widget_interaction(tmp_path):
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 url = f"http://127.0.0.1:{port}/lab/tree/{notebook.name}?token={token}"
+                context.grant_permissions(
+                    ["clipboard-read", "clipboard-write"],
+                    origin=f"http://127.0.0.1:{port}",
+                )
                 page.goto(url, wait_until="domcontentloaded", timeout=120_000)
                 page.wait_for_selector(".jp-Notebook", timeout=120_000)
                 page.locator(".jp-Cell").first.click()
@@ -286,6 +309,7 @@ def test_live_jupyter_webgpu_widget_interaction(tmp_path):
                     require=os.environ.get("QT_WEBGPU_REQUIRE_FRAME_SLIDER", "1") != "0",
                 )
                 _toggle_fft(page)
+                copied_types = _click_copy_buttons(page)
                 after = page.screenshot(full_page=False)
                 screenshot_changed = hashlib.sha256(before).hexdigest() != hashlib.sha256(after).hexdigest()
                 assert screenshot_changed
@@ -298,6 +322,7 @@ def test_live_jupyter_webgpu_widget_interaction(tmp_path):
                             "canvas_count": len(canvases),
                             "frame_slider_moved": frame_slider_moved,
                             "fft_toggled": True,
+                            "copy_png_buttons": len(copied_types),
                             "screenshot_changed": screenshot_changed,
                             "fps": fps,
                             "min_fps": min_fps,

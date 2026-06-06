@@ -140,10 +140,11 @@ python -m pytest -q tests/test_show4dstem_webgpu_live_jupyter.py
 ```
 
 Pass signals: `navigator.gpu == true`, at least four canvases, Dataset/frame
-slider found and moved for bounded/default 5D cases, FFT toggle clicked,
+slider found and moved for bounded/default 5D cases, FFT toggle clicked, both
+DP and virtual-image `COPY` buttons write `image/png` to the browser clipboard,
 screenshot changes after drag, and rAF FPS is at least 30. The test prints a
-JSON summary with canvas count, frame-slider status, screenshot-change status,
-and measured FPS.
+JSON summary with canvas count, frame-slider status, copy-button count,
+screenshot-change status, and measured FPS.
 
 Manual bounded crop equivalent, if the automated test needs debugging:
 
@@ -210,6 +211,7 @@ Pass signals:
 - Initial volume fetches `vol0/` chunk/meta files
 - Real Dataset slider drag fetches `vol1/` chunk/meta files
 - ROI/scan drag changes screenshots
+- DP and virtual-image `COPY` buttons write `image/png` to the browser clipboard
 - rAF is at least 30 FPS
 
 ## Cleanup
