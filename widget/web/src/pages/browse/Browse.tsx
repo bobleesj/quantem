@@ -20,7 +20,7 @@ import MetaRail from "./MetaRail";
 import { pickFolderAndScan } from "../../local/folderPicker";
 import {
   defaultSelection, fetchSessions, fetchGpuFreeBytes, lastScanSkipped,
-  fileKey, findFile, pickAutoBin, preloadSet5D,
+  fileKey, findFile, pickAutoBin, planWarmSet5D, preloadSet5D,
   type BrowseDtype, type ColormapName, type DetBin, type DetBinSetting, type DetectorMode,
   type DetShape, type MasterFile, type Session, type Set5D, type ShapeParams,
 } from "./types";
@@ -473,23 +473,25 @@ export default function Browse() {
   const onLoad5DInternal = async (
     sess: Session, orderedFiles: MasterFile[], setting: DetBinSetting, initialIdx = 0,
   ) => {
+    const free = await fetchGpuFreeBytes();
     let resolvedBin: DetBin;
     if (setting === "auto") {
-      const free = await fetchGpuFreeBytes();
-      resolvedBin = pickAutoBin(orderedFiles, free);
+      resolvedBin = pickAutoBin(orderedFiles, free, 0.45, browseDtype);
       // eslint-disable-next-line no-console
       console.log(`5D auto-bin: ${orderedFiles.length} files, ${(free / 1e9).toFixed(1)} GB free → bin=${resolvedBin}`);
     } else {
       resolvedBin = setting;
     }
     const activeIdx = Math.max(0, Math.min(orderedFiles.length - 1, initialIdx));
+    const warmPlan = planWarmSet5D(orderedFiles, activeIdx, free);
     const next: Set5D = {
       session: sess, files: orderedFiles, activeIdx, detBin: resolvedBin,
+      warmCount: warmPlan.files.length, warmTotal: warmPlan.totalFiles, warmMode: warmPlan.mode,
     };
     setSet5D(next);
     setActiveSession(sess);
     setActiveFile(orderedFiles[activeIdx]);
-    void preloadSet5D(sess, orderedFiles, resolvedBin, browseDtype).catch((err) => {
+    void preloadSet5D(sess, orderedFiles, resolvedBin, browseDtype, activeIdx, free).catch((err) => {
       // eslint-disable-next-line no-console
       console.warn("preloadSet5D failed:", err);
     });
@@ -504,29 +506,32 @@ export default function Browse() {
       .map((k) => fmap.get(k))
       .filter((f): f is MasterFile => !!f);
     if (orderedFiles.length < 2) return;
-    // Resolve "auto" to a concrete DetBin by sizing against current GPU
-    // free bytes. Auto picks the smallest bin (best resolution) that fits
-    // the whole set in 60% of free VRAM. Falls through to bin=8 if even
-    // 8× binned doesn't fit — the user gets warned in the console.
+    // Resolve "auto" to a concrete DetBin by sizing against the conservative
+    // browser memory proxy. The warm planner may still choose a sliding window
+    // rather than pinning the whole set.
+    const free = await fetchGpuFreeBytes();
     let resolvedBin: DetBin;
     if (pendingDetBin === "auto") {
-      const free = await fetchGpuFreeBytes();
-      resolvedBin = pickAutoBin(orderedFiles, free);
+      resolvedBin = pickAutoBin(orderedFiles, free, 0.45, browseDtype);
       // eslint-disable-next-line no-console
       console.log(`5D auto-bin: ${orderedFiles.length} files, ${(free / 1e9).toFixed(1)} GB free → bin=${resolvedBin}`);
     } else {
       resolvedBin = pendingDetBin;
     }
+    const warmPlan = planWarmSet5D(orderedFiles, 0, free);
     const next: Set5D = {
       session: selectionSession,
       files: orderedFiles,
       activeIdx: 0,
       detBin: resolvedBin,
+      warmCount: warmPlan.files.length,
+      warmTotal: warmPlan.totalFiles,
+      warmMode: warmPlan.mode,
     };
     setSet5D(next);
     setActiveSession(selectionSession);
     setActiveFile(orderedFiles[0]);
-    void preloadSet5D(selectionSession, orderedFiles, resolvedBin, browseDtype).catch((err) => {
+    void preloadSet5D(selectionSession, orderedFiles, resolvedBin, browseDtype, 0, free).catch((err) => {
       // Surface as console warning — the user's URL still works, fetches
       // for the active master will trigger a single-master load on demand.
       // eslint-disable-next-line no-console
@@ -539,8 +544,19 @@ export default function Browse() {
   const setActiveIdx = (idx: number) => {
     if (!set5D) return;
     const clamped = Math.max(0, Math.min(set5D.files.length - 1, idx));
-    setSet5D({ ...set5D, activeIdx: clamped });
+    const warmPlan = planWarmSet5D(set5D.files, clamped, gpuFreeBytes);
+    setSet5D({
+      ...set5D,
+      activeIdx: clamped,
+      warmCount: warmPlan.files.length,
+      warmTotal: warmPlan.totalFiles,
+      warmMode: warmPlan.mode,
+    });
     setActiveFile(set5D.files[clamped]);
+    void preloadSet5D(set5D.session, set5D.files, set5D.detBin, browseDtype, clamped, gpuFreeBytes).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn("preloadSet5D failed:", err);
+    });
   };
 
   const sessionStackFiles = useMemo(

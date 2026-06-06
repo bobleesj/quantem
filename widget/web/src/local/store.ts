@@ -55,7 +55,7 @@ const HANDLES = new Map<string, Handles>();          // fileKey -> file handles
 // scanCols = the master's true raster WIDTH (from ntrigger). Needed so a PARTIAL dataset (fewer
 // data files than the full scan) reshapes into the correct-width grid instead of a sqrt() square
 // (which wraps the partial frames at the wrong stride -> diagonal garbage).
-const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Array; scanCols: number }>();
+const GEOM = new Map<string, { detRows: number; detCols: number; badPx: Uint32Array; scanCols: number; scanCount: number }>();
 const LOADED = new Map<string, Promise<LoadedDS>>();  // fileKey -> decoded dataset (LRU)
 const LRU: string[] = [];
 const MAX_RESIDENT = 2;
@@ -73,6 +73,10 @@ function humanSize(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
   return `${(bytes / 1e3).toFixed(0)} KB`;
+}
+
+function safeResidentBudgetBytes(): number {
+  return Math.max(256 * 1024 * 1024, Math.min(freeVramBytes() * 0.4, 3 * 1024 * 1024 * 1024));
 }
 
 // Scan a picked folder into Session[]. A *_master.h5 + its *_data_*.h5 siblings is one
@@ -133,7 +137,7 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
         name: p.m.name, shape: [scanRows, scanCols, detRows, detCols], cal: "un",
         size: humanSize(ntrigger * detRows * detCols), loadable: p.dataFiles.length > 0,
       };
-      GEOM.set(key(source, date, p.m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols });
+      GEOM.set(key(source, date, p.m.name), { detRows, detCols, badPx: new Uint32Array(bad), scanCols, scanCount: ntrigger });
       pushFile(source, date, mf, { master: p.m, dataFiles: p.dataFiles });
     } catch { skipped++; }   // unreadable master (corrupt/truncated/not HDF5)
   });
@@ -154,7 +158,7 @@ export async function scanFolder(files: LocalFile[]): Promise<void> {
       name: file.name, shape: [side, Math.ceil(head.nFrames / side), head.detRows, head.detCols], cal: "un",
       size: humanSize(head.nFrames * head.detSize), loadable: true,
     };
-    GEOM.set(key(source, date, file.name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side) });
+    GEOM.set(key(source, date, file.name), { detRows: head.detRows, detCols: head.detCols, badPx: new Uint32Array(0), scanCols: Math.ceil(head.nFrames / side), scanCount: head.nFrames });
     pushFile(source, date, mf, { master: null, dataFiles: [file] });
   });
   SESSIONS.sort((a, b) => `${a.source}/${a.date}`.localeCompare(`${b.source}/${b.date}`));
@@ -185,6 +189,14 @@ async function ensureLoaded(source: string, date: string, name: string): Promise
   const handles = HANDLES.get(k);
   const geom = GEOM.get(k);
   if (!handles || !geom) throw new Error(`unknown dataset ${k}`);
+  const residentBytes = geom.scanCount * geom.detRows * geom.detCols;
+  const budgetBytes = safeResidentBudgetBytes();
+  if (residentBytes > budgetBytes) {
+    throw new Error(
+      `dataset needs ${humanSize(residentBytes)} browser GPU cache, above the safe ${humanSize(budgetBytes)} limit; ` +
+      "use a smaller crop or the CUDA/MPS notebook path for full-resolution data"
+    );
+  }
   const p = (async (): Promise<LoadedDS> => {
     const PERF = ((window as unknown as { __perf: unknown[] }).__perf ||= []) as Record<string, unknown>[];
     const tA = performance.now();
@@ -490,5 +502,13 @@ export async function cbedRoi(
   return reshapeDP(dp, ds);
 }
 
-// Free VRAM proxy from the WebGPU adapter (the app has no server GPU monitor).
-export function freeVramBytes(): number { return 8 * 1024 * 1024 * 1024; }
+// Free VRAM proxy for standalone browser mode. WebGPU does not expose reliable free VRAM,
+// and macOS unified memory can stall the whole laptop if we over-pin buffers. Use a
+// conservative client-memory proxy capped at 8 GB; the 5D planner applies another safety
+// factor before pinning.
+export function freeVramBytes(): number {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const deviceMemoryGiB = Number(nav.deviceMemory || 8);
+  const conservativeGiB = Math.max(2, Math.min(8, deviceMemoryGiB * 0.5));
+  return conservativeGiB * 1024 * 1024 * 1024;
+}

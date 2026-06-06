@@ -1189,6 +1189,12 @@ function Scrubber5D({
         <span>·</span>
         <span>bin {set5D.detBin}×</span>
         <span>·</span>
+        <span>
+          {set5D.warmMode === "window"
+            ? `cached ${set5D.warmCount ?? 0}/${set5D.warmTotal ?? N}`
+            : "cached all"}
+        </span>
+        <span>·</span>
         <span>Alt+←/→</span>
       </Box>
       <Box sx={{ display: "flex", gap: 0.5, overflowX: "auto", py: 0.25 }}>

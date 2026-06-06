@@ -307,8 +307,7 @@ export function fetchMasterMetadata(
 
 /** Detector binning levels the backend supports. 1 = full resolution,
  *  higher values divide each detector dimension, cutting per-master VRAM
- *  by ``bin²``. uint16 raw → 4D shape × 2 bytes / bin² gives the on-GPU
- *  master size. */
+ *  by ``bin²``. ``dtype`` chooses the estimated browser cache precision. */
 export type DetBin = 1 | 2 | 4 | 8;
 /** Browse-block precision. "uint8" (default) halves VRAM so ~2× more masters
  *  cache; lossless when raw counts ≤ 255 (the common Arina case). "uint16"
@@ -321,27 +320,83 @@ export type BrowseDtype = "uint8" | "uint16";
 export type DetBinSetting = DetBin | "auto";
 
 /** Estimated on-GPU bytes for one master at a given binning. */
-export function masterBytesAtBin(f: MasterFile, bin: DetBin): number {
+export function masterBytesAtBin(f: MasterFile, bin: DetBin, dtype: BrowseDtype = "uint16"): number {
   const [wx, wy, kx, ky] = f.shape;
   if (!wx || !wy || !kx || !ky) return 0;
   const det_w = Math.floor(kx / bin);
   const det_h = Math.floor(ky / bin);
-  return wx * wy * det_w * det_h * 2; // uint16
+  return wx * wy * det_w * det_h * (dtype === "uint8" ? 1 : 2);
 }
 
 /** Pick the best (smallest) detector bin so the selected set fits in
  *  ``freeBytes * safety`` of GPU 0. Walks 1 → 2 → 4 → 8 and returns the
  *  first that fits. Falls through to 8 when nothing fits — caller can
  *  warn the user that the set is just too big. Empty file list → 1. */
-export function pickAutoBin(files: MasterFile[], freeBytes: number, safety = 0.6): DetBin {
+export function pickAutoBin(files: MasterFile[], freeBytes: number, safety = 0.45, dtype: BrowseDtype = "uint8"): DetBin {
   if (!files.length) return 1;
   const budget = freeBytes * safety;
   const bins: DetBin[] = [1, 2, 4, 8];
   for (const bin of bins) {
-    const total = files.reduce((acc, f) => acc + masterBytesAtBin(f, bin), 0);
+    const total = files.reduce((acc, f) => acc + masterBytesAtBin(f, bin, dtype), 0);
     if (total <= budget) return bin;
   }
   return 8;
+}
+
+export interface WarmPlan {
+  files: MasterFile[];
+  activeIdx: number;
+  budgetBytes: number;
+  estimatedBytes: number;
+  totalFiles: number;
+  mode: "all" | "window";
+}
+
+/** Current standalone WebGPU loader persists uint8 full-detector stacks. The UI may show
+ *  a requested bin for future/remote parity, but until local binned decode exists the
+ *  safety planner must budget against the actual resident format. */
+function htmlResidentBytes(f: MasterFile): number {
+  return masterBytesAtBin(f, 1, "uint8");
+}
+
+export function planWarmSet5D(
+  files: MasterFile[], activeIdx: number, freeBytes: number,
+): WarmPlan {
+  const totalFiles = files.length;
+  const clamped = Math.max(0, Math.min(totalFiles - 1, activeIdx));
+  const reportedBudget = Math.floor(Math.max(0, freeBytes) * 0.4);
+  const hardBudget = 3 * 1024 * 1024 * 1024;
+  const budgetBytes = Math.max(256 * 1024 * 1024, Math.min(reportedBudget || hardBudget, hardBudget));
+  const allBytes = files.reduce((acc, f) => acc + htmlResidentBytes(f), 0);
+  if (allBytes <= budgetBytes) {
+    return { files, activeIdx: clamped, budgetBytes, estimatedBytes: allBytes, totalFiles, mode: "all" };
+  }
+
+  const chosen = new Set<number>();
+  let estimatedBytes = 0;
+  const tryAdd = (idx: number): boolean => {
+    if (idx < 0 || idx >= totalFiles || chosen.has(idx)) return true;
+    const bytes = htmlResidentBytes(files[idx]);
+    if (estimatedBytes + bytes > budgetBytes) return false;
+    chosen.add(idx);
+    estimatedBytes += bytes;
+    return true;
+  };
+  tryAdd(clamped);
+  for (let radius = 1; radius < totalFiles; radius++) {
+    const leftOk = tryAdd(clamped - radius);
+    const rightOk = tryAdd(clamped + radius);
+    if (!leftOk && !rightOk) break;
+  }
+  const idxs = Array.from(chosen).sort((a, b) => a - b);
+  return {
+    files: idxs.map((idx) => files[idx]),
+    activeIdx: clamped,
+    budgetBytes,
+    estimatedBytes,
+    totalFiles,
+    mode: "window",
+  };
 }
 
 /** Snapshot of which masters are currently in the server's GPU LRU
@@ -404,6 +459,10 @@ export interface Set5D {
   /** Detector binning applied at GPU load time. Determines which cache
    *  entry the realspace endpoint queries via the ``det_bin`` param. */
   detBin: DetBin;
+  /** Number of masters intentionally warmed/pinned under the browser VRAM budget. */
+  warmCount?: number;
+  warmTotal?: number;
+  warmMode?: "all" | "window";
 }
 
 /** Stable identity for a Set5D (used as a React effect dependency). */
@@ -417,21 +476,18 @@ interface PreloadSetResponse {
   session?: string;
 }
 
-/** Background-load every master in the set onto GPU 0 with the chosen
- *  binning. Returns 200 immediately — the server runs the loads
- *  sequentially through a single worker queue, so a 4-file set takes
- *  ~30-60 s wall before every master is hot. The first master is usable
- *  for scrubbing within ~8-15 s; subsequent indices warm in the background.
- *  Re-calling with the same set is a no-op (each master hits the LRU). */
+/** Warm a budgeted subset of a 5D set in standalone browser mode. The active
+ *  file plus as many neighbors as fit are pinned; the rest stay cold and load
+ *  on demand when the scrubber reaches them. */
 export async function preloadSet5D(
   s: Session, files: MasterFile[], detBin: DetBin = 1, _dtype: BrowseDtype = "uint8",
+  activeIdx = 0, freeBytes = fetchGpuFreeBytes(),
 ): Promise<PreloadSetResponse> {
-  // Pin every frame of the active 5D series so the LRU never evicts them, then background-warm
-  // them (sequential decode) so the time/tilt scrub is LIVE from the start, all resident on the
-  // GPU. Fire-and-forget - the first frame is usable immediately; the rest warm behind it.
-  store.setPinned5DKeys(files.map((f) => fileKey(s, f)));
-  void store.warmSet5D(files.map((f) => ({ source: s.source, date: s.date, name: f.name })));
-  return { queued: files.length, det_bin: detBin };
+  const free = typeof freeBytes === "number" ? freeBytes : await freeBytes;
+  const plan = planWarmSet5D(files, activeIdx, free);
+  store.setPinned5DKeys(plan.files.map((f) => fileKey(s, f)));
+  void store.warmSet5D(plan.files.map((f) => ({ source: s.source, date: s.date, name: f.name })));
+  return { queued: plan.files.length, det_bin: detBin };
 }
 
 /** Fire-and-forget warm-up. Tells the backend to open the master file

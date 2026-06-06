@@ -126,8 +126,8 @@ function FolderVramChip({
 }) {
   if (files.length < 2 || !freeBytes) return null;
   const bin: DetBin = pickAutoBin(files, freeBytes);
-  const total = files.reduce((s, f) => s + masterBytesAtBin(f, bin), 0);
-  const budget = freeBytes * 0.6;
+  const total = files.reduce((s, f) => s + masterBytesAtBin(f, bin, "uint8"), 0);
+  const budget = freeBytes * 0.45;
   let color: string;
   if (bin === 1) color = colors.success.dot;
   else if (total <= budget) color = colors.warning.medium;
