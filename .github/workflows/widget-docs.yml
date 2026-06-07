@@ -32,6 +32,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/configure-pages@v5
       - run: pip install -r widget/docs/requirements.txt
       - run: jupyter-book build widget/docs
       - uses: actions/upload-pages-artifact@v3

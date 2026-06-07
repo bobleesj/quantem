@@ -108,6 +108,31 @@ jobs:
       - name: Check widget distributions
         run: python -m twine check dist/widget/*
 
+      - name: Check widget wheel contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheels = sorted(Path("dist/widget").glob("quantem_widget-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {wheels}")
+          wheel = wheels[0]
+          required = {
+              "quantem/widget/static/show2d.js",
+              "quantem/widget/static/show3d.js",
+              "quantem/widget/static/show3dslices.js",
+              "quantem/widget/static/show4dstem.js",
+              "quantem/widget/static/browser/index.html",
+          }
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"{wheel} missing required files: {missing}")
+          print(f"wheel ok: {wheel}")
+          PY
+
       - name: Publish widget to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
