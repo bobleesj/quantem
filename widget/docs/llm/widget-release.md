@@ -174,8 +174,13 @@ until the workflow succeeds and the clean TestPyPI install smoke passes.
 The `widget docs` workflow is a separate public-docs path. Treat it as:
 
 - Blocker for docs site updates.
-- Not a package release blocker if the docs build job passes but the GitHub
-  Pages deploy job fails due to Pages/environment permissions.
+- Not a package release blocker if the docs build job passes but GitHub Pages is
+  skipped or rejected due to Pages/environment permissions.
+
+Current repository rule: the `github-pages` environment rejects deployments from
+`widget-show3d-show4dstem-kernels`. The workflow therefore builds docs on the
+release branch, but only deploys Pages from `main`. To publish docs directly
+from the release branch, first change the GitHub environment protection rule.
 
 If it fails:
 
@@ -198,4 +203,3 @@ Report:
 - Clean Jupyter gate, if run.
 - Workflow status.
 - Any caveats.
-

@@ -12,8 +12,11 @@ on:
       - ".github/workflows/widget-docs.yml"
   workflow_dispatch:
 
-# Origin-only: never deploy Pages from the upstream electronmicroscopy repo even
-# if this branch ever lands there.
+# Origin-only. The release branch should still build docs on every docs change,
+# but GitHub Pages deployment is controlled by the repo's `github-pages`
+# environment protection rules. On bobleesj/quantem that environment currently
+# rejects this release branch, so deploy only from an allowed branch to avoid a
+# false red workflow when the docs build itself is healthy.
 permissions:
   contents: read
   pages: write
@@ -40,7 +43,7 @@ jobs:
           path: widget/docs/_build/html
 
   deploy:
-    if: github.repository == 'bobleesj/quantem'
+    if: github.repository == 'bobleesj/quantem' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:
