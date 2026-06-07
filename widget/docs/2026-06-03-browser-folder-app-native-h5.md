@@ -105,6 +105,12 @@ bright NPs). Zero console errors. CDP-driven via a `window.__loadServed(base, na
 
 ## Folder selection and watch semantics
 
+- A standalone HTML file cannot read sibling `.h5` files just because it lives
+  in the same folder. Browsers deliberately block that: local file access
+  requires a user-granted File System Access handle or a file-input selection.
+  The supported UX is therefore: open the HTML, click **Choose folder**, select
+  the folder containing `*_master.h5` and `*_data_*.h5`, then browse. No Python
+  or Jupyter kernel is used after that grant.
 - Native File System Access (`showDirectoryPicker`) recursively scans the chosen
   parent folder and polls it every 1 s while folder watch is enabled. New
   `_master.h5` + sidecar `_data_*.h5` files appear without reselecting the

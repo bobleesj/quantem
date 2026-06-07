@@ -2346,6 +2346,11 @@ def _load_impl(
     backend = resolve_backend(backend)
     if row_prefix and backend != "mps":
         raise ValueError("row_prefix=True is only supported with backend='mps'.")
+    if series_type is not None and series_type != "generic" and series is None:
+        raise ValueError(
+            f"series= is required for series_type={series_type!r} (Arina h5 does not store the "
+            f"{series_type} axis); pass the per-frame coordinate, e.g. series=[0, 5, 12, 30]."
+        )
     if backend != "cuda":
         # These features are intrinsically CUDA (multi-GPU sharding, GPU
         # pinning, the torch-from-dlpack 5D dataset wrap). Name the fix.
@@ -2387,11 +2392,6 @@ def _load_impl(
         # Arina h5 does NOT store the tilt/time axis, so the per-frame coordinate
         # has to come from the caller. Without it a non-'generic' series would have
         # no axis to plot against - fail early with a copy-paste fix.
-        if series_type != "generic" and series is None:
-            raise ValueError(
-                f"series= is required for series_type={series_type!r} (Arina h5 does not store the "
-                f"{series_type} axis); pass the per-frame coordinate, e.g. series=[0, 5, 12, 30]."
-            )
         return _load_as_dataset5dstem(
             filepath, dataset_path=dataset_path, apply_mask=apply_mask,
             scan_shape=scan_shape, det_bin=det_bin, verbose=verbose,
