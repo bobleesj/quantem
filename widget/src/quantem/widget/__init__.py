@@ -29,11 +29,18 @@ from quantem.widget.dataset import Dataset4dstemGPU
 def Show4DSTEM(data, **kwargs):
     """Open a 4D-STEM viewer over ``load(...)`` output, on any backend.
 
-    One mental model, single + multi, CUDA + MacBook::
+    Canonical examples::
 
         from quantem.widget import load, Show4DSTEM
-        Show4DSTEM(load("a.h5", det_bin=2))                 # one dataset
-        Show4DSTEM(load(["a.h5", "b.h5", ...], det_bin=4))  # many (dataset slider)
+
+        Show4DSTEM(load("a.h5"))                         # auto: CUDA / MPS / CPU
+        Show4DSTEM(load("a.h5", backend="mps"))          # explicit Apple Metal load
+        Show4DSTEM(load(["a.h5", "b.h5"], det_bin=4))    # many datasets, one slider
+        Show4DSTEM(load("a.h5"), backend="web")          # browser WebGPU compute
+
+        w = Show4DSTEM(load("a.h5"), backend="web", offline_codec="bslz4",
+                       data_url="show4dstem-data")
+        w.export_html("show4dstem.html")
 
     Dispatch is automatic from what ``load`` returns:
       - MacBook (MPS) single -> the raw-Metal real-time viewer (full-res CBED +
@@ -43,6 +50,11 @@ def Show4DSTEM(data, **kwargs):
         background behind the dataset slider.
       - CUDA / CPU single or many -> the universal torch viewer (a 5D array gives
         an instant dataset slider on big-VRAM boxes).
+
+    Web aliases ``backend="browser"``, ``backend="webgpu"``, and
+    ``offline=True`` are accepted for compatibility. Large backendless exports
+    should use ``offline_codec="bslz4"`` plus a ``data_url`` companion directory
+    instead of embedding the full stack in the HTML.
     """
     # Dataset4dstemGPU -> open the raw viewer on its underlying tensor / Metal chunks.
     if getattr(data, "_qw_dataset", False):

@@ -35,4 +35,4 @@ load
 | [Show2D](show2d) | `quantem.widget.show2d.Show2D` | state JSON, PNG |
 | [Show3D](show3d) | `quantem.widget.show3d.Show3D` | state JSON, PNG, interactive HTML (exact / quantized) |
 | [Show3DSlices](show3dslices) | `quantem.widget.show3dslices.Show3DSlices` | state JSON, PNG, interactive HTML (exact / quantized) |
-| [Show4DSTEM](show4dstem) | `quantem.widget.show4dstem.Show4DSTEM` | state JSON, PNG |
+| [Show4DSTEM](show4dstem) | `quantem.widget.Show4DSTEM` dispatcher | state JSON, PNG, interactive WebGPU HTML; large exports use a companion data directory |

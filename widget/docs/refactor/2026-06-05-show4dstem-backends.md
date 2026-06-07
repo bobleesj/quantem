@@ -6,8 +6,7 @@ Architecture ledger for the phased refactor that landed on
 ## Canonical operator API (after this refactor)
 
 ```python
-from quantem.widget import Show4DSTEM
-from quantem.live import load
+from quantem.widget import load, Show4DSTEM
 
 # Auto-pick Python compute (CUDA / MPS / CPU based on data type).
 w = Show4DSTEM(load(path))
@@ -17,7 +16,9 @@ w = Show4DSTEM(load(path))
 w = Show4DSTEM(load(path), backend='web')
 
 # Standalone HTML — no kernel needed after export.
-Show4DSTEM(load(path)).export_html('/tmp/share.html')
+w = Show4DSTEM(load(path), backend='web', offline_codec='bslz4',
+               data_url='show4dstem-data')
+w.export_html('show4dstem.html')
 ```
 
 Three lines, four backend options. `backend=` is the only widget-level

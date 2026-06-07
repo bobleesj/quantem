@@ -48,7 +48,9 @@ levels anyway so it looks identical). The canvas below each example stays fully
 interactive in this static page with no running kernel: scrub, zoom, change
 contrast, toggle the FFT - all in the browser. Show4DSTEM goes further: for a
 small dataset its virtual-detector math runs in **WebGPU**, so dragging the
-aperture recomputes the virtual image in the browser, bit-exact to the kernel.
+aperture recomputes the virtual image in the browser. The browser stack is
+uint8-clipped for transport, so it is exact for detector counts `<=255`; use the
+CUDA/MPS kernel path when full uint16 count fidelity matters.
 
 See [Installation](install) to get started.
 

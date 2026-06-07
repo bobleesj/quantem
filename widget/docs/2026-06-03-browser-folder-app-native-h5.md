@@ -46,13 +46,13 @@ bright-field disk; dragging the detector gives live virtual-image contrast.
 
 - Laptop budget: 9.66 GB needs a workstation GPU. Auto-bin (detector and/or scan) on load
   to fit a laptop's VRAM is not implemented - currently full-res only.
-- Single shareable HTML: app is esbuild-bundled multi-file under `/tmp/h5app/`; needs a
-  Vite single-file build with jsfive deep-import aliases baked in.
+- Single shareable HTML: now built by the Vite `web/` app with
+  `npm run build:offline`.
 - Full Show4DSTEM viewer (BF/ABF/ADF presets, ROI modes, FFT, per-probe DP scrub): the
   app's viewer is currently minimal (mean DP + draggable detector + virtual image).
-- Real File System Access picker drive on a Mac (the served-folder `__loadServed` hook is
-  what was driven here; the `showDirectoryPicker`/webkitdirectory path is wired but
-  needs a gesture/Mac drive).
+- Real File System Access picker drive on a Mac or Linux desktop requires a user
+  gesture. It has now been driven with native mouse events against visible
+  Chrome/GNOME on mjgoat.
 
 ## Update: GUI is now the quantem.live Browse page (not a hand-rolled viewer)
 
@@ -94,13 +94,45 @@ bright NPs). Zero console errors. CDP-driven via a `window.__loadServed(base, na
   on gold04 512^2; iCoM shows the expected smooth DPC phase.
 - Scan-crosshair -> CBED confirmed (clicking the real-space canvas updates the DP via
   `frameAt`).
-- Single-file deliverable: `web/` Vite build inlined into one 681 KB HTML
-  (`/tmp/quantem_4dstem_app.html`). Drop it in a folder next to the Arina `.h5` files,
-  double-click (file://), click "Choose folder", pick that folder -> Browse loads.
-  Verified on file://: secure context, WebGPU adapter OK, showDirectoryPicker present
-  (webkitdirectory input fallback if blocked). NOTE: file:// CANNOT fetch sibling files
-  (CORS), so the folder-pick click is mandatory - it's the only way to hand the bytes to
-  the engine; the data path itself is the http-proven, bit-exact one.
+- Single-file deliverable: `cd web && npm run build:offline` writes a runnable
+  `dist/index.html`. The build may also emit a worker asset because the normal
+  served app uses worker reads, but offline mode compiles the app to use
+  main-thread file reads, so `index.html` is the artifact to share. Drop it in a
+  folder, double-click (file://), click "Choose folder", pick the Arina folder,
+  and Browse loads. NOTE: file:// CANNOT fetch sibling files (CORS), so the
+  folder-pick click is mandatory - it is the browser security boundary that
+  grants access to local bytes.
+
+## Folder selection and watch semantics
+
+- Native File System Access (`showDirectoryPicker`) recursively scans the chosen
+  parent folder and polls it every 1 s while folder watch is enabled. New
+  `_master.h5` + sidecar `_data_*.h5` files appear without reselecting the
+  folder. Refreshes are serialized so a slow scan cannot overlap the next tick.
+- `webkitdirectory` fallback is snapshot-based. It cannot live-watch a folder,
+  but reselecting the same folder replaces that root instead of creating
+  `folder-2`, so newly copied files appear after reselect.
+- A `_master.h5` is required. Orphan `_data_*.h5` files are ignored until the
+  master appears. A master with missing sidecars is listed as not loadable, and
+  corrupt/incomplete masters are skipped until a later scan sees a valid file.
+- The scan phase reads only masters for metadata/readiness. Sidecar data bytes
+  are read only when the user opens a dataset.
+
+## VRAM and detector binning
+
+- Single-master WebGPU Browse now uses the same VRAM-aware auto-bin planner as
+  5D/multi-dataset Browse. A full 512x512x192x192 master is not assumed to fit
+  no-bin in browser VRAM; the app picks the smallest detector bin that fits the
+  conservative browser-GPU budget for the current `uint8`/`uint16` setting.
+- On the mjgoat visual smoke, the full Samsung 512x512x192x192 master chose
+  `det_bin=2`, decoded in 4.37 s, reduced BF in 18 ms, rendered nonblank BF/DP,
+  and measured ~61 fps via `requestAnimationFrame`.
+- Native picker release-gate retest on mjgoat (visible Chrome/GNOME, real mouse
+  events) selected `/home/owner/AAAA_QWIDGET_NATIVE`, accepted Chrome's folder
+  permission prompt, scanned two full Samsung masters, showed `watching`,
+  `2 files · 1 sessions`, Stack viewer `1/2`, and rendered nonblank BF/CBED.
+  The warmed `det_bin=2,uint8` decode path completed in 1.77 s with BF reduce
+  in 20 ms.
 
 ## Rejected / notes
 
@@ -108,6 +140,5 @@ bright NPs). Zero console errors. CDP-driven via a `window.__loadServed(base, na
   decode hits an assert). Not needed: the app globs `*_data_*.h5` by filename and reads
   scan size (`ntrigger`) + hot pixels (`pixel_mask`) from the master directly. pixel_mask
   nonzero count (4) matched the per-file saturation heuristic exactly.
-- bundled `jsfive` dist exports only File/Dataset/Filters/Group - `BTreeV1RawDataChunks`
-  lives only in the loose `esm/` files, so the build aliases
-  `jsfive/esm/{high-level,btree}.js` to the loose sources.
+- Current code imports the public `jsfive` module directly; the stale deep-import
+  Vite aliases were removed.

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
@@ -52,6 +52,7 @@ const LEFT_RAIL_DEFAULT_PX = 260;
 const LEFT_RAIL_MIN_PX = 220;
 const LEFT_RAIL_MAX_PX = 560;
 const BROWSE_STACK_FPS_OPTIONS = [1, 2, 5, 10, 15];
+const FOLDER_WATCH_INTERVAL_MS = 1000;
 const BROWSE_SHORTCUTS: Shortcut[] = [
   { key: "drag", label: "Move scan crosshair", group: "Browse viewer", handler: () => {} },
   { key: "↑/↓/←/→", label: "Step scan or detector position", group: "Browse viewer", handler: () => {} },
@@ -309,6 +310,9 @@ export default function Browse() {
   const [folderWatchEnabled, setFolderWatchEnabled] = useState(false);
   const [folderCanRefresh, setFolderCanRefresh] = useState(false);
   const [folderWatchBusy, setFolderWatchBusy] = useState(false);
+  const folderWatchInFlightRef = useRef(false);
+  const activeSessionRef = useRef<Session | null>(null);
+  useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
 
   // Cold-load sessions once.
   useEffect(() => {
@@ -338,10 +342,17 @@ export default function Browse() {
       const n = lastScanSkipped();
       if (n > 0) { setScanNotice(`Skipped ${n} unreadable file${n > 1 ? "s" : ""} (corrupt / not 4D-STEM).`); window.setTimeout(() => setScanNotice(""), 7000); }
       setActiveFile((cur) => {
-        if (cur) return cur;
+        if (cur) {
+          const curSession = activeSessionRef.current;
+          const curKey = curSession ? fileKey(curSession, cur) : cur.name;
+          const sel = rows.flatMap((session) => session.files.map((file) => ({ session, file })))
+            .find(({ session, file }) => fileKey(session, file) === curKey || file.name === curKey);
+          if (sel) { setActiveSession(sel.session); return sel.file; }
+        }
         const sel = defaultSelection(rows);
         if (sel) { setActiveSession(sel.session); return sel.file; }
-        return cur;
+        setActiveSession(null);
+        return null;
       });
     });
     window.addEventListener("quantem-folder-loaded", onLoaded);
@@ -391,6 +402,7 @@ export default function Browse() {
   // tabs evict masters, without yet another HTTP poll.
   const [gpuFreeBytes, setGpuFreeBytes] = useState(0);
   useEffect(() => {
+    void fetchGpuFreeBytes().then(setGpuFreeBytes).catch(() => {});
     const es = new EventSource(`/api/gpu/stream`);
     es.onmessage = (ev) => {
       try {
@@ -410,6 +422,10 @@ export default function Browse() {
     };
     return () => { es.close(); };
   }, []);
+
+  const singleDetBin = useMemo<DetBin>(() => (
+    activeFile ? pickAutoBin([activeFile], gpuFreeBytes || 4 * 1024 * 1024 * 1024, 0.45, browseDtype) : 1
+  ), [activeFile, gpuFreeBytes, browseDtype]);
 
   // Multi-select toggle handler. Cmd-click toggles inclusion; shift-click
   // extends a contiguous range from the last toggle anchor to the current
@@ -718,19 +734,21 @@ export default function Browse() {
   }, [folderScanBusy]);
 
   const refreshFolder = useCallback(async () => {
-    if (!canRefreshWatchedFolders() || folderWatchBusy) return;
+    if (!canRefreshWatchedFolders() || folderWatchInFlightRef.current) return;
+    folderWatchInFlightRef.current = true;
     setFolderWatchBusy(true);
     try {
       await refreshWatchedFolders();
       setFolderCanRefresh(canRefreshWatchedFolders());
     } finally {
+      folderWatchInFlightRef.current = false;
       setFolderWatchBusy(false);
     }
-  }, [folderWatchBusy]);
+  }, []);
 
   useEffect(() => {
     if (!folderWatchEnabled || !folderCanRefresh) return;
-    const id = window.setInterval(() => { void refreshFolder(); }, 5000);
+    const id = window.setInterval(() => { void refreshFolder(); }, FOLDER_WATCH_INTERVAL_MS);
     return () => window.clearInterval(id);
   }, [folderWatchEnabled, folderCanRefresh, refreshFolder]);
 
@@ -928,6 +946,7 @@ export default function Browse() {
               session={activeSession}
               file={activeFile}
               browseDtype={browseDtype}
+              singleDetBin={singleDetBin}
               mode={mode}
               setMode={setMode}
               cmapImage={cmapImage}

@@ -9,14 +9,21 @@ interface ReadRequest { id: number; name: string; file?: File; handle?: FileSyst
 
 self.onmessage = async (e: MessageEvent<ReadRequest>) => {
   const { id, name, file, handle } = e.data;
-  const f = file ?? (handle ? await handle.getFile() : null);
-  if (!f) { (self as unknown as Worker).postMessage({ id, error: "no file source" }); return; }
-  const buffer = await f.arrayBuffer();                 // the parallel-read win happens here
-  const vol = readH5Volume(buffer, name);
-  const spec = vol.chunks[0];
-  (self as unknown as Worker).postMessage(
-    { id, name, nFrames: spec.nFrames, nBlocksPerFrame: spec.nBlocksPerFrame, blockElems: spec.blockElems,
-      detSize: spec.detSize, srcDtype: vol.srcDtype, blockMeta: spec.blockMeta, buffer },
-    [buffer, spec.blockMeta.buffer],
-  );
+  try {
+    const f = file ?? (handle ? await handle.getFile() : null);
+    if (!f) { (self as unknown as Worker).postMessage({ id, error: "no file source" }); return; }
+    const buffer = await f.arrayBuffer();                 // the parallel-read win happens here
+    const vol = readH5Volume(buffer, name);
+    const spec = vol.chunks[0];
+    (self as unknown as Worker).postMessage(
+      { id, name, nFrames: spec.nFrames, nBlocksPerFrame: spec.nBlocksPerFrame, blockElems: spec.blockElems,
+        detSize: spec.detSize, srcDtype: vol.srcDtype, blockMeta: spec.blockMeta, buffer },
+      [buffer, spec.blockMeta.buffer],
+    );
+  } catch (e) {
+    (self as unknown as Worker).postMessage({
+      id,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
 };

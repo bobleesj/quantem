@@ -9,7 +9,7 @@
 // engine eats here are the same bytes CUDA eats. Parity is by composition: jsfive chunk
 // == h5py chunk, and engine decode == CUDA decode.
 
-import * as jsfive from "jsfive/esm/high-level.js";
+import * as jsfive from "jsfive";
 import type { Bslz4Spec } from "./bslz4";
 
 export interface H5Volume {

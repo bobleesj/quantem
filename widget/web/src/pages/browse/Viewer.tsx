@@ -99,6 +99,7 @@ interface Props {
   session: Session;
   file: MasterFile;
   browseDtype?: BrowseDtype;
+  singleDetBin?: DetBin;
   mode: DetectorMode;
   setMode: (m: DetectorMode) => void;
   cmapImage: ColormapName;
@@ -1226,7 +1227,7 @@ function Scrubber5D({
 
 export default function Viewer(props: Props) {
   const {
-    session, file, browseDtype = "uint8",
+    session, file, browseDtype = "uint8", singleDetBin,
     mode, setMode, cmapImage, setCmapImage, cmapDp, setCmapDp,
     scanPos, setScanPos,
     ringInner, setRingInner, ringOuter, setRingOuter,
@@ -1262,7 +1263,7 @@ export default function Viewer(props: Props) {
   // right LRU entry. 5D mode uses the chosen stack bin; single-master mode is
   // no-bin on CUDA, bin2 on MacBook (MPS) for fast browse. At no-bin on MPS the
   // server's bin2 sidecar keeps masked-sum real-time anyway.
-  const detBin: DetBin = set5D?.detBin ?? (browseBackend === "mps" ? 2 : 1);
+  const detBin: DetBin = set5D?.detBin ?? singleDetBin ?? (browseBackend === "mps" ? 2 : 1);
 
   const realRef = useRef<HTMLCanvasElement>(null);
   const dpRef = useRef<HTMLCanvasElement>(null);

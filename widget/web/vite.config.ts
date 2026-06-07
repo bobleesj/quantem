@@ -19,14 +19,7 @@ const offline = process.env.OFFLINE_HTML === "1";
 
 export default defineConfig({
   plugins: [react(), ...(offline ? [viteSingleFile()] : [])],
-  resolve: {
-    alias: {
-      // jsfive's bundled dist drops BTreeV1RawDataChunks; the engine needs the
-      // loose esm sources, so point the bare deep-imports at them.
-      "jsfive/esm/high-level.js": resolve(widgetRoot, "node_modules/jsfive/esm/high-level.js"),
-      "jsfive/esm/btree.js": resolve(widgetRoot, "node_modules/jsfive/esm/btree.js"),
-    },
-  },
+  define: { __QWIDGET_OFFLINE_HTML__: JSON.stringify(offline) },
   server: {
     // allow importing the engine symlink target (widget/js/engine) + jsfive from
     // the parent node_modules, both outside the web/ root.

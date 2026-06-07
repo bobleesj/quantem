@@ -89,6 +89,7 @@ function pickViaInput(): Promise<LocalFile[]> {
 export async function pickFolderAndScan(): Promise<number> {
   let files: LocalFile[] = [];
   let inputFallback = false;
+  let inputFallbackRoot: string | null = null;
   let pickedRoot: string | null = null;
   let dirHandle: FileSystemDirectoryHandle | null = null;
   if ("showDirectoryPicker" in window) {
@@ -98,15 +99,21 @@ export async function pickFolderAndScan(): Promise<number> {
       dirHandle = dir;
       pickedRoot = uniqueRootName(dir.name);
       files = filesUnderRoot(await filesFromDirHandle(dir), dir.name, false, pickedRoot);
-    } catch { inputFallback = true; files = await pickViaInput(); }   // unsupported (file://) / cancelled -> input fallback
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return 0;
+      inputFallback = true; files = await pickViaInput();
+    }   // unsupported (file://) -> input fallback
   } else {
     inputFallback = true;
     files = await pickViaInput();
   }
-  if (inputFallback && files.length && files[0].relPath.includes("/")) files = filesUnderRoot(files, files[0].relPath.split("/")[0], true);
+  if (inputFallback && files.length && files[0].relPath.includes("/")) {
+    inputFallbackRoot = files[0].relPath.split("/")[0];
+    files = filesUnderRoot(files, inputFallbackRoot, true, inputFallbackRoot);
+  }
   if (!files.length) return 0;
   if (dirHandle && pickedRoot) watchedDirs.set(pickedRoot, dirHandle);
-  const allFiles = mergePickedFiles(files);
+  const allFiles = inputFallbackRoot ? replaceRoot(inputFallbackRoot, files) : mergePickedFiles(files);
   await scanFolder(allFiles);
   window.dispatchEvent(new Event("quantem-folder-loaded"));
   return allFiles.length;

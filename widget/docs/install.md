@@ -24,5 +24,5 @@ finds at runtime.
 ```python
 import quantem.widget as qw
 print(qw.__version__)
-print(qw.__all__)   # ['Show2D', 'Show3D', 'Show3DSlices', 'Show4DSTEM', 'load']
+print(qw.__all__)   # public widgets, load(), DPC helpers, detector helpers
 ```

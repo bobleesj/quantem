@@ -785,11 +785,15 @@ def Show4DSTEM_MACBOOK(
     if sampling is None and (scan_sampling_A is not None or det_sampling_mrad_per_px is not None):
         sampling = (
             float(scan_sampling_A) if scan_sampling_A is not None else 1.0,
+            float(scan_sampling_A) if scan_sampling_A is not None else 1.0,
+            float(det_sampling_mrad_per_px) if det_sampling_mrad_per_px is not None else 1.0,
             float(det_sampling_mrad_per_px) if det_sampling_mrad_per_px is not None else 1.0,
         )
     if units is None and sampling is not None:
         units = (
             "Å" if scan_sampling_A is not None else "pixels",
+            "Å" if scan_sampling_A is not None else "pixels",
+            "mrad" if det_sampling_mrad_per_px is not None else "pixels",
             "mrad" if det_sampling_mrad_per_px is not None else "pixels",
         )
     verbose = bool(kwargs.get("verbose", True))
@@ -802,6 +806,9 @@ def Show4DSTEM_MACBOOK(
             viewer.k_pixel_size = float(det_sampling_mrad_per_px)
             viewer.k_pixel_unit = "mrad"
             inferred_det_sampling = True
+    elif det_sampling_mrad_per_px is not None:
+        viewer.k_pixel_size = float(det_sampling_mrad_per_px)
+        viewer.k_pixel_unit = "mrad"
     if scan_sampling_A is not None:
         viewer.pixel_size = float(scan_sampling_A)
         viewer.pixel_unit = "Å"

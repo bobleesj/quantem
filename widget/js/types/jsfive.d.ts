@@ -1,4 +1,4 @@
-declare module "jsfive/esm/high-level.js" {
+declare module "jsfive" {
   export class File {
     constructor(buffer: ArrayBuffer | Uint8Array | DataView | unknown, filename?: string);
     get(path: string): unknown;

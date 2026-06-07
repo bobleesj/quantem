@@ -1,15 +1,39 @@
 # Show4DSTEM
 
-A 4D-STEM viewer with live virtual detectors: a movable aperture over the
-diffraction stack and the resulting virtual image. See the
-[Show4DSTEM tutorial](../tutorials/show4dstem).
+Public import:
 
-```{note}
-`quantem.widget.Show4DSTEM` is a thin dispatcher that picks the right backend
-viewer from what you pass (raw array / tensor / `Dataset4dstem` / `load(...)`
-output) and the device (CUDA, Apple Metal, CPU). The constructor parameters
-below are the universal Torch viewer documented as the base class.
+```python
+from quantem.widget import load, Show4DSTEM
 ```
+
+`Show4DSTEM` is a dispatcher/factory with one operator-facing API. It picks the
+viewer from what `load(...)` returns and from the requested widget backend:
+CUDA/Torch on Linux, raw Metal on Apple Silicon MPS loads, CPU fallback, or
+browser WebGPU.
+
+Canonical forms:
+
+```python
+# Auto-pick CUDA / MPS / CPU from the loaded data.
+w = Show4DSTEM(load(path))
+
+# Apple Silicon raw-Metal path, with sampling read from metadata when present.
+w = Show4DSTEM(load(path, backend="mps", det_bin=4))
+
+# Multi-dataset stack: one viewer, one Dataset slider.
+w = Show4DSTEM(load([path1, path2, path3], det_bin=4))
+
+# Live-kernel WebGPU: the browser owns virtual-detector compute.
+w = Show4DSTEM(load(path), backend="web")
+
+# Standalone backendless export for large data: HTML + companion data folder.
+w = Show4DSTEM(load(path), backend="web", offline_codec="bslz4",
+               data_url="show4dstem-data")
+w.export_html("show4dstem.html")
+```
+
+`backend="browser"`, `backend="webgpu"`, and `offline=True` are compatibility
+aliases for `backend="web"`.
 
 ## Reference
 
@@ -17,12 +41,18 @@ below are the universal Torch viewer documented as the base class.
 render_plugin = "myst"
 ```
 
+```{note}
+The generated reference above is the universal base viewer. The public
+`quantem.widget.Show4DSTEM` factory accepts the same viewer options plus dispatch
+options such as `backend="web"`, `offline_codec`, `data_url`, and
+`export_html(...)`.
+```
+
 ## Interactive controls
 
-With a running kernel these recompute on the GPU backend (CUDA / MPS / CPU). For
-a small dataset passed `offline=True`, the same controls run entirely in the
-browser via WebGPU (bit-exact, sub-millisecond) with no kernel - see
-[Performance](../perf/index).
+With a running kernel these recompute on the GPU backend (CUDA / MPS / CPU). In
+`backend="web"` mode, the same controls run in the browser via WebGPU with no
+Python round trip - see [Performance](../perf/index).
 
 | Control | Trait | Expected effect |
 |---|---|---|

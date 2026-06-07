@@ -21,7 +21,10 @@ export interface LocalFile {
   lastModified?: number;
 }
 
+declare const __QWIDGET_OFFLINE_HTML__: boolean;
+
 interface ParsedSpec { id: number; nFrames: number; nBlocksPerFrame: number; blockElems: number; detSize: number; srcDtype: "uint8" | "uint16" | "uint32"; blockMeta: Uint32Array; buffer: ArrayBuffer; }
+type ParsedWorkerMessage = ParsedSpec & { error?: string };
 let READERS: Worker[] | null = null;
 function readerPool(): Worker[] {
   if (!READERS) {
@@ -30,15 +33,49 @@ function readerPool(): Worker[] {
   }
   return READERS;
 }
+async function parseSlabOnMain(slab: LocalFile, id: number): Promise<ParsedSpec> {
+  const buf = await slab.bytes();
+  const vol = readH5Volume(buf, slab.name);
+  const c = vol.chunks[0];
+  return {
+    id,
+    nFrames: c.nFrames,
+    nBlocksPerFrame: c.nBlocksPerFrame,
+    blockElems: c.blockElems,
+    detSize: c.detSize,
+    srcDtype: vol.srcDtype,
+    blockMeta: c.blockMeta,
+    buffer: buf,
+  };
+}
+
 // Read + parse every slab across the worker pool (parallel disk reads ~10 GB/s vs ~2.3 GB/s
 // on the main thread). Calls onReady(id, spec) as each file completes, in arrival order.
-function readParseInWorkers(slabs: LocalFile[], onReady: (s: ParsedSpec) => void): void {
+function readParseInWorkers(slabs: LocalFile[], onReady: (s: ParsedSpec) => void, onError: (id: number, e: Error) => void): void {
   const pool = readerPool();
   let next = 0;
   const pump = (w: Worker) => {
     if (next >= slabs.length) return;
     const id = next++;
-    w.onmessage = (e: MessageEvent<ParsedSpec>) => { onReady(e.data); pump(w); };
+    let activeId: number | null = id;
+    w.onmessage = (e: MessageEvent<ParsedWorkerMessage>) => {
+      activeId = null;
+      if (e.data.error) {
+        onError(id, new Error(e.data.error));
+      } else {
+        onReady(e.data);
+      }
+      pump(w);
+    };
+    w.onerror = (e: ErrorEvent) => {
+      const failedId = activeId;
+      activeId = null;
+      if (failedId != null) {
+        onError(failedId, new Error(e.message || "worker read failed"));
+      }
+      e.preventDefault();
+      pump(w);
+    };
     const src = slabs[id].source!;
     w.postMessage({ id, name: slabs[id].name, file: src instanceof File ? src : undefined, handle: src instanceof File ? undefined : src });
   };
@@ -219,7 +256,7 @@ async function binDecodedBufferU8(
 // dataset; the master gives scan size (ntrigger) + hot pixels (pixel_mask). A bare .h5 is
 // a standalone single-slab volume. Called once before the Browse GUI mounts.
 export async function scanFolder(files: LocalFile[]): Promise<void> {
-  const jsfive = await import("jsfive/esm/high-level.js") as { File: new (ab: ArrayBuffer, name: string) => unknown };
+  const jsfive = await import("jsfive") as { File: new (ab: ArrayBuffer, name: string) => unknown };
   SESSIONS = []; HANDLES.clear(); GEOM.clear();
   const seenDatasetKeys = new Set<string>();
   const byKey = new Map<string, Session>();
@@ -387,17 +424,30 @@ async function ensureLoaded(source: string, date: string, name: string, detBin: 
     let srcDtype: "uint8" | "uint16" | "uint32" = "uint16";   // detected from the data
     // Picker path -> parallel worker reads. But file:// (the double-click single-HTML artifact)
     // blocks `new Worker()` (origin "null"), so fall back to the main-thread read there.
-    const useWorkers = slabs.every((s) => s.source) && location.protocol !== "file:";
+    const offlineHtmlBuild = typeof __QWIDGET_OFFLINE_HTML__ !== "undefined" && __QWIDGET_OFFLINE_HTML__;
+    const useWorkers = slabs.every((s) => s.source) && location.protocol !== "file:" && !offlineHtmlBuild;
     // Read + parse all slabs (in workers when we have File/handle sources, else on the main
     // thread). Collect parsed specs keyed by file index so we can decode in scan order.
     const parsed: (ParsedSpec | null)[] = new Array(slabs.length).fill(null);
-    const ready: (() => void)[] = []; const readyP = slabs.map((_, i) => new Promise<void>((r) => (ready[i] = r)));
+    const ready: (() => void)[] = [];
+    const rejectReady: ((e: Error) => void)[] = [];
+    const readyP = slabs.map((_, i) => new Promise<void>((resolve, reject) => {
+      ready[i] = resolve;
+      rejectReady[i] = reject;
+    }));
     if (useWorkers) {
-      readParseInWorkers(slabs, (ps) => { parsed[ps.id] = ps; ready[ps.id](); });
+      readParseInWorkers(
+        slabs,
+        (ps) => { parsed[ps.id] = ps; ready[ps.id](); },
+        (id, e) => { rejectReady[id](e); },
+      );
     } else {
       (async () => { for (let i = 0; i < slabs.length; i++) {
-        const buf = await slabs[i].bytes(); const vol = readH5Volume(buf, slabs[i].name);
-        const c = vol.chunks[0]; parsed[i] = { id: i, nFrames: c.nFrames, nBlocksPerFrame: c.nBlocksPerFrame, blockElems: c.blockElems, detSize: c.detSize, srcDtype: vol.srcDtype, blockMeta: c.blockMeta, buffer: buf }; ready[i]();
+        try {
+          parsed[i] = await parseSlabOnMain(slabs[i], i); ready[i]();
+        } catch (e) {
+          rejectReady[i](e instanceof Error ? e : new Error(String(e)));
+        }
       } })();
     }
     // Decode groups in scan order as their files become available; the worker reads (fast)

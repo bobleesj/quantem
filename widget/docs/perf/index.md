@@ -12,13 +12,14 @@ How to stay fast on large datasets, written for the two platforms we serve:
   This is the one widget where the GPU backend matters - with one exception
   below: a small dataset can compute entirely in the browser via WebGPU.
 
-## Small 4D-STEM in the browser (`offline=True`)
+## 4D-STEM in the browser (`backend="web"` / `offline=True`)
 
-For a small dataset (the uint16 stack under ~300 MB, e.g. 128x128 scan x 96x96
-detector), pass `offline=True`. The whole stack ships to the browser once and the
-virtual-detector reductions run in **WebGPU** - no Python kernel in the loop. The
-detector counts are integers, so the browser accumulates the masked sum in u32:
-the virtual image is **bit-exact** to the kernel, not a quantized approximation.
+For a small dataset, pass `backend="web"` (or the compatibility alias
+`offline=True`). The stack ships to the browser once and the virtual-detector
+reductions run in **WebGPU** - no Python kernel in the loop. Browser transport is
+uint8-clipped for the detector stack, so it is exact for detector counts
+`<=255`; hot/dead pixels are carried separately. Use the CUDA/MPS kernel path
+when full uint16 count fidelity is required.
 
 This is what makes the Show4DSTEM example in these docs interactive, and it powers
 kernel-less shared HTML and Colab demos. Measured ~0.7 ms per virtual-image
