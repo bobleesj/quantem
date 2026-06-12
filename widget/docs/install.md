@@ -1,11 +1,16 @@
 # Installation
 
+`quantem.widget` is currently published on **TestPyPI** (pre-release). Install it from
+there, with PyPI as the extra index so its dependencies (numpy, torch, ...) resolve
+normally:
+
 ```bash
-pip install quantem.widget
+pip install -i https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ \
+    quantem.widget
 ```
 
-That single line works on every backend; the widget picks the fastest path it
-finds at runtime.
+That works on every backend; the widget picks the fastest path it finds at runtime.
 
 ## Backends
 
