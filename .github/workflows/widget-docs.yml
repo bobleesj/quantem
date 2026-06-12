@@ -12,11 +12,10 @@ on:
       - ".github/workflows/widget-docs.yml"
   workflow_dispatch:
 
-# Origin-only. The release branch should still build docs on every docs change,
-# but GitHub Pages deployment is controlled by the repo's `github-pages`
-# environment protection rules. On bobleesj/quantem that environment currently
-# rejects this release branch, so deploy only from an allowed branch to avoid a
-# false red workflow when the docs build itself is healthy.
+# Origin-only. Builds + DEPLOYS the docs to GitHub Pages from this widget branch
+# (it holds the live docs). The `github-pages` environment allowlist on
+# bobleesj/quantem includes this branch, so the deploy is accepted; `main` is kept
+# for when the work merges. Published at https://bobleesj.github.io/quantem/.
 permissions:
   contents: read
   pages: write
@@ -43,7 +42,9 @@ jobs:
           path: widget/docs/_build/html
 
   deploy:
-    if: github.repository == 'bobleesj/quantem' && github.ref == 'refs/heads/main'
+    # Publish from the active widget branch (its docs are the live ones); main kept for when it merges.
+    # The github-pages environment allowlist includes this branch, so the deploy is accepted.
+    if: github.repository == 'bobleesj/quantem' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/widget-show3d-show4dstem-kernels')
     needs: build
     runs-on: ubuntu-latest
     environment:
