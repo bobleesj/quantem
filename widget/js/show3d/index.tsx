@@ -30,7 +30,7 @@ import FastRewindIcon from "@mui/icons-material/FastRewind";
 import FastForwardIcon from "@mui/icons-material/FastForward";
 import StopIcon from "@mui/icons-material/Stop";
 import { useTheme } from "../theme";
-import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, roundToNiceValue, unitSymbol } from "../figure";
+import { drawScaleBarHiDPI, drawFFTScaleBarHiDPI, drawColorbar, roundToNiceValue, unitSymbol, formatScaleLabel } from "../figure";
 import { downloadBlob, extractBytes, extractFloat32, formatNumber } from "../format";
 import { findDataRange, applyLogScale, applyLogScaleInPlace, percentileClip, sliderRange, computeStats, computeHistogramFromBytes } from "../stats";
 // ============================================================================
@@ -5039,7 +5039,7 @@ function Show3D() {
         ctx.shadowOffsetY = 1;
         ctx.fillStyle = "white";
         ctx.fillRect(barX, barY, barPx, barThickness);
-        const label = nicePhysical >= 1 ? `${Math.round(nicePhysical)} ${unit}` : `${nicePhysical.toFixed(2)} ${unit}`;
+        const label = formatScaleLabel(nicePhysical, unit);
         ctx.textAlign = "center";
         ctx.textBaseline = "bottom";
         ctx.fillText(label, barX + barPx / 2, barY - 4);
