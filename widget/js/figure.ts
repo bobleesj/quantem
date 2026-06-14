@@ -36,11 +36,35 @@ export function unitSymbol(unit: string): string {
   return u;
 }
 
-/** Format scale bar label. Unit rendered as its scientific symbol via unitSymbol. */
+// Length-unit ladder for the scale bar, each as its size in nm. Lets a sub-1 value
+// in one unit (e.g. 0.5 nm) display as a clean integer in a smaller unit (500 pm /
+// 5 A) instead of a decimal - microscopists read "5 A", not "0.50 nm".
+const LENGTH_UNITS_NM: { sym: string; nm: number }[] = [
+  { sym: "mm", nm: 1e6 }, { sym: "µm", nm: 1e3 }, { sym: "nm", nm: 1 }, { sym: "Å", nm: 0.1 }, { sym: "pm", nm: 1e-3 },
+];
+// Base unit (the trait's unit) -> nm. Only length units rescale; anything else
+// (mrad, ps, px, ...) keeps its own unit and the old decimal fallback.
+const BASE_UNIT_NM: Record<string, number> = {
+  mm: 1e6, "µm": 1e3, "μm": 1e3, micron: 1e3, microns: 1e3, um: 1e3,
+  nm: 1, nanometer: 1, nanometers: 1, "å": 0.1, angstrom: 0.1, angstroms: 0.1, ang: 0.1, a: 0.1, pm: 1e-3, picometer: 1e-3, picometers: 1e-3,
+};
+
+/** Format scale bar label. Length values auto-pick the unit that reads as a clean
+ *  integer (no decimals) - 0.5 nm -> "5 Å", 0.005 nm -> "5 pm". Non-length units
+ *  (mrad, ps, px) keep their unit. roundToNiceValue gives n×10^k, and every ladder
+ *  step is a power of 10, so the rescaled number is always exact. */
 export function formatScaleLabel(value: number, unit: string): string {
   const nice = roundToNiceValue(value);
-  const sym = unitSymbol(unit);
-  return nice >= 1 ? `${Math.round(nice)} ${sym}` : `${nice.toFixed(2)} ${sym}`;
+  const baseNm = BASE_UNIT_NM[(unit || "").trim().toLowerCase()];
+  if (baseNm === undefined) {
+    // not a length unit - keep the unit, fall back to integer-or-decimal
+    const sym = unitSymbol(unit);
+    return nice >= 1 ? `${Math.round(nice)} ${sym}` : `${nice.toFixed(2)} ${sym}`;
+  }
+  const valueNm = nice * baseNm;
+  // largest ladder unit where the value is >= 1 -> the cleanest (fewest-digit) integer
+  const pick = LENGTH_UNITS_NM.find((u) => valueNm / u.nm >= 1) ?? LENGTH_UNITS_NM[LENGTH_UNITS_NM.length - 1];
+  return `${Math.round(valueNm / pick.nm)} ${pick.sym}`;
 }
 
 const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
