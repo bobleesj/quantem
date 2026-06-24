@@ -5,3 +5,4 @@ from quantem.diffraction.strain_autocorrelation import (
 
 from quantem.diffraction.maped import MAPED as MAPED
 from quantem.diffraction.maped import MAPEDTorch as MAPEDTorch
+from quantem.diffraction.dataset5dstem import Dataset5dstem as Dataset5dstem
