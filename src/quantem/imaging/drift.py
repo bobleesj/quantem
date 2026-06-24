@@ -837,7 +837,7 @@ class DriftCorrection(AutoSerialize):
         show_images: bool = False,
         overlay_knots: bool = True,
         show_knot_plot: bool = False,
-        verbose: bool = False,
+        verbose: bool = True,
         **kwargs,
     ):
         """Correct affine drift between scan pairs using a batched grid search.

@@ -630,8 +630,12 @@ def read_emd_with_metadata(path: str | Path) -> dict:
     }
 
 
-def read_emd_pair(path_0: str | Path, path_1: str | Path) -> dict:
+def read_emd_pair(path_0: str | Path, path_1: str | Path, verbose: bool = True) -> dict:
     """Read a paired 0°/90° EMD acquisition and return a ready-to-use bundle.
+
+    With ``verbose=True`` (default) prints the shape, pixel size, and the scan
+    angles read from each file's metadata, so the caller sees the calibration
+    without writing print statements.
 
     Returns
     -------
@@ -650,13 +654,18 @@ def read_emd_pair(path_0: str | Path, path_1: str | Path) -> dict:
         raise ValueError(
             f"shape mismatch: {m0['shape']} != {m1['shape']}"
         )
-    return {
+    bundle = {
         "data": [m0["data"], m1["data"]],
         "scan_direction_degrees": (m0["scan_rotation_deg"], m1["scan_rotation_deg"]),
         "pixel_size_nm": m0["pixel_size_nm"],
         "shape": m0["shape"],
         "metadata": [m0, m1],
     }
+    if verbose:
+        print(f"shape       = {bundle['shape']}")
+        print(f"pixel size  = {bundle['pixel_size_nm'] * 1e3:.2f} pm")
+        print(f"scan angles = {bundle['scan_direction_degrees']} deg  (read from EMD)")
+    return bundle
 
 
 def _read_scan_rotation_deg(path: str) -> float:
