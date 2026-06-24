@@ -1176,14 +1176,23 @@ class DriftCorrection(AutoSerialize):
         ``× dtype_bytes`` at peak. We sample free memory at call time, divide
         by that estimate with a 0.4 safety factor, and cap the result at
         ``num_candidates`` (no point splitting if it all fits).
-        On CPU we just process all candidates at once - no VRAM constraint.
+        On MPS (Apple unified memory) the same constraint applies - the candidate
+        batch shares the system RAM budget, so we size it from ``torch.mps`` memory
+        info exactly like CUDA. Skipping this (the old ``!= "cuda"`` early return)
+        let MPS try all candidates at once and OOM a 24 GB Mac. On CPU we process all
+        candidates at once - no separate device pool to overflow.
         """
         device = torch.device(device)
-        if device.type != "cuda":
-            return num_candidates
         bytes_per_element = torch.finfo(dtype).bits // 8
         per_candidate_bytes = canvas_shape[0] * canvas_shape[1] * bytes_per_element * 32
-        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+        elif device.type == "mps":
+            # recommended_max is Metal's working-set ceiling; subtract what's already
+            # live to get the headroom this batch can use.
+            free_bytes = torch.mps.recommended_max_memory() - torch.mps.current_allocated_memory()
+        else:
+            return num_candidates
         chunk_size = max(1, int(free_bytes * 0.4 / per_candidate_bytes))
         return min(chunk_size, num_candidates)
 
