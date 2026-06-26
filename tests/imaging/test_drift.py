@@ -25,6 +25,7 @@ from quantem.imaging.drift_visualization import (
     center_crop,
     fft_log_magnitude,
     normalized_cross_correlation,
+    element_map,
 )
 
 
@@ -2462,3 +2463,59 @@ def test_canvas_to_raw_drift_nonsquare_integration():
     raw_rms = float(np.sqrt(((ref - drifted) ** 2).mean()))
     cor_rms = float(np.sqrt(((ref - corrected) ** 2).mean()))
     assert cor_rms < raw_rms, f"non-square correction should reduce RMSE: {raw_rms=}, {cor_rms=}"
+
+
+# --- Synthetic EDS (reference-mode) integration tests -------------------------
+
+def test_element_map_integrates_energy_window():
+    """element_map sums the calibrated energy window -> a 2-D band image."""
+    cube = np.zeros((8, 8, 100), dtype=np.float32)
+    cube[2:5, 2:5, 40:50] = 3.0  # a feature living in the [4.0, 5.0) keV band
+    energy_axis = np.arange(100) * 0.1
+    emap = element_map(cube, energy_axis, 4.5, width=0.5)  # window -> channels 40..50
+    assert emap.shape == (8, 8)
+    np.testing.assert_allclose(emap, cube[..., 40:51].sum(-1), atol=1e-5)
+
+
+def test_from_reference_eds_recovers_known_column_drift():
+    """Chevron HAADF + multi-channel cube + a KNOWN column drift: from_reference must
+    recover it and apply_correction must move the cube back toward the clean ground truth."""
+    scan = 96
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[:scan, :scan]
+    ref = np.zeros((scan, scan), np.float32)
+    for cy, cx in rng.uniform(15, scan - 15, (8, 2)):        # localized particles -> sharp, unambiguous drift constraint
+        ref += np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 7.0 ** 2))
+    ref = (ref + 0.2 * gaussian_filter(rng.standard_normal((scan, scan)).astype(np.float32), 1.2)).astype(np.float32)
+    n_channels = 6
+    eds_clean = np.stack(
+        [ref * (0.5 + 0.5 * np.sin(0.1 * c)) for c in range(n_channels)], -1).astype(np.float32)
+
+    rate = 0.06
+    def column_drift(img):
+        cols = np.arange(img.shape[1])
+        out = np.empty_like(img)
+        for r in range(img.shape[0]):
+            x = np.clip(cols + rate * r, 0, img.shape[1] - 1.001)
+            c0 = np.floor(x).astype(int)
+            frac = x - c0
+            lo, hi = img[r, c0], img[r, c0 + 1]
+            out[r] = lo + (hi - lo) * (frac[:, None] if img.ndim == 3 else frac)
+        return out
+
+    haadf_drifted = column_drift(ref).astype(np.float32)
+    eds_drifted = column_drift(eds_clean).astype(np.float32)
+
+    dc = DriftCorrection.from_reference(
+        ref, eds_drifted, alignment_image=haadf_drifted, scan_direction_degrees=0)
+    dc.preprocess(pad_fraction=0.25, pad_value="median", kde_sigma=0.5, number_knots=1,
+                  normalize=False, show_merged=False, show_images=False)
+    dc.align_affine(step=0.01, num_tests=31, refine=True, upsample_factor=8,
+                    max_image_shift=16, fixed_indices=[0], show_merged=False, show_images=False)
+    corrected = dc.apply_correction(eds_drifted)
+    corrected = corrected.cpu().numpy() if hasattr(corrected, "cpu") else np.asarray(corrected)
+
+    ncc_drifted = normalized_cross_correlation(eds_clean, eds_drifted, margin=10)
+    ncc_corrected = normalized_cross_correlation(eds_clean, corrected, margin=10)
+    assert ncc_corrected > ncc_drifted, f"correction did not improve match: {ncc_corrected} <= {ncc_drifted}"
+    assert ncc_corrected > 0.9, f"corrected cube should closely match ground truth, got {ncc_corrected}"

@@ -114,6 +114,24 @@ def center_crop(
     return arr[row_slice, col_slice, ...]
 
 
+def element_map(
+    cube: np.ndarray,
+    energy_axis: np.ndarray,
+    energy: float,
+    width: float = 0.18,
+) -> np.ndarray:
+    """Band-integrate an EDS/EELS cube over an energy window -> a 2-D element map.
+
+    For a spectrum image ``(row, col, energy)``, an element's map is the signal summed over the
+    energy window around its characteristic line (a single channel is too noisy). ``energy_axis``
+    is the calibrated energy of each channel; ``energy`` +/- ``width`` selects the window. Used to
+    turn a drift-corrected EDS cube into per-element images.
+    """
+    lo = int(np.argmin(np.abs(energy_axis - (energy - width))))
+    hi = int(np.argmin(np.abs(energy_axis - (energy + width))))
+    return np.asarray(cube)[..., lo : hi + 1].sum(-1)
+
+
 def fft_log_magnitude(
     image: np.ndarray,
     *,
