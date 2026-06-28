@@ -1047,6 +1047,8 @@ class MAPEDTorch(AutoSerialize):
         paths: Sequence[str],
         read: Callable[[str], torch.Tensor] | None = None,
         device: str | torch.device | None = None,
+        det_bin: int | None = None,
+        backend: str | None = None,
     ) -> Self:
         """Build a MAPED from tilt files too large to all hold in GPU memory at once
 
@@ -1068,6 +1070,14 @@ class MAPEDTorch(AutoSerialize):
         device : str or torch.device, optional
             Compute device, e.g. ``"cuda:0"``. Default picks the least-busy GPU so the
             large merge does not land on a card already running something else.
+        det_bin : int, optional
+            Bin the detector by this factor (integer-sum) at load time. Use on a
+            small-memory box (Mac MPS 24 GB, or a no-GPU CPU machine) so each
+            streamed tilt fits. Default ``None`` keeps full detector resolution.
+        backend : str, optional
+            Decode backend forwarded to ``load`` (``"cuda"`` / ``"mps"`` / ``"cpu"``).
+            Default ``None`` auto-detects. Pass ``"cpu"`` to force CPU decode on a
+            box that has an NVIDIA card but no usable cupy.
 
         Returns
         -------
@@ -1092,7 +1102,15 @@ class MAPEDTorch(AutoSerialize):
             from quantem.widget import load as _load
 
             def read(path):
-                return torch.from_dlpack(_load(path, verbose=False).data)
+                # det_bin / backend let a small box (Mac MPS 24 GB, or a no-GPU CPU
+                # machine) bin the detector and force a non-cuda decode so the merge
+                # fits. Default (None) keeps the full-res cuda path bit-identical.
+                kw = {"verbose": False}
+                if det_bin is not None:
+                    kw["det_bin"] = det_bin
+                if backend is not None:
+                    kw["backend"] = backend
+                return torch.from_dlpack(_load(path, **kw).data)
 
         if device is None and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             device = f"cuda:{_pick_idle_gpu(torch.cuda.device_count())}"
@@ -1817,40 +1835,59 @@ class MAPEDTorch(AutoSerialize):
         coverage = torch.clip(torch.sum(wdp_shifted, dim=0), 0.0, 1.0)
         edge_w_dp = 1.0 - coverage
 
-        # Where the accumulator lives. Default = the compute device. Pass
-        # accumulator_device (another GPU or 'cpu') to keep the 38.6 GB output off the
-        # compute card when even it won't fit beside a streamed tilt (the _split path).
-        _acc_device = accumulator_device if accumulator_device is not None else self.device
+        # Where the accumulator lives - auto-picked from free VRAM. If the full
+        # float32 accumulator (Rout*Cout*Hp*Wp*4, ~38.6 GB at no-bin) plus one
+        # streamed uint16 tilt won't fit the compute GPU, put the accumulator in
+        # CPU RAM (the _split path): one tilt stays on the GPU (19 GB fits a 24 GB
+        # card), the 38.6 GB output lives in RAM. A big card (96 GB) keeps both on
+        # the GPU - bit-identical to before. Pass accumulator_device explicitly
+        # ('cpu' or another GPU) to override the auto-pick.
+        row_elems = Cout * Hp * Wp
+        acc_bytes = Rout * row_elems * 4
+        tilt_bytes = Rs * Cs * H * W * 2
+        _dev = torch.device(self.device)
+        _free_bytes = None
+        if _dev.type == "cuda" and torch.cuda.is_available():
+            # Reclaim what preprocess/align left cached (and free the streaming
+            # loader's stranded tilt) BEFORE reading free memory - otherwise the
+            # budget reads artificially low and both the accumulator pick and the
+            # auto batch-size collapse.
+            if hasattr(arrays, "release"):
+                arrays.release()
+            torch.cuda.empty_cache()
+            _free_bytes, _ = torch.cuda.mem_get_info(_dev)
+        if accumulator_device is not None:
+            _acc_device = accumulator_device
+        elif _free_bytes is not None and _free_bytes < (acc_bytes + tilt_bytes) * 1.2:
+            _acc_device = "cpu"
+            if verbose:
+                print(
+                    f"  merge: out-of-core - accumulator -> CPU RAM "
+                    f"(free {_free_bytes / 1e9:.0f} GB < need "
+                    f"{(acc_bytes + tilt_bytes) / 1e9:.0f} GB; one tilt stays on GPU)"
+                )
+        else:
+            _acc_device = self.device
         _split = torch.device(_acc_device) != torch.device(self.device)
 
         # Determine batch size. Auto-pick from free VRAM so the merge fits without
         # the caller tuning it. Bigger batches are faster; smaller cut peak memory.
         # The result is bit-identical regardless of batch_size.
         if batch_size is None:
-            _dev = torch.device(self.device)
-            if _dev.type == "cuda" and torch.cuda.is_available():
-                # Reclaim what preprocess/align left cached (and free the streaming
-                # loader's stranded tilt) BEFORE reading free memory - otherwise the
-                # budget reads artificially low and the auto batch-size collapses.
-                if hasattr(arrays, "release"):
-                    arrays.release()
-                torch.cuda.empty_cache()
-                free_bytes, _ = torch.cuda.mem_get_info(_dev)
-                row_elems = Cout * Hp * Wp
-                # Resident set: the float32 accumulator (Rout x row x 4) + one uint16
-                # tilt (Rs*Cs*H*W x 2). The per-batch working buffers (slab cast, FFT
-                # pair, dp_padded) are reused across batches, so the peak is ~=
-                # accumulator + tilt and barely grows with batch size - hence no safety
-                # factor and the complex FFT pair (x8) as the per-row cost. Cap at 48
-                # (the empirically safe, fast no-bin value).
-                fixed_bytes = Rout * row_elems * 4 + Rs * Cs * H * W * 2
+            if _free_bytes is not None:
+                # Resident GPU set: one uint16 tilt (always on the compute card) +,
+                # when NOT split, the float32 accumulator too. The per-batch buffers
+                # (slab cast, FFT pair, dp_padded) are reused across batches, so the
+                # peak barely grows with batch size - the complex FFT pair (x8) is
+                # the per-row cost. Cap at 48 (the empirically safe no-bin value).
+                fixed_bytes = tilt_bytes if _split else acc_bytes + tilt_bytes
                 per_row_bytes = row_elems * 8
-                budget = free_bytes - fixed_bytes
+                budget = _free_bytes - fixed_bytes
                 batch_size = max(8, min(48, int(budget / per_row_bytes)))
                 if verbose:
                     print(
                         f"  merge: auto batch_size={batch_size} "
-                        f"(free {free_bytes / 1e9:.1f} GB, ~{per_row_bytes / 1e9:.3f} GB/row)"
+                        f"(free {_free_bytes / 1e9:.1f} GB, ~{per_row_bytes / 1e9:.3f} GB/row)"
                     )
             else:
                 batch_size = max(1, min(32, Rout // 2))
@@ -1954,7 +1991,11 @@ class MAPEDTorch(AutoSerialize):
             # stays on one stream, so the sync is only needed when _split.
             if _split:
                 torch.cuda.synchronize(self.device)
-                torch.cuda.synchronize(_acc_device)
+                # _acc_device is a second GPU (cross-GPU split) OR CPU RAM
+                # (out-of-core). Only a CUDA accumulator needs a device sync; the
+                # copy to CPU pinned memory is already synchronous.
+                if torch.device(_acc_device).type == "cuda":
+                    torch.cuda.synchronize(_acc_device)
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
         # Edge contribution + factorized-den divide, one output-row band at a
         # time so den is only ever materialized batch-sized, never full.
