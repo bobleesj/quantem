@@ -1931,8 +1931,14 @@ class MAPEDTorch(AutoSerialize):
         # ~7x faster. One buffer sized to the largest batch, reused every batch. A
         # second-GPU accumulator (cross-GPU split) keeps the already-fast .to() path.
         _acc_is_cpu = torch.device(_acc_device).type == "cpu"
+        # pin_memory needs a CUDA context; pin only when the compute device is CUDA
+        # (the normal out-of-core path). A non-CUDA box that forces
+        # accumulator_device='cpu' falls back to a pageable buffer, not a crash.
         _stage = (
-            torch.empty((batch_size, Cout, Hp, Wp), dtype=torch.float32, pin_memory=True)
+            torch.empty(
+                (batch_size, Cout, Hp, Wp), dtype=torch.float32,
+                pin_memory=torch.cuda.is_available(),
+            )
             if _acc_is_cpu
             else None
         )
@@ -1995,6 +2001,7 @@ class MAPEDTorch(AutoSerialize):
                     else:
                         # cross-GPU: a GPU->GPU peer copy is already fast.
                         num[batch_start:batch_end] += prod.to(_acc_device)
+                    del prod  # ~3.6 GB batch buffer - free before the next batch
                 else:
                     # single device: fuse weight-mul + accumulate into one addcmul_
                     # kernel (no full-size weighted temporary, no identity .to copy).
@@ -2008,13 +2015,20 @@ class MAPEDTorch(AutoSerialize):
             # kernels (CUDA "unspecified launch failure"). Single-GPU stream
             # stays on one stream, so the sync is only needed when _split.
             if _split:
-                torch.cuda.synchronize(self.device)
                 # _acc_device is a second GPU (cross-GPU split) OR CPU RAM
-                # (out-of-core). Only a CUDA accumulator needs a device sync; the
-                # copy to CPU pinned memory is already synchronous.
+                # (out-of-core). Sync only CUDA devices: a CPU accumulator's blocking
+                # copy already synchronized, and self.device may be MPS/CPU if a
+                # caller forces accumulator_device='cpu' off a CUDA box.
+                if torch.device(self.device).type == "cuda":
+                    torch.cuda.synchronize(self.device)
                 if torch.device(_acc_device).type == "cuda":
                     torch.cuda.synchronize(_acc_device)
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                # empty_cache helps ONLY the memory-tight split path; on the in-VRAM
+                # path it returns cached blocks and forces the next tilt to
+                # re-cudaMalloc (a per-tilt stall), so gate it here.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        del _stage  # free the (pinned) staging buffer before the divide + scaling
         # Edge contribution + factorized-den divide, one output-row band at a
         # time so den is only ever materialized batch-sized, never full.
         edge = edge_w_dp.to(_acc_device)  # (Hp, Wp)
