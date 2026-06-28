@@ -300,3 +300,59 @@ def test_maped_merge_bitexact():
     np.testing.assert_allclose(float(m.max()), BASELINE["vmax"], rtol=1e-5)
     for idx, expected in BASELINE["samples"].items():
         np.testing.assert_allclose(float(m[idx]), expected, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not __available(), reason="needs CUDA + quantem.widget + MAPED data")
+def test_out_of_core_cpu_accumulator_matches_in_vram():
+    """Out-of-core merge (accumulator in CPU RAM) is bit-for-bit identical to the
+    in-VRAM merge, and keeps the float32 accumulator off the GPU.
+
+    This is the small-VRAM path (audience: a 24 GB GPU + big CPU RAM). The merge
+    auto-switches to it when the float accumulator + one streamed tilt won't fit
+    the card; here both accumulator devices are forced on the same aligned state so
+    the only variable is where the accumulator lives. Two things must hold:
+
+    - the result must not deviate - the out-of-core path forms the weighted product
+      on the GPU and copies it to a CPU accumulator instead of fusing it into the
+      in-VRAM ``addcmul_``, and on the production ``from_files`` (uint16, bilinear)
+      path that is bit-for-bit identical (``torch.equal``), and
+    - the merged result lands in CPU RAM (``out_of_core.device == "cpu"``) - it IS
+      the accumulator, so that proves it lived off the GPU, leaving only one tilt +
+      the batch buffers resident and letting the merge run on a card too small to
+      hold the output.
+    """
+    from quantem.diffraction import MAPEDTorch
+    from quantem.widget.io import discover_masters
+
+    dev = torch.device(f"cuda:{_freest_gpu()}")
+    # The production load path: from_files streams uint16 tilts (det_bin keeps the
+    # test fast), NOT the cupy float32 path the baseline test uses. 3 tilts prove the
+    # accumulator-device parity just as well as 7.
+    files = sorted(discover_masters(MAPED_TEST_DIR))[:3]
+    maped = MAPEDTorch.from_files(files, device=dev, det_bin=4)
+    maped.preprocess(plot_summary=False)
+    maped.diffraction_origin(vmax=1000, sigma=1, plot_origins=False)
+    maped.diffraction_align(edge_blend=2, vmax=5000, plot_aligned=False)
+    maped.real_space_align(
+        num_iter=20, hanning_filter=True, padding=2, edge_blend=5,
+        pad_val="median", shift_method="bilinear", plot_aligned=False,
+    )
+
+    in_vram = maped.merge_datasets(
+        real_space_edge_blend=5, shift_method="bilinear",
+        accumulator_device=dev, plot_result=False,
+    ).tensor
+    out_of_core = maped.merge_datasets(
+        real_space_edge_blend=5, shift_method="bilinear",
+        accumulator_device="cpu", plot_result=False,
+    ).tensor
+
+    # The merged result IS the accumulator. Landing on CPU proves the float32
+    # accumulator (38.6 GB at full res, ~2.4 GB at det_bin=4) lived in RAM and never
+    # on the GPU - that, with only one tilt streamed through the card at a time, is
+    # what lets the merge run on a GPU too small to hold the output.
+    assert str(out_of_core.device) == "cpu"
+    assert torch.equal(in_vram.cpu(), out_of_core.cpu()), (
+        "out-of-core (CPU accumulator) merge deviates from the in-VRAM result"
+    )
