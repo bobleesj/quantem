@@ -1647,9 +1647,9 @@ class MAPEDTorch(AutoSerialize):
         scale_output: bool = False,
         plot_result: bool = True,
         verbose: bool = True,
-        batch_size: int = None,
-        cast_dtype=None,
-        accumulator_device=None,
+        batch_size: int | None = None,
+        cast_dtype: torch.dtype | None = None,
+        accumulator_device: str | torch.device | None = None,
         **plot_kwargs: Any,
     ) -> Dataset4dstem:
         """
@@ -1689,7 +1689,15 @@ class MAPEDTorch(AutoSerialize):
         plot_result : bool
             If True, plot merged BF and merged mean DP.
         batch_size : int, optional
-            Number of rows to process per batch. If None, uses adaptive sizing (1-32 rows).
+            Number of rows to process per batch. If None, auto-sized from free VRAM
+            (8-48 rows) so the merge fits the card without tuning.
+        cast_dtype : torch.dtype, optional
+            dtype the streamed tilts are cast to for sub-pixel warping. If None, uses
+            the parent float dtype.
+        accumulator_device : str or torch.device, optional
+            Where the float32 output accumulator lives. If None, auto-picks: the
+            compute device when it fits, else CPU RAM (out-of-core) for a small-VRAM
+            card. Pass 'cpu' or a second GPU to force it.
         **plot_kwargs
             Passed to show_2d.
 
@@ -1905,9 +1913,10 @@ class MAPEDTorch(AutoSerialize):
         # won't fit beside a streamed tilt (the _split path below).
 
         # File-backed tilts (from_files) leave the last preprocess tilt in memory;
-        # release it before allocating the accumulator so the card starts clean.
-        # No-op for in-memory dataset lists.
-        if hasattr(arrays, "release"):
+        # release it before allocating the accumulator so the card starts clean. On
+        # CUDA this already ran above (before the free-memory read); only the non-CUDA
+        # path (no _free_bytes) still needs it here. No-op for in-memory dataset lists.
+        if _free_bytes is None and hasattr(arrays, "release"):
             arrays.release()
         # When accumulator_device differs from the compute device (_split), num/den
         # live on the accumulator card and tilts are cast ONE AT A TIME on the compute

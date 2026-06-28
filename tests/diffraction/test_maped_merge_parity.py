@@ -108,7 +108,25 @@ def test_grid_sample_vectorized_matches_perrow():
     assert torch.equal(wi_vec, wi_ref), "vectorized wi != per-row reference"
 
 
-def __available():
+def _master_files():
+    """The MAPED_TEST_PREFIX master files in MAPED_TEST_DIR, sorted (full paths).
+
+    One discovery path for every test - the prefix env var stays honored - instead of
+    a hand-rolled os.listdir in some tests and discover_masters in others.
+    """
+    from quantem.widget.io import discover_masters
+
+    try:
+        return sorted(
+            discover_masters(
+                MAPED_TEST_DIR, pattern=f"{MAPED_TEST_PREFIX}*_master.h5", verbose=False
+            )
+        )
+    except (ValueError, FileNotFoundError):
+        return []
+
+
+def _have_maped_data():
     if not torch.cuda.is_available():
         return False
     if not os.path.isdir(MAPED_TEST_DIR):
@@ -117,12 +135,7 @@ def __available():
         import quantem.widget  # noqa: F401  - GPU loader used by the pipeline
     except ImportError:
         return False
-    masters = [
-        f
-        for f in os.listdir(MAPED_TEST_DIR)
-        if f.endswith("master.h5") and f.startswith(MAPED_TEST_PREFIX)
-    ]
-    return len(masters) >= 2
+    return len(_master_files()) >= 2
 
 
 def _freest_gpu():
@@ -130,8 +143,21 @@ def _freest_gpu():
     return int(max(range(len(free)), key=lambda i: free[i]))
 
 
-def _run__merge(batch_size):
-    """Load the tilts (GPU LZ4) -> align -> merge. Returns the merged tensor."""
+def _align(maped):
+    """The MAPED alignment chain - identical params across every slow test, so the
+    'same aligned state' invariant lives in one place instead of four copies."""
+    maped.preprocess(plot_summary=False)
+    maped.diffraction_origin(vmax=1000, sigma=1, plot_origins=False)
+    maped.diffraction_align(edge_blend=2, vmax=5000, plot_aligned=False)
+    maped.real_space_align(
+        num_iter=20, hanning_filter=True, padding=2, edge_blend=5,
+        pad_val="median", shift_method="bilinear", plot_aligned=False,
+    )
+    return maped
+
+
+def _run_merge(batch_size):
+    """Load the tilts (GPU LZ4, bin 4x4) -> align -> merge. Returns the merged tensor."""
     import cupy as cp
 
     from quantem.core.config import set_device
@@ -144,43 +170,24 @@ def _run__merge(batch_size):
     cp.cuda.Device(gpu).use()
     device = torch.device(f"cuda:{gpu}")
     set_device(device)
-    files = sorted(
-        f
-        for f in os.listdir(MAPED_TEST_DIR)
-        if f.endswith("master.h5") and f.startswith(MAPED_TEST_PREFIX)
-    )
     ds = []
-    for f in files:
-        w = wload(os.path.join(MAPED_TEST_DIR, f)).data  # cupy uint16, GPU
+    for path in _master_files():
+        w = wload(path).data  # cupy uint16, GPU
         rr, cc, hh, ww = w.shape
         b = w.reshape(rr // 4, 4, cc // 4, 4, hh, ww).sum(axis=(1, 3), dtype=cp.uint32)
         ds.append(torch.from_dlpack(b.astype(cp.float32)))
         del w, b
         cp.get_default_memory_pool().free_all_blocks()
-    maped = MAPEDTorch.from_datasets(ds)
-    maped.preprocess(plot_summary=False)
-    maped.diffraction_origin(vmax=1000, sigma=1, plot_origins=False)
-    maped.diffraction_align(edge_blend=2, vmax=5000, plot_aligned=False)
-    maped.real_space_align(
-        num_iter=20,
-        hanning_filter=True,
-        padding=2,
-        edge_blend=5,
-        pad_val="median",
-        shift_method="bilinear",
-        plot_aligned=False,
-    )
+    maped = _align(MAPEDTorch.from_datasets(ds))
     merged = maped.merge_datasets(
-        real_space_edge_blend=5,
-        shift_method="fourier",
-        batch_size=batch_size,
+        real_space_edge_blend=5, shift_method="fourier", batch_size=batch_size,
         plot_result=False,
     )
     return maped, merged.tensor
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not __available(), reason="needs CUDA + quantem.widget + MAPED data")
+@pytest.mark.skipif(not _have_maped_data(), reason="needs CUDA + quantem.widget + MAPED data")
 def test_nobin_single_gpu_streaming_fits():
     """No-bin (512x512x192x192) MAPED merge runs on ONE GPU, streaming uint16 tilts.
 
@@ -207,11 +214,7 @@ def test_nobin_single_gpu_streaming_fits():
     cp.cuda.Device(gpu).use()
     device = torch.device(f"cuda:{gpu}")
     set_device(device)
-    files = sorted(
-        os.path.join(MAPED_TEST_DIR, f)
-        for f in os.listdir(MAPED_TEST_DIR)
-        if f.endswith("master.h5") and f.startswith(MAPED_TEST_PREFIX)
-    )[:3]
+    files = _master_files()[:3]
 
     class _LazyUint16:
         """One no-bin uint16 tilt at a time: GPU LZ4 load -> torch uint16 clone ->
@@ -239,13 +242,7 @@ def test_nobin_single_gpu_streaming_fits():
         [torch.zeros((2, 2, 192, 192), dtype=torch.uint16, device=device) for _ in range(n)]
     )
     maped.datasets = _LazyUint16(files)
-    maped.preprocess(plot_summary=False)
-    maped.diffraction_origin(vmax=1000, sigma=1, plot_origins=False)
-    maped.diffraction_align(edge_blend=2, vmax=5000, plot_aligned=False)
-    maped.real_space_align(
-        num_iter=20, hanning_filter=True, padding=2, edge_blend=5,
-        pad_val="median", shift_method="bilinear", plot_aligned=False,
-    )
+    _align(maped)
     torch.cuda.reset_peak_memory_stats(device)
     merged = maped.merge_datasets(
         real_space_edge_blend=5, shift_method="fourier",
@@ -254,13 +251,18 @@ def test_nobin_single_gpu_streaming_fits():
     peak_gb = torch.cuda.max_memory_allocated(device) / 1e9
     assert tuple(merged.shape) == (512, 512, 192, 192)
     assert merged.dtype == torch.float32
-    assert str(merged.device) == f"cuda:{gpu}"
-    assert bool(torch.isfinite(merged[0]).all())  # band-wise: a full isfinite is 77 GB
+    # The merge auto-routes the accumulator to CPU RAM when the aligned state leaves
+    # the card too tight for the in-VRAM accumulator (num+tilt ~57 GB vs the ~43 GB
+    # free after alignment with the no-release _LazyUint16 fixture) - that IS the
+    # streaming fit, just out-of-core. Accept either; the bounded GPU peak is the claim.
+    assert str(merged.device) in (f"cuda:{gpu}", "cpu")
+    # Band-wise finiteness on a few scan rows (a full isfinite would be 77 GB).
+    assert all(bool(torch.isfinite(merged[b]).all()) for b in (0, 255, 511))
     assert peak_gb < 90, f"streaming merge peak {peak_gb:.1f} GB should fit a 96 GB card"
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not __available(), reason="needs CUDA + quantem.widget + MAPED data")
+@pytest.mark.skipif(not _have_maped_data(), reason="needs CUDA + quantem.widget + MAPED data")
 def test_maped_merge_bitexact():
     """Real series: merge is batch-invariant, deterministic, and on baseline.
 
@@ -271,7 +273,7 @@ def test_maped_merge_bitexact():
     - frozen baseline: global stats + sampled voxels match the captured values,
       so a future merge refactor that drifts numerically is caught.
     """
-    maped, merged_128 = _run__merge(batch_size=128)
+    maped, merged_128 = _run_merge(batch_size=128)
 
     # batch-size invariance (bit-exact) - reuses the same aligned state.
     merged_15 = maped.merge_datasets(
@@ -303,7 +305,7 @@ def test_maped_merge_bitexact():
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not __available(), reason="needs CUDA + quantem.widget + MAPED data")
+@pytest.mark.skipif(not _have_maped_data(), reason="needs CUDA + quantem.widget + MAPED data")
 def test_out_of_core_cpu_accumulator_matches_in_vram():
     """Out-of-core merge (accumulator in CPU RAM) is bit-for-bit identical to the
     in-VRAM merge, and keeps the float32 accumulator off the GPU.
@@ -323,21 +325,13 @@ def test_out_of_core_cpu_accumulator_matches_in_vram():
       hold the output.
     """
     from quantem.diffraction import MAPEDTorch
-    from quantem.widget.io import discover_masters
 
     dev = torch.device(f"cuda:{_freest_gpu()}")
     # The production load path: from_files streams uint16 tilts (det_bin keeps the
     # test fast), NOT the cupy float32 path the baseline test uses. 3 tilts prove the
     # accumulator-device parity just as well as 7.
-    files = sorted(discover_masters(MAPED_TEST_DIR))[:3]
-    maped = MAPEDTorch.from_files(files, device=dev, det_bin=4)
-    maped.preprocess(plot_summary=False)
-    maped.diffraction_origin(vmax=1000, sigma=1, plot_origins=False)
-    maped.diffraction_align(edge_blend=2, vmax=5000, plot_aligned=False)
-    maped.real_space_align(
-        num_iter=20, hanning_filter=True, padding=2, edge_blend=5,
-        pad_val="median", shift_method="bilinear", plot_aligned=False,
-    )
+    files = _master_files()[:3]
+    maped = _align(MAPEDTorch.from_files(files, device=dev, det_bin=4))
 
     in_vram = maped.merge_datasets(
         real_space_edge_blend=5, shift_method="bilinear",
@@ -356,3 +350,40 @@ def test_out_of_core_cpu_accumulator_matches_in_vram():
     assert torch.equal(in_vram.cpu(), out_of_core.cpu()), (
         "out-of-core (CPU accumulator) merge deviates from the in-VRAM result"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _have_maped_data(), reason="needs CUDA + quantem.widget + MAPED data")
+def test_merge_fits_48gb_card():
+    """No-bin MAPED merge runs on a simulated 48 GB card without OOM.
+
+    The standard limited-VRAM test (see docs/2026-06-28-limited-vram-testing-standard):
+    cap the GPU to a target card size with the REAL full-size workload and confirm it
+    survives - an estimate and a 96 GB run both miss the small-card path. The full-res
+    float32 accumulator (38.6 GB) cannot sit on a 48 GB card beside a 19.3 GB uint16
+    tilt, so the merge must auto-switch the accumulator to CPU RAM and keep the GPU
+    peak under 48. 24 GB is intentionally NOT a no-bin target: tilt 19.3 GB + a 9.6 GB
+    cast slab already exceed it (a 24 GB card needs det_bin=2).
+    """
+    from ._vram_cap import fits_in_vram
+
+    from quantem.diffraction import MAPEDTorch
+
+    gpu = _freest_gpu()
+    dev = torch.device(f"cuda:{gpu}")
+    # No-bin, full-res; 3 tilts prove the fit (the GPU peak is one streamed tilt + the
+    # cast slab + a batch, with the accumulator on CPU - independent of tilt count).
+    files = _master_files()[:3]
+    maped = _align(MAPEDTorch.from_files(files, device=dev))
+    # Settle resident VRAM BEFORE capping, else the merge's own start-of-run release
+    # bumps free past the cap (the release-bump gotcha) and it picks the in-VRAM path.
+    if hasattr(maped.datasets, "release"):
+        maped.datasets.release()
+    torch.cuda.empty_cache()
+    fits, peak_gb = fits_in_vram(
+        48,
+        lambda: maped.merge_datasets(shift_method="bilinear", plot_result=False),
+        device=f"cuda:{gpu}",
+    )
+    assert fits, "no-bin merge OOM'd on a 48 GB card (should auto-switch to out-of-core)"
+    assert peak_gb < 48, f"merge GPU peak {peak_gb:.0f} GB exceeds the 48 GB target"
