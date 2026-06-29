@@ -59,7 +59,25 @@ def _as_array(x):
 # concerns stay together.
 from quantem.imaging.drift_4dstem import (  # noqa: E402, F401
     CorrectionResult,
+    to_numpy,
 )
+
+
+def _padding_offset(canvas_shape, scan_shape, *, integer: bool = False):
+    """Return the ``(row, col)`` offset of a scan inside its padded canvas.
+
+    The drift canvas centers each scan with equal padding on both sides, so the
+    offset is half the size difference. ``integer`` floor-divides for array-slice
+    indices; otherwise the exact float offset is kept for sub-pixel probe
+    positions. Shared by probe-position export and corrected-image cropping so the
+    two never disagree on where the scan sits. The float and integer variants stay
+    distinct on purpose: rounding them together would shift one of the two paths.
+    """
+    canvas_h, canvas_w = canvas_shape
+    scan_h, scan_w = scan_shape
+    if integer:
+        return (canvas_h - scan_h) // 2, (canvas_w - scan_w) // 2
+    return (canvas_h - scan_h) / 2.0, (canvas_w - scan_w) / 2.0
 
 
 def _distance_transform_edt_torch(mask: torch.Tensor) -> torch.Tensor:
@@ -265,7 +283,7 @@ class DriftCorrection(AutoSerialize):
             Pre-computed VDF / summary of the second dataset, used as
             the alignment partner when the second dataset is ≥3-D in
             reference mode.  When ``None``, computed automatically via
-            :meth:`compute_vdf`.
+            :meth:`compute_virtual_image`.
 
         Four supported use cases (the dispatch picks one by input shapes
         and angles)
@@ -443,7 +461,7 @@ class DriftCorrection(AutoSerialize):
                 elif b_ndim == 2:
                     vdf = b
                 else:
-                    vdf = self.compute_vdf(b)
+                    vdf = self.compute_virtual_image(b)
                 self._setup_image_collection([a, vdf], sd)
                 self._reference_mode = True
                 self._datasets = [None, b]
@@ -490,8 +508,8 @@ class DriftCorrection(AutoSerialize):
                     raise TypeError(
                         "alignment_image= is only meaningful in reference mode; "
                         "for 4D-STEM collections the VDFs are auto-extracted.")
-                vdf_a = self.compute_vdf(a)
-                vdf_b = self.compute_vdf(b)
+                vdf_a = self.compute_virtual_image(a)
+                vdf_b = self.compute_virtual_image(b)
                 self._setup_image_collection([vdf_a, vdf_b], sd)
                 self._datasets = [a, b]
                 return
@@ -529,12 +547,12 @@ class DriftCorrection(AutoSerialize):
         dataset).  Use :attr:`_is_4dstem_collection` to distinguish from
         reference mode.
         """
-        return self._datasets is not None
+        return getattr(self, "_datasets", None) is not None
 
     @property
     def _is_4dstem_collection(self) -> bool:
         """True only for 4D-STEM collection (two datasets, not reference mode)."""
-        return self._datasets is not None and not self._reference_mode
+        return getattr(self, "_datasets", None) is not None and not self._reference_mode
 
     def _show_after_step(self, label: str, show_merged: bool, show_images: bool,
                           show_knots: bool, kwargs: dict):
@@ -643,17 +661,16 @@ class DriftCorrection(AutoSerialize):
         row_t, col_t = self._interpolator(idx, knots).to_canvas()
         positions = torch.stack([row_t, col_t], dim=-1)
         if strip_padding:
-            scan_h, scan_w = self.imgs[0].shape[:2]
-            canvas_h, canvas_w = self.shape[1], self.shape[2]
-            pad_h = (canvas_h - scan_h) / 2.0
-            pad_w = (canvas_w - scan_w) / 2.0
+            pad_h, pad_w = _padding_offset(
+                (self.shape[1], self.shape[2]), self.imgs[0].shape[:2]
+            )
             offset = torch.tensor(
                 [pad_h, pad_w],
                 device=positions.device,
                 dtype=positions.dtype,
             )
             positions = positions - offset
-        positions_np = positions.detach().cpu().numpy().astype(np.float32)
+        positions_np = to_numpy(positions, dtype=np.float32)
         if plot:
             self.plot_probe_positions(
                 image_index=idx,
@@ -1736,7 +1753,7 @@ class DriftCorrection(AutoSerialize):
             return Dataset4d.from_array(corrected)
         # 4D-STEM collection has its own explicit API because it returns both
         # corrected inputs and the diffraction-pattern-level merge.
-        if self._datasets is not None:
+        if getattr(self, "_datasets", None) is not None:
             raise RuntimeError(
                 "4D-STEM collection correction uses the explicit "
                 "generate_corrected_4dstem() API. Use "
@@ -1834,9 +1851,9 @@ class DriftCorrection(AutoSerialize):
 
         if strip_padding and output_original_shape:
             scan_h, scan_w = self.imgs[0].shape[:2]
-            canvas_h, canvas_w = corr_np.shape[:2]
-            pad_h = (canvas_h - scan_h) // 2
-            pad_w = (canvas_w - scan_w) // 2
+            pad_h, pad_w = _padding_offset(
+                corr_np.shape[:2], (scan_h, scan_w), integer=True
+            )
             corr_np = corr_np[pad_h:pad_h + scan_h, pad_w:pad_w + scan_w]
 
         image_corr = Dataset2d.from_array(
@@ -1930,7 +1947,7 @@ class DriftCorrection(AutoSerialize):
         # with batch == scan_h) fall back on the factory mode.
         # Reference-mode is detected separately: _datasets[0] is None (only
         # the drifted side is stored), so the dataset path uses _datasets[1] directly.
-        is_4dstem_mode = self._datasets is not None and not self._reference_mode
+        is_4dstem_mode = getattr(self, "_datasets", None) is not None and not self._reference_mode
         scan_h = self.imgs[idx].shape[0]
         scan_w = self.imgs[idx].shape[1]
         if data is None:
@@ -1982,6 +1999,73 @@ class DriftCorrection(AutoSerialize):
 
     # 4D-STEM dataset path: implementations live in drift_4dstem.py so the
     # orchestrator stays focused on the image pipeline.
+
+    def plot_alignment(self, *, mode: str = "green-magenta", axsize: tuple[float, float] = (5.5, 5.5)):
+        """Virtual-dark-field overlay of the two scans - the quickest check the drift solve worked.
+
+        ``mode='green-magenta'`` (default, colourblind-safe): reference magenta, the other green,
+        aligned = white. ``mode='rgb'`` gives red-green, where aligned = yellow (often easier to
+        eyeball). Both pass straight through to :func:`overlay_pair`.
+        """
+        import matplotlib.pyplot as plt
+
+        from quantem.imaging.drift_visualization import overlay_pair
+
+        vdf_0 = np.asarray(self.imgs[0].array, dtype=np.float32)
+        vdf_1 = np.asarray(self.imgs[1].array, dtype=np.float32)
+        edge = max(1, min(vdf_0.shape) // 12)
+        keep = slice(edge, -edge)
+        aligned = "yellow" if mode == "rgb" else "white"
+        fig, axes = plt.subplots(1, 2, figsize=(2 * axsize[0], axsize[1]))
+        axes[0].imshow(overlay_pair(vdf_0[keep, keep], vdf_1[keep, keep], mode=mode))
+        axes[0].set_title(f"scans overlaid (colour = drift, {aligned} = aligned)")
+        axes[1].imshow(vdf_0[keep, keep], cmap="gray")
+        axes[1].set_title("virtual dark field")
+        for ax in axes:
+            ax.axis("off")
+        fig.tight_layout()
+
+    def _auto_crop_slices(self) -> tuple[slice, slice]:
+        """Row/col crop to the overlapping field of view - the LARGEST area free of drift artifacts.
+
+        The two scans differ only by the measured drift (peak of the virtual-dark-field
+        cross-correlation). The non-overlap is exactly that shift, removed from one edge per axis -
+        a symmetric margin would discard ~2x too much and zoom the view in.
+        """
+        vdf_0 = np.asarray(self.imgs[0].array, dtype=np.float32)
+        vdf_1 = np.asarray(self.imgs[1].array, dtype=np.float32)
+        spectrum = np.fft.fft2(vdf_0 - vdf_0.mean()) * np.conj(np.fft.fft2(vdf_1 - vdf_1.mean()))
+        peak = np.unravel_index(np.fft.fftshift(np.abs(np.fft.ifft2(spectrum))).argmax(), vdf_0.shape)
+        scan_h, scan_w = vdf_0.shape
+        shift_row = int(round(peak[0] - scan_h / 2))
+        shift_col = int(round(peak[1] - scan_w / 2))
+        pad = 4  # tiny guard for the bilinear footprint
+        row = slice(max(0, shift_row) + pad, scan_h + min(0, shift_row) - pad)
+        col = slice(max(0, shift_col) + pad, scan_w + min(0, shift_col) - pad)
+        return row, col
+
+    def corrected_views(self, *, det_bin: int = 1) -> list:
+        """``[0deg raw, 0deg corrected, 0/90 merged]`` at one artifact-free FOV, ready for ``Show4DSTEM``.
+
+        Runs the full bilinear correction + merge, crops all three to the overlapping field of view
+        (:meth:`_auto_crop_slices`, the largest area both scans cover), and optionally bins the
+        detector by ``det_bin`` for a snappier browse - the scan drift is scan-axis, so detector
+        binning never changes the correction. Returns plain arrays so ``Show4DSTEM(views)`` just works.
+        """
+        raw_0 = self._datasets[0]  # grab before the merge may consume it
+        result = self.generate_corrected_4dstem(merge=True)
+        row, col = self._auto_crop_slices()
+
+        def view(cube):
+            cropped = cube[row, col]
+            if det_bin > 1:
+                sh = cropped.shape
+                cropped = cropped.reshape(
+                    sh[0], sh[1], sh[2] // det_bin, det_bin, sh[3] // det_bin, det_bin
+                ).sum((3, 5))
+            return to_numpy(cropped, dtype=np.float32)
+
+        return [view(raw_0), view(result.corrected_4dstem_0), view(result.corrected_4dstem)]
 
     def generate_corrected_4dstem(
         self,
@@ -2056,12 +2140,22 @@ class DriftCorrection(AutoSerialize):
         )
 
     @staticmethod
-    def compute_vdf(
+    def compute_virtual_image(
         ds_4d: np.ndarray,
         chunk_rows: int | None = None,
     ) -> np.ndarray:
-        """Virtual dark-field from a 4D-STEM dataset (delegates to drift_4dstem)."""
-        return _4dstem.compute_vdf(ds_4d, chunk_rows)
+        """Full-detector virtual image from a 4D-STEM dataset (no detector mask).
+
+        Integrates every detector pixel per scan position, so the result is a
+        *total* virtual image (bright-field dominated for thin samples), not a
+        dark field. This is the scalar image the 0/90 collection solve registers
+        on. Delegates to :func:`drift_4dstem.integrate_virtual_image`.
+        """
+        return _4dstem.integrate_virtual_image(ds_4d, chunk_rows=chunk_rows)
+
+    # Back-compat alias: the no-mask result is a full-detector virtual image, so
+    # the accurate name is compute_virtual_image; compute_vdf is kept for callers.
+    compute_vdf = compute_virtual_image
 
     def _apply_correction_to_dataset(self, *args, **kwargs):
         """Delegates the ≥3-D dataset path to :mod:`drift_4dstem`."""
