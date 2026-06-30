@@ -2366,7 +2366,7 @@ def shift_images_torch(
     shifts_rc = shifts_rc.to(dtype=torch.float32, device=images.device)
 
     if not blend:
-        # simple shift per-image without padding/blending — keep original behavior
+        # simple shift per-image without padding/blending, keep original behavior
         imgs = images.float().unsqueeze(1)
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, H, device=images.device),
@@ -2877,7 +2877,7 @@ def dscan_correct(
                 row_peak = flat_idx // W_dp
                 col_peak = flat_idx % W_dp
 
-                # log-parabolic sub-pixel refinement — row direction
+                # log-parabolic sub-pixel refinement, row direction
                 row_safe = row_peak.clamp(1, H_dp - 2)
                 vr_m = dp_b[batch_idx, row_safe - 1, col_peak].clamp(min=1e-6).log()
                 vr_0 = dp_b[batch_idx, row_safe, col_peak].clamp(min=1e-6).log()
@@ -2889,7 +2889,7 @@ def dscan_correct(
                     torch.zeros(B, device=device),
                 )
 
-                # log-parabolic sub-pixel refinement — col direction
+                # log-parabolic sub-pixel refinement, col direction
                 col_safe = col_peak.clamp(1, W_dp - 2)
                 vc_m = dp_b[batch_idx, row_peak, col_safe - 1].clamp(min=1e-6).log()
                 vc_0 = dp_b[batch_idx, row_peak, col_safe].clamp(min=1e-6).log()
