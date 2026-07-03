@@ -64,6 +64,11 @@ def auto_probe(mean_dp):
     return (cy, cx), radius
 
 
+def detect_bf_radius(mean_dp) -> tuple[tuple[float, float], float]:
+    """Return the auto-detected BF disk center and radius in detector pixels."""
+    return auto_probe(mean_dp)
+
+
 def detector_mask(center, lo_px, hi_px, det_shape) -> np.ndarray:
     """THE virtual-detector geometry primitive: boolean ``(det_row, det_col)`` mask
     of pixels whose distance from ``center`` (row, col) is in ``[lo_px, hi_px]``

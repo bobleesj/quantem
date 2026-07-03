@@ -1,5 +1,6 @@
 import os as _os
 import warnings as _warnings
+from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError, version
 
 # Silence two noisy-but-harmless warnings at import, BEFORE anything imports cupy
@@ -15,15 +16,32 @@ _os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 _warnings.filterwarnings("ignore", message=r"(?s).*multiple CuPy packages.*")
 _warnings.filterwarnings("ignore", message=r"(?s).*HF_TOKEN.*")
 
-from quantem.widget.show2d import Show2D
-from quantem.widget.show3d import Show3D
-from quantem.widget.show3dslices import Show3DSlices
-from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
-from quantem.widget.io import load
-from quantem.widget.dpc import idpc, com
-from quantem.widget.info import device_info
-from quantem.widget.detector import bf, adf, df
-from quantem.widget.dataset import Dataset4dstemGPU
+
+_EXPORT_MODULES = {
+    "Show2D": "quantem.widget.show2d",
+    "Show3D": "quantem.widget.show3d",
+    "Show3DSlices": "quantem.widget.show3dslices",
+    "load": "quantem.widget.io",
+    "discover_masters": "quantem.widget.io",
+    "detect_backend": "quantem.widget.io",
+    "resolve_backend": "quantem.widget.io",
+    "idpc": "quantem.widget.dpc",
+    "com": "quantem.widget.dpc",
+    "device_info": "quantem.widget.info",
+    "bf": "quantem.widget.detector",
+    "adf": "quantem.widget.detector",
+    "df": "quantem.widget.detector",
+    "virtual_image": "quantem.widget.preprocess",
+    "dp_mean": "quantem.widget.preprocess",
+    "detect_bf_radius": "quantem.widget.detector",
+    "Dataset4dstemGPU": "quantem.widget.dataset",
+    "first_existing": "quantem.widget.paths",
+    "gpu_info": "quantem.widget.gpu",
+    "free_gpu": "quantem.widget.gpu",
+    "vram_status": "quantem.widget.gpu",
+    "FolderPicker": "quantem.widget.folder_picker",
+    "pick_folder": "quantem.widget.folder_picker",
+}
 
 
 def Show4DSTEM(data, **kwargs):
@@ -56,6 +74,8 @@ def Show4DSTEM(data, **kwargs):
     should use ``offline_codec="bslz4"`` plus a ``data_url`` companion directory
     instead of embedding the full stack in the HTML.
     """
+    from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
+
     # Dataset4dstemGPU -> open the raw viewer on its underlying tensor / Metal chunks.
     if getattr(data, "_qw_dataset", False):
         data = data._raw
@@ -92,4 +112,42 @@ except PackageNotFoundError:
     # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
     __version__ = "0.0.0+local"
 
-__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "idpc", "com", "device_info", "bf", "adf", "df", "Dataset4dstemGPU"]
+__all__ = [
+    "Show2D",
+    "Show3D",
+    "Show3DSlices",
+    "Show4DSTEM",
+    "load",
+    "discover_masters",
+    "detect_backend",
+    "resolve_backend",
+    "idpc",
+    "com",
+    "device_info",
+    "bf",
+    "adf",
+    "df",
+    "virtual_image",
+    "dp_mean",
+    "detect_bf_radius",
+    "Dataset4dstemGPU",
+    "first_existing",
+    "gpu_info",
+    "free_gpu",
+    "vram_status",
+    "FolderPicker",
+    "pick_folder",
+]
+
+
+def __getattr__(name: str):
+    if name in _EXPORT_MODULES:
+        module = _import_module(_EXPORT_MODULES[name])
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
