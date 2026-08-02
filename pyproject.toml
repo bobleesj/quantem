@@ -5,8 +5,13 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 addopts = [
     "--import-mode=importlib",
+    "--strict-markers",
 ]
 testpaths = ["tests", "widget/tests"]
+markers = [
+    "drift_realdata: end-to-end drift parity requiring external publication data",
+    "slow: tests excluded from the default run unless --runslow is supplied",
+]
 filterwarnings = [
     # PyTorch's own use of its deprecated torch.jit.script_method API in
     # torch/utils/mkldnn.py — not our code, will go away when PyTorch fixes it
@@ -44,6 +49,7 @@ dependencies = [
   "colorspacious",
   "dill",
   "numpy>2",
+  "pandas>=2.2",
   "matplotlib",
   "scipy",
   "tqdm",
