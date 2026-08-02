@@ -7,7 +7,7 @@ addopts = [
     "--import-mode=importlib",
     "--strict-markers",
 ]
-testpaths = ["tests", "widget/tests"]
+testpaths = ["tests"]
 markers = [
     "drift_realdata: end-to-end drift parity requiring external publication data",
     "slow: tests excluded from the default run unless --runslow is supplied",
@@ -30,12 +30,6 @@ line-length = 99
 
 [tool.uv]
 config-settings = { editable_mode = "compat" }
-
-[tool.uv.workspace]
-members = ["widget"]
-
-[tool.uv.sources]
-"quantem.widget" = { workspace = true }
 
 [project]
 name = "quantem"
@@ -65,11 +59,6 @@ dependencies = [
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
   "torchinfo>=1.8.0",
-]
-
-[project.optional-dependencies]
-widgets = [
-    "quantem.widget",
 ]
 
 [tool.hatch.build.targets.sdist]
