@@ -526,7 +526,9 @@ def preprocess(
     smoothing_sigma : float, default 0.5
         Gaussian smoothing in pixels after scanline interpolation.
     num_knots : int, default 1
-        Knots per scanline. One knot represents affine drift.
+        Knots per scanline for a fixed publication setup. One knot represents
+        affine drift. For routine non-rigid correction, prefer
+        ``correct_nonrigid(num_knots=...)`` so preprocessing stays automatic.
     normalize : bool, default False
         Scale each scan to ``[0, 1]`` for mixed-detector comparisons.
     downsample : int, default 1

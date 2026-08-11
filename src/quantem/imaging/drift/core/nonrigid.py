@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import quantem.imaging.drift.plot as drift_plot
-from quantem.imaging.drift.core.knots import gaussian_smooth_1d
+from quantem.imaging.drift.core import knots as drift_knots
 from quantem.imaging.drift.core.warping import warp_and_translate
 
 
@@ -267,7 +267,7 @@ def _regularize_knots(
             coefs, _, _, _ = torch.linalg.lstsq(vander, knots_flat)
             trend = (vander @ coefs).T
             residual = knots_flat.T - trend
-            smoothed = gaussian_smooth_1d(residual, sigma_px)
+            smoothed = drift_knots.gaussian_smooth_1d(residual, sigma_px)
             knots_batch.copy_(
                 (smoothed + trend)
                 .reshape(num_images, 2, K, num_rows_knot)
@@ -342,6 +342,7 @@ def setup_loss_kernel(
 def correct_nonrigid(
     self,
     *,
+    num_knots: int | None = None,
     optimizer: str = "adam",
     num_refine_cycles: int = 16,
     knot_smoothing_sigma: float = 8.0,
@@ -385,6 +386,11 @@ def correct_nonrigid(
 
     Parameters
     ----------
+    num_knots : int or None, default None
+        Knots along every fast-scan line. ``None`` keeps the current layout;
+        use more than one when residual drift changes within a scanline. The
+        existing affine or strip field is preserved before non-rigid
+        optimization begins.
     optimizer : str, default "adam"
         ``"adam"`` (first-order momentum) or ``"lbfgs"`` (quasi-Newton
         with strong-Wolfe line search). Adam is the fastest default for
@@ -472,6 +478,10 @@ def correct_nonrigid(
 
     >>> dc.correct_nonrigid(max_image_shift=2)
 
+    Let residual motion vary along the fast-scan direction:
+
+    >>> dc.correct_nonrigid(num_knots=6, max_image_shift=2)
+
     Dissimilar / cross-detector only (HAADF + VDF):
 
     >>> dc.correct_nonrigid(loss="gradient_mse", knot_smoothing_sigma=8.0)
@@ -487,10 +497,12 @@ def correct_nonrigid(
     # device before optimization.
     self.imgs_t = [t.to(self._device) for t in self.imgs_t]
     self.knots = [k.to(self._device) for k in self.knots]
-    for attr in ("_knots_after_affine", "_initial_knots"):
+    for attr in ("_knots_after_affine", "_knots_after_strip", "_initial_knots"):
         snapshot = getattr(self, attr, None)
         if snapshot is not None:
             setattr(self, attr, [k.to(self._device) for k in snapshot])
+    if num_knots is not None:
+        drift_knots.resize_scanline_knots(self, num_knots)
     if loss == "auto":
         loss = "ncc"
     valid_losses = ("mse", "gradient_mse", "ncc")

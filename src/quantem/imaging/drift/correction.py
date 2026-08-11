@@ -13,11 +13,12 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.core.affine as affine
 import quantem.imaging.drift.core.nonrigid as nonrigid
 import quantem.imaging.drift.core.strip as strip
+import quantem.imaging.drift.diagnostics as diagnostics
 import quantem.imaging.drift.fourdstem as fourdstem
-import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.plot as drift_plot
 import quantem.imaging.drift.preparation as preparation
 import quantem.imaging.drift.report as drift_report
@@ -390,6 +391,9 @@ class DriftCorrection(AutoSerialize):
     report = drift_report.report
 
     correct_nonrigid = nonrigid.correct_nonrigid
+
+    diagnose_affine = diagnostics.diagnose_affine
+    diagnose_nonrigid = diagnostics.diagnose_nonrigid
 
     corrected = drift_apply.corrected
     apply_correction = drift_apply.apply_correction

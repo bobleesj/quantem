@@ -21,8 +21,9 @@ Also: :meth:`~DriftCorrection.from_images`,
 :meth:`~DriftCorrection.from_4dstem`, and an explicit
 :meth:`~DriftCorrection.preprocess` when you need a fixed canvas.
 
-Supporting modules: ``plot``, ``io``, and ``fourdstem``. Numerical code lives
-under ``drift.core`` and is not a notebook entry point.
+Advanced troubleshooting stays on the same object through
+``diagnose_affine()`` and ``diagnose_nonrigid()``. Numerical code lives under
+``drift.core`` and is not a notebook entry point.
 
 Free residual helpers are not re-exported here; use ``dc.correct_strip()``.
 """

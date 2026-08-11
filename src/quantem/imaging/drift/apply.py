@@ -750,15 +750,30 @@ def coverage_mask(self) -> np.ndarray:
     >>> ncc = compare(first[common_pixels], second[common_pixels])
     """
     canvas_h, canvas_w = self.imgs_warped.array.shape[-2:]
+    knot_counts = {int(knots.shape[2]) for knots in self.knots}
+    if knot_counts != {1}:
+        knots = torch.stack(
+            [value.detach() for value in self.knots]
+        ).to(device=self._device, dtype=self._dtype)
+        _, weights = warp_and_translate(
+            self,
+            max_image_shift=None,
+            knots_batch=knots,
+            solve_translation=False,
+            return_weights=True,
+        )
+        common = (weights >= 1e-3).all(dim=0).cpu().numpy()
+        scan_h, scan_w = self.imgs[0].shape[:2]
+        offset_row = (canvas_h - scan_h) // 2
+        offset_col = (canvas_w - scan_w) // 2
+        return common[
+            offset_row : offset_row + scan_h,
+            offset_col : offset_col + scan_w,
+        ]
+
     common = np.ones((canvas_h, canvas_w), dtype=bool)
     for index in range(len(self.knots)):
         knots_full = self.knots[index].detach().cpu().numpy()
-        if knots_full.shape[2] != 1:
-            raise NotImplementedError(
-                "coverage_mask() assumes one knot per scanline; this solve has "
-                f"{knots_full.shape[2]} knots per line. The footprint would be "
-                "silently wrong - evaluate the full knot interpolation instead."
-            )
         knots = knots_full[:, :, 0]
         fast = np.asarray(self.scan_fast[index], dtype=float)
         width = int(self.imgs[index].shape[1])

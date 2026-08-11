@@ -12,11 +12,11 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
-from quantem.core.visualization import show_2d
 import quantem.imaging.drift.apply as drift_apply
+import quantem.imaging.drift.fourdstem as fourdstem
+from quantem.core.visualization import show_2d
 from quantem.imaging.drift.core import knots as drift_knots
 from quantem.imaging.drift.core.warping import ensure_warped_images
-import quantem.imaging.drift.fourdstem as fourdstem
 
 
 def show_after_step(
@@ -491,7 +491,9 @@ def plot_combined(
     Parameters
     ----------
     show_knots : bool, default True
-        Overlay knot trajectories on static panels only.
+        Overlay knot trajectories on static non-rigid panels. Initial and
+        affine panels stay clean because multiple knots add freedom only to
+        the non-rigid model. Use :meth:`plot_knots` to inspect affine geometry.
     rgb : bool, default True
         If True (2 or 3 scans), RGB comparison (image 0 red, 1 green, 2 blue).
         Misalignment shows as color fringes. If False, grayscale mean.
@@ -541,7 +543,11 @@ def plot_combined(
     Examples
     --------
     >>> dc.plot_combined(stage=("initial", "affine"), interactive=True, width=620)
-    >>> dc.plot_combined(stage="affine", interactive=False, show_knots=True)
+    >>> dc.plot_combined(
+    ...     stage=("affine", "nonrigid"),
+    ...     interactive=False,
+    ...     show_knots=True,
+    ... )
     """
     if interactive:
         from quantem.widget import Show2D  # lazy: quantem.widget is an optional extra
@@ -666,7 +672,15 @@ def plot_combined(
         panel_ax.set_xticks([])
         panel_ax.set_yticks([])
     merged_ax = axes[-1]
-    if show_knots:
+    nonrigid_stage = stage in ("nonrigid", "non-rigid")
+    if stage is None:
+        error_track = np.asarray(getattr(self, "error_track", []))
+        nonrigid_stage = bool(
+            error_track.ndim == 2
+            and error_track.shape[1] > 0
+            and np.any(error_track[:, 0] == 2)
+        )
+    if show_knots and nonrigid_stage:
         stage_knots = drift_knots.stage_knots(self, stage)
         row_scale = merged_u8.shape[0] / self.shape[1]
         column_scale = merged_u8.shape[1] / self.shape[2]

@@ -7,13 +7,15 @@ import torch
 from torch.fft import fftfreq
 from tqdm import tqdm
 
-import quantem.imaging.drift.preparation as preparation
+import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.plot as drift_plot
+import quantem.imaging.drift.preparation as preparation
 import quantem.imaging.drift.report as report
 from quantem.imaging.drift.core import knots as drift_knots
 from quantem.imaging.drift.core.warping import (
     backward_warp_grid_search,
     cross_corr_batch,
+    fixed_overlap_ncc,
     translate_align_pair_batch,
     warp_and_translate,
 )
@@ -267,6 +269,8 @@ def correct_affine(
     refine: bool = True,
     max_image_shift: float | None | str = "auto",
     fixed_scans: list[int] | None = None,
+    region: str | tuple[int, int, int, int] | None = None,
+    region_smoothing_sigma: float = 4.0,
     show_combined: bool = True,
     show_scans: bool = False,
     show_knots: bool = True,
@@ -336,6 +340,18 @@ def correct_affine(
         the remaining images are optimized. When ``None`` (default),
         all images receive the affine drift correction - the standard
         behavior for 0°/90° scan pairs.
+    region : str, tuple of int, or None
+        Region used to estimate the affine drift. The fitted affine model is
+        still applied to the complete scans. Leave as None for the standard
+        whole-image search. For periodic lattices, use ``diagnose_affine()``
+        to identify a region containing distinctive defects, then pass its
+        name (``"top_left"``, ``"top_right"``, ``"bottom_left"``, or
+        ``"bottom_right"``) or
+        ``(row_start, row_stop, column_start, column_stop)`` bounds.
+    region_smoothing_sigma : float, default 4.0
+        Gaussian smoothing used only when ``region`` is set. Smoothing helps
+        the regional search follow distinctive defect structure instead of
+        selecting a neighboring periodic lattice peak.
     show_combined : bool
         Display the combined RGB comparison after alignment.
     show_scans : bool
@@ -369,6 +385,12 @@ def correct_affine(
 
     >>> drift.correct_affine(max_drift_rate=0.10, num_rates=11)
 
+    Diagnose a periodic lattice, then anchor the affine fit to a region with
+    distinctive structure:
+
+    >>> figure, regions = drift.diagnose_affine(stage="initial")
+    >>> drift.correct_affine(region="top_left")
+
     Single-sided alignment (4D-STEM VDF against a fixed HAADF reference):
 
     >>> drift = DriftCorrection(
@@ -391,6 +413,38 @@ def correct_affine(
             "downsample only applies when max_drift_rate and "
             "num_rates are left unset for automatic affine alignment."
         )
+    if region is None and region_smoothing_sigma != 4.0:
+        raise ValueError(
+            "region_smoothing_sigma only applies when region is set. "
+            "Pass region='top_left' or custom row/column bounds, or leave "
+            "region_smoothing_sigma at its default."
+        )
+    if region is not None:
+        _correct_affine_region(
+            self,
+            region=region,
+            smoothing_sigma=region_smoothing_sigma,
+            max_drift_rate=max_drift_rate,
+            num_rates=num_rates,
+            refine=refine,
+            max_image_shift=max_image_shift,
+            fixed_scans=fixed_scans,
+            verbose=verbose,
+            downsample=downsample,
+            chunk_size=chunk_size,
+        )
+        drift_plot.show_after_step(
+            self,
+            "affine",
+            show_combined=show_combined,
+            show_scans=show_scans,
+            show_knots=show_knots,
+        )
+        if show_knot_plot:
+            self.plot_knots()
+        if show_report:
+            print(self.report().to_string())
+        return self
     if not hasattr(self, "_initial_knots"):
         preparation_start = time.perf_counter()
         planned_rate = 0.25 if automatic else abs(float(max_drift_rate))
@@ -592,6 +646,146 @@ def correct_affine(
     return self
 
 
+def _correct_affine_region(
+    self,
+    *,
+    region: str | tuple[int, int, int, int],
+    smoothing_sigma: float = 4.0,
+    max_drift_rate: float | None = None,
+    num_rates: int | None = None,
+    refine: bool = True,
+    max_image_shift: float | None | str = "auto",
+    fixed_scans: list[int] | None = None,
+    verbose: bool = True,
+    downsample: int | str = "auto",
+    chunk_size: int | None = None,
+):
+    """Fit one affine model from a trusted region and apply it to both scans."""
+    image_rows, image_columns = self.imgs[0].shape[:2]
+    middle_row = image_rows // 2
+    middle_column = image_columns // 2
+    quadrants = {
+        "top_left": (0, middle_row, 0, middle_column),
+        "top_right": (0, middle_row, middle_column, image_columns),
+        "bottom_left": (middle_row, image_rows, 0, middle_column),
+        "bottom_right": (
+            middle_row,
+            image_rows,
+            middle_column,
+            image_columns,
+        ),
+    }
+    if isinstance(region, str):
+        if region not in quadrants:
+            raise ValueError(
+                f"You entered region={region!r}. Choose from "
+                f"{sorted(quadrants)} or provide four pixel bounds."
+            )
+        bounds = quadrants[region]
+        region_name = region
+    else:
+        bounds = tuple(int(value) for value in region)
+        if len(bounds) != 4:
+            raise ValueError(
+                "region needs four bounds: "
+                "(row_start, row_stop, column_start, column_stop)."
+            )
+        region_name = "custom"
+    row_start, row_stop, column_start, column_stop = bounds
+    if not (
+        0 <= row_start < row_stop <= image_rows
+        and 0 <= column_start < column_stop <= image_columns
+    ):
+        raise ValueError(
+            f"region bounds {bounds} are outside the image shape "
+            f"{(image_rows, image_columns)}."
+        )
+    region_slice = (
+        slice(row_start, row_stop),
+        slice(column_start, column_stop),
+    )
+
+    self.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=smoothing_sigma,
+        num_knots=1,
+        normalize=True,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    panels = drift_apply.comparison_panels(self, stage="initial")
+    angles = np.asarray(self.scan_direction_degrees, dtype=float)
+    relative_angles = (angles - angles[0] + 180.0) % 360.0 - 180.0
+    quarter_turns = np.rint(-relative_angles / 90.0).astype(int)
+    regional_images = [
+        np.ascontiguousarray(
+            np.rot90(image[region_slice], -quarter_turns[index])
+        )
+        for index, image in enumerate(panels["raw_scans"])
+    ]
+    regional = type(self).from_images(
+        *regional_images,
+        scan_direction_degrees=tuple(relative_angles),
+        device=self.device,
+    )
+    regional.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=smoothing_sigma,
+        num_knots=1,
+        normalize=False,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    regional.correct_affine(
+        max_drift_rate=max_drift_rate,
+        num_rates=num_rates,
+        refine=refine,
+        max_image_shift=max_image_shift,
+        fixed_scans=fixed_scans,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=verbose,
+        downsample=downsample,
+        chunk_size=chunk_size,
+    )
+
+    solved_knots = [knots.clone() for knots in regional.knots]
+    regional.knots = [knots.clone() for knots in regional._initial_knots]
+    _apply_affine_rate(regional, regional.drift_rate, frozenset())
+    translations = [
+        (solved - rate_only).mean(dim=(1, 2))
+        for solved, rate_only in zip(
+            solved_knots,
+            regional.knots,
+            strict=True,
+        )
+    ]
+    fixed_set = frozenset(fixed_scans) if fixed_scans is not None else frozenset()
+    _apply_affine_rate(self, regional.drift_rate, fixed_set)
+    for index, (knots, translation) in enumerate(
+        zip(self.knots, translations, strict=True)
+    ):
+        if index in fixed_set:
+            continue
+        knots[0] += translation[0]
+        knots[1] += translation[1]
+    self._knots_after_affine = [knots.clone() for knots in self.knots]
+    self._images_warped_stale = True
+    self.affine_search_info = {
+        **regional.affine_search_info,
+        "strategy": "trusted_region",
+        "trusted_region": region_name,
+        "trusted_region_bounds_row_column": list(bounds),
+        "full_image_num_knots": 1,
+    }
+    return self
+
+
 @torch.inference_mode()
 def automatic_affine_search(
     self,
@@ -703,6 +897,9 @@ def automatic_affine_search(
                 max_image_shift=coarse_shift,
                 chunk_size=chunk_size,
                 fixed_indices=fixed_set,
+                # A second top-1 score only guards the broad basin. Once the
+                # basin is chosen, the established objective owns refinement.
+                fixed_overlap_check=True,
             )
             evaluations += len(new_indices)
             for index, cost in zip(
@@ -855,6 +1052,8 @@ def automatic_affine_search(
     validation_costs = None
     validation_evaluations = 0
     validation_status = set()
+    translation_verification_shift = np.zeros(2, dtype=np.float64)
+    translation_verification_gain = 0.0
     if not reference_search:
         # The batched forward-scatter score is excellent for locating the
         # drift-rate basin, but the public result is judged *after* the
@@ -956,6 +1155,26 @@ def automatic_affine_search(
         else:
             self.knots = [knot.clone() for knot in best_result[1]]
         warped = best_result[2]
+        residual_limit = min(float(native_shift or 64.0), 64.0)
+        _, residual, residual_gain = fixed_overlap_ncc(
+            warped[:1],
+            warped[1:],
+            image_shape,
+            residual_limit,
+        )
+        if residual_gain[0] >= 0.01:
+            residual = residual[0]
+            translation_verification_shift = residual.cpu().numpy()
+            translation_verification_gain = float(residual_gain[0].cpu())
+            pair_shifts = torch.stack((-residual / 2, residual / 2))
+            for image_index in range(2):
+                self.knots[image_index][0] += pair_shifts[image_index, 0]
+                self.knots[image_index][1] += pair_shifts[image_index, 1]
+            warped = warp_and_translate(
+                self,
+                native_shift,
+                solve_translation=False,
+            )
         self.imgs_warped.array[:] = warped.cpu().numpy()
         validation_costs = sorted(result[0] for result in cache.values())
         validation_evaluations = len(cache)
@@ -1218,6 +1437,10 @@ def automatic_affine_search(
         "delivered_objective_memory_fallback": "memory" in validation_status,
         "drift_rate_row_col": center.tolist(),
         "translation_bridge_row_col": bridge_center.tolist(),
+        "translation_verification_shift_row_col": (
+            translation_verification_shift.tolist()
+        ),
+        "translation_verification_ncc_gain": translation_verification_gain,
         "max_image_shift": native_shift,
         "fallback_reason": fallback_reason,
         "seconds": elapsed,
@@ -1270,6 +1493,7 @@ def grid_search_batch(
     chunk_size=None,
     fixed_indices=None,
     progress_desc=None,
+    fixed_overlap_check=False,
 ):
     """Evaluate all candidate drift vectors in parallel.
 
@@ -1299,6 +1523,9 @@ def grid_search_batch(
     progress_desc : str or None
         Description for a progress bar shown only when candidate
         evaluation requires multiple chunks. ``None`` disables it.
+    fixed_overlap_check : bool
+        Guard the automatic search's broad basin against a translation peak
+        selected mostly by padding. Refinement keeps the established cost.
 
     Returns
     -------
@@ -1367,6 +1594,7 @@ def grid_search_batch(
         chunk_size = automatic_chunk_size(num_candidates, canvas_shape, dtype, device)
     chunked = chunk_size < num_candidates
     all_costs = []
+    all_overlap_costs = []
     chunk_start = 0
     chunk_idx = 0
     pbar = tqdm(
@@ -1404,6 +1632,7 @@ def grid_search_batch(
                 warped_images.append(warped)
             # Score all unique pairs and sum costs
             chunk_cost = torch.zeros(chunk_end - chunk_start, dtype=dtype, device=device)
+            overlap_cost = torch.zeros_like(chunk_cost)
             for i in range(n_images):
                 for j in range(i + 1, n_images):
                     chunk_cost += cross_corr_batch(
@@ -1413,7 +1642,17 @@ def grid_search_batch(
                         max_shift_mask=shift_mask,
                         freq_grids=freq_grids,
                     )
+                    if fixed_overlap_check:
+                        pair_cost, _, _ = fixed_overlap_ncc(
+                            warped_images[i],
+                            warped_images[j],
+                            tuple(int(value) for value in self.imgs[i].shape[:2]),
+                            max_image_shift,
+                        )
+                        overlap_cost += pair_cost
             all_costs.append(chunk_cost)
+            if fixed_overlap_check:
+                all_overlap_costs.append(overlap_cost)
             # After chunk 0, replace the conservative static estimate with the
             # actual measured per-candidate cost and print one summary line so
             # the user can see how the chunking adapted to their GPU state.
@@ -1452,7 +1691,15 @@ def grid_search_batch(
     finally:
         pbar.close()
     all_costs = torch.cat(all_costs)
-    return torch.argmin(all_costs).item(), all_costs
+    if not fixed_overlap_check:
+        return torch.argmin(all_costs).item(), all_costs
+    overlap_costs = torch.cat(all_overlap_costs)
+    legacy_index = torch.argmin(all_costs)
+    overlap_index = torch.argmin(overlap_costs)
+    overlap_gain = float(overlap_costs[legacy_index] - overlap_costs[overlap_index])
+    if overlap_gain >= 0.20:
+        return overlap_index.item(), overlap_costs
+    return legacy_index.item(), all_costs
 
 
 def automatic_chunk_size(num_candidates, canvas_shape, dtype, device):

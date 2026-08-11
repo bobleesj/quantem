@@ -93,6 +93,96 @@ def cross_corr_batch(
     return torch.mean(torch.abs(ref_images - aligned_images), dim=(1, 2))
 
 
+def fixed_overlap_ncc(
+    ref_images: torch.Tensor,
+    mov_images: torch.Tensor,
+    scan_shape: tuple[int, int],
+    max_image_shift: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rank translations without letting padded pixels choose the lattice branch.
+
+    A centered reference crop is compared with equally sized windows from the
+    moving scan. Every shift therefore uses the same number of measured pixels,
+    and normalized correlation removes intensity-scale differences.
+    """
+    scan_rows, scan_cols = scan_shape
+    canvas_rows, canvas_cols = ref_images.shape[-2:]
+    row_start = (canvas_rows - scan_rows) // 2
+    col_start = (canvas_cols - scan_cols) // 2
+    ref = ref_images[
+        :, row_start : row_start + scan_rows, col_start : col_start + scan_cols
+    ]
+    mov = mov_images[
+        :, row_start : row_start + scan_rows, col_start : col_start + scan_cols
+    ]
+
+    shift_limit = (
+        min(scan_shape) / 4 if max_image_shift is None else float(max_image_shift)
+    )
+    margin = min(
+        max(1, int(math.ceil(shift_limit))),
+        (min(scan_shape) - 2) // 2,
+    )
+    template = ref[:, margin:-margin, margin:-margin]
+    template = template - template.mean(dim=(-2, -1), keepdim=True)
+    template_rows, template_cols = template.shape[-2:]
+
+    fft_rows = 1 << (scan_rows + template_rows - 2).bit_length()
+    fft_cols = 1 << (scan_cols + template_cols - 2).bit_length()
+    numerator = torch.fft.irfft2(
+        torch.fft.rfft2(mov, s=(fft_rows, fft_cols))
+        * torch.fft.rfft2(
+            template.flip((-2, -1)), s=(fft_rows, fft_cols)
+        ),
+        s=(fft_rows, fft_cols),
+    )
+    numerator = numerator[
+        :,
+        template_rows - 1 : scan_rows,
+        template_cols - 1 : scan_cols,
+    ]
+
+    integral = torch.nn.functional.pad(mov, (1, 0, 1, 0))
+    integral = integral.cumsum(-2).cumsum(-1)
+    integral_sq = torch.nn.functional.pad(mov.square(), (1, 0, 1, 0))
+    integral_sq = integral_sq.cumsum(-2).cumsum(-1)
+
+    def window_sum(table):
+        return (
+            table[:, template_rows:, template_cols:]
+            - table[:, :-template_rows, template_cols:]
+            - table[:, template_rows:, :-template_cols]
+            + table[:, :-template_rows, :-template_cols]
+        )
+
+    moving_sum = window_sum(integral)
+    moving_sum_sq = window_sum(integral_sq)
+    pixels = float(template_rows * template_cols)
+    moving_norm = torch.sqrt(
+        (moving_sum_sq - moving_sum.square() / pixels).clamp_min(0.0)
+    )
+    template_norm = template.norm(dim=(-2, -1), keepdim=True)
+    ncc = numerator / (template_norm * moving_norm).clamp_min(1e-12)
+
+    shifts = torch.arange(
+        -margin,
+        margin + 1,
+        device=ncc.device,
+        dtype=ncc.dtype,
+    )
+    allowed = shifts[:, None].square() + shifts[None, :].square() <= shift_limit**2
+    ncc.masked_fill_(~allowed[None], -torch.inf)
+    flat_index = ncc.flatten(1).argmax(dim=1)
+    peak_row = flat_index // ncc.shape[-1]
+    peak_col = flat_index % ncc.shape[-1]
+    batch = torch.arange(ncc.shape[0], device=ncc.device)
+    best_ncc = ncc[batch, peak_row, peak_col]
+    image_shifts = -torch.stack(
+        (peak_row - margin, peak_col - margin), dim=1
+    ).to(ncc.dtype)
+    return 1.0 - best_ncc, image_shifts, best_ncc - ncc[:, margin, margin]
+
+
 def translate_align(
     warped_images: torch.Tensor,
     upsample_factor: int,
@@ -240,6 +330,19 @@ def warp_and_translate(
     canvas_shape = (correction.shape[1], correction.shape[2])
     fixed_set = fixed_indices if fixed_indices else frozenset()
     imgs_t = imgs_t_override if imgs_t_override is not None else correction.imgs_t
+    # AutoSerialize restores tensors on the host so one archive can be opened
+    # on CUDA, MPS, or CPU. Move the small alignment images at the shared warp
+    # boundary; callers should not need to repair a reloaded correction before
+    # requesting a report, coverage mask, or figure.
+    imgs_t = [image.to(device=device, dtype=dtype) for image in imgs_t]
+    if imgs_t_override is None:
+        correction.imgs_t = imgs_t
+    if knots_batch is None:
+        correction.knots = [
+            knots.to(device=device, dtype=dtype) for knots in correction.knots
+        ]
+    else:
+        knots_batch = knots_batch.to(device=device, dtype=dtype)
 
     def render(warped_t, weights_t):
         for img_idx in range(num_images):

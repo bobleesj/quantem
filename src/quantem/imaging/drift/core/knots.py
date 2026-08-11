@@ -119,6 +119,92 @@ def initialize_scanline_knots(
     return np.stack([row_knots, col_knots], axis=0)
 
 
+def resize_scanline_knots(correction, num_knots: int):
+    """Change fast-scan knot density without changing the fitted drift field
+
+    Affine and strip correction establish a displacement field before a
+    scientist decides how much fast-scan flexibility the non-rigid stage
+    needs. Resampling the displacement at a new knot density lets
+    ``correct_nonrigid(num_knots=...)`` retain that corrected geometry instead
+    of repeating affine correction or discarding its result.
+
+    Parameters
+    ----------
+    correction : DriftCorrection
+        Prepared correction containing the current and initial knot fields.
+    num_knots : int
+        New number of knots along every fast-scan line.
+
+    Returns
+    -------
+    DriftCorrection
+        The same correction with every saved checkpoint represented at the
+        requested knot density.
+    """
+    count = int(num_knots)
+    if count < 1:
+        raise ValueError(f"num_knots must be >= 1, got {num_knots!r}.")
+    current = {int(value.shape[2]) for value in correction.knots}
+    if current == {count}:
+        return correction
+    if len(current) != 1:
+        raise ValueError(
+            "All scans must use the same knot count before resizing; "
+            f"got {sorted(current)}."
+        )
+
+    old_initial = correction._initial_knots
+    new_initial = [
+        torch.as_tensor(
+            initialize_scanline_knots(
+                input_shape=correction.imgs[index].shape,
+                output_shape=correction.shape[1:],
+                scan_fast=correction.scan_fast[index],
+                scan_slow=correction.scan_slow[index],
+                number_knots=count,
+            ),
+            dtype=correction._dtype,
+            device=correction._device,
+        )
+        for index in range(correction.shape[0])
+    ]
+
+    def resize_checkpoint(checkpoint):
+        resized = []
+        for value, initial, target in zip(
+            checkpoint,
+            old_initial,
+            new_initial,
+            strict=True,
+        ):
+            displacement = value - initial
+            if displacement.shape[2] == 1:
+                displacement = displacement.expand(-1, -1, count)
+            else:
+                rows = displacement.shape[1]
+                displacement = torch.nn.functional.interpolate(
+                    displacement.reshape(1, 2 * rows, -1),
+                    size=count,
+                    mode="linear",
+                    align_corners=True,
+                ).reshape(2, rows, count)
+            resized.append(target + displacement)
+        return resized
+
+    checkpoints = {
+        name: resize_checkpoint(getattr(correction, name))
+        for name in ("knots", "_knots_after_affine", "_knots_after_strip")
+        if hasattr(correction, name)
+    }
+    correction._initial_knots = new_initial
+    for name, values in checkpoints.items():
+        setattr(correction, name, values)
+    correction.number_knots = count
+    correction.preprocess_info["num_knots"] = count
+    correction._images_warped_stale = True
+    return correction
+
+
 def _transform_coordinates_single_knot(
     knots: torch.Tensor,
     scan_fast: torch.Tensor,

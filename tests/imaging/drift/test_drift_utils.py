@@ -9,11 +9,11 @@ test_drift_simulations.py.
 import numpy as np
 import pytest
 import torch
+from matplotlib import pyplot as plt
 from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde
-from quantem.imaging.drift.apply import largest_rectangle
-from quantem.imaging.drift.correction import DriftCorrection
+from quantem.imaging.drift.apply import largest_rectangle, warped_stack
 from quantem.imaging.drift.core.knots import (
     DriftKnot,
     _symmetric_pad,
@@ -21,6 +21,7 @@ from quantem.imaging.drift.core.knots import (
     gaussian_smooth_1d,
     gaussian_smooth_batch,
     initialize_scanline_knots,
+    resize_scanline_knots,
 )
 from quantem.imaging.drift.core.warping import (
     _parabolic_peak_2d,
@@ -28,13 +29,282 @@ from quantem.imaging.drift.core.warping import (
     backward_warp,
     backward_warp_grid_search,
     cross_corr_batch,
+    fixed_overlap_ncc,
     translate_align,
     translate_align_pair_batch,
+    warp_and_translate,
 )
+from quantem.imaging.drift.correction import DriftCorrection
 
 # ---------------------------------------------------------------------------
 # High-level: cross-correlation and warping
 # ---------------------------------------------------------------------------
+
+
+def test_diagnose_affine_reports_actual_regions_without_changing_knots():
+    """Regional diagnostics should measure the delivered images without mutation."""
+    rng = np.random.default_rng(20260802)
+    reference = rng.random((64, 64), dtype=np.float32)
+    moving = np.roll(reference, (3, -4), axis=(0, 1))
+    correction = DriftCorrection.from_images(
+        reference,
+        moving,
+        scan_direction_degrees=(0.0, 0.0),
+        device="cpu",
+    )
+    correction.preprocess(
+        padding_fraction=0.25,
+        normalize=False,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    warped_stack(correction)
+    knots = [value.clone() for value in correction.knots]
+    smoothing_sigma = correction.kde_sigma
+    warped = correction.imgs_warped.array.copy()
+    warped_stale = correction._images_warped_stale
+    warped_fingerprint = correction._warped_fingerprint
+
+    figure, regions = correction.diagnose_affine(
+        stage=None,
+        smoothing_sigma=1.5,
+    )
+
+    assert regions.shape[0] == 4
+    assert len(figure.axes) == 16
+    assert figure.axes[0].get_title().startswith("Scan 0")
+    assert "Residual difference" in figure.axes[3].get_title()
+    assert np.all(regions["current_ncc"] < 0.1)
+    assert np.all(regions["mean_absolute_difference"] > 0)
+    for before, after in zip(knots, correction.knots, strict=True):
+        torch.testing.assert_close(before, after)
+    assert correction.kde_sigma == smoothing_sigma
+    assert correction._images_warped_stale == warped_stale
+    assert correction._warped_fingerprint == warped_fingerprint
+    np.testing.assert_array_equal(correction.imgs_warped.array, warped)
+    plt.close(figure)
+
+
+def test_affine_region_correction_transfers_to_full_pair():
+    """Trusted-region affine should correct the complete pair without notebook math."""
+    rng = np.random.default_rng(20260803)
+    reference = rng.random((128, 128), dtype=np.float32)
+    moving_global = np.roll(reference, (3, -4), axis=(0, 1))
+    moving = np.ascontiguousarray(np.rot90(moving_global, k=-1))
+    correction = DriftCorrection.from_images(
+        reference,
+        moving,
+        scan_direction_degrees=(0.0, -90.0),
+        device="cpu",
+    )
+
+    correction.correct_affine(
+        region="top_left",
+        region_smoothing_sigma=0.5,
+        max_image_shift=8,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    figure, regions = correction.diagnose_affine(
+        smoothing_sigma=0.5,
+    )
+
+    assert correction.affine_search_info["strategy"] == "trusted_region"
+    assert correction.affine_search_info["full_image_num_knots"] == 1
+    assert correction.affine_search_info["trusted_region"] == "top_left"
+    assert correction.affine_search_info["trusted_region_bounds_row_column"] == [
+        0,
+        64,
+        0,
+        64,
+    ]
+    assert all(knots.shape[-1] == 1 for knots in correction.knots)
+    assert np.isfinite(regions["current_ncc"]).all()
+    assert regions.loc[regions["region"] == "top left", "region_role"].item() == (
+        "trusted affine fit"
+    )
+    figure, axes = correction.plot_combined(
+        stage=("initial", "affine"),
+        show_knots=True,
+    )
+    assert all(not axis.lines for axis in axes)
+    plt.close(figure)
+    figure, axis = correction.plot_combined(stage="nonrigid", show_knots=True)
+    assert len(axis.lines) == 2
+    plt.close(figure)
+
+
+def test_affine_accepts_explicit_row_column_region_bounds():
+    """Scientists should be able to fit a feature that crosses quadrant bounds."""
+    rng = np.random.default_rng(20260804)
+    reference = rng.random((128, 128), dtype=np.float32)
+    moving = np.ascontiguousarray(
+        np.rot90(np.roll(reference, (2, -3), axis=(0, 1)), k=-1)
+    )
+    correction = DriftCorrection.from_images(
+        reference,
+        moving,
+        scan_direction_degrees=(0.0, -90.0),
+        device="cpu",
+    )
+
+    correction.correct_affine(
+        region=(8, 72, 16, 80),
+        region_smoothing_sigma=0.5,
+        max_image_shift=8,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+
+    assert correction.affine_search_info["trusted_region"] == "custom"
+    assert correction.affine_search_info["trusted_region_bounds_row_column"] == [
+        8,
+        72,
+        16,
+        80,
+    ]
+    corrected = correction.corrected()
+    assert corrected.array.ndim == 2
+
+
+def test_affine_rejects_region_bounds_outside_the_image():
+    """Invalid bounds should identify the image shape and requested region."""
+    image = np.ones((32, 32), dtype=np.float32)
+    correction = DriftCorrection.from_images(
+        image,
+        image.copy(),
+        scan_direction_degrees=(0.0, 0.0),
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="outside the image shape"):
+        correction.correct_affine(region=(0, 40, 0, 32))
+
+
+def test_coverage_mask_uses_full_multiple_knot_interpolation():
+    """Multi-knot diagnostics need the measured footprint of the full field."""
+    rng = np.random.default_rng(20260810)
+    image = rng.random((48, 48), dtype=np.float32)
+    correction = DriftCorrection.from_images(
+        image,
+        image.copy(),
+        scan_direction_degrees=(0.0, 0.0),
+        device="cpu",
+    )
+    correction.preprocess(
+        padding_fraction=0.25,
+        num_knots=3,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+
+    mask = correction.coverage_mask()
+
+    assert mask.shape == image.shape
+    assert mask.dtype == bool
+    assert mask.mean() > 0.95
+
+
+def test_resize_scanline_knots_preserves_affine_field():
+    """Choosing non-rigid flexibility must not change the affine correction."""
+    rng = np.random.default_rng(20260810)
+    image = rng.random((48, 48), dtype=np.float32)
+    correction = DriftCorrection.from_images(
+        image,
+        image.copy(),
+        scan_direction_degrees=(0.0, 90.0),
+        device="cpu",
+    )
+    correction.preprocess(
+        padding_fraction=0.25,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    row_ramp = torch.linspace(-2, 3, 48)
+    for knots in correction.knots:
+        knots[1, :, 0] += row_ramp
+    correction._knots_after_affine = [value.clone() for value in correction.knots]
+    before = warp_and_translate(
+        correction,
+        max_image_shift=None,
+        solve_translation=False,
+    )
+
+    resize_scanline_knots(correction, 6)
+    after = warp_and_translate(
+        correction,
+        max_image_shift=None,
+        solve_translation=False,
+    )
+
+    assert all(value.shape[-1] == 6 for value in correction.knots)
+    torch.testing.assert_close(before, after, rtol=2e-5, atol=2e-5)
+
+
+def test_diagnose_nonrigid_compares_counts_without_changing_correction():
+    """A knot-count study should return evidence and preserve its affine input."""
+    rng = np.random.default_rng(20260810)
+    reference = rng.random((32, 32), dtype=np.float32)
+    moving = np.roll(reference, (1, -1), axis=(0, 1))
+    correction = DriftCorrection.from_images(
+        reference,
+        moving,
+        scan_direction_degrees=(0.0, 90.0),
+        device="cpu",
+    )
+    correction.preprocess(
+        padding_fraction=0.25,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    correction._knots_after_affine = [value.clone() for value in correction.knots]
+    warped_stack(correction)
+    before = [value.clone() for value in correction.knots]
+    warped = correction.imgs_warped.array.copy()
+    warped_stale = correction._images_warped_stale
+    warped_fingerprint = correction._warped_fingerprint
+
+    figure, metrics = correction.diagnose_nonrigid(
+        num_knots=(1, 2),
+        num_refine_cycles=1,
+        optimizer_steps=1,
+        learning_rate=0.01,
+        knot_smoothing_sigma=0,
+        max_image_shift=2,
+        loss="mse",
+        early_stop_patience=1,
+        min_iterations=1,
+        verbose=False,
+    )
+
+    assert metrics["num_knots"].tolist() == [1, 2]
+    assert {
+        "common_ncc",
+        "yellow",
+        "fast_roughness_px",
+        "seconds",
+    }.issubset(metrics.columns)
+    assert len(figure.axes) == 8
+    for expected, actual in zip(before, correction.knots, strict=True):
+        torch.testing.assert_close(expected, actual)
+    assert correction._images_warped_stale == warped_stale
+    assert correction._warped_fingerprint == warped_fingerprint
+    np.testing.assert_array_equal(correction.imgs_warped.array, warped)
+    plt.close(figure)
 
 
 def test_cross_corr_zero_cost_for_identical():
@@ -50,6 +320,28 @@ def test_cross_corr_zero_cost_for_identical():
     reference = torch.tensor(image)[None]
     cost = cross_corr_batch(reference, reference.clone(), upsample_factor=8)
     assert cost.item() < 1e-6
+
+
+def test_fixed_overlap_ncc_ignores_padding_and_recovers_shift():
+    """Measured overlap must choose the image shift instead of padded borders."""
+    rng = np.random.default_rng(20260802)
+    reference = rng.random((48, 48)).astype(np.float32)
+    moving = np.full_like(reference, np.median(reference))
+    moving[5:, :-7] = reference[:-5, 7:]
+    canvas = np.full((2, 64, 64), np.median(reference), dtype=np.float32)
+    canvas[0, 8:56, 8:56] = reference
+    canvas[1, 8:56, 8:56] = moving
+
+    cost, shifts, gain = fixed_overlap_ncc(
+        torch.from_numpy(canvas[:1]),
+        torch.from_numpy(canvas[1:]),
+        (48, 48),
+        10,
+    )
+
+    torch.testing.assert_close(shifts[0], torch.tensor([-5.0, 7.0]))
+    assert cost[0] < 1e-5
+    assert gain[0] > 0.5
 
 
 def test_translate_align_pair_batch_matches_sequential_solver():
