@@ -412,7 +412,7 @@ class DriftCorrection(AutoSerialize):
     # -- serialization -------------------------------------------------------
 
     def save(self, path, mode="w", store="auto", skip=(), compression_level=4):
-        """AutoSerialize the solved correction to disk.
+        """Save a solved correction for later analysis and figure rendering.
 
         Persists knots and 2-D alignment state so figure notebooks can ``load``
         without re-solving. Large 4D-STEM cubes under ``_datasets`` are always
@@ -437,11 +437,12 @@ class DriftCorrection(AutoSerialize):
 
         Examples
         --------
-        >>> dc = DriftCorrection.from_emd(f0, f90, device="cpu")
+        >>> dc = DriftCorrection.from_emd(f0, f90)
         >>> dc.correct_affine(show_combined=False, verbose=False)
         >>> dc.save("data/sample/drift.zip", mode="o")
         >>> from quantem.core.io import load
         >>> dc2 = load("data/sample/drift.zip")
+
         """
         if isinstance(skip, (str, type)):
             skip = [skip]

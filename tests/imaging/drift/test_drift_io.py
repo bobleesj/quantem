@@ -15,6 +15,7 @@ from quantem.imaging.drift import DriftCorrection
 from quantem.imaging.drift.io import scan_pairs
 from tests.imaging.drift.simulation_fixture import make_synthetic_drift_data
 
+
 def _fake_dataset(image, angle_deg, px_nm=0.01):
     """A stamped Dataset2d, as em.imaging.read_emd would return it."""
     ds = Dataset2d.from_array(np.asarray(image, dtype=np.float32))

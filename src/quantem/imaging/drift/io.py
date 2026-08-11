@@ -46,8 +46,9 @@ def read_emd(path: str | Path):
     >>> image.metadata["scan_rotation_deg"]
     0.0
     """
-    from quantem.core.io.file_readers import read_emd_metadata
     from rsciio.emd import file_reader
+
+    from quantem.core.io.file_readers import read_emd_metadata
 
     streams = file_reader(str(path), select_type="images")
     stream = next(
@@ -120,8 +121,9 @@ def read_emd_eds(
     >>> acquisition["haadf"].shape
     (2048, 2048)
     """
-    from quantem.core.io.file_readers import read_emd_metadata
     from rsciio.emd import file_reader
+
+    from quantem.core.io.file_readers import read_emd_metadata
 
     streams = [
         (np.asarray(ds["data"]),
@@ -222,6 +224,7 @@ def scan_pairs(
     >>> pairs[pairs.pair_order == 0][["file", "partner"]]
     """
     import pandas as pd
+
     from quantem.core.io.file_readers import read_emd_metadata
 
     folder = Path(folder).expanduser()

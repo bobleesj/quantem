@@ -12,8 +12,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-import quantem.imaging.drift.plot as drift_plot
 import quantem.imaging.drift.core.warping as warping
+import quantem.imaging.drift.plot as drift_plot
+
 
 @dataclass(frozen=True, slots=True)
 class StripPass:

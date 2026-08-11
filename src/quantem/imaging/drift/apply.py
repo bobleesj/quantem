@@ -550,6 +550,8 @@ def apply_correction(
         4D-STEM dataset.
     image_index : int, optional
         Scan trajectory to apply. Default is the last scan.
+    stage : {"initial", "affine", "strip", None}, optional
+        Saved correction stage to apply. ``None`` uses the current solution.
     mode : str, optional
         Interpolation kernel, either ``"bilinear"`` or ``"bicubic"``.
         Default is ``"bilinear"``.
@@ -577,6 +579,7 @@ def apply_correction(
     >>> dc = DriftCorrection(reference, moving, scan_direction_degrees=(0, 90))
     >>> dc.correct_affine(show_combined=False)
     >>> corrected = dc.apply_correction(image_index=1)
+
     """
     if not hasattr(self, "knots") or not hasattr(self, "_initial_knots"):
         raise RuntimeError(
