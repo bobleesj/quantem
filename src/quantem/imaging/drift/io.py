@@ -1,6 +1,5 @@
 """Read Velox EMD images, spectrum images, and scan metadata for drift correction."""
 
-import re
 from pathlib import Path
 
 import numpy as np
@@ -201,9 +200,10 @@ def scan_pairs(
     """Pair orthogonal Velox scans acquired from the same specimen area.
 
     Stage position identifies the shared field of view; scan rotation identifies
-    the orthogonal acquisition, and filename magnification is only a tiebreak
-    when Velox omits nominal magnification. The returned inventory includes every
-    file so a microscopist can review both matched and unmatched acquisitions.
+    the orthogonal acquisition. Shape, pixel calibration, field of view, and
+    nominal magnification reject incompatible acquisitions when those metadata
+    are present. Only unique mutual matches are paired. The returned inventory
+    includes every file and a reason for every acquisition that is not included.
 
     Parameters
     ----------
@@ -242,7 +242,6 @@ def scan_pairs(
         shape = metadata["scan_shape"]
         pixel_size_nm = metadata["pixel_size_nm"]
         stage = metadata["stage_xy_m"]
-        token = re.search(r"[ _](\d+(?:\.\d+)?)[ _](Mx|kx|x)[ _]", path.name)
         records.append(
             {
                 "file": path.name,
@@ -250,12 +249,12 @@ def scan_pairs(
                 "pixel_size_nm": pixel_size_nm,
                 "fov_nm": None if metadata["fov_m"] is None else metadata["fov_m"] * 1e9,
                 "magnification": metadata["magnification"],
-                "magnification_token": "" if token is None else f"{token.group(1)}_{token.group(2)}",
                 "rotation_deg": metadata["scan_rotation_deg"],
                 "stage_x_m": None if stage is None else stage[0],
                 "stage_y_m": None if stage is None else stage[1],
                 "fov_m": metadata["fov_m"],
                 "acquired": metadata["acquisition_timestamp"],
+                "acquisition_context": metadata.get("acquisition_context", "image"),
             }
         )
 
@@ -266,12 +265,12 @@ def scan_pairs(
         "pixel_size_nm",
         "fov_nm",
         "magnification",
-        "magnification_token",
         "rotation_deg",
         "stage_x_m",
         "stage_y_m",
         "fov_m",
         "acquired",
+        "acquisition_context",
     ):
         if column not in table:
             table[column] = None
@@ -284,26 +283,44 @@ def scan_pairs(
     table["relative_partner_rotation_deg"] = np.nan
     table["stage_distance_nm"] = np.nan
     table["pair_tolerance_nm"] = np.nan
+    table["pair_status"] = "not_included"
+    table["pair_reason"] = ""
 
     tolerance = float(max_rotation_tolerance_deg)
     zero_indices = [
         index
         for index, angle in table.rotation_deg.items()
-        if pd.notna(angle) and abs(float(angle)) < tolerance
+        if pd.notna(angle)
+        and abs(float(angle)) < tolerance
+        and table.at[index, "acquisition_context"] != "spectrum_image"
     ]
     ninety_indices = [
         index
         for index, angle in table.rotation_deg.items()
         if pd.notna(angle) and abs(abs(float(angle)) - 90.0) < tolerance
+        and table.at[index, "acquisition_context"] != "spectrum_image"
     ]
-    claimed = set()
-    pair_count = 0
+    candidates_by_zero = {zero: [] for zero in zero_indices}
+    zeros_by_ninety = {ninety: [] for ninety in ninety_indices}
     for zero in zero_indices:
-        candidates = []
         for ninety in ninety_indices:
-            if ninety in claimed:
-                continue
-            if table.at[zero, "magnification_token"] != table.at[ninety, "magnification_token"]:
+            incompatible = False
+            if table.at[zero, "shape"] and table.at[ninety, "shape"]:
+                incompatible = tuple(table.at[zero, "shape"]) != tuple(
+                    table.at[ninety, "shape"]
+                )
+            for column, relative_tolerance in (
+                ("pixel_size_nm", 0.02),
+                ("fov_m", 0.02),
+                ("magnification", 0.02),
+            ):
+                first, second = table.loc[[zero, ninety], column]
+                if pd.notna(first) and pd.notna(second):
+                    scale = max(abs(float(first)), abs(float(second)), 1e-30)
+                    incompatible |= abs(float(first) - float(second)) > (
+                        relative_tolerance * scale
+                    )
+            if incompatible:
                 continue
             stage_values = table.loc[
                 [zero, ninety], ["stage_x_m", "stage_y_m"]
@@ -320,15 +337,57 @@ def scan_pairs(
                     continue
             else:
                 distance, pair_tolerance = float("inf"), float("nan")
-            candidates.append((distance, abs(ninety - zero), ninety, pair_tolerance))
+            candidate = (distance, ninety, pair_tolerance)
+            candidates_by_zero[zero].append(candidate)
+            zeros_by_ninety[ninety].append((distance, zero, pair_tolerance))
+
+    for index, angle in table.rotation_deg.items():
+        if table.at[index, "acquisition_context"] == "spectrum_image":
+            table.at[index, "pair_reason"] = (
+                "Spectrum-image acquisition belongs in the EDS/EELS reference workflow."
+            )
+        elif pd.isna(angle):
+            table.at[index, "pair_reason"] = "Missing scan-rotation metadata."
+        elif index not in zero_indices and index not in ninety_indices:
+            table.at[index, "pair_reason"] = (
+                f"Scan rotation is not within {tolerance:g}° of 0° or ±90°."
+            )
+
+    pair_count = 0
+    for zero in zero_indices:
+        candidates = candidates_by_zero[zero]
         if not candidates:
+            table.at[zero, "pair_reason"] = (
+                "No orthogonal scan has compatible shape, calibration, field of view, and stage position."
+            )
+            continue
+        if len(candidates) > 1:
+            table.at[zero, "pair_reason"] = (
+                f"Ambiguous: {len(candidates)} compatible ±90° scans match this 0° acquisition."
+            )
+            for _, ninety, _ in candidates:
+                table.at[ninety, "pair_reason"] = (
+                    "Ambiguous: this ±90° scan is one of multiple candidates for the same 0° acquisition."
+                )
             continue
 
-        distance, _, ninety, pair_tolerance = min(candidates)
+        distance, ninety, pair_tolerance = candidates[0]
+        reverse_candidates = zeros_by_ninety[ninety]
+        if len(reverse_candidates) != 1:
+            table.at[zero, "pair_reason"] = (
+                "Ambiguous: the compatible ±90° scan also matches multiple 0° acquisitions."
+            )
+            table.at[ninety, "pair_reason"] = (
+                f"Ambiguous: {len(reverse_candidates)} compatible 0° scans match this ±90° acquisition."
+            )
+            continue
+
         pair_count += 1
         pair_name = f"P{pair_count:02d}"
         rotations = table.loc[[zero, ninety], "rotation_deg"].astype(float).to_numpy()
         table.loc[[zero, ninety], "pair"] = pair_name
+        table.loc[[zero, ninety], "pair_status"] = "confident"
+        table.loc[[zero, ninety], "pair_reason"] = ""
         table.at[zero, "partner"] = table.at[ninety, "file"]
         table.at[ninety, "partner"] = table.at[zero, "file"]
         table.at[zero, "pair_order"] = 0
@@ -344,6 +403,11 @@ def scan_pairs(
         if np.isfinite(distance):
             table.loc[[zero, ninety], "stage_distance_nm"] = distance * 1e9
             table.loc[[zero, ninety], "pair_tolerance_nm"] = pair_tolerance * 1e9
-        claimed.update((zero, ninety))
+
+    for ninety in ninety_indices:
+        if not table.at[ninety, "pair"] and not table.at[ninety, "pair_reason"]:
+            table.at[ninety, "pair_reason"] = (
+                "No 0° scan has compatible shape, calibration, field of view, and stage position."
+            )
 
     return table.sort_values("acquired", na_position="last").reset_index(drop=True)

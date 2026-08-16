@@ -65,6 +65,13 @@ def read_emd_metadata(file_path: str | PathLike) -> dict[str, Any]:
     image metadata record, matching QuantEM Live's validated pairing policy.
     """
     metadata = _read_velox_metadata_record(file_path)
+    with h5py.File(file_path, "r") as handle:
+        acquisition_context = (
+            "spectrum_image"
+            if handle.get("Data/SpectrumImage") is not None
+            or handle.get("Data/SpectrumStream") is not None
+            else "image"
+        )
     rotation = metadata.get("Scan", {}).get("ScanRotation")
     magnification = metadata.get("Optics", {}).get("NominalMagnification")
     position = metadata.get("Stage", {}).get("Position", {}) or {}
@@ -108,6 +115,7 @@ def read_emd_metadata(file_path: str | PathLike) -> dict[str, Any]:
         "acquisition_timestamp": (
             int(timestamp) if timestamp and str(timestamp).isdigit() else None
         ),
+        "acquisition_context": acquisition_context,
         "original_metadata": metadata,
     }
 

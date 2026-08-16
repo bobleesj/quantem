@@ -5,6 +5,10 @@ scan_direction_degrees. Crop FOV shared across maps; one static show check.
 """
 
 
+import json
+import math
+
+import h5py
 import numpy as np
 import pytest
 from matplotlib import pyplot as plt
@@ -14,6 +18,32 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
 from quantem.imaging.drift.io import scan_pairs
 from tests.imaging.drift.simulation_fixture import make_synthetic_drift_data
+
+
+def _write_pairing_emd(
+    path,
+    *,
+    rotation_deg,
+    stage_xy_m,
+    acquired,
+    shape=(128, 128),
+    pixel_size_m=0.1e-9,
+    magnification=5.2e6,
+):
+    """Write the minimal real Velox HDF5 metadata used by ``scan_pairs``."""
+    metadata = {
+        "Scan": {
+            "ScanRotation": math.radians(rotation_deg),
+            "ScanSize": {"width": shape[1], "height": shape[0]},
+        },
+        "Optics": {"NominalMagnification": magnification},
+        "Stage": {"Position": {"x": stage_xy_m[0], "y": stage_xy_m[1]}},
+        "BinaryResult": {"PixelSize": {"width": pixel_size_m}},
+        "Acquisition": {"AcquisitionStartDatetime": {"DateTime": str(acquired)}},
+    }
+    encoded = np.frombuffer(json.dumps(metadata).encode(), dtype=np.uint8)
+    with h5py.File(path, "w") as handle:
+        handle.create_group("Data/Image/0").create_dataset("Metadata", data=encoded)
 
 
 def _fake_dataset(image, angle_deg, px_nm=0.01):
@@ -70,6 +100,99 @@ def test_scan_pairs_matches_orthogonal_scans_at_the_same_stage_position(
     assert reference.partner == files[1]
     assert reference.stage_distance_nm == pytest.approx(5.0)
     assert pairs.loc[pairs.file == files[2], "pair"].item() == ""
+
+
+def test_scan_pairs_real_emd_metadata_supports_multiple_plus_and_minus_90_pairs(tmp_path):
+    fixtures = [
+        ("misleading_90_name.emd", 0.2, (0.0, 0.0), 1),
+        ("no-angle-alpha.emd", 89.8, (2e-9, 0.0), 2),
+        ("misleading_0_name.emd", -0.3, (1e-6, 0.0), 3),
+        ("no-angle-beta.emd", -90.4, (1.002e-6, 0.0), 4),
+    ]
+    for filename, rotation, stage, acquired in fixtures:
+        _write_pairing_emd(
+            tmp_path / filename,
+            rotation_deg=rotation,
+            stage_xy_m=stage,
+            acquired=acquired,
+        )
+
+    inventory = scan_pairs(tmp_path)
+    confident = inventory[inventory.pair_status == "confident"]
+    assert confident.pair.nunique() == 2
+    references = confident[confident.pair_order == 0]
+    assert set(references.file) == {"misleading_90_name.emd", "misleading_0_name.emd"}
+    assert set(confident.rotation_deg.round(1)) == {0.2, 89.8, -0.3, -90.4}
+
+
+def test_scan_pairs_real_emd_metadata_rejects_plus_minus_90_ambiguity(tmp_path):
+    fixtures = [
+        ("reference.emd", 0.0, 1),
+        ("positive.emd", 90.0, 2),
+        ("negative.emd", -90.0, 3),
+    ]
+    for filename, rotation, acquired in fixtures:
+        _write_pairing_emd(
+            tmp_path / filename,
+            rotation_deg=rotation,
+            stage_xy_m=(0.0, 0.0),
+            acquired=acquired,
+        )
+
+    inventory = scan_pairs(tmp_path)
+    assert not inventory.pair.astype(bool).any()
+    assert inventory.pair_reason.str.contains("Ambiguous").all()
+
+
+def test_scan_pairs_real_emd_metadata_retains_incompatible_files_with_reasons(tmp_path):
+    _write_pairing_emd(
+        tmp_path / "reference.emd",
+        rotation_deg=0,
+        stage_xy_m=(0.0, 0.0),
+        acquired=1,
+    )
+    _write_pairing_emd(
+        tmp_path / "wrong-shape.emd",
+        rotation_deg=90,
+        stage_xy_m=(0.0, 0.0),
+        acquired=2,
+        shape=(64, 64),
+    )
+    _write_pairing_emd(
+        tmp_path / "far-field.emd",
+        rotation_deg=-90,
+        stage_xy_m=(1e-6, 0.0),
+        acquired=3,
+    )
+
+    inventory = scan_pairs(tmp_path)
+    assert not inventory.pair.astype(bool).any()
+    assert inventory.pair_reason.ne("").all()
+
+
+def test_scan_pairs_keeps_spectrum_image_out_of_2d_reference_pairing(tmp_path):
+    for filename, rotation, acquired in (
+        ("reference-zero.emd", 0, 1),
+        ("reference-ninety.emd", 90, 2),
+        ("spectral-target.emd", 0, 3),
+    ):
+        path = tmp_path / filename
+        _write_pairing_emd(
+            path,
+            rotation_deg=rotation,
+            stage_xy_m=(0.0, 0.0),
+            acquired=acquired,
+        )
+        if filename == "spectral-target.emd":
+            with h5py.File(path, "a") as handle:
+                handle.create_group("Data/SpectrumImage/0")
+
+    inventory = scan_pairs(tmp_path)
+    confident = inventory[inventory.pair_status == "confident"]
+    assert set(confident.file) == {"reference-zero.emd", "reference-ninety.emd"}
+    target = inventory[inventory.file == "spectral-target.emd"].iloc[0]
+    assert target.pair == ""
+    assert "EDS/EELS" in target.pair_reason
 
 def _solve(dc):
     """Run the standard light pipeline and return the final cross-scan error."""
