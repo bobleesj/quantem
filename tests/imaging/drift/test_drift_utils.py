@@ -279,7 +279,7 @@ def test_diagnose_nonrigid_compares_counts_without_changing_correction():
     warped_fingerprint = correction._warped_fingerprint
 
     figure, metrics = correction.diagnose_nonrigid(
-        num_knots=(1, 2),
+        num_knots=(1, 2, 3),
         num_refine_cycles=1,
         optimizer_steps=1,
         learning_rate=0.01,
@@ -291,14 +291,14 @@ def test_diagnose_nonrigid_compares_counts_without_changing_correction():
         verbose=False,
     )
 
-    assert metrics["num_knots"].tolist() == [1, 2]
+    assert metrics["num_knots"].tolist() == [1, 2, 3]
     assert {
         "common_ncc",
         "yellow",
         "fast_roughness_px",
         "seconds",
     }.issubset(metrics.columns)
-    assert len(figure.axes) == 8
+    assert len(figure.axes) == 12
     for expected, actual in zip(before, correction.knots, strict=True):
         torch.testing.assert_close(expected, actual)
     assert correction._images_warped_stale == warped_stale
