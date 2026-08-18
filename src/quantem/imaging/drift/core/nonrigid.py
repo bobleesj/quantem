@@ -264,8 +264,21 @@ def _regularize_knots(
             # knot) slot as an independent series along rows by moving the row
             # dim last and flattening the leading channels.
             knots_flat = knots_batch.permute(0, 1, 3, 2).reshape(-1, num_rows_knot).T
-            coefs, _, _, _ = torch.linalg.lstsq(vander, knots_flat)
-            trend = (vander @ coefs).T
+            if vander.device.type == "mps":
+                # MPS does not implement lstsq. The normalized polynomial basis
+                # has at most four columns, so its full-rank system is small.
+                if vander.shape[0] < vander.shape[1]:
+                    coefficients = torch.linalg.lstsq(
+                        vander.cpu(), knots_flat.cpu()
+                    ).solution.to(vander.device)
+                else:
+                    normal_matrix = vander.T @ vander
+                    coefficients = torch.linalg.solve(
+                        normal_matrix, vander.T @ knots_flat
+                    )
+            else:
+                coefficients = torch.linalg.lstsq(vander, knots_flat).solution
+            trend = (vander @ coefficients).T
             residual = knots_flat.T - trend
             smoothed = drift_knots.gaussian_smooth_1d(residual, sigma_px)
             knots_batch.copy_(
