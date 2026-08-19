@@ -405,6 +405,7 @@ class DriftCorrection(AutoSerialize):
     show_4dstem = drift_plot.show_4dstem
 
     corrected_virtual_images = fourdstem.corrected_virtual_images
+    regional_diffraction_patterns = fourdstem.regional_diffraction_patterns
     corrected_4dstem = fourdstem.corrected_4dstem
 
     integrate_virtual_detector = staticmethod(fourdstem.integrate_virtual_detector)

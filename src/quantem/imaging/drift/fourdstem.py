@@ -1,4 +1,5 @@
 """Virtual-detector and paired-dataset products for 4D-STEM correction."""
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -305,6 +306,185 @@ def corrected_virtual_images(
         "corrected_image": to_numpy(merged, dtype=np.float32),
         "corrected_image_0": to_numpy(components[0], dtype=np.float32),
         "corrected_image_1": to_numpy(components[1], dtype=np.float32),
+    }
+
+
+def regional_diffraction_patterns(
+    self,
+    regions: Mapping[str, tuple[float, float]],
+    *,
+    radius_px: float = 4.0,
+    datasets=None,
+    stages: tuple[str, ...] = ("initial", "corrected"),
+) -> dict[str, object]:
+    """Average diffraction patterns from named specimen regions.
+
+    Region membership is evaluated in the shared scan frame using either the
+    nominal or drift-corrected probe positions. Detector pixels are never
+    interpolated: the method averages the original diffraction patterns whose
+    probe positions fall inside each circular region. This makes before/after
+    comparisons test spatial indexing without changing diffraction detail.
+
+    Parameters
+    ----------
+    regions : mapping of str to tuple of float
+        Named region centers in shared ``(row, column)`` scan pixels.
+    radius_px : float, default 4.0
+        Circular region radius in scan pixels.
+    datasets : sequence of two arrays, optional
+        Raw scan-axis-leading 4D-STEM datasets. When omitted, use the datasets
+        retained by ``DriftCorrection.from_4dstem``. Pass this explicitly when
+        working from a saved correction because serialization intentionally
+        excludes multi-gigabyte diffraction cubes.
+    stages : tuple of str, default ("initial", "corrected")
+        Probe-position stages to compare. Each entry must be ``"initial"`` or
+        ``"corrected"``.
+
+    Returns
+    -------
+    dict[str, object]
+        ``patterns`` has shape ``(stage, region, scan, detector_row,
+        detector_column)``. The result also includes ``sample_counts``,
+        ``region_names``, ``region_centers_px``, ``radius_px``, ``stages``, and
+        ``scan_direction_degrees``.
+
+    Examples
+    --------
+    >>> regions = {"Au": (121, 220), "C": (25, 109)}
+    >>> comparison = drift.regional_diffraction_patterns(regions, radius_px=4)
+    >>> comparison["patterns"].shape
+    (2, 2, 2, 192, 192)
+    """
+    if not isinstance(regions, Mapping) or not regions:
+        raise ValueError("regions must be a non-empty name-to-(row, column) mapping")
+    region_names = tuple(regions)
+    if any(not isinstance(name, str) or not name for name in region_names):
+        raise ValueError("every region name must be a non-empty string")
+    region_centers = np.asarray(list(regions.values()), dtype=np.float32)
+    if region_centers.shape != (len(region_names), 2) or not np.isfinite(
+        region_centers
+    ).all():
+        raise ValueError(
+            "region centers must be finite (row, column) pairs; "
+            f"got shape {region_centers.shape}"
+        )
+    radius = float(radius_px)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError(f"radius_px must be positive and finite, got {radius_px!r}")
+
+    requested_stages = tuple(stages)
+    valid_stages = {"initial", "corrected"}
+    invalid_stages = [stage for stage in requested_stages if stage not in valid_stages]
+    if not requested_stages or invalid_stages:
+        raise ValueError(
+            "stages must contain 'initial' and/or 'corrected'; "
+            f"got {requested_stages!r}"
+        )
+    if len(set(requested_stages)) != len(requested_stages):
+        raise ValueError(f"stages must not contain duplicates, got {requested_stages!r}")
+
+    source_datasets = getattr(self, "_datasets", None) if datasets is None else datasets
+    if source_datasets is None:
+        raise RuntimeError(
+            "regional_diffraction_patterns() needs the two raw 4D-STEM datasets. "
+            "Pass datasets=(scan_0, scan_90) when using a saved correction."
+        )
+    source_datasets = tuple(source_datasets)
+    if len(source_datasets) != 2 or any(dataset is None for dataset in source_datasets):
+        raise ValueError(
+            "regional_diffraction_patterns() expects exactly two raw 4D-STEM "
+            f"datasets, got {len(source_datasets)}"
+        )
+    scan_shapes = [tuple(int(value) for value in data.shape[:2]) for data in source_datasets]
+    expected_shapes = [tuple(int(value) for value in image.shape) for image in self.imgs]
+    detector_shapes = [tuple(int(value) for value in data.shape[2:]) for data in source_datasets]
+    if scan_shapes != expected_shapes:
+        raise ValueError(
+            "dataset scan shapes must match the images used for correction: "
+            f"got {scan_shapes}, expected {expected_shapes}"
+        )
+    if len(detector_shapes[0]) != 2 or detector_shapes[0] != detector_shapes[1]:
+        raise ValueError(
+            "datasets must share one 2-D detector shape, got "
+            f"{detector_shapes}"
+        )
+
+    patterns = np.empty(
+        (
+            len(requested_stages),
+            len(region_names),
+            2,
+            *detector_shapes[0],
+        ),
+        dtype=np.float32,
+    )
+    sample_counts = np.empty(
+        (len(requested_stages), len(region_names), 2),
+        dtype=np.int32,
+    )
+    radius_squared = radius**2
+    for stage_index, stage in enumerate(requested_stages):
+        corrected = stage == "corrected"
+        for scan_index, dataset in enumerate(source_datasets):
+            positions = self.probe_positions(
+                scan_index,
+                corrected=corrected,
+                strip_padding=True,
+                plot=False,
+            )
+            for region_index, (name, center) in enumerate(
+                zip(region_names, region_centers, strict=True)
+            ):
+                mask = (
+                    (positions[..., 0] - center[0]) ** 2
+                    + (positions[..., 1] - center[1]) ** 2
+                    <= radius_squared
+                )
+                count = int(mask.sum())
+                if count == 0:
+                    raise ValueError(
+                        f"region {name!r} at ({center[0]:g}, {center[1]:g}) with "
+                        f"radius_px={radius:g} selects no samples for {stage!r} "
+                        f"scan {scan_index}"
+                    )
+                coordinates = np.argwhere(mask)
+                row_start, column_start = coordinates.min(axis=0)
+                row_stop, column_stop = coordinates.max(axis=0) + 1
+                local_mask = mask[
+                    row_start:row_stop,
+                    column_start:column_stop,
+                ]
+                block = dataset[
+                    int(row_start):int(row_stop),
+                    int(column_start):int(column_stop),
+                ]
+                if isinstance(block, torch.Tensor):
+                    # CUDA cannot boolean-index uint16 tensors. Convert only
+                    # this small region, never the full diffraction cube.
+                    local_mask_t = torch.as_tensor(local_mask, device=block.device)
+                    pattern = block.to(torch.float32)[local_mask_t].mean(dim=0)
+                    pattern = to_numpy(pattern, dtype=np.float32)
+                else:
+                    if hasattr(block, "get"):
+                        block = block.get()
+                    pattern = np.asarray(block, dtype=np.float32)[local_mask].mean(
+                        axis=0,
+                        dtype=np.float32,
+                    )
+                patterns[stage_index, region_index, scan_index] = pattern
+                sample_counts[stage_index, region_index, scan_index] = count
+
+    return {
+        "patterns": patterns,
+        "sample_counts": sample_counts,
+        "region_names": region_names,
+        "region_centers_px": region_centers,
+        "radius_px": radius,
+        "stages": requested_stages,
+        "scan_direction_degrees": np.asarray(
+            self.scan_direction_degrees,
+            dtype=np.float32,
+        ),
     }
 
 

@@ -722,6 +722,128 @@ def test_from_4dstem_named_api_and_result_fields():
         assert not hasattr(result, old_name)
 
 
+def test_regional_diffraction_patterns_uses_probe_position_membership():
+    """Named regions average raw patterns without detector interpolation."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=16, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a,
+        cube_b,
+        scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=0.5,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+    )
+
+    regions = {"particle": (8, 8)}
+    result = dc.regional_diffraction_patterns(regions, radius_px=2)
+
+    assert result["patterns"].shape == (2, 1, 2, 4, 4)
+    assert result["patterns"].dtype == np.float32
+    assert result["sample_counts"].shape == (2, 1, 2)
+    assert result["region_names"] == ("particle",)
+    assert result["stages"] == ("initial", "corrected")
+    np.testing.assert_array_equal(result["region_centers_px"], [[8, 8]])
+
+    for stage_index, corrected in enumerate((False, True)):
+        for scan_index, cube in enumerate((cube_a, cube_b)):
+            positions = dc.probe_positions(
+                scan_index,
+                corrected=corrected,
+                strip_padding=True,
+                plot=False,
+            )
+            mask = (
+                (positions[..., 0] - 8) ** 2
+                + (positions[..., 1] - 8) ** 2
+                <= 2**2
+            )
+            expected = cube[mask].mean(axis=0, dtype=np.float32)
+            np.testing.assert_allclose(
+                result["patterns"][stage_index, 0, scan_index],
+                expected,
+            )
+            assert result["sample_counts"][stage_index, 0, scan_index] == mask.sum()
+
+
+def test_regional_diffraction_patterns_accepts_saved_correction_datasets():
+    """A saved correction can consume an explicitly reloaded raw pair."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=16, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a,
+        cube_b,
+        scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=0.5,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+    )
+    dc._datasets = None
+
+    with pytest.raises(RuntimeError, match="Pass datasets"):
+        dc.regional_diffraction_patterns({"support": (8, 8)})
+
+    # Exercise the uint16 path used by the ARINA gold acquisition. The
+    # implementation converts only each small selected block before indexing.
+    datasets = tuple(
+        torch.as_tensor(np.clip(cube, 0, None), dtype=torch.uint16)
+        for cube in (cube_a, cube_b)
+    )
+    result = dc.regional_diffraction_patterns(
+        {"support": (8, 8)},
+        datasets=datasets,
+        radius_px=2,
+        stages=("corrected",),
+    )
+
+    assert result["patterns"].shape == (1, 1, 2, 4, 4)
+    assert np.isfinite(result["patterns"]).all()
+
+
+@pytest.mark.parametrize(
+    ("regions", "radius_px", "stages", "message"),
+    [
+        ({}, 4, ("initial", "corrected"), "non-empty"),
+        ({"bad": (8, 8)}, 0, ("initial", "corrected"), "positive"),
+        ({"bad": (8, 8)}, 4, ("affine",), "initial"),
+        ({"bad": (8, 8)}, 4, ("corrected", "corrected"), "duplicates"),
+    ],
+)
+def test_regional_diffraction_patterns_validates_scientific_inputs(
+    regions,
+    radius_px,
+    stages,
+    message,
+):
+    """Invalid region geometry and stage names fail with corrective messages."""
+    cube_a, cube_b = _make_4dstem_collection(scan_size=16, det_size=4)
+    dc = DriftCorrection.from_4dstem(
+        cube_a,
+        cube_b,
+        scan_direction_degrees=[0, 90],
+    )
+    dc.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=0.5,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dc.regional_diffraction_patterns(
+            regions,
+            radius_px=radius_px,
+            stages=stages,
+        )
+
+
 def test_virtual_detector_matches_array_backends():
     """Virtual images preserve masked integer sums across array backends."""
     data = np.arange(3 * 4 * 2 * 3, dtype=np.uint16).reshape(3, 4, 2, 3)
