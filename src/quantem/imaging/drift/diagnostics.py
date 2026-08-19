@@ -305,7 +305,10 @@ def diagnose_nonrigid(
         agreement, and their absolute difference.
     pandas.DataFrame
         Common-mask NCC, yellow agreement, coverage, runtime, and residual
-        displacement smoothness for every knot count.
+        displacement smoothness for every knot count. ``fast_roughness_px``
+        is the root-mean-square difference between neighboring knot
+        displacements along each fast-scan line. It is zero for one knot,
+        which has no neighbor, and does not measure image noise.
 
     Examples
     --------
@@ -450,10 +453,9 @@ def diagnose_nonrigid(
         axes[row, 1].imshow(moving, cmap="gray", vmin=low, vmax=high)
         axes[row, 2].imshow(overlay)
         axes[row, 3].imshow(difference, cmap="magma", vmin=0, vmax=1)
-        axes[row, 0].set_ylabel(
-            f"{candidate['num_knots']} knots per scanline",
-            fontsize=11,
-        )
+        count = candidate["num_knots"]
+        noun = "knot" if count == 1 else "knots"
+        axes[row, 0].set_ylabel(f"{count} {noun} per scanline", fontsize=11)
         axes[row, 0].set_title("Corrected scan 0")
         axes[row, 1].set_title("Corrected scan 1")
         axes[row, 2].set_title(

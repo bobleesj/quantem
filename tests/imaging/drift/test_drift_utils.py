@@ -299,6 +299,11 @@ def test_diagnose_nonrigid_compares_counts_without_changing_correction():
         "seconds",
     }.issubset(metrics.columns)
     assert len(figure.axes) == 12
+    assert [figure.axes[index].get_ylabel() for index in (0, 4, 8)] == [
+        "1 knot per scanline",
+        "2 knots per scanline",
+        "3 knots per scanline",
+    ]
     for expected, actual in zip(before, correction.knots, strict=True):
         torch.testing.assert_close(expected, actual)
     assert correction._images_warped_stale == warped_stale
