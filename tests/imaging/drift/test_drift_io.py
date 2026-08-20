@@ -91,7 +91,7 @@ def test_scan_pairs_matches_orthogonal_scans_at_the_same_stage_position(
         }
 
     monkeypatch.setattr(
-        "quantem.core.io.file_readers.read_emd_metadata", read_metadata
+        "quantem.imaging.drift.io.read_emd_metadata", read_metadata
     )
     pairs = scan_pairs(tmp_path)
 

@@ -1,6 +1,4 @@
 import importlib
-import json
-import math
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -14,110 +12,6 @@ from quantem.core.datastructures.dataset import Dataset as Dataset
 from quantem.core.datastructures.dataset2d import Dataset2d as Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d as Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem as Dataset4dstem
-
-
-def _deinterleave_velox_metadata(raw: bytes) -> bytes:
-    """Undo Velox's repeated-byte metadata encoding for image stacks."""
-    for stride in range(2, 17):
-        candidate = raw[::stride]
-        if candidate.startswith(b"{"):
-            return candidate
-    return raw
-
-
-def _read_velox_metadata_record(file_path: str | PathLike) -> dict[str, Any]:
-    """Decode the first Velox image metadata record without loading pixels."""
-    with h5py.File(file_path, "r") as handle:
-        image_group = handle.get("Data/Image")
-        if image_group is None:
-            return {}
-        for image_name in image_group:
-            raw = bytes(image_group[image_name]["Metadata"][:]).replace(b"\x00", b"")
-            for candidate in (raw, _deinterleave_velox_metadata(raw)):
-                try:
-                    return json.loads(candidate.decode("utf-8", errors="ignore"))
-                except json.JSONDecodeError:
-                    continue
-    return {}
-
-
-def read_emd_metadata(file_path: str | PathLike) -> dict[str, Any]:
-    """Read normalized Velox acquisition metadata without loading image data.
-
-    Parameters
-    ----------
-    file_path : str or os.PathLike
-        Velox EMD file.
-
-    Returns
-    -------
-    dict
-        Normalized fields: ``scan_rotation_deg``, ``magnification``,
-        ``stage_xy_m``, ``pixel_size_nm``, ``scan_shape``, ``fov_m``, and
-        ``acquisition_timestamp``. Missing Velox fields are returned as
-        ``None``. ``original_metadata`` retains the decoded metadata tree for
-        specialized consumers.
-
-    Notes
-    -----
-    Multi-stream EMD files can contain slightly different stage readouts on
-    individual image streams. This function deliberately uses the first Velox
-    image metadata record, matching QuantEM Live's validated pairing policy.
-    """
-    metadata = _read_velox_metadata_record(file_path)
-    with h5py.File(file_path, "r") as handle:
-        acquisition_context = (
-            "spectrum_image"
-            if handle.get("Data/SpectrumImage") is not None
-            or handle.get("Data/SpectrumStream") is not None
-            else "image"
-        )
-    rotation = metadata.get("Scan", {}).get("ScanRotation")
-    magnification = metadata.get("Optics", {}).get("NominalMagnification")
-    position = metadata.get("Stage", {}).get("Position", {}) or {}
-    stage_xy_m = (
-        (float(position["x"]), float(position["y"]))
-        if "x" in position and "y" in position
-        else None
-    )
-    pixel_size_m = metadata.get("BinaryResult", {}).get("PixelSize", {}).get("width")
-    scan_size = metadata.get("Scan", {}).get("ScanSize", {}) or {}
-    scan_width = scan_size.get("width")
-    scan_height = scan_size.get("height", scan_width)
-    scan_shape = (
-        (int(scan_height), int(scan_width))
-        if scan_height and scan_width
-        else None
-    )
-    timestamp = (
-        metadata.get("Acquisition", {})
-        .get("AcquisitionStartDatetime", {})
-        .get("DateTime")
-    )
-    return {
-        "path": str(file_path),
-        "scan_rotation_deg": (
-            None if rotation is None else math.degrees(float(rotation))
-        ),
-        "magnification": (
-            None if magnification is None else float(magnification)
-        ),
-        "stage_xy_m": stage_xy_m,
-        "pixel_size_nm": (
-            None if pixel_size_m is None else float(pixel_size_m) * 1e9
-        ),
-        "scan_shape": scan_shape,
-        "fov_m": (
-            float(pixel_size_m) * float(scan_width)
-            if pixel_size_m and scan_width
-            else None
-        ),
-        "acquisition_timestamp": (
-            int(timestamp) if timestamp and str(timestamp).isdigit() else None
-        ),
-        "acquisition_context": acquisition_context,
-        "original_metadata": metadata,
-    }
 
 
 def read_4dstem(

@@ -10,7 +10,6 @@ def __getattr__(name):
     if name in (
         "read_2d",
         "read_4dstem",
-        "read_emd_metadata",
         "read_emdfile_to_4dstem",
     ):
         from quantem.core.io import file_readers
