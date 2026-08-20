@@ -699,11 +699,30 @@ def test_from_4dstem_named_api_and_result_fields():
         dc.imgs[0].array,
         dc.imgs[1].array,
     )
+    canvas_vdf = dc.corrected_virtual_images(
+        dc.imgs[0].array,
+        dc.imgs[1].array,
+        output_frame="canvas",
+    )
     result = dc.corrected_4dstem()
 
     assert corrected_vdf["corrected_image"].shape == (32, 32)
     assert corrected_vdf["corrected_image_0"].shape == (32, 32)
     assert corrected_vdf["corrected_image_1"].shape == (32, 32)
+    canvas_shape = tuple(dc.shape[-2:])
+    assert canvas_vdf["corrected_image"].shape == canvas_shape
+    assert canvas_vdf["coverage_image"].shape == canvas_shape
+    valid_0 = canvas_vdf["coverage_image_0"] >= 1e-3
+    valid_1 = canvas_vdf["coverage_image_1"] >= 1e-3
+    contribution_count = valid_0.astype(np.float32) + valid_1.astype(np.float32)
+    expected_canvas = np.divide(
+        canvas_vdf["corrected_image_0"] * valid_0
+        + canvas_vdf["corrected_image_1"] * valid_1,
+        contribution_count,
+        out=np.zeros(canvas_shape, dtype=np.float32),
+        where=contribution_count > 0,
+    )
+    np.testing.assert_array_equal(canvas_vdf["corrected_image"], expected_canvas)
     assert isinstance(result, CorrectionResult)
     assert result.corrected_4dstem is not None
     assert result.corrected_4dstem_0.shape == cube_a.shape

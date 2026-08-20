@@ -230,6 +230,8 @@ def corrected_virtual_images(
     self,
     image_0,
     image_1,
+    *,
+    output_frame: str = "scan",
 ) -> dict[str, np.ndarray]:
     """Correct two scalar virtual images like matching 4D-STEM channels.
 
@@ -245,18 +247,32 @@ def corrected_virtual_images(
     image_0, image_1 : array-like
         Scalar virtual images from the two 4D-STEM acquisitions. Their scan
         shapes must match the images used to solve the correction.
+    output_frame : {"scan", "canvas"}, default "scan"
+        Return each corrected image in image 0's scan frame or on the shared
+        padded correction canvas. Canvas output also includes per-scan and
+        combined coverage arrays and averages only scans that cover each
+        output pixel.
 
     Returns
     -------
     dict[str, np.ndarray]
         The merged ``corrected_image`` and the separately corrected
         ``corrected_image_0`` and ``corrected_image_1``, all in image 0's scan
-        frame.
+        frame by default. Canvas output also contains ``coverage_image``,
+        ``coverage_image_0``, and ``coverage_image_1``.
+
+    Raises
+    ------
+    ValueError
+        If ``output_frame`` is not ``"scan"`` or ``"canvas"``.
 
     Examples
     --------
     >>> images = drift.corrected_virtual_images(vdf_0, vdf_90)
     >>> corrected_vdf = images["corrected_image"]
+    >>> canvas = drift.corrected_virtual_images(
+    ...     vdf_0, vdf_90, output_frame="canvas"
+    ... )
     """
     if not hasattr(self, "_initial_knots"):
         raise RuntimeError(
@@ -266,6 +282,11 @@ def corrected_virtual_images(
     if len(self.imgs) != 2:
         raise ValueError(
             "corrected_virtual_images() expects exactly two scan images"
+        )
+    if output_frame not in {"scan", "canvas"}:
+        raise ValueError(
+            "output_frame must be 'scan' or 'canvas'; "
+            f"got {output_frame!r}"
         )
     images = [
         np.asarray(image_0, dtype=np.float32),
@@ -277,6 +298,53 @@ def corrected_virtual_images(
             f"alignment: got {images[0].shape}, {images[1].shape}; expected "
             f"{self.imgs[0].shape}, {self.imgs[1].shape}"
         )
+
+    if output_frame == "canvas":
+        canvas_shape = tuple(int(value) for value in self.shape[-2:])
+        components = []
+        coverages = []
+        for image_index, image in enumerate(images):
+            image_t = torch.as_tensor(
+                image,
+                device=self._device,
+                dtype=torch.float32,
+            )
+            corrected, coverage = drift_knots.interpolator(
+                self,
+                image_index,
+            ).warp_to_canvas(
+                image_t,
+                canvas_shape,
+                self.kde_sigma,
+                0.0,
+            )
+            components.append(corrected)
+            coverages.append(coverage)
+
+        valid = [coverage >= 1e-3 for coverage in coverages]
+        contribution_count = valid[0].to(torch.float32) + valid[1].to(
+            torch.float32
+        )
+        merged = torch.where(
+            contribution_count > 0,
+            (
+                components[0] * valid[0]
+                + components[1] * valid[1]
+            )
+            / contribution_count.clamp_min(1),
+            0.0,
+        )
+        return {
+            "corrected_image": to_numpy(merged, dtype=np.float32),
+            "corrected_image_0": to_numpy(components[0], dtype=np.float32),
+            "corrected_image_1": to_numpy(components[1], dtype=np.float32),
+            "coverage_image": to_numpy(
+                torch.maximum(coverages[0], coverages[1]),
+                dtype=np.float32,
+            ),
+            "coverage_image_0": to_numpy(coverages[0], dtype=np.float32),
+            "coverage_image_1": to_numpy(coverages[1], dtype=np.float32),
+        }
 
     components = []
     for image_index, image in enumerate(images):
@@ -350,7 +418,7 @@ def regional_diffraction_patterns(
 
     Examples
     --------
-    >>> regions = {"Au": (121, 220), "C": (25, 109)}
+    >>> regions = {"Au": (121, 220), "support region": (25, 109)}
     >>> comparison = drift.regional_diffraction_patterns(regions, radius_px=4)
     >>> comparison["patterns"].shape
     (2, 2, 2, 192, 192)
