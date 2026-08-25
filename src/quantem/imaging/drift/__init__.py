@@ -16,6 +16,10 @@ Optional residual stages after affine::
     dc.correct_strip(...)       # piecewise-rigid bands
     dc.correct_nonrigid(...)    # per-scanline polish (tiny max_image_shift on lattices)
 
+Manual rigid registration remains available when needed::
+
+    dc.align_translation(max_image_shift=32)
+
 Also: :meth:`~DriftCorrection.from_images`,
 :meth:`~DriftCorrection.from_reference`,
 :meth:`~DriftCorrection.from_4dstem`, and an explicit
