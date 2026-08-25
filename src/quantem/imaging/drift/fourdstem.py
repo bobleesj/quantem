@@ -731,6 +731,8 @@ def corrected_4dstem(
         chunk_size=chunk_size,
         output_dtype=output_dtype,
     )
+    if output_device is not None and output_0 is None:
+        corrected_4dstem_0 = torch.as_tensor(corrected_4dstem_0).to(output_device)
     if output_0 is not None:
         output_0[...] = to_numpy(corrected_4dstem_0, dtype=output_0.dtype)
         corrected_4dstem_0 = output_0
@@ -745,6 +747,8 @@ def corrected_4dstem(
         chunk_size=chunk_size,
         output_dtype=output_dtype,
     )
+    if output_device is not None and output_1 is None:
+        corrected_4dstem_1 = torch.as_tensor(corrected_4dstem_1).to(output_device)
     if output_1 is not None:
         output_1[...] = to_numpy(corrected_4dstem_1, dtype=output_1.dtype)
         corrected_4dstem_1 = output_1

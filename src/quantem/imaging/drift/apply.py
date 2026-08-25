@@ -121,6 +121,10 @@ def _apply_scan_field(
     if requested_dtype is not None:
         if source_is_torch or isinstance(requested_dtype, torch.dtype):
             torch_dtype = source_dtype if preserve_dtype else requested_dtype
+            if not isinstance(torch_dtype, torch.dtype):
+                torch_dtype = torch.from_numpy(
+                    np.empty((), dtype=np.dtype(torch_dtype))
+                ).dtype
             if not torch_dtype.is_floating_point:
                 limits = torch.iinfo(torch_dtype)
                 corrected_t = corrected_t.round().clamp(limits.min, limits.max)
@@ -209,8 +213,8 @@ def apply_correction(
             raise ValueError("output must be a NumPy array matching the input shape.")
         output[...] = np.asarray(corrected_array, dtype=output.dtype)
         corrected_array = output
-    elif output_device is not None and isinstance(corrected_array, torch.Tensor):
-        corrected_array = corrected_array.to(output_device)
+    elif output_device is not None:
+        corrected_array = torch.as_tensor(corrected_array).to(output_device)
     if dataset is None:
         return corrected_array
     corrected = Dataset3d.from_array(

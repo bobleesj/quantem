@@ -138,3 +138,69 @@ def test_regional_patterns_average_native_detector_samples():
                 cube[mask].mean(axis=0, dtype=np.float32),
             )
             assert comparison["sample_counts"][stage_index, 0, scan_index] == mask.sum()
+
+
+def test_canvas_combination_uses_union_coverage():
+    """The combined canvas retains pixels covered by either corrected scan."""
+    cube_0, cube_1, _ = _orthogonal_4dstem_pair(scan_size=16)
+    drift = _fit_small_pair(cube_0, cube_1)
+    image_0 = drift.integrate_virtual_detector(cube_0, np.ones((4, 4), dtype=bool))
+    image_1 = drift.integrate_virtual_detector(cube_1, np.ones((4, 4), dtype=bool))
+
+    result = drift.corrected_virtual_images(
+        image_0,
+        image_1,
+        output_frame="canvas",
+    )
+
+    expected_union = np.maximum(
+        result["coverage_image_0"],
+        result["coverage_image_1"],
+    )
+    np.testing.assert_allclose(result["coverage_image"], expected_union)
+    either_scan = expected_union >= 1e-3
+    assert np.count_nonzero(result["corrected_image"][either_scan]) > 0
+
+
+def test_saved_correction_accepts_explicit_4dstem_datasets():
+    """Serialized corrections can analyze explicitly reattached raw cubes."""
+    cube_0, cube_1, _ = _orthogonal_4dstem_pair(scan_size=16)
+    drift = DriftCorrection.from_4dstem(
+        cube_0,
+        cube_1,
+        scan_direction_degrees=(0.0, 90.0),
+        device="cpu",
+    ).preprocess(
+        number_knots=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+    drift._datasets = None
+
+    result = drift.regional_diffraction_patterns(
+        {"feature": (8.0, 8.0)},
+        radius_px=2.0,
+        datasets=(cube_0, cube_1),
+        stages=("initial",),
+    )
+
+    assert result["patterns"].shape == (1, 1, 2, 4, 4)
+
+
+def test_numpy_cube_can_return_torch_output_on_requested_device():
+    """An explicit output device is honored without changing detector layout."""
+    cube_0, cube_1, _ = _orthogonal_4dstem_pair(scan_size=16)
+    drift = _fit_small_pair(cube_0, cube_1)
+
+    result = drift.corrected_4dstem(
+        merge=False,
+        output_device="cpu",
+        output_dtype=np.float32,
+        verbose=False,
+    )
+
+    assert isinstance(result.corrected_4dstem_0, torch.Tensor)
+    assert isinstance(result.corrected_4dstem_1, torch.Tensor)
+    assert result.corrected_4dstem_0.device.type == "cpu"
+    assert result.corrected_4dstem_0.shape == cube_0.shape
