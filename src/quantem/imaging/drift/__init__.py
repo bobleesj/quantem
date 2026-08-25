@@ -10,6 +10,7 @@ from quantem.imaging.drift.core.knots import (
 from quantem.imaging.drift.fourdstem import (
     CorrectionResult as CorrectionResult,
 )
+from quantem.imaging.drift.core.strip import StripPass as StripPass
 from quantem.imaging.drift.io import (
     pair_spectrum_image_references as pair_spectrum_image_references,
     read_emd as read_emd,
