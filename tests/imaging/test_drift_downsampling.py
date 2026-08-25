@@ -2,9 +2,11 @@
 
 import numpy as np
 import pytest
+from scipy.ndimage import gaussian_filter
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
+from quantem.imaging.drift.core.affine import _affine_rate_from_knots
 from quantem.imaging.drift.preparation import (
     average_downsample_2d,
     resolve_downsample,
@@ -113,3 +115,69 @@ def test_automatic_factor_is_largest_exact_divisor_up_to_eight():
     assert resolve_downsample("auto", (2048, 2048)) == 8
     assert resolve_downsample("auto", (1026, 1026)) == 2
     assert resolve_downsample("auto", (1025, 1025)) == 1
+
+
+def test_affine_pyramid_refines_rate_on_native_grid():
+    """A pooled broad search retains the native image and affine rate."""
+    size = 64
+    rng = np.random.default_rng(23)
+    reference = gaussian_filter(rng.normal(size=(size, size)), 1.5).astype(np.float32)
+    target = np.empty_like(reference)
+    columns = np.arange(size, dtype=np.float32)
+    for row in range(size):
+        shift = 0.04 * (row - (size - 1) / 2)
+        target[row] = np.interp(
+            columns + shift,
+            columns,
+            reference[row],
+            left=float(np.median(reference[row])),
+            right=float(np.median(reference[row])),
+        )
+
+    native = DriftCorrection.from_reference(
+        reference,
+        target,
+        scan_direction_degrees=0.0,
+        device="cpu",
+    ).preprocess(
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+    pyramid = DriftCorrection.from_reference(
+        reference,
+        target,
+        scan_direction_degrees=0.0,
+        device="cpu",
+    ).preprocess(
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+
+    native.align_affine(
+        step=0.02,
+        num_tests=7,
+        max_image_shift=8,
+        downsample=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+    pyramid.align_affine(
+        step=0.02,
+        num_tests=7,
+        max_image_shift=8,
+        downsample=2,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+
+    assert pyramid.images[0].shape == (size, size)
+    assert pyramid.affine_search_info["downsample_factor"] == 2
+    np.testing.assert_allclose(
+        _affine_rate_from_knots(pyramid, 1),
+        _affine_rate_from_knots(native, 1),
+        atol=0.01,
+    )
