@@ -89,7 +89,10 @@ def test_corrected_4dstem_transforms_scan_axes_not_detector_axes():
         detector_difference = corrected - corrected[..., :1, :1]
         np.testing.assert_allclose(
             detector_difference,
-            detector_offset - detector_offset[0, 0],
+            np.broadcast_to(
+                detector_offset - detector_offset[0, 0],
+                corrected.shape,
+            ),
             atol=2e-5,
         )
 
