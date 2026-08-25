@@ -389,7 +389,12 @@ def _regularize_knots(
         3. Step-size blend: ``new = prev + step_size · (new - prev)``,
            under-relaxes the update for stability across outer iterations.
     """
-    num_images, _, num_rows_knot = knots_batch.shape
+    if knots_batch.ndim not in (3, 4):
+        raise ValueError(
+            "knots_batch must have shape (N, 2, rows) or (N, 2, rows, knots)"
+        )
+    num_images, _, num_rows_knot = knots_batch.shape[:3]
+    num_fast_knots = knots_batch.shape[3] if knots_batch.ndim == 4 else 1
     with torch.no_grad():
         if max_shift_px is not None:
             shift = knots_batch - knots_prev
@@ -397,13 +402,40 @@ def _regularize_knots(
             scale_factor = torch.clamp(max_shift_px / dist.clamp(min=1e-8), max=1.0)
             knots_batch.copy_(knots_prev + shift * scale_factor)
         if sigma_px is not None and sigma_px > 0:
-            # Detrend + smooth all (N*2, num_rows) knots in one batched lstsq + smooth
-            knots_flat = knots_batch.reshape(-1, num_rows_knot).T  # (num_rows, N*2)
-            coefs, _, _, _ = torch.linalg.lstsq(vander, knots_flat)
-            trend = (vander @ coefs).T  # (N*2, num_rows)
-            residual = knots_batch.reshape(-1, num_rows_knot) - trend
+            # Treat every (image, coordinate, fast-knot) trajectory as an
+            # independent series along the slow-scan row axis.
+            if knots_batch.ndim == 4:
+                knots_flat = knots_batch.permute(0, 1, 3, 2).reshape(
+                    -1, num_rows_knot
+                ).T
+            else:
+                knots_flat = knots_batch.reshape(-1, num_rows_knot).T
+            if vander.device.type == "mps":
+                # torch.linalg.lstsq is unavailable on MPS. The normalized
+                # polynomial basis is tiny and full rank in the usual case,
+                # so solve its normal equations on-device. Underdetermined
+                # systems fall back to the CPU least-squares implementation.
+                if vander.shape[0] < vander.shape[1]:
+                    coefficients = torch.linalg.lstsq(
+                        vander.cpu(), knots_flat.cpu()
+                    ).solution.to(vander.device)
+                else:
+                    coefficients = torch.linalg.solve(
+                        vander.T @ vander, vander.T @ knots_flat
+                    )
+            else:
+                coefficients = torch.linalg.lstsq(vander, knots_flat).solution
+            trend = (vander @ coefficients).T
+            residual = knots_flat.T - trend
             smoothed = gaussian_smooth_1d(residual, sigma_px)
-            knots_batch.copy_((smoothed + trend).reshape(num_images, 2, num_rows_knot))
+            regularized = smoothed + trend
+            if knots_batch.ndim == 4:
+                regularized = regularized.reshape(
+                    num_images, 2, num_fast_knots, num_rows_knot
+                ).permute(0, 1, 3, 2)
+            else:
+                regularized = regularized.reshape(num_images, 2, num_rows_knot)
+            knots_batch.copy_(regularized)
         if step_size is not None:
             knots_batch.copy_(knots_prev + (knots_batch - knots_prev) * step_size)
 
