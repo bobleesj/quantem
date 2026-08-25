@@ -103,6 +103,13 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
     assert corrected.units == scan_0.units
     assert len(drift.drift_rate) == 2
 
+    canvas = drift.corrected(
+        upsample_factor=1,
+        output_frame="canvas",
+        verbose=False,
+    )
+    assert canvas.shape == tuple(drift.shape[-2:])
+
 
 def test_nonrigid_diagnostic_defines_fast_roughness():
     """The difficult multi-knot diagnostic states exactly what roughness means."""
