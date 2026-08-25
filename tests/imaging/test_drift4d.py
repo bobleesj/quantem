@@ -1,6 +1,7 @@
 """4D-STEM drift propagation keeps detector coordinates scientifically intact."""
 
 import numpy as np
+import pytest
 import torch
 from scipy.ndimage import gaussian_filter
 
@@ -360,4 +361,64 @@ def test_integer_merge_is_float32_and_backend_consistent():
     np.testing.assert_allclose(
         result_np.corrected_4dstem,
         result_torch.corrected_4dstem.cpu().numpy(),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_matches_cpu_for_uint32_native_detector_frames():
+    """CUDA and CPU preserve one native 192-square detector field equally."""
+    scan_size = 8
+    detector_shape = (192, 192)
+    row = np.arange(scan_size, dtype=np.uint32)[:, None, None, None]
+    column = np.arange(scan_size, dtype=np.uint32)[None, :, None, None]
+    detector = np.arange(
+        np.prod(detector_shape),
+        dtype=np.uint32,
+    ).reshape(1, 1, *detector_shape)
+    cube_0 = row * 100_000 + column * 10_000 + detector
+    cube_1 = np.rot90(cube_0, k=-1, axes=(0, 1)).copy()
+    cpu = DriftCorrection.from_4dstem(
+        cube_0,
+        cube_1,
+        scan_direction_degrees=(0.0, 90.0),
+        device="cpu",
+    ).preprocess(
+        number_knots=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+    cuda = DriftCorrection.from_4dstem(
+        torch.from_numpy(cube_0).cuda(),
+        torch.from_numpy(cube_1).cuda(),
+        scan_direction_degrees=(0.0, 90.0),
+        device="cuda",
+    ).preprocess(
+        number_knots=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    )
+    drift_row = np.linspace(-0.75, 0.75, scan_size)
+    drift_column = np.linspace(0.5, -0.5, scan_size)
+    _add_known_raw_drift(cpu, 0, drift_row, drift_column)
+    _add_known_raw_drift(cuda, 0, drift_row, drift_column)
+
+    cpu_result = cpu.corrected_4dstem(
+        merge=False,
+        output_dtype=np.float32,
+        chunk_size=4096,
+        verbose=False,
+    )
+    cuda_result = cuda.corrected_4dstem(
+        merge=False,
+        output_dtype=torch.float32,
+        chunk_size=4096,
+        verbose=False,
+    )
+
+    np.testing.assert_allclose(
+        cpu_result.corrected_4dstem_0,
+        cuda_result.corrected_4dstem_0.cpu().numpy(),
+        atol=2e-3,
     )

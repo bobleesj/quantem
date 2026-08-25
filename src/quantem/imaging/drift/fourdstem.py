@@ -142,8 +142,8 @@ def integrate_virtual_detector(
         raise ValueError("detector_mask selects zero detector pixels")
     if isinstance(dataset, torch.Tensor):
         mask_t = torch.as_tensor(mask, device=dataset.device)
-        flattened = dataset.reshape(*scan_shape, -1)
-        image = flattened[..., mask_t.reshape(-1)].to(torch.float32).sum(-1)
+        flattened = dataset.reshape(*scan_shape, -1).to(torch.float32)
+        image = flattened[..., mask_t.reshape(-1)].sum(-1)
         image = image.detach().cpu().numpy()
     else:
         array = dataset.get() if hasattr(dataset, "get") else np.asarray(dataset)
@@ -590,72 +590,6 @@ def regional_diffraction_patterns(
             dtype=np.float32,
         ),
     }
-
-
-def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
-    """Prepare a compact raw-to-corrected 4D-STEM comparison.
-
-    Detector binning before correction preserves the correction field while
-    avoiding work on detector detail that the interactive viewer will discard.
-    The returned stages share image 0's scan frame and the solved crop.
-    """
-    def detector_bin(cube):
-        if det_bin == 1:
-            return cube
-        detector_rows, detector_columns = cube.shape[-2:]
-        shape = cube.shape
-        reshaped = cube.reshape(
-            shape[0],
-            shape[1],
-            detector_rows // det_bin,
-            det_bin,
-            detector_columns // det_bin,
-            det_bin,
-        )
-        if isinstance(reshaped, torch.Tensor):
-            dtype = reshaped.dtype if reshaped.is_floating_point() else torch.int32
-        else:
-            dtype = (
-                reshaped.dtype
-                if np.issubdtype(reshaped.dtype, np.floating)
-                else np.int32
-            )
-        return reshaped.sum((3, 5), dtype=dtype)
-
-    raw_0, raw_1 = (detector_bin(dataset) for dataset in correction._datasets)
-    corrected_0 = correction.apply_correction(
-        raw_0,
-        image_index=0,
-        output_dtype="same",
-        verbose=False,
-    )
-    corrected_1 = correction.apply_correction(
-        raw_1,
-        image_index=1,
-        output_dtype="same",
-        verbose=False,
-    )
-    quarter_turns = _rot90_to_image0_frame(correction)
-    if quarter_turns:
-        corrected_1 = (
-            torch.rot90(corrected_1, quarter_turns, dims=(0, 1))
-            if isinstance(corrected_1, torch.Tensor)
-            else np.rot90(corrected_1, quarter_turns, axes=(0, 1)).copy()
-        )
-    if isinstance(corrected_0, torch.Tensor):
-        if corrected_0.is_floating_point():
-            merged = (corrected_0 + corrected_1) * 0.5
-        else:
-            merged = (
-                (corrected_0.to(torch.int64) + corrected_1.to(torch.int64)) >> 1
-            ).to(corrected_0.dtype)
-    elif np.issubdtype(corrected_0.dtype, np.floating):
-        merged = (corrected_0 + corrected_1) * 0.5
-    else:
-        merged = (
-            (corrected_0.astype(np.int64) + corrected_1.astype(np.int64)) >> 1
-        ).astype(corrected_0.dtype)
-    return [to_numpy(cube) for cube in (raw_0, corrected_0, merged)]
 
 
 def corrected_4dstem(
