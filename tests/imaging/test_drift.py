@@ -7,9 +7,14 @@ See PR #133 for images: https://github.com/electronmicroscopy/quantem/pull/133
 
 import numpy as np
 import pytest
+from matplotlib import pyplot as plt
 from scipy.ndimage import gaussian_filter
+
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
+from quantem.imaging.drift import diagnostics as drift_diagnostics
+from quantem.imaging.drift import plot as drift_plot
+from quantem.imaging.drift import report as drift_report
 
 
 def make_synthetic_drift_data(scale=1, seed=42):
@@ -241,3 +246,112 @@ def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, exp
         drift.knots[0].sum(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
         drift.knots[1].sum(), expected_k1, decimal=6)
+
+
+def _make_affine_diagnostic_correction():
+    """Build the standard synthetic affine result used by diagnostics tests."""
+    image_0, image_1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    correction = DriftCorrection.from_data(
+        images=[image_0, image_1],
+        scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    correction.align_affine(
+        step=0.02,
+        num_tests=5,
+        refine=False,
+        show_merged=False,
+        show_images=False,
+    )
+    return correction
+
+
+def test_registration_report_matches_frozen_common_coverage_metrics():
+    """Registration evidence uses one measured footprint across stages."""
+    correction = _make_affine_diagnostic_correction()
+    registration = drift_report._registration_report(correction)
+
+    assert [row["Correction stage"] for row in registration] == ["initial", "affine"]
+    np.testing.assert_allclose(
+        [row["Coverage"] for row in registration],
+        [0.6423046875, 0.6423046875],
+        rtol=0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        [[row["Common NCC"], row["Mean absolute difference"]] for row in registration],
+        [
+            [0.48240861115393513, 0.456299068925209],
+            [0.7480021414803405, 0.2941893335769055],
+        ],
+        rtol=0,
+        # The affine solver's sub-pixel translation varies slightly across
+        # CPU thread counts; the report itself is deterministic for fixed knots.
+        atol=1e-4,
+    )
+
+
+def test_displacement_report_names_endpoint_and_roughness_metrics():
+    """Displacement evidence distinguishes endpoint motion from roughness."""
+    correction = _make_affine_diagnostic_correction()
+    displacement = drift_report._displacement_report(correction)
+
+    initial = [row for row in displacement if row["Correction stage"] == "initial"]
+    affine = [row for row in displacement if row["Correction stage"] == "affine"]
+    assert all(
+        value == 0
+        for row in initial
+        for name, value in row.items()
+        if name not in {"Correction stage", "Image"}
+    )
+    np.testing.assert_allclose(
+        [row["Endpoint displacement (px)"] for row in affine],
+        [5.679612662972729, 5.679612662972729],
+        rtol=0,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        [row["Slow-direction roughness (px)"] for row in affine],
+        [0.0316227766016838, 0.0316227766016838],
+        rtol=0,
+        atol=1e-8,
+    )
+    np.testing.assert_array_equal(
+        [row["Fast-direction roughness (px)"] for row in affine],
+        0.0,
+    )
+
+
+def test_diagnostic_reports_and_plots_do_not_mutate_correction():
+    """Reports and static figures leave fitted fields and caches untouched."""
+    correction = _make_affine_diagnostic_correction()
+    knots_before = [np.asarray(knot).copy() for knot in correction.knots]
+    images_before = correction.images_warped.array.copy()
+    weights_before = correction.weights_warped.array.copy()
+    errors_before = correction.error_track.copy()
+
+    drift_report._registration_report(correction)
+    drift_report._displacement_report(correction)
+    registration_figure, registration_axes = drift_plot._plot_registration_diagnostics(correction)
+    displacement_figure, displacement_axes = drift_plot._plot_displacement_diagnostics(correction)
+
+    assert registration_axes.shape == (2, 3)
+    assert displacement_axes.shape == (2, 2)
+    assert registration_figure.number in plt.get_fignums()
+    assert displacement_figure.number in plt.get_fignums()
+    for before, after in zip(knots_before, correction.knots, strict=True):
+        np.testing.assert_array_equal(after, before)
+    np.testing.assert_array_equal(correction.images_warped.array, images_before)
+    np.testing.assert_array_equal(correction.weights_warped.array, weights_before)
+    np.testing.assert_array_equal(correction.error_track, errors_before)
+    assert drift_diagnostics._available_stages(correction) == ("initial", "affine")
+    plt.close(registration_figure)
+    plt.close(displacement_figure)
+
+
+def test_rerunning_stage_discards_later_diagnostic_checkpoints():
+    """A repeated earlier stage cannot leave stale later-stage evidence."""
+    correction = _make_affine_diagnostic_correction()
+    drift_diagnostics._record_stage(correction, "nonrigid")
+    drift_diagnostics._record_stage(correction, "affine")
+
+    assert drift_diagnostics._available_stages(correction) == ("initial", "affine")
