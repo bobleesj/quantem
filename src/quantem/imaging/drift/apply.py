@@ -141,7 +141,7 @@ def corrected(
     self,
     *,
     upsample_factor: int = 2,
-    output_original_shape: bool = True,
+    output_original_shape: bool | None = None,
     strip_padding: bool = False,
     smoothing_sigma: float | None = 0.5,
     stage: str | None = None,
@@ -158,8 +158,10 @@ def corrected(
     ----------
     upsample_factor : int, default 2
         Sampling multiplier for the corrected image.
-    output_original_shape : bool, default True
-        Return the original image shape instead of the padded solver canvas.
+    output_original_shape : bool or None, default None
+        ``None`` keeps the natural frame: the padded solver canvas for paired
+        2-D scans and the native input frame for reference datasets. ``True``
+        returns the original image shape; ``False`` keeps the solver canvas.
     strip_padding : bool, default False
         Remove pixels that do not share measured coverage across scans.
     smoothing_sigma : float or None, default 0.5
@@ -181,6 +183,13 @@ def corrected(
     >>> corrected = drift.corrected()
     >>> scans = drift.corrected(merge=False)
     """
+    automatic_output_frame = output_original_shape is None
+    output_original_shape = (
+        self._reference_mode
+        if automatic_output_frame
+        else bool(output_original_shape)
+    )
+
     if self._reference_mode:
         if (
             upsample_factor != 2
@@ -220,7 +229,7 @@ def corrected(
     if not merge:
         if (
             upsample_factor != 2
-            or not output_original_shape
+            or (not automatic_output_frame and not output_original_shape)
             or strip_padding
             or smoothing_sigma != 0.5
         ):
