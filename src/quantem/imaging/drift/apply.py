@@ -134,6 +134,211 @@ def apply_correction(self, spectrum_image: Dataset3d) -> Dataset3d:
     return corrected
 
 
+def padding_offset(
+    canvas_shape: tuple[int, int],
+    scan_shape: tuple[int, int],
+) -> tuple[int, int]:
+    """Return the centered scan offset inside the drift solver canvas."""
+    if any(
+        canvas < scan
+        for canvas, scan in zip(canvas_shape, scan_shape, strict=True)
+    ):
+        raise ValueError(
+            f"canvas_shape {canvas_shape} must contain scan_shape {scan_shape}."
+        )
+    return tuple(
+        int((canvas - scan) // 2)
+        for canvas, scan in zip(canvas_shape, scan_shape, strict=True)
+    )
+
+
+def crop_slices(self) -> tuple[slice, slice]:
+    """Return the centered native scan window on the shared solver canvas."""
+    scan_shape = tuple(int(value) for value in self.images[0].shape[:2])
+    canvas_shape = tuple(int(value) for value in self.shape[-2:])
+    row_offset, column_offset = padding_offset(canvas_shape, scan_shape)
+    return (
+        slice(row_offset, row_offset + scan_shape[0]),
+        slice(column_offset, column_offset + scan_shape[1]),
+    )
+
+
+def _cast_corrected_array(array: torch.Tensor, dtype):
+    """Cast an interpolated tensor without silently wrapping integer values."""
+    if dtype is None:
+        return array
+    if isinstance(dtype, np.dtype):
+        dtype = torch.from_numpy(np.empty((), dtype=dtype)).dtype
+    elif isinstance(dtype, str):
+        dtype = torch.from_numpy(np.empty((), dtype=np.dtype(dtype))).dtype
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(
+            "output_dtype must be a dtype, 'same', or None; "
+            f"got {dtype!r}."
+        )
+    if dtype.is_floating_point:
+        return array.to(dtype)
+    info = torch.iinfo(dtype)
+    return array.round().clamp(info.min, info.max).to(dtype)
+
+
+@torch.inference_mode()
+def apply_correction_to_dataset(
+    self,
+    dataset=None,
+    *,
+    image_index: int = 0,
+    mode: str = "bilinear",
+    chunk_size: int | None = None,
+    output_dtype: torch.dtype | np.dtype | str | None = None,
+    output_device: str | torch.device | None = None,
+    output=None,
+    output_frame: str = "scan",
+    return_coverage: bool = False,
+    verbose: bool = False,
+    progress_desc: str | None = None,
+):
+    """Apply one fitted field to the leading scan axes of a dataset.
+
+    Trailing spectral or detector axes are flattened only for batching; their
+    order and pixels are never resampled against one another. The default
+    floating-point output preserves interpolation precision. Pass
+    ``output_dtype="same"`` only when an explicitly quantized output is wanted.
+    """
+    del verbose, progress_desc
+    if mode != "bilinear":
+        raise ValueError(f"mode must be 'bilinear'; got {mode!r}.")
+    if output_frame not in {"scan", "canvas"}:
+        raise ValueError(
+            "output_frame must be 'scan' or 'canvas'; "
+            f"got {output_frame!r}."
+        )
+    if not hasattr(self, "_initial_knots"):
+        raise RuntimeError(
+            "No drift field found. Call preprocess() and align_affine() first."
+        )
+    index = image_index % len(self.images)
+    if dataset is None:
+        datasets = getattr(self, "_datasets", None)
+        if datasets is None or datasets[index] is None:
+            raise RuntimeError(
+                "No dataset is attached. Pass dataset explicitly or construct "
+                "the correction with DriftCorrection.from_4dstem(...)."
+            )
+        dataset = datasets[index]
+    source = dataset.array if hasattr(dataset, "array") else dataset
+    original_shape = tuple(int(value) for value in source.shape)
+    if len(original_shape) < 3:
+        raise ValueError(
+            "dataset must have leading scan axes followed by one or more "
+            f"channel/detector axes; got shape {original_shape}."
+        )
+    scan_shape = original_shape[:2]
+    expected_shape = tuple(int(value) for value in self.images[index].shape[:2])
+    if scan_shape != expected_shape:
+        raise ValueError(
+            f"dataset scan shape {scan_shape} does not match image {index} "
+            f"shape {expected_shape}."
+        )
+
+    input_is_torch = isinstance(source, torch.Tensor)
+    input_dtype = source.dtype if input_is_torch else np.asarray(source).dtype
+    target_device = torch.device(
+        output_device
+        if output_device is not None
+        else (source.device if input_is_torch else self._device)
+    )
+    trailing_shape = original_shape[2:]
+    num_channels = int(np.prod(trailing_shape))
+    if chunk_size is None:
+        chunk_size = min(num_channels, 32)
+    if not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError(
+            f"chunk_size must be a positive integer; got {chunk_size!r}."
+        )
+
+    canvas_shape = tuple(int(value) for value in self.shape[-2:])
+    row_coordinates, column_coordinates = self.interpolator[
+        index
+    ].transform_coordinates(self.knots[index])
+    row_coordinates = torch.as_tensor(
+        row_coordinates,
+        dtype=torch.float32,
+        device=target_device,
+    )
+    column_coordinates = torch.as_tensor(
+        column_coordinates,
+        dtype=torch.float32,
+        device=target_device,
+    )
+    rows, columns = crop_slices(self)
+    result_shape = canvas_shape if output_frame == "canvas" else scan_shape
+    result_flat = torch.empty(
+        (*result_shape, num_channels),
+        dtype=torch.float32,
+        device=target_device,
+    )
+    coverage = None
+    for start in range(0, num_channels, chunk_size):
+        stop = min(start + chunk_size, num_channels)
+        if input_is_torch:
+            block = source.reshape(*scan_shape, num_channels)[..., start:stop]
+            block = block.to(device=target_device, dtype=torch.float32)
+        else:
+            block = torch.as_tensor(
+                np.ascontiguousarray(
+                    np.asarray(source).reshape(
+                        *scan_shape,
+                        num_channels,
+                    )[..., start:stop]
+                ),
+                dtype=torch.float32,
+                device=target_device,
+            )
+        block = block.permute(2, 0, 1)
+        count = stop - start
+        warped, weights = bilinear_kde_batch(
+            row_coordinates.expand(count, -1, -1),
+            column_coordinates.expand(count, -1, -1),
+            block,
+            canvas_shape,
+            self.kde_sigma,
+            0.0,
+        )
+        if coverage is None:
+            coverage = weights[0]
+        warped = warped if output_frame == "canvas" else warped[:, rows, columns]
+        result_flat[..., start:stop] = warped.permute(1, 2, 0)
+
+    requested_dtype = input_dtype if output_dtype == "same" else output_dtype
+    result = _cast_corrected_array(result_flat, requested_dtype).reshape(
+        *result_shape,
+        *trailing_shape,
+    )
+    coverage_result = coverage if output_frame == "canvas" else coverage[rows, columns]
+    if output is not None:
+        if tuple(output.shape) != tuple(result.shape):
+            raise ValueError(
+                f"preallocated output has shape {output.shape}; "
+                f"expected {result.shape}."
+            )
+        if isinstance(output, torch.Tensor):
+            output.copy_(result.to(output.device, dtype=output.dtype))
+        else:
+            output[...] = result.detach().cpu().numpy().astype(
+                output.dtype,
+                copy=False,
+            )
+        result = output
+    elif not input_is_torch and output_device is None:
+        result = result.detach().cpu().numpy()
+
+    if return_coverage:
+        coverage_result = coverage_result.detach().cpu().numpy()
+        return result, coverage_result.astype(np.float32, copy=False)
+    return result
+
+
 @torch.inference_mode()
 def generate_corrected(
     self,

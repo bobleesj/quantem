@@ -14,8 +14,8 @@ from quantem.core.utils.compound_validators import (
 from quantem.core.utils.validators import ensure_valid_array
 
 from . import apply as drift_apply
+from . import fourdstem, preparation
 from . import plot as drift_plot
-from . import preparation
 from .core import affine, nonrigid
 
 
@@ -167,6 +167,68 @@ class DriftCorrection(AutoSerialize):
         )
 
     @classmethod
+    def from_4dstem(
+        cls,
+        dataset_0,
+        dataset_1,
+        *,
+        scan_direction_degrees: Sequence[float] | NDArray = (0.0, 90.0),
+        detector_mask=None,
+        reduce: str = "mean",
+    ) -> Self:
+        """Build a paired correction from native 4D-STEM acquisitions.
+
+        Only a scalar virtual-detector image is used to fit the field. The two
+        native datasets remain attached so the fitted field can later be
+        applied to their leading scan axes without resampling detector pixels.
+        """
+        source_datasets = [dataset_0, dataset_1]
+        datasets = [
+            dataset.array if hasattr(dataset, "array") else dataset
+            for dataset in source_datasets
+        ]
+        shapes = [tuple(int(value) for value in data.shape) for data in datasets]
+        if any(len(shape) != 4 for shape in shapes):
+            raise ValueError(
+                "from_4dstem expects two (scan_row, scan_col, detector_row, "
+                f"detector_col) arrays; got {shapes}."
+            )
+        if shapes[0] != shapes[1]:
+            raise ValueError(
+                f"4D-STEM datasets must share one shape; got {shapes}."
+            )
+        virtual_images = [
+            fourdstem.integrate_virtual_detector(
+                dataset,
+                detector_mask=detector_mask,
+                reduce=reduce,
+            )
+            for dataset in datasets
+        ]
+        result = cls.from_data(
+            images=virtual_images,
+            scan_direction_degrees=scan_direction_degrees,
+        )
+        result._datasets = datasets
+        result._dataset_metadata = [
+            {
+                name: getattr(dataset, name)
+                for name in (
+                    "origin",
+                    "sampling",
+                    "units",
+                    "signal_units",
+                    "metadata",
+                )
+                if hasattr(dataset, name)
+            }
+            for dataset in source_datasets
+        ]
+        result._datasets_consumed = False
+        result._built_from_datasets = True
+        return result
+
+    @classmethod
     def from_reference(
         cls,
         reference_image: Dataset2d | NDArray | Self,
@@ -259,6 +321,15 @@ class DriftCorrection(AutoSerialize):
     generate_corrected = drift_apply.generate_corrected
     generate_corrected_image = drift_apply.generate_corrected_image
     apply_correction = drift_apply.apply_correction
+    apply_correction_to_dataset = drift_apply.apply_correction_to_dataset
+    drift_field = fourdstem.drift_field
+    probe_positions = fourdstem.probe_positions
+    plot_probe_positions = fourdstem.plot_probe_positions
+    corrected_virtual_images = fourdstem.corrected_virtual_images
+    regional_diffraction_patterns = fourdstem.regional_diffraction_patterns
+    diffraction_patterns_at_points = fourdstem.diffraction_patterns_at_points
+    corrected_4dstem = fourdstem.corrected_4dstem
+    integrate_virtual_detector = staticmethod(fourdstem.integrate_virtual_detector)
     calculate_error = drift_apply.calculate_error
     plot_transformed_images = drift_plot.plot_transformed_images
     plot_convergence = drift_plot.plot_convergence
