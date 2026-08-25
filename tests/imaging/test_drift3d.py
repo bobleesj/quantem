@@ -122,18 +122,20 @@ def _write_metadata_emd(
     stage_position: tuple[float, float],
     spectrum_image: bool,
     timestamp: int,
+    scan_shape: tuple[int, int] = (256, 256),
+    pixel_size_m: float = 6.74e-9 / 256,
 ):
     """Write the minimal Velox metadata used by the pairing workflow."""
     metadata = {
         "Scan": {
             "ScanRotation": math.radians(rotation_degrees),
-            "ScanSize": {"width": 256, "height": 256},
+            "ScanSize": {"width": scan_shape[1], "height": scan_shape[0]},
         },
         "Optics": {"NominalMagnification": 15_000_000},
         "Stage": {
             "Position": {"x": stage_position[0], "y": stage_position[1]}
         },
-        "BinaryResult": {"PixelSize": {"width": 6.74e-9 / 256}},
+        "BinaryResult": {"PixelSize": {"width": pixel_size_m}},
         "Acquisition": {
             "AcquisitionStartDatetime": {"DateTime": str(timestamp)}
         },
@@ -177,6 +179,15 @@ def test_spectrum_image_pairing_uses_metadata_not_names_or_order(tmp_path):
         spectrum_image=False,
         timestamp=40,
     )
+    _write_metadata_emd(
+        tmp_path / "same_area_wrong_grid.emd",
+        rotation_degrees=90.0,
+        stage_position=stage,
+        spectrum_image=False,
+        timestamp=50,
+        scan_shape=(128, 128),
+        pixel_size_m=6.74e-9 / 128,
+    )
 
     match = pair_spectrum_image_references(tmp_path)[0]
 
@@ -184,6 +195,41 @@ def test_spectrum_image_pairing_uses_metadata_not_names_or_order(tmp_path):
     assert match["spectrum_image"].name == "middle_name.emd"
     assert match["reference_zero"].name == "zzz_last_name.emd"
     assert match["reference_orthogonal"].name == "aaa_first_name.emd"
+
+
+def test_spectrum_image_pairing_rejects_shared_reference_assignment(tmp_path):
+    """One reference pair cannot be silently reused for multiple acquisitions."""
+    stage = (1.2e-6, -3.4e-6)
+    _write_metadata_emd(
+        tmp_path / "reference_zero.emd",
+        rotation_degrees=0.0,
+        stage_position=stage,
+        spectrum_image=False,
+        timestamp=10,
+    )
+    _write_metadata_emd(
+        tmp_path / "reference_orthogonal.emd",
+        rotation_degrees=90.0,
+        stage_position=stage,
+        spectrum_image=False,
+        timestamp=20,
+    )
+    for index in range(2):
+        _write_metadata_emd(
+            tmp_path / f"spectrum_{index}.emd",
+            rotation_degrees=0.0,
+            stage_position=stage,
+            spectrum_image=True,
+            timestamp=30 + index,
+        )
+
+    matches = pair_spectrum_image_references(tmp_path)
+
+    assert len(matches) == 2
+    assert {match["status"] for match in matches} == {"ambiguous"}
+    assert all("matches 2 spectrum images" in match["reason"] for match in matches)
+    assert all(match["reference_zero"] is None for match in matches)
+    assert all(match["reference_orthogonal"] is None for match in matches)
 
 
 def test_read_emd_eds_preserves_native_energy_axis(tmp_path, monkeypatch):

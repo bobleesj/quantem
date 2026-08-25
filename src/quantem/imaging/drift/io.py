@@ -319,7 +319,15 @@ def _relative_difference(first: float | None, second: float | None) -> float:
 
 
 def _same_specimen_area(first: dict, second: dict) -> bool:
-    """Match field of view, magnification, and stage position."""
+    """Match scan grid, calibration, field of view, and stage position."""
+    if (
+        first["scan_shape"] is not None
+        and second["scan_shape"] is not None
+        and tuple(first["scan_shape"]) != tuple(second["scan_shape"])
+    ):
+        return False
+    if _relative_difference(first["pixel_size_nm"], second["pixel_size_nm"]) > 0.02:
+        return False
     if _relative_difference(first["field_of_view_m"], second["field_of_view_m"]) > 0.02:
         return False
     if _relative_difference(first["magnification"], second["magnification"]) > 0.02:
@@ -347,8 +355,10 @@ def pair_spectrum_image_references(
 
     Filenames and acquisition order are never used. Each spectrum image must
     have one compatible near-zero reference and one compatible near-90-degree
-    reference from the same specimen area. Ambiguous and incomplete matches
-    are returned with a reason rather than guessed.
+    reference from the same specimen area, scan grid, and calibration. The
+    assignment must also be mutual: a reference pair cannot silently match
+    multiple spectrum images. Ambiguous and incomplete matches are returned
+    with a reason rather than guessed.
 
     Parameters
     ----------
@@ -427,4 +437,22 @@ def pair_spectrum_image_references(
                 "reason": reason,
             }
         )
+    pair_users: dict[tuple[Path, Path], list[int]] = {}
+    for index, match in enumerate(matches):
+        if match["status"] != "ready":
+            continue
+        pair = (match["reference_zero"], match["reference_orthogonal"])
+        pair_users.setdefault(pair, []).append(index)
+    for indices in pair_users.values():
+        if len(indices) == 1:
+            continue
+        reason = (
+            "Ambiguous: the same compatible reference pair matches "
+            f"{len(indices)} spectrum images."
+        )
+        for index in indices:
+            matches[index]["status"] = "ambiguous"
+            matches[index]["reason"] = reason
+            matches[index]["reference_zero"] = None
+            matches[index]["reference_orthogonal"] = None
     return matches
