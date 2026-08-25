@@ -273,11 +273,15 @@ def corrected(
         stack_corr[image_index] = warped
     image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
 
-    if output_original_shape:
-        image_corr_fft = fourier_crop_torch(
-            image_corr_fft,
-            self.imgs[0].shape[:2],
-        ) / upsample_factor**2
+    output_shape = (
+        tuple(int(value) for value in self.imgs[0].shape[:2])
+        if output_original_shape
+        else tuple(int(value) for value in self.shape[-2:])
+    )
+    image_corr_fft = fourier_crop_torch(
+        image_corr_fft,
+        output_shape,
+    ) / upsample_factor**2
     corrected_array = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
     if strip_padding and output_original_shape:
         scan_h, scan_w = self.imgs[0].shape[:2]

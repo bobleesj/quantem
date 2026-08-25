@@ -107,9 +107,8 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
     assert corrected.units == scan_0.units
     assert len(drift.drift_rate) == 2
 
-    automatic = drift.corrected(upsample_factor=1, verbose=False)
+    automatic = drift.corrected(verbose=False)
     canvas = drift.corrected(
-        upsample_factor=1,
         output_original_shape=False,
         verbose=False,
     )
