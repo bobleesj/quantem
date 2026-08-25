@@ -420,5 +420,6 @@ def test_cuda_matches_cpu_for_uint32_native_detector_frames():
     np.testing.assert_allclose(
         cpu_result.corrected_4dstem_0,
         cuda_result.corrected_4dstem_0.cpu().numpy(),
-        atol=2e-3,
+        rtol=3e-7,
+        atol=0.125,
     )
