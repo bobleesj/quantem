@@ -94,7 +94,12 @@ def integrate_virtual_detector(
     --------
     >>> adf = integrate_virtual_detector(data, detector_mask=annulus)
     """
-    from quantem.gpu.detector import masked_sum
+    try:
+        from quantem.gpu.detector import masked_sum
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"quantem.gpu", "quantem.gpu.detector"}:
+            raise
+        masked_sum = None
 
     if reduce not in {"mean", "sum"}:
         raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
@@ -122,8 +127,19 @@ def integrate_virtual_detector(
     ):
         flat = dataset.reshape(*scan_shape, -1)
         image = flat[..., mask.reshape(-1)].sum(axis=-1, dtype=np.float32)
-    else:
+    elif masked_sum is not None:
         image = masked_sum(dataset, mask).reshape(scan_shape)
+    elif isinstance(dataset, torch.Tensor):
+        mask_t = torch.as_tensor(mask, device=dataset.device)
+        flat = dataset.reshape(*scan_shape, -1).to(torch.float32)
+        image = flat[..., mask_t.reshape(-1)].sum(-1).detach().cpu().numpy()
+    else:
+        array = dataset.get() if hasattr(dataset, "get") else np.asarray(dataset)
+        flat = array.reshape(*scan_shape, -1)
+        image = flat[..., mask.reshape(-1)].sum(
+            axis=-1,
+            dtype=np.float32,
+        )
     return image / num_selected if reduce == "mean" else image
 
 
