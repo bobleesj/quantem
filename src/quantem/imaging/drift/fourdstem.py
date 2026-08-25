@@ -6,7 +6,26 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from quantem.imaging.drift.apply import _apply_scan_field
+from quantem.imaging.drift.apply import (
+    _apply_scan_field,
+    _raw_frame_displacement,
+)
+
+
+def data_array(dataset):
+    """Return the resident array or tensor from a QuantEM dataset wrapper."""
+    if isinstance(dataset, (np.ndarray, torch.Tensor)):
+        return dataset
+    array = getattr(dataset, "array", None)
+    if array is not None:
+        return array
+    tensor = getattr(dataset, "_tensor", None)
+    if tensor is not None:
+        return tensor
+    raise TypeError(
+        "4D-STEM input must be an array, tensor, or QuantEM dataset with "
+        "resident .array/.tensor data."
+    )
 
 
 def padding_offset(
@@ -100,6 +119,7 @@ def integrate_virtual_detector(
     --------
     >>> adf = integrate_virtual_detector(data, detector_mask=annulus)
     """
+    dataset = data_array(dataset)
     if reduce not in {"mean", "sum"}:
         raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
     scan_shape = tuple(int(value) for value in dataset.shape[:2])
@@ -161,21 +181,7 @@ def drift_field(self, idx: int) -> torch.Tensor:
             "Run dc.preprocess().correct_affine() (and optionally "
             ".correct_nonrigid()) before drift_field()."
         )
-    index = idx % len(self.images)
-    current = self.interpolator[index].transform_coordinates(self.knots[index])
-    initial = self.interpolator[index].transform_coordinates(
-        self._initial_knots[index]
-    )
-    return torch.as_tensor(
-        np.stack(
-            (
-                np.asarray(current[0]) - np.asarray(initial[0]),
-                np.asarray(current[1]) - np.asarray(initial[1]),
-            )
-        ),
-        dtype=torch.float32,
-        device=self._device,
-    )
+    return _raw_frame_displacement(self, idx)
 
 
 def probe_positions(
@@ -485,7 +491,7 @@ def regional_diffraction_patterns(
             "regional_diffraction_patterns() needs the two raw 4D-STEM datasets. "
             "Pass datasets=(scan_0, scan_90) when using a saved correction."
         )
-    source_datasets = tuple(source_datasets)
+    source_datasets = tuple(data_array(dataset) for dataset in source_datasets)
     if len(source_datasets) != 2 or any(dataset is None for dataset in source_datasets):
         raise ValueError(
             "regional_diffraction_patterns() expects exactly two raw 4D-STEM "
@@ -730,12 +736,10 @@ def corrected_4dstem(
         mode=mode,
         chunk_size=chunk_size,
         output_dtype=output_dtype,
+        output=output_0,
     )
     if output_device is not None and output_0 is None:
         corrected_4dstem_0 = torch.as_tensor(corrected_4dstem_0).to(output_device)
-    if output_0 is not None:
-        output_0[...] = to_numpy(corrected_4dstem_0, dtype=output_0.dtype)
-        corrected_4dstem_0 = output_0
     if inputs_on_device:
         self._datasets[0] = None
         torch.cuda.empty_cache()
@@ -746,12 +750,10 @@ def corrected_4dstem(
         mode=mode,
         chunk_size=chunk_size,
         output_dtype=output_dtype,
+        output=output_1,
     )
     if output_device is not None and output_1 is None:
         corrected_4dstem_1 = torch.as_tensor(corrected_4dstem_1).to(output_device)
-    if output_1 is not None:
-        output_1[...] = to_numpy(corrected_4dstem_1, dtype=output_1.dtype)
-        corrected_4dstem_1 = output_1
     if inputs_on_device:
         self._datasets[1] = None
         self._datasets_consumed = True
@@ -766,7 +768,7 @@ def corrected_4dstem(
         else:
             corrected_4dstem_1 = np.rot90(
                 corrected_4dstem_1, k=rot_k, axes=(0, 1),
-            ).copy()
+            )
 
     corrected_4dstem = None
     if merge:
@@ -787,24 +789,16 @@ def corrected_4dstem(
             disable=not verbose or len(row_starts) <= 1,
         )
         if isinstance(corrected_4dstem_0, torch.Tensor):
-            corrected_4dstem = torch.empty_like(corrected_4dstem_0)
+            corrected_4dstem = torch.empty_like(
+                corrected_4dstem_0,
+                dtype=torch.float32,
+            )
             for r0 in row_starts:
                 r1 = min(r0 + row_block, Hm)
-                if corrected_4dstem_0.is_floating_point():
-                    corrected_4dstem[r0:r1] = (
-                        corrected_4dstem_0[r0:r1]
-                        + corrected_4dstem_1[r0:r1]
-                    ) * 0.5
-                else:
-                    # Avoid promoting the full integer dataset to float32.
-                    # int32 sum fits in 2× input bytes per row block.
-                    a = corrected_4dstem_0[r0:r1].to(torch.int32)
-                    a += corrected_4dstem_1[r0:r1].to(torch.int32)
-                    a >>= 1  # divide by 2 (round-toward-zero for non-negative ints)
-                    corrected_4dstem[r0:r1] = a.clamp_(
-                        0, torch.iinfo(corrected_4dstem_0.dtype).max
-                    ).to(corrected_4dstem_0.dtype)
-                    del a
+                corrected_4dstem[r0:r1] = (
+                    corrected_4dstem_0[r0:r1].to(torch.float32)
+                    + corrected_4dstem_1[r0:r1].to(torch.float32)
+                ) * 0.5
                 merge_progress.update(r1 - r0)
         else:
             corrected_4dstem = np.empty_like(corrected_4dstem_0, dtype=np.float32)

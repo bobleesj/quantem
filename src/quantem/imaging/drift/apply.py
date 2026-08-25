@@ -19,8 +19,8 @@ from quantem.imaging.drift.core.knots import (
 )
 
 
-def _scan_warp_grid(self, image_index: int) -> torch.Tensor:
-    """Return one raw-frame sampling grid for a solved scan trajectory."""
+def _raw_frame_displacement(self, image_index: int) -> torch.Tensor:
+    """Return a one-knot trajectory displacement in raw scan coordinates."""
     index = image_index % len(self.images)
     if self.knots[index].shape[-1] != 1:
         raise ValueError(
@@ -51,6 +51,14 @@ def _scan_warp_grid(self, image_index: int) -> torch.Tensor:
         -scan_slow_t[1] * delta_canvas_t[0]
         + scan_slow_t[0] * delta_canvas_t[1]
     ) / determinant
+    return torch.stack((drift_row_t, drift_col_t))
+
+
+def _scan_warp_grid(self, image_index: int) -> torch.Tensor:
+    """Return one raw-frame sampling grid for a solved scan trajectory."""
+    index = image_index % len(self.images)
+    scan_rows, scan_cols = self.images[index].shape
+    drift_row_t, drift_col_t = _raw_frame_displacement(self, index)
     row_t = torch.arange(scan_rows, dtype=torch.float32, device=self._device)
     col_t = torch.arange(scan_cols, dtype=torch.float32, device=self._device)
     sample_row_t = row_t[:, None] - drift_row_t[:, None]
@@ -73,6 +81,7 @@ def _apply_scan_field(
     chunk_size: int | None,
     output_dtype: np.dtype | torch.dtype | str | None,
     mode: str = "bilinear",
+    output: np.ndarray | None = None,
 ) -> np.ndarray | torch.Tensor:
     """Warp only the two leading scan axes of an array."""
     index = image_index % len(self.images)
@@ -86,6 +95,12 @@ def _apply_scan_field(
     num_channels = int(np.prod(trailing_shape, dtype=np.int64)) if trailing_shape else 1
     source_is_torch = isinstance(data, torch.Tensor)
     source_dtype = data.dtype
+    if output is not None:
+        if not isinstance(output, np.ndarray) or output.shape != tuple(data.shape):
+            raise ValueError("output must be a NumPy array matching the input shape.")
+        output_flat = output.reshape(scan_rows, scan_cols, num_channels)
+    else:
+        output_flat = None
     flat = (
         data.reshape(scan_rows, scan_cols, num_channels)
         if source_is_torch
@@ -97,24 +112,43 @@ def _apply_scan_field(
     chunk_size = min(num_channels, 64 if chunk_size is None else int(chunk_size))
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-    corrected_t = torch.empty(
-        (scan_rows, scan_cols, num_channels),
-        dtype=torch.float32,
-        device=self._device,
-    )
+    corrected_t = None
+    if output_flat is None:
+        corrected_t = torch.empty(
+            (scan_rows, scan_cols, num_channels),
+            dtype=torch.float32,
+            device=self._device,
+        )
     for start in range(0, num_channels, chunk_size):
         stop = min(start + chunk_size, num_channels)
         channels_t = flat[:, :, start:stop].to(
             device=self._device,
             dtype=torch.float32,
         ).permute(2, 0, 1)[None]
-        corrected_t[:, :, start:stop] = torch.nn.functional.grid_sample(
+        corrected_block_t = torch.nn.functional.grid_sample(
             channels_t,
             grid_t,
             mode=mode,
             padding_mode="border",
             align_corners=True,
         )[0].permute(1, 2, 0)
+        if output_flat is None:
+            corrected_t[:, :, start:stop] = corrected_block_t
+        else:
+            output_dtype_np = output_flat.dtype
+            if np.issubdtype(output_dtype_np, np.integer):
+                limits = np.iinfo(output_dtype_np)
+                corrected_block_t = corrected_block_t.round().clamp(
+                    limits.min,
+                    limits.max,
+                )
+            output_flat[:, :, start:stop] = corrected_block_t.cpu().numpy().astype(
+                output_dtype_np,
+                copy=False,
+            )
+    if output_flat is not None:
+        return output
+    assert corrected_t is not None
     corrected_t = corrected_t.reshape((scan_rows, scan_cols, *trailing_shape))
     preserve_dtype = output_dtype == "same"
     requested_dtype = source_dtype if preserve_dtype else output_dtype
@@ -207,13 +241,9 @@ def apply_correction(
         chunk_size=chunk_size,
         output_dtype=output_dtype,
         mode=mode,
+        output=output,
     )
-    if output is not None:
-        if not isinstance(output, np.ndarray) or output.shape != array.shape:
-            raise ValueError("output must be a NumPy array matching the input shape.")
-        output[...] = np.asarray(corrected_array, dtype=output.dtype)
-        corrected_array = output
-    elif output_device is not None:
+    if output is None and output_device is not None:
         corrected_array = torch.as_tensor(corrected_array).to(output_device)
     if dataset is None:
         return corrected_array

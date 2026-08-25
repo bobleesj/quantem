@@ -269,6 +269,18 @@ class DriftCorrection(AutoSerialize):
             raise ValueError(
                 f"from_4dstem requires exactly two datasets, got {len(datasets)}."
             )
+        raw_datasets = [fourdstem.data_array(dataset) for dataset in datasets]
+        if any(data.ndim != 4 for data in raw_datasets):
+            raise ValueError(
+                "from_4dstem expects scan-axis-leading 4-D inputs; got "
+                f"{[tuple(data.shape) for data in raw_datasets]}."
+            )
+        detector_shapes = [tuple(data.shape[2:]) for data in raw_datasets]
+        if detector_shapes[0] != detector_shapes[1]:
+            raise ValueError(
+                "4D-STEM inputs must share one detector shape; got "
+                f"{detector_shapes}."
+            )
         if scan_direction_degrees is None:
             angles = [
                 getattr(dataset, "metadata", {}).get("scan_rotation_deg")
@@ -280,13 +292,20 @@ class DriftCorrection(AutoSerialize):
                     "do not carry scan_rotation_deg metadata."
                 )
             scan_direction_degrees = angles
-        virtual_images = [
-            Dataset2d.from_array(
-                fourdstem.integrate_virtual_detector(dataset),
+        virtual_images = []
+        for index, (dataset, raw_dataset) in enumerate(
+            zip(datasets, raw_datasets, strict=True)
+        ):
+            image = Dataset2d.from_array(
+                fourdstem.integrate_virtual_detector(raw_dataset),
                 name=f"4D-STEM virtual image {index}",
             )
-            for index, dataset in enumerate(datasets)
-        ]
+            if scan_sampling is None and hasattr(dataset, "sampling"):
+                image.sampling = np.asarray(dataset.sampling[:2], dtype=float)
+            if isinstance(scan_units, str) and hasattr(dataset, "units"):
+                image.units = list(dataset.units[:2])
+            image.metadata.update(dict(getattr(dataset, "metadata", {})))
+            virtual_images.append(image)
         if scan_sampling is not None:
             sampling = (
                 (float(scan_sampling), float(scan_sampling))
@@ -306,7 +325,7 @@ class DriftCorrection(AutoSerialize):
             scan_direction_degrees=scan_direction_degrees,
             device=device,
         )
-        result._datasets = list(datasets)
+        result._datasets = raw_datasets
         result._datasets_consumed = False
         return result
 
