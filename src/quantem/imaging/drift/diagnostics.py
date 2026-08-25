@@ -231,7 +231,12 @@ def _displacement_rows(
     correction,
     stages: Sequence[str] | None = None,
 ) -> list[dict[str, float | int | str]]:
-    """Summarize scan-line-origin displacement for each image and stage."""
+    """Summarize scan-line-origin displacement for each image and stage.
+
+    Adjacent-change values are component-wise RMS measurements. Fast-knot
+    differences are not normalized by knot separation, so they are comparable
+    only when the fast-direction knot topology and spacing are unchanged.
+    """
     selected = _select_stages(correction, stages)
     rows: list[dict[str, float | int | str]] = []
     for stage in selected:
@@ -239,9 +244,9 @@ def _displacement_rows(
         for image_index, field in enumerate(fields):
             magnitude = np.linalg.norm(field, axis=0)
             endpoint_vector = np.mean(field[:, -1] - field[:, 0], axis=1)
-            slow_difference = np.diff(field, axis=1)
-            fast_difference = np.diff(field, axis=2)
-            fast_curvature = np.diff(field, n=2, axis=2)
+            adjacent_line_change = np.diff(field, axis=1)
+            adjacent_fast_knot_change = np.diff(field, axis=2)
+            fast_knot_second_difference = np.diff(field, n=2, axis=2)
             rows.append(
                 {
                     "stage": stage,
@@ -251,18 +256,20 @@ def _displacement_rows(
                     "endpoint_displacement_px": float(np.linalg.norm(endpoint_vector)),
                     "rms_displacement_px": float(np.sqrt(np.mean(magnitude**2))),
                     "max_displacement_px": float(np.max(magnitude)),
-                    "slow_roughness_px": (
-                        float(np.sqrt(np.mean(slow_difference**2)))
-                        if slow_difference.size
+                    "component_rms_adjacent_line_change_px": (
+                        float(np.sqrt(np.mean(adjacent_line_change**2)))
+                        if adjacent_line_change.size
                         else 0.0
                     ),
-                    "fast_roughness_px": (
-                        float(np.sqrt(np.mean(fast_difference**2)))
-                        if fast_difference.size
+                    "component_rms_adjacent_fast_knot_change_px": (
+                        float(np.sqrt(np.mean(adjacent_fast_knot_change**2)))
+                        if adjacent_fast_knot_change.size
                         else 0.0
                     ),
-                    "fast_curvature_px": (
-                        float(np.sqrt(np.mean(fast_curvature**2))) if fast_curvature.size else 0.0
+                    "component_rms_fast_knot_second_difference_px": (
+                        float(np.sqrt(np.mean(fast_knot_second_difference**2)))
+                        if fast_knot_second_difference.size
+                        else 0.0
                     ),
                 }
             )

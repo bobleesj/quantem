@@ -193,6 +193,7 @@ def align_translation(
             self.images[ind].array,
             self.knots[ind],
         )
+    diagnostics._record_stage(self, "translation")
     kwargs.pop("title", None)
     if show_merged:
         self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)

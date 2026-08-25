@@ -278,7 +278,10 @@ def test_registration_report_matches_frozen_common_coverage_metrics():
         atol=1e-12,
     )
     np.testing.assert_allclose(
-        [[row["Common NCC"], row["Mean absolute difference"]] for row in registration],
+        [
+            [row["Common NCC"], row["Mean absolute difference (native intensity units)"]]
+            for row in registration
+        ],
         [
             [0.48240861115393513, 0.456299068925209],
             [0.7480021414803405, 0.2941893335769055],
@@ -290,8 +293,8 @@ def test_registration_report_matches_frozen_common_coverage_metrics():
     )
 
 
-def test_displacement_report_names_endpoint_and_roughness_metrics():
-    """Displacement evidence distinguishes endpoint motion from roughness."""
+def test_displacement_report_names_endpoint_and_adjacent_change_metrics():
+    """Displacement evidence distinguishes endpoint motion from adjacent changes."""
     correction = _make_affine_diagnostic_correction()
     displacement = drift_report._displacement_report(correction)
 
@@ -310,13 +313,18 @@ def test_displacement_report_names_endpoint_and_roughness_metrics():
         atol=1e-7,
     )
     np.testing.assert_allclose(
-        [row["Slow-direction roughness (px)"] for row in affine],
+        [row["Component RMS adjacent-line displacement change (px)"] for row in affine],
         [0.0316227766016838, 0.0316227766016838],
         rtol=0,
         atol=1e-8,
     )
     np.testing.assert_array_equal(
-        [row["Fast-direction roughness (px)"] for row in affine],
+        [
+            row[
+                "Component RMS adjacent-fast-knot displacement change (px; knot-spacing dependent)"
+            ]
+            for row in affine
+        ],
         0.0,
     )
 
@@ -348,10 +356,56 @@ def test_diagnostic_reports_and_plots_do_not_mutate_correction():
     plt.close(displacement_figure)
 
 
-def test_rerunning_stage_discards_later_diagnostic_checkpoints():
-    """A repeated earlier stage cannot leave stale later-stage evidence."""
+def test_translation_records_current_knots_and_affine_rerun_discards_it():
+    """Translation evidence follows the fitted state through an affine rerun."""
     correction = _make_affine_diagnostic_correction()
-    drift_diagnostics._record_stage(correction, "nonrigid")
-    drift_diagnostics._record_stage(correction, "affine")
+    correction.align_translation(show_merged=False, show_images=False)
+
+    assert drift_diagnostics._available_stages(correction) == (
+        "initial",
+        "affine",
+        "translation",
+    )
+    for recorded, current in zip(
+        drift_diagnostics._stage_knots(correction, "translation"),
+        correction.knots,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(recorded, current)
+
+    correction.align_affine(
+        step=0.02,
+        num_tests=5,
+        refine=False,
+        show_merged=False,
+        show_images=False,
+    )
 
     assert drift_diagnostics._available_stages(correction) == ("initial", "affine")
+
+
+def test_multiscan_plot_metric_describes_the_rendered_comparison():
+    """A multi-scan plot labels the exact scan-0-versus-rest image it shows."""
+    image_0, image_1, _ = make_synthetic_drift_data(scale=1, seed=42)
+    image_2 = np.roll(image_0, shift=7, axis=0)
+    correction = DriftCorrection.from_data(
+        images=[image_0, image_1, image_2],
+        scan_direction_degrees=[0.0, 90.0, 45.0],
+    ).preprocess(show_merged=False, show_images=False)
+
+    figure, axes = drift_plot._plot_registration_diagnostics(
+        correction,
+        stages=("initial",),
+    )
+    _, stacks, common_mask, aggregate_rows = drift_diagnostics._registration_data(
+        correction,
+        ("initial",),
+    )
+    reference, moving = drift_plot._comparison_pair(stacks["initial"])
+    expected_overlay, _ = drift_plot._registration_overlay(reference, moving, common_mask)
+    displayed_metrics = drift_diagnostics._pair_metrics(reference, moving, common_mask)
+
+    np.testing.assert_allclose(axes[0, 0].images[0].get_array(), expected_overlay)
+    assert f"{displayed_metrics['common_ncc']:.4f}" in axes[0, 0].get_title()
+    assert not np.isclose(displayed_metrics["common_ncc"], aggregate_rows[0]["common_ncc"])
+    plt.close(figure)

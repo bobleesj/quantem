@@ -113,7 +113,7 @@ def plot_merged_images(self, show_knots: bool = True, **kwargs):
 
 
 def _comparison_pair(stack: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return one representative reference and moving image for display."""
+    """Compare scan 0 with scan 1, or with the mean of all remaining scans."""
     if stack.shape[0] == 2:
         return stack[0], stack[1]
     return np.mean(stack[1:], axis=0), stack[0]
@@ -124,7 +124,7 @@ def _registration_overlay(
     moving: np.ndarray,
     mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build shared-scale RGB agreement and absolute-difference images."""
+    """Build percentile-normalized RGB agreement and difference images."""
     values = np.concatenate((reference[mask], moving[mask]))
     if values.size:
         low, high = np.percentile(values, (1.0, 99.0))
@@ -147,7 +147,7 @@ def _plot_registration_diagnostics(
     figsize: tuple[float, float] | None = None,
 ):
     """Plot stage-by-stage registration on one fixed measured footprint."""
-    selected, stacks, common_mask, rows = diagnostics._registration_data(
+    selected, stacks, common_mask, _ = diagnostics._registration_data(
         correction,
         stages,
     )
@@ -159,8 +159,9 @@ def _plot_registration_diagnostics(
         figsize=figsize,
         squeeze=False,
     )
-    for row_index, (stage, metrics) in enumerate(zip(selected, rows, strict=True)):
+    for row_index, stage in enumerate(selected):
         reference, moving = _comparison_pair(stacks[stage])
+        metrics = diagnostics._pair_metrics(reference, moving, common_mask)
         overlay, difference = _registration_overlay(reference, moving, common_mask)
         axes[row_index, 0].imshow(overlay)
         axes[row_index, 0].set_title(
@@ -168,11 +169,13 @@ def _plot_registration_diagnostics(
         )
         axes[row_index, 1].imshow(difference, cmap="magma", vmin=0.0, vmax=1.0)
         axes[row_index, 1].set_title(
-            f"Absolute difference\nmean {float(metrics['mean_absolute_difference']):.4g}"
+            "Percentile-normalized |difference|\n"
+            f"native MAD {float(metrics['mean_absolute_difference']):.4g}; "
+            f"RMS {float(metrics['root_mean_square_difference']):.4g}"
         )
         axes[row_index, 2].imshow(common_mask, cmap="gray", vmin=0, vmax=1)
         axes[row_index, 2].set_title(
-            f"Fixed common coverage\n{float(metrics['coverage']):.1%} of canvas"
+            f"Fixed common coverage\n{float(common_mask.mean()):.1%} of canvas"
         )
         for axis in axes[row_index]:
             axis.set_xticks([])
