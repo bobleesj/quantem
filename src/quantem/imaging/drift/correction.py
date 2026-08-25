@@ -353,7 +353,7 @@ class DriftCorrection(AutoSerialize):
                     verbose=False,
                 )
             reference_image = preparation.match_reference_image(
-                reference_dc.corrected().array,
+                reference_dc.corrected(output_frame="canvas").array,
                 tuple(int(value) for value in reference_dc.imgs[0].shape[:2]),
                 tuple(int(value) for value in drifted_shape),
             )
