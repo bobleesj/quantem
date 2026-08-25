@@ -177,7 +177,7 @@ def _apply_scan_field(
 @torch.inference_mode()
 def apply_correction(
     self,
-    data: Dataset3d | np.ndarray | torch.Tensor | None = None,
+    data: Dataset2d | Dataset3d | np.ndarray | torch.Tensor | None = None,
     image_index: int = -1,
     *,
     mode: str = "bilinear",
@@ -191,7 +191,7 @@ def apply_correction(
 
     Parameters
     ----------
-    data : Dataset3d, numpy.ndarray, torch.Tensor, or None
+    data : Dataset2d, Dataset3d, numpy.ndarray, torch.Tensor, or None
         Data with leading ``(scan_row, scan_col)`` axes. ``None`` uses a raw
         dataset retained by :meth:`DriftCorrection.from_4dstem`.
     image_index : int, default -1
@@ -209,7 +209,7 @@ def apply_correction(
 
     Returns
     -------
-    Dataset3d, numpy.ndarray, or torch.Tensor
+    Dataset2d, Dataset3d, numpy.ndarray, or torch.Tensor
         Corrected data with unchanged shape and trailing-axis order.
 
     Examples
@@ -232,7 +232,7 @@ def apply_correction(
         if datasets is None:
             raise ValueError("No data supplied and no 4D-STEM dataset is retained.")
         data = datasets[image_index % len(datasets)]
-    dataset = data if isinstance(data, Dataset3d) else None
+    dataset = data if isinstance(data, (Dataset2d, Dataset3d)) else None
     array = dataset.array if dataset is not None else data
     corrected_array = _apply_scan_field(
         self,
@@ -247,7 +247,7 @@ def apply_correction(
         corrected_array = torch.as_tensor(corrected_array).to(output_device)
     if dataset is None:
         return corrected_array
-    corrected = Dataset3d.from_array(
+    corrected = type(dataset).from_array(
         np.asarray(corrected_array),
         name=f"drift-corrected {dataset.name}",
         origin=dataset.origin.copy(),

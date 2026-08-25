@@ -305,6 +305,7 @@ def read_emd_eds(
         "haadf": haadf,
         "spectrum": spectrum,
         "element_maps": element_maps,
+        "scan_rotation_deg": metadata["scan_rotation_deg"],
         "metadata": metadata,
         "path": str(path),
     }
