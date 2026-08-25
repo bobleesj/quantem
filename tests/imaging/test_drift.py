@@ -93,7 +93,11 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
         show_knots=False,
         verbose=False,
     )
-    corrected = drift.corrected(upsample_factor=1, verbose=False)
+    corrected = drift.corrected(
+        upsample_factor=1,
+        output_frame="input",
+        verbose=False,
+    )
 
     assert isinstance(corrected, Dataset2d)
     assert corrected.shape == scan_0.shape
@@ -103,11 +107,13 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
     assert corrected.units == scan_0.units
     assert len(drift.drift_rate) == 2
 
+    automatic = drift.corrected(upsample_factor=1, verbose=False)
     canvas = drift.corrected(
         upsample_factor=1,
         output_frame="canvas",
         verbose=False,
     )
+    assert automatic.shape == tuple(drift.shape[-2:])
     assert canvas.shape == tuple(drift.shape[-2:])
 
 

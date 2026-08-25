@@ -142,7 +142,7 @@ def corrected(
     self,
     *,
     upsample_factor: int = 2,
-    output_frame: Literal["input", "canvas"] = "input",
+    output_frame: Literal["auto", "input", "canvas"] = "auto",
     strip_padding: bool = False,
     smoothing_sigma: float | None = 0.5,
     stage: str | None = None,
@@ -159,10 +159,12 @@ def corrected(
     ----------
     upsample_factor : int, default 2
         Sampling multiplier for the corrected image.
-    output_frame : {"input", "canvas"}, default "input"
-        ``"input"`` returns the original scan shape. ``"canvas"`` retains
-        the padded solver canvas used when chaining a solved correction as a
-        structural reference.
+    output_frame : {"auto", "input", "canvas"}, default "auto"
+        ``"auto"`` returns the padded solver canvas for paired 2-D scans and
+        the native input frame for a channel-resolved reference dataset.
+        ``"input"`` always returns the original scan shape. ``"canvas"``
+        retains the padded solver canvas used for publication figures and
+        when chaining a solved correction as a structural reference.
     strip_padding : bool, default False
         Remove pixels that do not share measured coverage across scans.
     smoothing_sigma : float or None, default 0.5
@@ -184,18 +186,21 @@ def corrected(
     >>> corrected = drift.corrected()
     >>> scans = drift.corrected(merge=False)
     """
-    if output_frame not in {"input", "canvas"}:
+    if output_frame not in {"auto", "input", "canvas"}:
         raise ValueError(
-            "output_frame must be either 'input' or 'canvas', "
+            "output_frame must be 'auto', 'input', or 'canvas', "
             f"got {output_frame!r}"
         )
-    if strip_padding and output_frame != "input":
+    resolved_output_frame = (
+        "input" if self._reference_mode else "canvas"
+    ) if output_frame == "auto" else output_frame
+    if strip_padding and resolved_output_frame != "input":
         raise ValueError("strip_padding=True requires output_frame='input'")
 
     if self._reference_mode:
         if (
             upsample_factor != 2
-            or output_frame != "input"
+            or resolved_output_frame != "input"
             or strip_padding
             or smoothing_sigma != 0.5
             or not merge
@@ -241,7 +246,7 @@ def corrected(
             )
         panels = comparison_panels(self, stage)
         corrected_scans = panels["corrected_scans"]
-        if output_frame == "input":
+        if resolved_output_frame == "input":
             scan_shape = tuple(int(value) for value in self.imgs[0].shape[:2])
             row, column = padding_offset(
                 corrected_scans[0].shape[:2],
@@ -288,7 +293,7 @@ def corrected(
 
     output_shape = (
         tuple(int(value) for value in self.imgs[0].shape[:2])
-        if output_frame == "input"
+        if resolved_output_frame == "input"
         else tuple(int(value) for value in self.shape[-2:])
     )
     image_corr_fft = fourier_crop_torch(
