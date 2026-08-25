@@ -8,7 +8,10 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection, StripPass
 from quantem.imaging.drift import diagnostics as drift_diagnostics
 from quantem.imaging.drift.core.nonrigid import _regularize_knots
-from quantem.imaging.drift.core.strip import free_weight
+from quantem.imaging.drift.core.strip import (
+    free_weight,
+    measure_strip_residual_torch,
+)
 
 
 def _accelerator_device() -> torch.device:
@@ -88,6 +91,28 @@ def test_strip_free_weight_can_freeze_then_smoothly_release_scanlines():
     assert np.all(weights[:47] == 0.0)
     assert np.all((weights >= 0.0) & (weights <= 1.0))
     assert np.all(weights[55:] == 1.0)
+
+
+def test_strip_measurement_recovers_local_integer_residual():
+    """Each slow-scan strip recovers the same known residual displacement."""
+    rng = np.random.default_rng(5)
+    reference = rng.normal(size=(48, 48)).astype(np.float32)
+    moving = np.roll(np.roll(reference, 2, axis=0), -3, axis=1)
+
+    result = measure_strip_residual_torch(
+        reference,
+        moving,
+        np.ones_like(reference, dtype=bool),
+        n_strips=4,
+        max_shift_row=3,
+        max_shift_col=4,
+        device="cpu",
+        method="brute",
+    )
+
+    np.testing.assert_array_equal(result["drow"], np.full(4, -2.0))
+    np.testing.assert_array_equal(result["dcol"], np.full(4, 3.0))
+    assert np.all(result["valid"])
 
 
 @pytest.mark.parametrize("trend_order", (0, 1, 2, 3))
