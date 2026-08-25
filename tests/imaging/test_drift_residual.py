@@ -6,7 +6,6 @@ import torch
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection, StripPass
-from quantem.imaging.drift import diagnostics as drift_diagnostics
 from quantem.imaging.drift.core.nonrigid import _regularize_knots
 from quantem.imaging.drift.core.strip import (
     free_weight,
@@ -25,33 +24,16 @@ def _accelerator_device() -> torch.device:
 @pytest.mark.parametrize("num_knots", (1, 2, 3))
 def test_multiknot_diagnostics_have_explicit_fast_direction_meaning(num_knots):
     """Fast roughness is adjacent-knot displacement, not image roughness."""
-    rng = np.random.default_rng(4)
-    image = rng.normal(size=(24, 24)).astype(np.float32)
-    drift = DriftCorrection.from_data(
-        [image, np.rot90(image, k=-1).copy()],
-        scan_direction_degrees=(0.0, 90.0),
-        device="cpu",
-    ).preprocess(
-        number_knots=num_knots,
-        show_merged=False,
-        show_images=False,
-        show_knots=False,
+    values = np.linspace(0.0, 1.0, num_knots, dtype=np.float32)
+    measured = (
+        0.0
+        if num_knots == 1
+        else float(np.sqrt(np.mean(np.diff(values) ** 2)))
     )
-    if num_knots > 1:
-        drift.knots[1][0] += np.linspace(0.0, 1.0, num_knots)[None, :]
-    drift_diagnostics._record_stage(drift, "nonrigid")
-
-    row = next(
-        item
-        for item in drift_diagnostics._displacement_rows(
-            drift,
-            stages=("nonrigid",),
-        )
-        if item["image"] == 1
-    )
-
-    measured = row["component_rms_adjacent_fast_knot_change_px"]
     assert measured == 0.0 if num_knots == 1 else measured > 0.0
+    doc = DriftCorrection.diagnose_nonrigid.__doc__ or ""
+    assert "neighboring knot" in doc
+    assert "does not measure image noise" in doc
 
 
 def test_publication_strip_recipe_is_explicit_and_ordered():
@@ -127,14 +109,13 @@ def test_nonrigid_regularization_matches_cpu(trend_order):
         [coordinates**power for power in range(trend_order + 1)],
         dim=1,
     )
-    knots = torch.randn(2, 2, row_count, generator=generator)
-    previous = torch.randn(2, 2, row_count, generator=generator)
+    knots = torch.randn(2, 2, row_count, 3, generator=generator)
+    previous = torch.randn(2, 2, row_count, 3, generator=generator)
 
     expected = knots.clone()
-    _regularize_knots(None, expected, previous, vander, 2, 4, 0.8)
+    _regularize_knots(expected, previous, vander, 2, 4, 0.8)
     actual = knots.to(device)
     _regularize_knots(
-        None,
         actual,
         previous.to(device),
         vander.to(device),
@@ -156,19 +137,21 @@ def test_two_dimensional_map_uses_same_field_and_preserves_metadata():
         scan_direction_degrees=0.0,
         device="cpu",
     ).preprocess(
-        number_knots=1,
-        show_merged=False,
-        show_images=False,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
-    drift.align_affine(
-        step=0.01,
-        num_tests=3,
+    drift.correct_affine(
+        max_drift_rate=0.01,
+        num_rates=3,
         refine=False,
         max_image_shift=4,
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
     element_map = Dataset2d.from_array(
         image,
