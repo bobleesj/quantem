@@ -172,7 +172,7 @@ def transform_coordinates_single_knot(
     return row_coords, col_coords
 
 
-def initialize_scanline_knots(
+def _initialize_scanline_knots(
     input_shape: tuple[int, int],
     output_shape: tuple[int, int],
     scan_fast: NDArray,
@@ -225,35 +225,50 @@ def initialize_scanline_knots(
     return np.stack([row_knots, col_knots], axis=0)
 
 
+def _interpolate_fast_knots(
+    values: torch.Tensor,
+    num_cols: int,
+) -> torch.Tensor:
+    """Interpolate fast-scan knots with the established K=2/3 basis."""
+    number_knots = values.shape[-1]
+    position = torch.linspace(
+        0, 1, num_cols, dtype=values.dtype, device=values.device
+    )
+    if number_knots == 2:
+        return values[..., 0, None] * (1 - position) + values[..., 1, None] * position
+    if number_knots == 3:
+        # Lagrange basis at equally spaced anchors (0, 0.5, 1), matching
+        # DriftInterpolator's established quadratic interpolation.
+        basis_0 = 2 * (position - 0.5) * (position - 1)
+        basis_1 = -4 * position * (position - 1)
+        basis_2 = 2 * position * (position - 0.5)
+        return (
+            values[..., 0, None] * basis_0
+            + values[..., 1, None] * basis_1
+            + values[..., 2, None] * basis_2
+        )
+    raise ValueError(
+        f"Internal Torch geometry supports 2 or 3 knots, got {number_knots}."
+    )
+
+
 def _transform_coordinates_multi_knot(
     knots: torch.Tensor,
     input_shape: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Linearly interpolate two or more knot anchors per scan line."""
+    """Interpolate two or three knot anchors with the established basis."""
     _, num_cols = input_shape
     number_knots = knots.shape[2]
     if number_knots < 2:
         raise ValueError("Multi-knot interpolation requires at least 2 knots per scan line.")
 
-    position = torch.linspace(
-        0,
-        number_knots - 1,
-        num_cols,
-        dtype=knots.dtype,
-        device=knots.device,
+    return (
+        _interpolate_fast_knots(knots[0], num_cols),
+        _interpolate_fast_knots(knots[1], num_cols),
     )
-    segment = torch.clamp(position.long(), max=number_knots - 2)
-    fraction = (position - segment.to(knots.dtype))[None, :]
-    row_low = knots[0, :, segment]
-    row_high = knots[0, :, segment + 1]
-    col_low = knots[1, :, segment]
-    col_high = knots[1, :, segment + 1]
-    row_coords = row_low + (row_high - row_low) * fraction
-    col_coords = col_low + (col_high - col_low) * fraction
-    return row_coords, col_coords
 
 
-class DriftKnot:
+class _DriftKnot:
     """Internal Torch geometry for one or more knots per scan line.
 
     The existing :class:`DriftInterpolator` remains the compatibility path for
@@ -291,29 +306,23 @@ class DriftKnot:
             return displacement[:, :, 0]
 
         _, num_cols = self.input_shape
-        position = torch.linspace(
-            0,
-            self.number_knots - 1,
-            num_cols,
-            dtype=displacement.dtype,
-            device=displacement.device,
+        return torch.stack(
+            [
+                _interpolate_fast_knots(displacement[0], num_cols),
+                _interpolate_fast_knots(displacement[1], num_cols),
+            ]
         )
-        segment = torch.clamp(position.long(), max=self.number_knots - 2)
-        fraction = (position - segment.to(displacement.dtype))[None, :]
-        row = displacement[0, :, segment]
-        row += (displacement[0, :, segment + 1] - row) * fraction
-        col = displacement[1, :, segment]
-        col += (displacement[1, :, segment + 1] - col) * fraction
-        return torch.stack([row, col])
 
     def drift_raw(self, initial_knots: torch.Tensor) -> torch.Tensor:
         """Convert canvas displacement to the raw scan coordinate frame."""
         displacement = self._drift_canvas(initial_knots)
-        scan_rows, scan_cols = self.input_shape
-        aspect = float(scan_rows - 1) / float(scan_cols - 1) if scan_cols > 1 else 1.0
-        determinant = self.scan_slow[0] * self.scan_fast[1] - self.scan_fast[0] * aspect * self.scan_slow[1]
+        determinant = (
+            self.scan_slow[0] * self.scan_fast[1]
+            - self.scan_fast[0] * self.scan_slow[1]
+        )
         drift_row = (
-            self.scan_fast[1] * displacement[0] - self.scan_fast[0] * aspect * displacement[1]
+            self.scan_fast[1] * displacement[0]
+            - self.scan_fast[0] * displacement[1]
         ) / determinant
         drift_col = (
             -self.scan_slow[1] * displacement[0] + self.scan_slow[0] * displacement[1]

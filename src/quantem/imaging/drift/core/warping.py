@@ -167,7 +167,7 @@ def translate_align(
     return image_shifts
 
 
-def backward_warp(
+def _backward_warp(
     images: torch.Tensor,
     drift: tuple[float, float] | torch.Tensor,
     rigid_shift: tuple[float, float] = (0.0, 0.0),

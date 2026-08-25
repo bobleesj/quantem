@@ -14,7 +14,7 @@ from quantem.imaging.drift.core.warping import (
 )
 
 
-def candidate_grid(step: float, num_tests: int) -> np.ndarray:
+def _candidate_grid(step: float, num_tests: int) -> np.ndarray:
     """Build the legacy circular affine-rate grid in deterministic order.
 
     This helper isolates candidate construction from orchestration without
@@ -114,7 +114,7 @@ def align_affine(
             f"Provide image pairs with different scan directions."
         )
     # Build candidate grid with circular mask (~21% fewer than square).
-    drift_vectors = candidate_grid(step, num_tests)
+    drift_vectors = _candidate_grid(step, num_tests)
 
     def _print_top_candidates(label, candidates, costs_tensor):
         costs_np = costs_tensor.cpu().numpy()

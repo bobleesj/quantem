@@ -16,17 +16,18 @@ from quantem.imaging.drift import (
     bounded_sine_sigmoid,
 )
 from quantem.imaging.drift.core.knots import (
-    DriftKnot,
+    DriftInterpolator,
+    _DriftKnot,
+    _initialize_scanline_knots,
     _symmetric_pad,
     bilinear_kde_batch,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
-    initialize_scanline_knots,
 )
 from quantem.imaging.drift.core.warping import (
+    _backward_warp,
     _parabolic_peak_2d,
     _parabolic_sub_pixel,
-    backward_warp,
     cross_corr_batch,
 )
 
@@ -53,7 +54,7 @@ def test_cross_corr_zero_cost_for_identical():
 def test_backward_warp_identity_preserves_image():
     """A zero drift field must preserve every source pixel."""
     image = torch.arange(63, dtype=torch.float32).reshape(7, 9)
-    result = backward_warp(image, drift=(0.0, 0.0))
+    result = _backward_warp(image, drift=(0.0, 0.0))
     torch.testing.assert_close(result, image, atol=3e-6, rtol=0.0)
 
 
@@ -64,7 +65,7 @@ def test_backward_warp_translation_from_knot_geometry(number_knots):
     scan_fast = np.array([0.0, 1.0], dtype=np.float32)
     scan_slow = np.array([1.0, 0.0], dtype=np.float32)
     initial = torch.tensor(
-        initialize_scanline_knots(
+        _initialize_scanline_knots(
             input_shape,
             input_shape,
             scan_fast,
@@ -76,7 +77,7 @@ def test_backward_warp_translation_from_knot_geometry(number_knots):
     translated = initial.clone()
     translated[0] += 2.0
     translated[1] -= 3.0
-    geometry = DriftKnot(
+    geometry = _DriftKnot(
         translated,
         torch.tensor(scan_fast),
         torch.tensor(scan_slow),
@@ -85,7 +86,7 @@ def test_backward_warp_translation_from_knot_geometry(number_knots):
 
     image = torch.zeros(input_shape, dtype=torch.float32)
     image[8, 9] = 1.0
-    result = backward_warp(image, geometry.drift_raw(initial), mode="nearest")
+    result = _backward_warp(image, geometry.drift_raw(initial), mode="nearest")
     peak = torch.nonzero(result == result.max(), as_tuple=False)[0]
     torch.testing.assert_close(peak, torch.tensor([10, 6]))
 
@@ -99,7 +100,7 @@ def test_initial_knot_geometry_matches_for_one_and_two_knots():
     geometries = []
     for number_knots in (1, 2):
         knots = torch.tensor(
-            initialize_scanline_knots(
+            _initialize_scanline_knots(
                 input_shape,
                 output_shape,
                 scan_fast,
@@ -109,7 +110,7 @@ def test_initial_knot_geometry_matches_for_one_and_two_knots():
             dtype=torch.float32,
         )
         geometries.append(
-            DriftKnot(
+            _DriftKnot(
                 knots,
                 torch.tensor(scan_fast),
                 torch.tensor(scan_slow),
@@ -127,7 +128,7 @@ def test_three_knot_geometry_interpolates_middle_anchor():
     scan_fast = np.array([0.0, 1.0], dtype=np.float32)
     scan_slow = np.array([1.0, 0.0], dtype=np.float32)
     knots = torch.tensor(
-        initialize_scanline_knots(
+        _initialize_scanline_knots(
             input_shape,
             input_shape,
             scan_fast,
@@ -137,7 +138,7 @@ def test_three_knot_geometry_interpolates_middle_anchor():
         dtype=torch.float32,
     )
     knots[0, :, 1] += 1.5
-    geometry = DriftKnot(
+    geometry = _DriftKnot(
         knots,
         torch.tensor(scan_fast),
         torch.tensor(scan_slow),
@@ -151,6 +152,60 @@ def test_three_knot_geometry_interpolates_middle_anchor():
     torch.testing.assert_close(col_coords[:, 0], knots[1, :, 0])
     torch.testing.assert_close(col_coords[:, 4], knots[1, :, 1])
     torch.testing.assert_close(col_coords[:, -1], knots[1, :, -1])
+
+
+def test_three_knot_geometry_matches_legacy_quadratic_interpolation():
+    """Torch K=3 geometry must preserve the established quadratic curve."""
+    input_shape = (7, 13)
+    scan_fast = np.array([0.0, 1.0], dtype=np.float32)
+    scan_slow = np.array([1.0, 0.0], dtype=np.float32)
+    knots = _initialize_scanline_knots(
+        input_shape, input_shape, scan_fast, scan_slow, 3
+    )
+    knots[0, :, 1] += 2.0
+    legacy = DriftInterpolator(
+        input_shape,
+        input_shape,
+        scan_fast,
+        scan_slow,
+        pad_value=0.0,
+        kde_sigma=0.5,
+    )
+    expected_row, expected_column = legacy.transform_coordinates(knots)
+    actual_row, actual_column = _DriftKnot(
+        torch.tensor(knots),
+        torch.tensor(scan_fast),
+        torch.tensor(scan_slow),
+        input_shape,
+    ).to_canvas()
+    np.testing.assert_allclose(actual_row.numpy(), expected_row, atol=2e-6)
+    np.testing.assert_allclose(actual_column.numpy(), expected_column, atol=2e-6)
+
+
+def test_raw_drift_inverse_for_arbitrary_angle_and_nonsquare_scan():
+    """Canvas displacement must invert to raw row/column coordinates."""
+    input_shape = (17, 31)
+    angle = np.deg2rad(30.0)
+    scan_fast = np.array([np.sin(-angle), np.cos(-angle)], dtype=np.float32)
+    scan_slow = np.array([np.cos(-angle), -np.sin(-angle)], dtype=np.float32)
+    initial = torch.tensor(
+        _initialize_scanline_knots(
+            input_shape, input_shape, scan_fast, scan_slow, 3
+        ),
+        dtype=torch.float32,
+    )
+    raw_drift = torch.tensor([2.0, -3.0])
+    canvas_drift = torch.tensor(scan_slow) * raw_drift[0]
+    canvas_drift += torch.tensor(scan_fast) * raw_drift[1]
+    fitted = initial + canvas_drift[:, None, None]
+    recovered = _DriftKnot(
+        fitted,
+        torch.tensor(scan_fast),
+        torch.tensor(scan_slow),
+        input_shape,
+    ).drift_raw(initial)
+    expected = raw_drift[:, None, None].expand_as(recovered)
+    torch.testing.assert_close(recovered, expected, atol=2e-6, rtol=0.0)
 
 
 @pytest.mark.parametrize("shift_row,shift_col", [(0, 0), (3, -5), (7, 2), (2.3, -1.7)])
