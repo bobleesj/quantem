@@ -399,8 +399,21 @@ def _regularize_knots(
         if sigma_px is not None and sigma_px > 0:
             # Detrend + smooth all (N*2, num_rows) knots in one batched lstsq + smooth
             knots_flat = knots_batch.reshape(-1, num_rows_knot).T  # (num_rows, N*2)
-            coefs, _, _, _ = torch.linalg.lstsq(vander, knots_flat)
-            trend = (vander @ coefs).T  # (N*2, num_rows)
+            if vander.device.type == "mps":
+                if vander.shape[0] < vander.shape[1]:
+                    coefficients = torch.linalg.lstsq(
+                        vander.cpu(),
+                        knots_flat.cpu(),
+                    ).solution.to(vander.device)
+                else:
+                    normal_matrix = vander.T @ vander
+                    coefficients = torch.linalg.solve(
+                        normal_matrix,
+                        vander.T @ knots_flat,
+                    )
+            else:
+                coefficients = torch.linalg.lstsq(vander, knots_flat).solution
+            trend = (vander @ coefficients).T  # (N*2, num_rows)
             residual = knots_batch.reshape(-1, num_rows_knot) - trend
             smoothed = gaussian_smooth_1d(residual, sigma_px)
             knots_batch.copy_((smoothed + trend).reshape(num_images, 2, num_rows_knot))
