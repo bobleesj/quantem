@@ -2,10 +2,12 @@
 
 import inspect
 
+import numpy as np
 import pytest
 import torch
 
 from quantem.imaging.drift import DriftCorrection
+from quantem.imaging.drift.core.affine import candidate_grid
 from quantem.imaging.drift.core.nonrigid import _regularize_knots
 
 
@@ -119,3 +121,20 @@ def test_public_workflow_signatures_remain_unchanged():
         parameters = inspect.signature(getattr(DriftCorrection, method_name)).parameters
         for parameter_name, default in defaults.items():
             assert parameters[parameter_name].default == default
+
+
+def test_affine_candidate_grid_preserves_legacy_order_and_extent():
+    """The shared grid helper must reproduce the existing affine search."""
+    step = 0.02
+    num_tests = 5
+    axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+    row, column = np.meshgrid(axis, axis, indexing="ij")
+    keep = row**2 + column**2 <= (num_tests / 2) ** 2
+    expected = np.column_stack((row[keep], column[keep])) * step
+    np.testing.assert_array_equal(candidate_grid(step, num_tests), expected)
+
+
+def test_affine_candidate_grid_rejects_even_width():
+    """An odd grid width is required to include zero drift."""
+    with pytest.raises(ValueError, match="must be odd"):
+        candidate_grid(0.01, 4)

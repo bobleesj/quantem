@@ -14,6 +14,25 @@ from quantem.imaging.drift.core.warping import (
 )
 
 
+def candidate_grid(step: float, num_tests: int) -> np.ndarray:
+    """Build the legacy circular affine-rate grid in deterministic order.
+
+    This helper isolates candidate construction from orchestration without
+    changing the existing ``align_affine`` search extent or candidate order.
+    """
+    if num_tests % 2 == 0:
+        raise ValueError(
+            f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}."
+        )
+    grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+    row_grid, col_grid = np.meshgrid(grid_axis, grid_axis, indexing="ij")
+    circular_mask = row_grid**2 + col_grid**2 <= (num_tests / 2) ** 2
+    return (
+        np.column_stack((row_grid[circular_mask], col_grid[circular_mask]))
+        * step
+    )
+
+
 def align_affine(
     self,
     step: float = 0.01,
@@ -94,15 +113,8 @@ def align_affine(
             f"align_affine requires at least 2 images (got {self.shape[0]}). "
             f"Provide image pairs with different scan directions."
         )
-    if num_tests % 2 == 0:
-        raise ValueError(
-            f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}."
-        )
-    # Build candidate grid with circular mask (~21% fewer than square)
-    grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
-    row_grid, col_grid = np.meshgrid(grid_axis, grid_axis, indexing="ij")
-    circular_mask = row_grid**2 + col_grid**2 <= (num_tests / 2) ** 2
-    drift_vectors = np.vstack((row_grid[circular_mask], col_grid[circular_mask])).T * step
+    # Build candidate grid with circular mask (~21% fewer than square).
+    drift_vectors = candidate_grid(step, num_tests)
 
     def _print_top_candidates(label, candidates, costs_tensor):
         costs_np = costs_tensor.cpu().numpy()
