@@ -16,14 +16,17 @@ from quantem.imaging.drift import (
     bounded_sine_sigmoid,
 )
 from quantem.imaging.drift.core.knots import (
+    DriftKnot,
     _symmetric_pad,
     bilinear_kde_batch,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
+    initialize_scanline_knots,
 )
 from quantem.imaging.drift.core.warping import (
     _parabolic_peak_2d,
     _parabolic_sub_pixel,
+    backward_warp,
     cross_corr_batch,
 )
 
@@ -45,6 +48,109 @@ def test_cross_corr_zero_cost_for_identical():
     reference = torch.tensor(image)[None]
     cost = cross_corr_batch(reference, reference.clone(), upsample_factor=8)
     assert cost.item() < 1e-6
+
+
+def test_backward_warp_identity_preserves_image():
+    """A zero drift field must preserve every source pixel."""
+    image = torch.arange(63, dtype=torch.float32).reshape(7, 9)
+    result = backward_warp(image, drift=(0.0, 0.0))
+    torch.testing.assert_close(result, image, atol=3e-6, rtol=0.0)
+
+
+@pytest.mark.parametrize("number_knots", [1, 2, 3])
+def test_backward_warp_translation_from_knot_geometry(number_knots):
+    """K=1, 2, and 3 must describe the same rigid translation."""
+    input_shape = (17, 19)
+    scan_fast = np.array([0.0, 1.0], dtype=np.float32)
+    scan_slow = np.array([1.0, 0.0], dtype=np.float32)
+    initial = torch.tensor(
+        initialize_scanline_knots(
+            input_shape,
+            input_shape,
+            scan_fast,
+            scan_slow,
+            number_knots,
+        ),
+        dtype=torch.float32,
+    )
+    translated = initial.clone()
+    translated[0] += 2.0
+    translated[1] -= 3.0
+    geometry = DriftKnot(
+        translated,
+        torch.tensor(scan_fast),
+        torch.tensor(scan_slow),
+        input_shape,
+    )
+
+    image = torch.zeros(input_shape, dtype=torch.float32)
+    image[8, 9] = 1.0
+    result = backward_warp(image, geometry.drift_raw(initial), mode="nearest")
+    peak = torch.nonzero(result == result.max(), as_tuple=False)[0]
+    torch.testing.assert_close(peak, torch.tensor([10, 6]))
+
+
+def test_initial_knot_geometry_matches_for_one_and_two_knots():
+    """Initial K=1 and K=2 models must map to the same scan canvas."""
+    input_shape = (7, 11)
+    output_shape = (13, 17)
+    scan_fast = np.array([0.0, 1.0], dtype=np.float32)
+    scan_slow = np.array([1.0, 0.0], dtype=np.float32)
+    geometries = []
+    for number_knots in (1, 2):
+        knots = torch.tensor(
+            initialize_scanline_knots(
+                input_shape,
+                output_shape,
+                scan_fast,
+                scan_slow,
+                number_knots,
+            ),
+            dtype=torch.float32,
+        )
+        geometries.append(
+            DriftKnot(
+                knots,
+                torch.tensor(scan_fast),
+                torch.tensor(scan_slow),
+                input_shape,
+            ).to_canvas()
+        )
+
+    torch.testing.assert_close(geometries[0][0], geometries[1][0])
+    torch.testing.assert_close(geometries[0][1], geometries[1][1])
+
+
+def test_three_knot_geometry_interpolates_middle_anchor():
+    """The center pixel of a K=3 line must pass through its middle knot."""
+    input_shape = (5, 9)
+    scan_fast = np.array([0.0, 1.0], dtype=np.float32)
+    scan_slow = np.array([1.0, 0.0], dtype=np.float32)
+    knots = torch.tensor(
+        initialize_scanline_knots(
+            input_shape,
+            input_shape,
+            scan_fast,
+            scan_slow,
+            3,
+        ),
+        dtype=torch.float32,
+    )
+    knots[0, :, 1] += 1.5
+    geometry = DriftKnot(
+        knots,
+        torch.tensor(scan_fast),
+        torch.tensor(scan_slow),
+        input_shape,
+    )
+    row_coords, col_coords = geometry.to_canvas()
+
+    torch.testing.assert_close(row_coords[:, 0], knots[0, :, 0])
+    torch.testing.assert_close(row_coords[:, 4], knots[0, :, 1])
+    torch.testing.assert_close(row_coords[:, -1], knots[0, :, -1])
+    torch.testing.assert_close(col_coords[:, 0], knots[1, :, 0])
+    torch.testing.assert_close(col_coords[:, 4], knots[1, :, 1])
+    torch.testing.assert_close(col_coords[:, -1], knots[1, :, -1])
 
 
 @pytest.mark.parametrize("shift_row,shift_col", [(0, 0), (3, -5), (7, 2), (2.3, -1.7)])

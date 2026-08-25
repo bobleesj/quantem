@@ -172,6 +172,155 @@ def transform_coordinates_single_knot(
     return row_coords, col_coords
 
 
+def initialize_scanline_knots(
+    input_shape: tuple[int, int],
+    output_shape: tuple[int, int],
+    scan_fast: NDArray,
+    scan_slow: NDArray,
+    number_knots: int,
+) -> NDArray:
+    """Build centered knot anchors for a two-dimensional raster scan.
+
+    Parameters
+    ----------
+    input_shape : tuple[int, int]
+        Source image shape in ``(rows, columns)`` order.
+    output_shape : tuple[int, int]
+        Padded canvas shape in ``(rows, columns)`` order.
+    scan_fast : numpy.ndarray
+        Fast-scan unit vector in ``(row, column)`` order.
+    scan_slow : numpy.ndarray
+        Slow-scan unit vector in ``(row, column)`` order.
+    number_knots : int
+        Number of anchors along each fast-scan line.
+
+    Returns
+    -------
+    numpy.ndarray
+        Knot positions with shape ``(2, input_rows, number_knots)``.
+    """
+    if number_knots < 1:
+        raise ValueError(f"number_knots must be at least 1, got {number_knots}.")
+
+    slow_position = np.linspace(
+        -(input_shape[0] - 1) / 2,
+        (input_shape[0] - 1) / 2,
+        input_shape[0],
+    )
+    fast_position = np.linspace(
+        -(input_shape[1] - 1) / 2,
+        (input_shape[1] - 1) / 2,
+        number_knots,
+    )
+    row_knots = (
+        (output_shape[0] - 1) / 2
+        + fast_position[None, :] * scan_fast[0]
+        + slow_position[:, None] * scan_slow[0]
+    )
+    col_knots = (
+        (output_shape[1] - 1) / 2
+        + fast_position[None, :] * scan_fast[1]
+        + slow_position[:, None] * scan_slow[1]
+    )
+    return np.stack([row_knots, col_knots], axis=0)
+
+
+def _transform_coordinates_multi_knot(
+    knots: torch.Tensor,
+    input_shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linearly interpolate two or more knot anchors per scan line."""
+    _, num_cols = input_shape
+    number_knots = knots.shape[2]
+    if number_knots < 2:
+        raise ValueError("Multi-knot interpolation requires at least 2 knots per scan line.")
+
+    position = torch.linspace(
+        0,
+        number_knots - 1,
+        num_cols,
+        dtype=knots.dtype,
+        device=knots.device,
+    )
+    segment = torch.clamp(position.long(), max=number_knots - 2)
+    fraction = (position - segment.to(knots.dtype))[None, :]
+    row_low = knots[0, :, segment]
+    row_high = knots[0, :, segment + 1]
+    col_low = knots[1, :, segment]
+    col_high = knots[1, :, segment + 1]
+    row_coords = row_low + (row_high - row_low) * fraction
+    col_coords = col_low + (col_high - col_low) * fraction
+    return row_coords, col_coords
+
+
+class DriftKnot:
+    """Internal Torch geometry for one or more knots per scan line.
+
+    The existing :class:`DriftInterpolator` remains the compatibility path for
+    the current correction API. This class supplies the tensor geometry needed
+    by the staged two-dimensional kernels without changing that API.
+    """
+
+    def __init__(
+        self,
+        knots: torch.Tensor,
+        scan_fast: torch.Tensor,
+        scan_slow: torch.Tensor,
+        input_shape: tuple[int, int],
+    ):
+        self.knots = knots
+        self.scan_fast = scan_fast
+        self.scan_slow = scan_slow
+        self.input_shape = input_shape
+        self.number_knots = knots.shape[2]
+
+    def to_canvas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-pixel canvas coordinates in ``(row, column)`` order."""
+        if self.number_knots == 1:
+            return transform_coordinates_single_knot(
+                self.knots,
+                self.scan_fast,
+                self.input_shape,
+            )
+        return _transform_coordinates_multi_knot(self.knots, self.input_shape)
+
+    def _drift_canvas(self, initial_knots: torch.Tensor) -> torch.Tensor:
+        """Return fitted displacement relative to the initial canvas knots."""
+        displacement = self.knots - initial_knots
+        if self.number_knots == 1:
+            return displacement[:, :, 0]
+
+        _, num_cols = self.input_shape
+        position = torch.linspace(
+            0,
+            self.number_knots - 1,
+            num_cols,
+            dtype=displacement.dtype,
+            device=displacement.device,
+        )
+        segment = torch.clamp(position.long(), max=self.number_knots - 2)
+        fraction = (position - segment.to(displacement.dtype))[None, :]
+        row = displacement[0, :, segment]
+        row += (displacement[0, :, segment + 1] - row) * fraction
+        col = displacement[1, :, segment]
+        col += (displacement[1, :, segment + 1] - col) * fraction
+        return torch.stack([row, col])
+
+    def drift_raw(self, initial_knots: torch.Tensor) -> torch.Tensor:
+        """Convert canvas displacement to the raw scan coordinate frame."""
+        displacement = self._drift_canvas(initial_knots)
+        scan_rows, scan_cols = self.input_shape
+        aspect = float(scan_rows - 1) / float(scan_cols - 1) if scan_cols > 1 else 1.0
+        determinant = self.scan_slow[0] * self.scan_fast[1] - self.scan_fast[0] * aspect * self.scan_slow[1]
+        drift_row = (
+            self.scan_fast[1] * displacement[0] - self.scan_fast[0] * aspect * displacement[1]
+        ) / determinant
+        drift_col = (
+            -self.scan_slow[1] * displacement[0] + self.scan_slow[0] * displacement[1]
+        ) / determinant
+        return torch.stack([drift_row, drift_col])
+
+
 def bilinear_kde_batch(
     row_coords: torch.Tensor,
     col_coords: torch.Tensor,

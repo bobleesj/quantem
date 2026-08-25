@@ -167,6 +167,86 @@ def translate_align(
     return image_shifts
 
 
+def backward_warp(
+    images: torch.Tensor,
+    drift: tuple[float, float] | torch.Tensor,
+    rigid_shift: tuple[float, float] = (0.0, 0.0),
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    """Apply a two-dimensional drift field by backward interpolation.
+
+    ``drift`` may be an affine ``(row_slope, column_slope)`` tuple, a
+    per-scan-line tensor with shape ``(2, rows)``, or a per-pixel tensor with
+    shape ``(2, rows, columns)``. A two-dimensional input is returned as two
+    dimensional; a stack ``(N, rows, columns)`` is warped with one shared grid.
+
+    Parameters
+    ----------
+    images : torch.Tensor
+        Image or image stack with shape ``(rows, columns)`` or
+        ``(N, rows, columns)``.
+    drift : tuple[float, float] or torch.Tensor
+        Affine rate or dense displacement in ``(row, column)`` order.
+    rigid_shift : tuple[float, float], default=(0.0, 0.0)
+        Global translation used with affine-rate input.
+    mode : str, default="bilinear"
+        Interpolation mode passed to :func:`torch.nn.functional.grid_sample`.
+
+    Returns
+    -------
+    torch.Tensor
+        Warped data with the same shape as ``images``.
+    """
+    squeeze = images.ndim == 2
+    if squeeze:
+        images = images[None]
+    if images.ndim != 3:
+        raise ValueError(
+            "images must have shape (rows, columns) or (N, rows, columns); "
+            f"got {tuple(images.shape)}."
+        )
+
+    _, num_rows, num_cols = images.shape
+    device = images.device
+    dtype = images.dtype
+    rows = torch.arange(num_rows, device=device, dtype=dtype)
+    cols = torch.arange(num_cols, device=device, dtype=dtype)
+
+    if isinstance(drift, torch.Tensor):
+        drift = drift.to(device=device, dtype=dtype)
+        if drift.shape == (2, num_rows):
+            row_shift = drift[0][:, None]
+            col_shift = drift[1][:, None]
+        elif drift.shape == (2, num_rows, num_cols):
+            row_shift = drift[0]
+            col_shift = drift[1]
+        else:
+            raise ValueError(
+                f"drift must have shape (2, {num_rows}) or "
+                f"(2, {num_rows}, {num_cols}); got {tuple(drift.shape)}."
+            )
+        sample_rows = rows[:, None].expand(-1, num_cols) - row_shift
+        sample_cols = cols[None, :].expand(num_rows, -1) - col_shift
+    else:
+        row_rate, col_rate = drift
+        row_shift, col_shift = rigid_shift
+        offset = rows - (num_rows - 1) / 2
+        sample_rows = rows[:, None].expand(-1, num_cols) - row_rate * offset[:, None] - row_shift
+        sample_cols = cols[None, :].expand(num_rows, -1) - col_rate * offset[:, None] - col_shift
+
+    grid_rows = 2.0 * sample_rows / (num_rows - 1) - 1.0
+    grid_cols = 2.0 * sample_cols / (num_cols - 1) - 1.0
+    grid = torch.stack([grid_cols, grid_rows], dim=-1)[None]
+    warped = torch.nn.functional.grid_sample(
+        images[None],
+        grid,
+        mode=mode,
+        align_corners=True,
+        padding_mode="border",
+    )[0]
+    return warped[0] if squeeze else warped
+
+
 def _dft_refine_shifts(
     cross_corr_fft,
     peak_row,
