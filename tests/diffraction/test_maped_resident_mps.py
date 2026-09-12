@@ -37,7 +37,7 @@ def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
     result = None
     try:
         source = maped.datasets.sources[0]
-        assert source.representation.value == "ans"
+        assert source.representation.value == "encoded"
         assert source.metadata["source_read_passes"] == 1
         correction = source.metadata["hot_pixel_correction"]
         assert correction["method"] == "median"

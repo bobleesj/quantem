@@ -1191,12 +1191,12 @@ class MAPEDTorch(AutoSerialize):
         det_bin: int | None = None,
         backend: str | None = None,
     ) -> Self:
-        """Build MAPED from files using native-count resident ANS by default.
+        """Build MAPED from files using native-count encoded residency by default.
 
         The CUDA path keeps all encoded acquisitions resident and computes summaries
         and bounded merge regions directly from them. It never constructs a complete
         dense input tilt. Stored detector-mask pixels receive the loader's default
-        GPU local-median replacement before ANS encoding. A custom reader, detector
+        GPU local-median replacement before encoded storage. A custom reader, detector
         binning, or another backend keeps the established one-file-at-a-time path.
 
         Parameters
@@ -1212,9 +1212,9 @@ class MAPEDTorch(AutoSerialize):
             large merge does not land on a card already running something else.
         det_bin : int, optional
             Bin the detector by this factor in the dense streaming path. Default
-            ``None`` preserves the complete detector and selects ANS on CUDA.
+            ``None`` preserves the complete detector and selects encoded residency.
         backend : str, optional
-            Decode backend. Default ``None`` selects CUDA ANS when CUDA is the
+            Decode backend. Default ``None`` selects the current accelerator encoded
             compute device.
 
         Returns
@@ -1245,13 +1245,13 @@ class MAPEDTorch(AutoSerialize):
 
         selected_device = torch.device(get_device())
         selected_backend = selected_device.type if backend in (None, "auto") else backend
-        use_ans = (
+        use_encoded = (
             read is None
             and selected_device.type in {"cuda", "mps"}
             and selected_backend == selected_device.type
             and det_bin in (None, 1)
         )
-        if use_ans:
+        if use_encoded:
             from quantem.gpu import io as gpu_io
 
             sources = []
@@ -1261,7 +1261,7 @@ class MAPEDTorch(AutoSerialize):
                         gpu_io.load(
                             path,
                             backend=selected_backend,
-                            representation="ans",
+                            representation="encoded",
                             dtype="native",
                             apply_mask=False,
                             **(
@@ -1347,7 +1347,7 @@ class MAPEDTorch(AutoSerialize):
         Parameters
         ----------
         sources
-            Loaded ``quantem.gpu.io.FourDSTEMData`` objects with ANS or packed
+            Loaded ``quantem.gpu.io.FourDSTEMData`` objects with encoded or packed
             uint8/uint16 counts and identical native four-dimensional shapes.
         device
             Device containing every source and running the merge.
@@ -1388,10 +1388,10 @@ class MAPEDTorch(AutoSerialize):
         for loaded in sources:
             if (
                 not isinstance(loaded, FourDSTEMData)
-                or loaded.representation.value not in {"ans", "packed"}
+                or loaded.representation.value not in {"encoded", "packed"}
             ):
                 raise TypeError(
-                    "Load native counts with representation='ans' or 'packed'."
+                    "Load native counts with representation='encoded' or 'packed'."
                 )
             source_device = getattr(
                 loaded.data, "device", getattr(loaded.data, "_device_id", None)

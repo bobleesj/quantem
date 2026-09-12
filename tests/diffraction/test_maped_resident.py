@@ -34,7 +34,7 @@ def test_ans_tilts_match_dense_alignment_and_merge(tmp_path):
                 {
                     "working_shape": tilt.shape,
                     "pixel_mask": mask,
-                    "representation": "ans",
+                    "representation": "encoded",
                 },
             )
         )
@@ -82,7 +82,7 @@ def test_ans_tilts_match_dense_alignment_and_merge(tmp_path):
                 rtol=0,
                 atol=report["scale"],
             )
-        assert result.metadata["maped_merge"]["source_representation"] == "ans"
+        assert result.metadata["maped_merge"]["source_representation"] == "encoded"
         assert actual.dp_mean_merged.shape == (8, 8)
         assert actual.im_bf_merged.shape == (12, 11)
         np.testing.assert_array_equal(
@@ -120,7 +120,7 @@ def test_from_files_defaults_to_median_corrected_ans_on_cuda(tmp_path):
     maped = MAPEDTorch.from_files([path], device="cuda:0")
     try:
         source = maped.datasets.sources[0]
-        assert source.representation.value == "ans"
+        assert source.representation.value == "encoded"
         assert not source.lossless
         assert source.metadata["working_counts_exact"] is True
         correction = source.metadata["hot_pixel_correction"]
