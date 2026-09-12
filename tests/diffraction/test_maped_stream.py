@@ -79,6 +79,31 @@ def test_grid_sample_tilt_float_is_whole_call():
     assert torch.equal(_grid_sample_tilt(a, grid, torch.float32), ref)
 
 
+def test_from_files_non_cuda_uses_gpu_dense_loader(monkeypatch):
+    """The MPS stream calls quantem.gpu directly with explicit dense output."""
+    from types import SimpleNamespace
+
+    from quantem.gpu import io as gpu_io
+
+    calls = []
+    tensor = torch.zeros((2, 3, 4, 5), dtype=torch.uint16)
+
+    def fake_load(path, **kwargs):
+        calls.append((path, kwargs))
+        return SimpleNamespace(data=tensor)
+
+    monkeypatch.setattr(gpu_io, "load", fake_load)
+    maped = MAPEDTorch.from_files(["tilt_master.h5"], device="cpu", backend="mps")
+
+    assert maped.datasets[0] is tensor
+    assert calls == [
+        (
+            "tilt_master.h5",
+            {"verbose": False, "representation": "dense", "backend": "mps"},
+        )
+    ]
+
+
 def _synthetic_tilts(n=3, Rs=10, Cs=10, H=12, W=12, dtype=torch.float32):
     """Tiny tilt series with a real-space blob + a diffraction disk, each rigidly
     offset per tilt, so preprocess/align have a real (small) signal to lock onto."""

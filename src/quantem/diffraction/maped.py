@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import math
+from pathlib import Path
+import time
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Self, Sequence
 
 import numpy as np
@@ -812,39 +816,6 @@ class MAPED(AutoSerialize):
         return dataset_merged
 
 
-def _pick_idle_gpu(count: int) -> int:
-    """Choose a GPU for the big merge: the least busy one, then the most free.
-
-    A merge dropped onto the card that is running an interactive dashboard shares
-    its compute and crawls (measured ~14x slower). Prefer the GPU with the lowest
-    utilization, breaking ties by free memory. Falls back to free-memory-only if
-    NVML is unavailable.
-    """
-    def by_free_memory() -> int:
-        free = [torch.cuda.mem_get_info(i)[0] for i in range(count)]
-        return max(range(count), key=lambda i: free[i])
-
-    try:
-        import pynvml
-    except ImportError:
-        return by_free_memory()
-    try:
-        pynvml.nvmlInit()
-        ranked = []
-        for i in range(count):
-            h = pynvml.nvmlDeviceGetHandleByIndex(i)
-            util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
-            free = pynvml.nvmlDeviceGetMemoryInfo(h).free
-            # Memory must come first - the merge needs a big accumulator, so a card
-            # that doesn't fit it is useless however idle. Bucket free memory in
-            # 20 GB steps (so two cards with comparable room tie), then break the
-            # tie toward the least busy. Avoids both the OOM card and the busy one.
-            ranked.append((-(free // (20 * 1024**3)), util, -free, i))
-        return min(ranked)[3]
-    except pynvml.NVMLError:
-        return by_free_memory()
-
-
 class _TiltFiles:
     """A tilt series that lives on disk and is read one tilt at a time.
 
@@ -872,18 +843,26 @@ class _TiltFiles:
     def __len__(self) -> int:
         return len(self.paths)
 
-    def release(self) -> None:
+    def release(self, *, reclaim_cache: bool = True) -> None:
         """Drop and free the tilt currently in memory (idempotent)."""
+        had_current = self._current is not None
         self._current = None
+        if not reclaim_cache or not had_current:
+            return
         import gc
 
         gc.collect()
         try:
-            import cupy as cp
+            from quantem.gpu.device import release_cached_memory
 
-            cp.get_default_memory_pool().free_all_blocks()
+            release_cached_memory()
         except (ImportError, RuntimeError):
             pass
+        # Apple GPUs need the same courtesy: the Metal loader hands back buffers
+        # that torch does not own, so dropping the tensor alone leaves them on the
+        # shared pool and the next tilt stacks on top of the last one.
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     def __getitem__(self, i: int):
         self.release()
@@ -901,6 +880,83 @@ class _TiltFiles:
     def __iter__(self):
         for i in range(len(self.paths)):
             yield self[i]
+
+
+class _ResidentTilts:
+    """Borrow exact encoded tilt owners without materializing dense tilts."""
+
+    def __init__(self, sources, *, owns_sources: bool = False):
+        self.sources = list(sources)
+        self.owns_sources = bool(owns_sources)
+
+    def __len__(self):
+        return len(self.sources)
+
+    def __getitem__(self, index):
+        return self.sources[index]
+
+    def __iter__(self):
+        return iter(self.sources)
+
+    def close(self):
+        """Release sources loaded by MAPED while preserving borrowed sources."""
+        if not self.owns_sources:
+            return
+        for source in self.sources:
+            source.close()
+        self.sources.clear()
+
+
+def _resident_summaries(sources, device: str):
+    """Compute MAPED summaries from encoded residents without dense tilts."""
+    from quantem.gpu.detector import prepare
+
+    sources = list(sources)
+    native_sources = [getattr(source, "data", source) for source in sources]
+    if all(
+        callable(getattr(source, "mean_dp_device", None))
+        and callable(getattr(source, "detector_mean_device", None))
+        for source in native_sources
+    ):
+        mean_dp_torch = []
+        detector_mean_torch = []
+        for source in native_sources:
+            mean_dp = source.mean_dp_device()
+            detector_mean = source.detector_mean_device()
+            try:
+                mean_dp_torch.append(mean_dp.to_torch())
+                detector_mean_torch.append(detector_mean.to_torch())
+            finally:
+                mean_dp.release()
+                detector_mean.release()
+        return mean_dp_torch, detector_mean_torch
+    session = prepare(sources[0] if len(sources) == 1 else sources)
+    mean_dp = session.mean_dp(output="native")
+    detector_mask = np.ones(session.detector_shape, dtype=bool)
+    detector_sum = session.masked_sum(detector_mask, output="native")
+    if hasattr(mean_dp, "_mtl") and hasattr(detector_sum, "_mtl"):
+        try:
+            mean_dp_torch = torch.from_numpy(mean_dp.get()).to(device=device)
+            detector_sum_torch = torch.from_numpy(detector_sum.get()).to(device=device)
+            detector_mean_torch = detector_sum_torch / float(
+                math.prod(session.detector_shape)
+            )
+        finally:
+            mean_dp.release()
+            detector_sum.release()
+        if mean_dp_torch.ndim == 2:
+            mean_dp_torch = mean_dp_torch[None]
+            detector_mean_torch = detector_mean_torch[None]
+        return list(mean_dp_torch.unbind(0)), list(detector_mean_torch.unbind(0))
+    detector_mean = (
+        detector_sum / float(math.prod(session.detector_shape))
+    ).astype(mean_dp.dtype)
+    mean_dp_torch = torch.from_dlpack(mean_dp).to(device=device)
+    detector_mean_torch = torch.from_dlpack(detector_mean).to(device=device)
+    if mean_dp_torch.ndim == 2:
+        mean_dp_torch = mean_dp_torch[None]
+        detector_mean_torch = detector_mean_torch[None]
+    return list(mean_dp_torch.unbind(0)), list(detector_mean_torch.unbind(0))
 
 
 def _shift_diffraction_batch(
@@ -948,12 +1004,97 @@ def _shift_diffraction_batch(
         fft_result = torch.fft.fft2(dp_padded)
         fft_result.mul_(ramp[None, None])
         return torch.fft.ifft2(fft_result).real
-    n_det_images = batch_n * cout
-    return shift_images_torch(
-        dp_padded.reshape(n_det_images, hp, wp),
-        shift_rc.expand(n_det_images, 2),
-        mode="bilinear",
+    return _shift_constant_bilinear_grid_sample_convention(
+        dp_padded.reshape(batch_n * cout, hp, wp),
+        shift_rc,
     ).reshape(batch_n, cout, hp, wp)
+
+
+def _shift_constant_bilinear_grid_sample_convention(
+    images: torch.Tensor,
+    shift_rc: torch.Tensor,
+) -> torch.Tensor:
+    """Bilinear shift for one shared shift using the existing grid_sample convention.
+
+    ``shift_images_torch`` builds a full per-image grid even though MAPED shifts all
+    diffraction patterns for one tilt by the same ``(row, col)`` offset. With
+    ``align_corners=True`` its normalized ``2 * shift / size`` convention samples
+    source coordinates ``out - shift * (size - 1) / size``. This helper evaluates
+    that same separable bilinear interpolation with four slice adds and zero
+    padding, avoiding the large random-gather grid.
+    """
+    n, height, width = images.shape
+    out = torch.zeros_like(images)
+    shift = shift_rc.reshape(-1)
+    row_offset = -float(shift[0]) * float(height - 1) / float(height)
+    col_offset = -float(shift[1]) * float(width - 1) / float(width)
+    row_floor = math.floor(row_offset)
+    col_floor = math.floor(col_offset)
+    row_frac = row_offset - row_floor
+    col_frac = col_offset - col_floor
+
+    row_taps = ((row_floor, 1.0 - row_frac), (row_floor + 1, row_frac))
+    col_taps = ((col_floor, 1.0 - col_frac), (col_floor + 1, col_frac))
+    for row_delta, row_weight in row_taps:
+        if row_weight == 0.0:
+            continue
+        row_start = max(0, -row_delta)
+        row_stop = min(height, height - row_delta)
+        if row_start >= row_stop:
+            continue
+        src_row_start = row_start + row_delta
+        src_row_stop = row_stop + row_delta
+        for col_delta, col_weight in col_taps:
+            weight = row_weight * col_weight
+            if weight == 0.0:
+                continue
+            col_start = max(0, -col_delta)
+            col_stop = min(width, width - col_delta)
+            if col_start >= col_stop:
+                continue
+            src_col_start = col_start + col_delta
+            src_col_stop = col_stop + col_delta
+            out[:, row_start:row_stop, col_start:col_stop] += (
+                images[:, src_row_start:src_row_stop, src_col_start:src_col_stop]
+                * weight
+            )
+    return out
+
+
+@lru_cache(maxsize=4)
+def _compiled_merge_tail(method: str):
+    if method == "fourier":
+
+        def _tail(
+            num_band: torch.Tensor,
+            dp_padded: torch.Tensor,
+            wi: torch.Tensor,
+            ramp: torch.Tensor,
+            shift_rc: torch.Tensor,
+        ) -> torch.Tensor:
+            fft_result = torch.fft.fft2(dp_padded)
+            shifted = torch.fft.ifft2(fft_result * ramp[None, None]).real
+            return num_band + wi[..., None, None] * shifted
+
+    else:
+
+        def _tail(
+            num_band: torch.Tensor,
+            dp_padded: torch.Tensor,
+            wi: torch.Tensor,
+            ramp: torch.Tensor,
+            shift_rc: torch.Tensor,
+        ) -> torch.Tensor:
+            batch_n, cout, hp, wp = dp_padded.shape
+            n_det_images = batch_n * cout
+            shifted = shift_images_torch(
+                dp_padded.reshape(n_det_images, hp, wp),
+                shift_rc.expand(n_det_images, 2),
+                mode="bilinear",
+            ).reshape(batch_n, cout, hp, wp)
+            return num_band + wi[..., None, None] * shifted
+
+    return torch.compile(_tail, backend="inductor", dynamic=False)
 
 
 class MAPEDTorch(AutoSerialize):
@@ -1050,14 +1191,13 @@ class MAPEDTorch(AutoSerialize):
         det_bin: int | None = None,
         backend: str | None = None,
     ) -> Self:
-        """Build a MAPED from tilt files too large to all hold in GPU memory at once
+        """Build MAPED from files using native-count resident ANS by default.
 
-        A no-bin seven-tilt 4D-STEM series is ~135 GB, far more than a GPU holds.
-        Rather than load every tilt, this stores the file paths and reads one tilt at
-        a time during ``preprocess`` and ``merge_datasets``, freeing each before the
-        next - so the whole series merges on a single GPU. The returned object is used
-        exactly like one built from in-memory tilts; the streaming is invisible to the
-        rest of the pipeline.
+        The CUDA path keeps all encoded acquisitions resident and computes summaries
+        and bounded merge regions directly from them. It never constructs a complete
+        dense input tilt. Stored detector-mask pixels receive the loader's default
+        GPU local-median replacement before ANS encoding. A custom reader, detector
+        binning, or another backend keeps the established one-file-at-a-time path.
 
         Parameters
         ----------
@@ -1065,24 +1205,22 @@ class MAPEDTorch(AutoSerialize):
             One ``*_master.h5`` tilt file per tilt, e.g. from
             ``quantem.widget.io.discover_masters``.
         read : callable, optional
-            ``read(path) -> uint16 torch tensor`` for a single tilt. Default reads
-            Arina/h5 onto the GPU with ``quantem.widget.load``.
+            ``read(path) -> uint16 torch tensor`` for a single tilt. Supplying this
+            selects the established dense streaming path.
         device : str or torch.device, optional
             Compute device, e.g. ``"cuda:0"``. Default picks the least-busy GPU so the
             large merge does not land on a card already running something else.
         det_bin : int, optional
-            Bin the detector by this factor (integer-sum) at load time. Use on a
-            small-memory box (Mac MPS 24 GB, or a no-GPU CPU machine) so each
-            streamed tilt fits. Default ``None`` keeps full detector resolution.
+            Bin the detector by this factor in the dense streaming path. Default
+            ``None`` preserves the complete detector and selects ANS on CUDA.
         backend : str, optional
-            Decode backend forwarded to ``load`` (``"cuda"`` / ``"mps"`` / ``"cpu"``).
-            Default ``None`` auto-detects. Pass ``"cpu"`` to force CPU decode on a
-            box that has an NVIDIA card but no usable cupy.
+            Decode backend. Default ``None`` selects CUDA ANS when CUDA is the
+            compute device.
 
         Returns
         -------
         Self
-            A MAPED whose tilts are streamed from disk one at a time.
+            A MAPED backed by encoded resident sources on CUDA.
 
         Examples
         --------
@@ -1091,44 +1229,182 @@ class MAPEDTorch(AutoSerialize):
         >>> maped = MAPEDTorch.from_files(files)
         >>> maped.preprocess(); maped.diffraction_origin(); maped.diffraction_align()
         >>> maped.real_space_align()
-        >>> merged = maped.merge_datasets().tensor
+        >>> merged = maped.merge_datasets(save_to="merged_master.h5")
         """
         from quantem.core.config import get_device, set_device
 
         paths = list(paths)
         if not paths:
             raise ValueError("MAPEDTorch.from_files expects a non-empty sequence of paths.")
+        if device is None and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            from quantem.gpu.device import least_busy_cuda_device
+
+            device = f"cuda:{least_busy_cuda_device(torch.cuda.device_count())}"
+        if device is not None:
+            set_device(device)
+
+        selected_device = torch.device(get_device())
+        selected_backend = selected_device.type if backend in (None, "auto") else backend
+        use_ans = (
+            read is None
+            and selected_device.type in {"cuda", "mps"}
+            and selected_backend == selected_device.type
+            and det_bin in (None, 1)
+        )
+        if use_ans:
+            from quantem.gpu import io as gpu_io
+
+            sources = []
+            try:
+                for path in paths:
+                    sources.append(
+                        gpu_io.load(
+                            path,
+                            backend=selected_backend,
+                            representation="ans",
+                            dtype="native",
+                            apply_mask=False,
+                            **(
+                                {"device": selected_device.index or 0}
+                                if selected_device.type == "cuda"
+                                else {}
+                            ),
+                            verbose=False,
+                        )
+                    )
+            except BaseException:
+                for source in sources:
+                    source.close()
+                raise
+            return cls.from_resident(
+                sources,
+                device=str(selected_device),
+                _owns_sources=True,
+            )
+
         if read is None:
-            from quantem.widget import load as _load
+            from quantem.gpu import io as gpu_io
 
             def read(path):
                 # det_bin / backend let a small box (Mac MPS 24 GB, or a no-GPU CPU
                 # machine) bin the detector and force a non-cuda decode so the merge
                 # fits. Default (None) keeps the full-res cuda path bit-identical.
-                kw = {"verbose": False}
+                kw = {"verbose": False, "representation": "dense"}
                 if det_bin is not None:
                     kw["det_bin"] = det_bin
                 if backend is not None:
                     kw["backend"] = backend
-                return torch.from_dlpack(_load(path, **kw).data)
+                data = gpu_io.load(path, **kw).data
+                if torch.is_tensor(data):
+                    return data
+                if hasattr(data, "__dlpack__"):
+                    return torch.from_dlpack(data)
+                if hasattr(data, "chunks") and hasattr(data, "scan_shape"):
+                    scan_rows, scan_cols = data.scan_shape
+                    n_frames, k_row, k_col = data.shape
+                    target = device if device is not None else get_device()
+                    frames = torch.empty(
+                        (n_frames, k_row, k_col),
+                        dtype=torch.uint16,
+                        device=target,
+                    )
+                    offset = 0
+                    for chunk in data.chunks:
+                        n_chunk = int(chunk.shape[0])
+                        frames[offset : offset + n_chunk].copy_(torch.from_numpy(chunk))
+                        offset += n_chunk
+                    if hasattr(data, "free"):
+                        data.free()
+                    return frames.view(scan_rows, scan_cols, k_row, k_col)
+                raise TypeError(
+                    "quantem.gpu.io.load returned data that cannot be converted "
+                    "to a torch.Tensor. Pass a custom read= callable to "
+                    "MAPEDTorch.from_files()."
+                )
 
-        if device is None and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            device = f"cuda:{_pick_idle_gpu(torch.cuda.device_count())}"
-        if device is not None:
-            set_device(device)
-            idx = torch.device(device).index
-            if idx is not None:  # keep the cupy reader on the same card as the tensors
-                try:
-                    import cupy as cp
-
-                    cp.cuda.Device(idx).use()
-                except (ImportError, RuntimeError):
-                    pass
         return cls(
             datasets=_TiltFiles(paths, read),
             _token=cls._token,
             device=get_device(),
             dtype=torch.uint16,
+        )
+
+    @classmethod
+    def from_resident(
+        cls,
+        sources: Sequence,
+        *,
+        device: str = "cuda:0",
+        apply_mask: bool = True,
+        _owns_sources: bool = False,
+    ) -> Self:
+        """Build MAPED over encoded native-count tilts on one accelerator.
+
+        Every source stays resident and caller-owned. MAPED computes directly from
+        its exact encoding and does not materialize a complete dense tilt. Close
+        borrowed sources only after the final MAPED or detector consumer finishes.
+
+        Parameters
+        ----------
+        sources
+            Loaded ``quantem.gpu.io.FourDSTEMData`` objects with ANS or packed
+            uint8/uint16 counts and identical native four-dimensional shapes.
+        device
+            Device containing every source and running the merge.
+        apply_mask
+            Honor each source's recorded detector policy during GPU computation.
+            Loader-corrected pixels remain valid; uncorrected stored-mask pixels are
+            excluded. This compatibility switch must remain ``True``.
+
+        Returns
+        -------
+        Self
+            MAPED with reusable resident tilt owners.
+
+        Examples
+        --------
+        >>> maped = MAPEDTorch.from_resident(tilts, device="cuda:0")
+        >>> maped.preprocess(plot_summary=False)
+        >>> maped.diffraction_origin(); maped.diffraction_align()
+        >>> maped.real_space_align()
+        >>> merged = maped.merge_datasets(save_to="merged_master.h5")
+        """
+        from quantem.core.config import set_device
+        from quantem.gpu.io import FourDSTEMData
+
+        sources = list(sources)
+        if not sources:
+            raise ValueError("Provide at least one encoded tilt from quantem.gpu.io.")
+        if not apply_mask:
+            raise ValueError(
+                "Resident MAPED always honors each source's recorded detector-mask "
+                "policy."
+            )
+        selected = torch.device(device)
+        if selected.type not in {"cuda", "mps"} or (
+            selected.type == "cuda" and selected.index is None
+        ):
+            raise ValueError("Specify a resident accelerator such as 'cuda:0' or 'mps'.")
+        for loaded in sources:
+            if (
+                not isinstance(loaded, FourDSTEMData)
+                or loaded.representation.value not in {"ans", "packed"}
+            ):
+                raise TypeError(
+                    "Load native counts with representation='ans' or 'packed'."
+                )
+            source_device = getattr(
+                loaded.data, "device", getattr(loaded.data, "_device_id", None)
+            )
+            expected_device = selected.index if selected.type == "cuda" else selected
+            if loaded.shape != sources[0].shape or source_device != expected_device:
+                raise ValueError("Resident tilts must share their shape and the requested device.")
+        set_device(device)
+        return cls(
+            datasets=_ResidentTilts(sources, owns_sources=_owns_sources),
+            dtype=torch.uint16,
+            device=device,
+            _token=cls._token,
         )
 
     def preprocess(
@@ -1163,13 +1439,19 @@ class MAPEDTorch(AutoSerialize):
         """
         n = len(self.datasets)
 
+        # Scales are a per-tilt multiplicative factor, so they are float even when
+        # the tilts themselves are a native integer dtype. Building them as uint16
+        # (self.dtype) also left `scales == 0` with no MPS kernel
+        # (eq_dense_scalar_cast_bool_ushort), which broke preprocess on Apple GPUs.
         if scale is None:
-            self.scales = torch.ones(n, dtype=self.dtype, device=self.device)
+            self.scales = torch.ones(n, dtype=torch.float32, device=self.device)
         elif isinstance(scale, (int, float, np.floating)):
-            self.scales = torch.full(n, float(scale), dtype=float)
+            self.scales = torch.full(
+                (n,), float(scale), dtype=torch.float32, device=self.device
+            )
         else:
-            self.scales = torch.tensor(scale, dtype=self.dtype, device=self.device)
-            if self.scales.dim != (n,):
+            self.scales = torch.tensor(scale, dtype=torch.float32, device=self.device)
+            if self.scales.shape != (n,):
                 raise ValueError(
                     "scale must be a scalar or a sequence with the same length as datasets."
                 )
@@ -1179,20 +1461,38 @@ class MAPEDTorch(AutoSerialize):
         self.dp_mean: list[torch.Tensor] = []
         self.im_bf: list[torch.Tensor] = []
 
-        for d in self.datasets:
-            # Mean DP + mean BF, the SAME single torch.mean reduction the original
-            # used. Cast a native-integer (uint16) tilt to float first - mean needs
-            # float. Only THIS tilt is in scope here (the streaming loader holds one
-            # at a time), so its 38.6 GB float copy fits beside nothing else; the
-            # merge's big accumulators don't exist yet. Computing dp_mean any other
-            # way (e.g. a chunked sum with a different reduction order) shifts it by
-            # ~1e-8, which diffraction_align's cross-correlation then amplifies into
-            # a ~1e-4 px shift and a ~1% merge difference. Match the reduction exactly.
-            d = d.to(self.device)
-            d = d if d.is_floating_point() else d.float()
-            self.dp_mean.append(torch.mean(d, dim=(0, 1)))
-            self.im_bf.append(torch.mean(d, dim=(2, 3)))
-            del d
+        if isinstance(self.datasets, _ResidentTilts):
+            self.dp_mean, self.im_bf = _resident_summaries(
+                self.datasets.sources, self.device
+            )
+        else:
+            for d in self.datasets:
+                d = d.to(self.device)
+                rows, cols, k_row, k_col = d.shape
+                if (
+                    torch.device(self.device).type == "mps"
+                    and d.numel() > _MAX_MPS_FUSED_ELEMENTS
+                ):
+                    dp_sum = torch.zeros((k_row, k_col), dtype=torch.float32, device=self.device)
+                    im_bf = torch.empty((rows, cols), dtype=torch.float32, device=self.device)
+                    for r0 in range(0, rows, _MPS_PREPROCESS_ROW_BAND):
+                        r1 = min(r0 + _MPS_PREPROCESS_ROW_BAND, rows)
+                        band = d[r0:r1].contiguous()
+                        band = band if band.is_floating_point() else band.float()
+                        flat = band.reshape((r1 - r0) * cols, k_row * k_col)
+                        dp_sum += flat.sum(0).reshape(k_row, k_col)
+                        im_bf[r0:r1] = flat.mean(1).reshape(r1 - r0, cols)
+                        del band, flat
+                    self.dp_mean.append(dp_sum / float(rows * cols))
+                    self.im_bf.append(im_bf)
+                    del dp_sum
+                else:
+                    d = d if d.is_floating_point() else d.float()
+                    flat = d.reshape(rows * cols, k_row * k_col)
+                    self.dp_mean.append(flat.mean(0).reshape(k_row, k_col))
+                    self.im_bf.append(flat.mean(1).reshape(rows, cols))
+                    del flat
+                del d
 
         if plot_summary:
             tiles = [[(self.im_bf[i] / self.scales[i]), self.dp_mean[i]] for i in range(n)]
@@ -1644,14 +1944,21 @@ class MAPEDTorch(AutoSerialize):
         diffraction_pad_val: str | float = "min",
         shift_method: str = "bilinear",
         dtype=None,
+        save_to: str | Path | None = None,
         scale_output: bool = False,
         plot_result: bool = True,
         verbose: bool = True,
         batch_size: int | None = None,
         cast_dtype: torch.dtype | None = None,
         accumulator_device: str | torch.device | None = None,
+        compile_merge: bool | None = None,
+        compile_uint16_as_int16: bool = True,
+        compute_summaries: bool = True,
+        use_mlx_fused_merge: bool | None = None,
+        prefetch_tilts: bool = False,
+        profile_timings: dict[str, Any] | None = None,
         **plot_kwargs: Any,
-    ) -> Dataset4dstem:
+    ) -> Any:
         """
         Merge aligned datasets into a single Dataset4dstem.
 
@@ -1683,7 +1990,11 @@ class MAPEDTorch(AutoSerialize):
             but its sinc kernel rings on the sharp direct-beam disk, leaving a faint
             dotted 'cross' through the center of the merged mean diffraction pattern.
         dtype : str or torch.dtype, optional
-            Output dtype. If None, uses parent dtype.
+            Output dtype. Resident encoded sources use globally scaled uint16 by
+            default; pass ``"scaled_uint16"`` to state that choice explicitly.
+        save_to : str, optional
+            Output HDF5 path for resident encoded sources. The merge is written in
+            bounded regions and reopened as packed scaled uint16 for live viewing.
         scale_output : bool
             If True and dtype is integer, scale to full dynamic range using global max.
         plot_result : bool
@@ -1698,6 +2009,30 @@ class MAPEDTorch(AutoSerialize):
             Where the float32 output accumulator lives. If None, auto-picks: the
             compute device when it fits, else CPU RAM (out-of-core) for a small-VRAM
             card. Pass 'cpu' or a second GPU to force it.
+        compile_merge : bool, optional
+            Compile experimental merge kernels with ``torch.compile``. If None, this
+            is enabled only for MPS Fourier-shift merges and disabled elsewhere so
+            CUDA's bit-exact baseline and the faster MPS bilinear path are unchanged
+            by default.
+        compile_uint16_as_int16 : bool
+            When compiling a uint16 tilt, convert it to int16 after verifying the
+            counts fit in int16. Inductor does not support uint16, and int16 is
+            lossless for low-count MAPED data.
+        compute_summaries : bool
+            If True, compute merged BF and mean-DP summaries after merging. Disable
+            for latency-critical live viewing when only the merged 4D tensor is
+            needed.
+        use_mlx_fused_merge : bool, optional
+            Use the MLX custom Metal fused merge kernel for the default MPS uint16
+            bilinear no-padding path. If None, the kernel is tried automatically
+            when its exact preconditions are met.
+        prefetch_tilts : bool
+            If True for file-backed streams, load the next tilt on a background
+            thread while the current tilt is being accumulated. This can hide HDF5
+            decode/disk latency on unified-memory MPS machines, but increases peak
+            memory by up to one resident tilt.
+        profile_timings : dict, optional
+            If provided, populated with synchronized phase timings for profiling.
         **plot_kwargs
             Passed to show_2d.
 
@@ -1724,6 +2059,18 @@ class MAPEDTorch(AutoSerialize):
         n = len(arrays)
         if n == 0:
             raise RuntimeError("No datasets found in self.datasets.")
+        _profile_t0 = time.perf_counter()
+
+        def _profile_now() -> float:
+            if profile_timings is not None:
+                if torch.device(self.device).type == "mps" and torch.backends.mps.is_available():
+                    torch.mps.synchronize()
+                elif torch.device(self.device).type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+            return time.perf_counter()
+
+        def _profile_elapsed(start: float) -> float:
+            return _profile_now() - start
 
         # Shapes come from the preprocess summaries already in memory - im_bf[i] is
         # (Rs, Cs) and dp_mean[i] is (H, W) - NOT by re-reading a tilt. For file-backed
@@ -1744,6 +2091,85 @@ class MAPEDTorch(AutoSerialize):
             raise ValueError("self.real_space_shifts must have shape (n, 2).")
         if dp_shifts.shape != (n, 2):
             raise ValueError("self.diffraction_shifts must have shape (n, 2).")
+
+        if isinstance(arrays, _ResidentTilts):
+            unsupported = []
+            if int(real_space_padding) != 0:
+                unsupported.append("real_space_padding=0")
+            if float(real_space_edge_blend) != 1.0:
+                unsupported.append("real_space_edge_blend=1")
+            if int(diffraction_padding) != 0:
+                unsupported.append("diffraction_padding=0")
+            if float(diffraction_edge_blend) != 0.0:
+                unsupported.append("diffraction_edge_blend=0")
+            if str(shift_method).strip().lower() != "bilinear":
+                unsupported.append("shift_method='bilinear'")
+            if dtype not in (None, "scaled_uint16"):
+                unsupported.append("dtype='scaled_uint16'")
+            if scale_output:
+                unsupported.append("scale_output=False")
+            if unsupported:
+                raise ValueError(
+                    "The encoded resident merge currently requires "
+                    + ", ".join(unsupported)
+                    + "."
+                )
+            if save_to is None:
+                raise ValueError(
+                    "Encoded resident MAPED writes its bounded result as scaled "
+                    "uint16; provide save_to='merged_master.h5'."
+                )
+            from quantem.gpu import io as gpu_io
+            from quantem.gpu._maped import resident_merge
+
+            generated = resident_merge(
+                arrays.sources,
+                rs_shifts,
+                dp_shifts,
+            )
+            generated.release_sources_before_reopen = bool(arrays.owns_sources)
+            gpu_io.save(
+                save_to,
+                generated,
+                dtype="scaled_uint16",
+                backend=torch.device(self.device).type,
+                verbose=verbose,
+            )
+            if arrays.owns_sources:
+                # Release MAPED-owned inputs after io.save finishes and before
+                # io.load reopens the packed result, so both complete resident
+                # representations never overlap. Preserve borrowed sources.
+                for source in arrays.sources:
+                    source.close()
+                arrays.sources = []
+                if torch.device(self.device).type == "cuda":
+                    torch.cuda.empty_cache()
+                elif torch.device(self.device).type == "mps":
+                    torch.mps.empty_cache()
+            result = gpu_io.load(
+                save_to,
+                backend=torch.device(self.device).type,
+                representation="packed",
+                verbose=False,
+            )
+            self.merged = result
+            if compute_summaries or plot_result:
+                summaries_dp, summaries_bf = _resident_summaries([result], self.device)
+                self.dp_mean_merged = summaries_dp[0]
+                self.im_bf_merged = summaries_bf[0]
+            else:
+                self.dp_mean_merged = None
+                self.im_bf_merged = None
+            if profile_timings is not None:
+                profile_timings.update(result.metadata.get("maped_merge", {}))
+                profile_timings["total_profiled_seconds"] = time.perf_counter() - _profile_t0
+            if plot_result:
+                show_2d(
+                    [[self.im_bf_merged, self.dp_mean_merged]],
+                    title=[["Merged Bright Field", "Merged Mean Diffraction Pattern"]],
+                    **plot_kwargs,
+                )
+            return result
 
         if dtype is None:
             # The merged dataset is an interpolated + accumulated quantity, so it
@@ -1861,7 +2287,7 @@ class MAPEDTorch(AutoSerialize):
             # budget reads artificially low and both the accumulator pick and the
             # auto batch-size collapse.
             if hasattr(arrays, "release"):
-                arrays.release()
+                arrays.release(reclaim_cache=False)
             torch.cuda.empty_cache()
             _free_bytes, _ = torch.cuda.mem_get_info(_dev)
         if accumulator_device is not None:
@@ -1877,6 +2303,18 @@ class MAPEDTorch(AutoSerialize):
         else:
             _acc_device = self.device
         _split = torch.device(_acc_device) != torch.device(self.device)
+        if compile_merge is None:
+            compile_merge = (
+                torch.device(self.device).type == "mps"
+                and hasattr(torch, "compile")
+                and method == "fourier"
+            )
+        compile_merge = bool(compile_merge)
+        use_mlx_fused_merge = (
+            torch.device(self.device).type == "mps"
+            if use_mlx_fused_merge is None
+            else bool(use_mlx_fused_merge)
+        )
 
         # Determine batch size. Auto-pick from free VRAM so the merge fits without
         # the caller tuning it. Bigger batches are faster; smaller cut peak memory.
@@ -1940,110 +2378,297 @@ class MAPEDTorch(AutoSerialize):
         # ~7x faster. One buffer sized to the largest batch, reused every batch. A
         # second-GPU accumulator (cross-GPU split) keeps the already-fast .to() path.
         _acc_is_cpu = torch.device(_acc_device).type == "cpu"
+        # Only the Metal backend has the fused-multiply-add ceiling; CUDA keeps
+        # its addcmul_ so the frozen baseline stays bit-exact.
+        _acc_over_int_max = (
+            torch.device(_acc_device).type == "mps"
+            and Rout * row_elems > _MAX_MPS_FUSED_ELEMENTS
+        )
+        _compiled_tail = (
+            _compiled_merge_tail(method)
+            if compile_merge and not _split and method == "fourier"
+            else None
+        )
         # pin_memory needs a CUDA context; pin only when the compute device is CUDA
         # (the normal out-of-core path). A non-CUDA box that forces
         # accumulator_device='cpu' falls back to a pageable buffer, not a crash.
         _stage = (
             torch.empty(
                 (batch_size, Cout, Hp, Wp), dtype=torch.float32,
-                pin_memory=torch.cuda.is_available(),
+                pin_memory=_dev.type == "cuda" and torch.cuda.is_available(),
             )
             if _acc_is_cpu
             else None
         )
-        for i in tqdm(range(n), desc="Merging tilts"):
-            # Keep the tilt in native dtype (uint16 = 19.3 GB) on the compute
-            # device; the whole 38.6 GB float copy never exists - detector slabs
-            # are cast to float inside grid_sample below.
-            a = arrays[i].to(device=self.device)
-            a_reshaped = a.view(Rs, Cs, H * W).permute(2, 0, 1)[None]
-            for batch_start in range(0, Rout, batch_size):
-                batch_end = min(batch_start + batch_size, Rout)
-                batch_rows = torch.arange(
-                    batch_start, batch_end, dtype=torch.float32, device=self.device
-                )
-                r_in = (batch_rows.unsqueeze(1) - real_space_padding).expand(-1, Cout) - rs_shifts[i, 0]
-                c_in = c_base_b.expand(batch_end - batch_start, -1) - rs_shifts[i, 1]
-                c_norm = 2.0 * c_in / (Cs - 1) - 1.0
-                r_norm = 2.0 * r_in / (Rs - 1) - 1.0
-                grid_full = torch.stack([c_norm, r_norm], dim=-1).unsqueeze(0)
-                dp_sample = _grid_sample_tilt(a_reshaped, grid_full, _cast)
-                wi_sample = torch.nn.functional.grid_sample(
-                    w_rs_reshaped, grid_full,
-                    mode="bilinear", padding_mode="zeros", align_corners=True,
-                )
-                dp_interp = dp_sample.squeeze(0).view(
-                    H, W, batch_end - batch_start, Cout
-                ).permute(2, 3, 0, 1)
-                wi = wi_sample.squeeze(0).squeeze(0)
-                # dp_interp is already float32 (grid_sample output); the weight
-                # mul stays float32, so no .float() copy. When there is no
-                # diffraction padding (Hp==H), the weighted interp IS the FFT
-                # input - skip allocating + zeroing + scattering a full padded
-                # buffer every batch (pure waste that was overwritten anyway).
-                dp_weighted = dp_interp * w_dp[None, None]
-                if Hp == H and Wp == W:
-                    dp_padded = dp_weighted
-                else:
-                    dp_padded = torch.zeros(
-                        (batch_end - batch_start, Cout, Hp, Wp),
-                        dtype=torch.float32, device=self.device,
-                    )
-                    dp_padded[:, :, rp0 : rp0 + H, cp0 : cp0 + W] = dp_weighted
-                del dp_sample, dp_interp, wi_sample, dp_weighted
-                dp_shifted = _shift_diffraction_batch(
-                    dp_padded, method,
-                    ramps[i] if method == "fourier" else None,
-                    dp_shifts[i : i + 1],
-                    batch_end - batch_start, Cout, Hp, Wp,
-                )
-                wi_exp = wi[..., None, None]
-                if _split:
-                    prod = wi_exp * dp_shifted  # weighted product on the compute device
-                    if _acc_is_cpu:
-                        # page-locked staging -> ~7x faster GPU->CPU copy than a
-                        # pageable .to(cpu); same values, so the accumulate stays
-                        # bit-exact vs the in-VRAM addcmul_ on the production path.
-                        stg = _stage[: batch_end - batch_start]
-                        stg.copy_(prod)
-                        num[batch_start:batch_end] += stg
+        if profile_timings is not None:
+            profile_timings.clear()
+            profile_timings["setup_seconds"] = _profile_elapsed(_profile_t0)
+            profile_timings["tilts"] = []
+        _tilt_loop_t0 = _profile_now()
+        _prefetch_executor: ThreadPoolExecutor | None = None
+        _prefetch_future: Future[Any] | None = None
+        _use_prefetch = (
+            bool(prefetch_tilts)
+            and isinstance(arrays, _TiltFiles)
+            and torch.device(self.device).type != "mps"
+        )
+        if prefetch_tilts and isinstance(arrays, _TiltFiles) and not _use_prefetch:
+            warnings.warn(
+                "prefetch_tilts=True is disabled for MPS because overlapping "
+                "background MPS loads with active MPS kernels is not thread-safe "
+                "in the current backend. Use a chunk-direct MPS reader instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if _use_prefetch:
+            _prefetch_executor = ThreadPoolExecutor(max_workers=1)
+            _prefetch_future = _prefetch_executor.submit(arrays.read, arrays.paths[0])
+        try:
+            for i in tqdm(range(n), desc="Merging tilts"):
+                _tilt_profile: dict[str, float | int | bool] = {"index": i}
+                _tilt_t0 = _profile_now()
+                # Keep the tilt in native dtype (uint16 = 19.3 GB) on the compute
+                # device; the whole 38.6 GB float copy never exists - detector slabs
+                # are cast to float inside grid_sample below.
+                _load_t0 = _profile_now()
+                if _use_prefetch:
+                    assert _prefetch_future is not None
+                    a_raw = _prefetch_future.result()
+                    if i + 1 < n:
+                        assert _prefetch_executor is not None
+                        _prefetch_future = _prefetch_executor.submit(
+                            arrays.read,
+                            arrays.paths[i + 1],
+                        )
                     else:
-                        # cross-GPU: a GPU->GPU peer copy is already fast.
-                        num[batch_start:batch_end] += prod.to(_acc_device)
-                    del prod  # ~3.6 GB batch buffer - free before the next batch
+                        _prefetch_future = None
                 else:
-                    # single device: fuse weight-mul + accumulate into one addcmul_
-                    # kernel (no full-size weighted temporary, no identity .to copy).
-                    num[batch_start:batch_end].addcmul_(wi_exp, dp_shifted)
-                wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
-                del dp_padded, dp_shifted, wi, wi_exp
-            del a, a_reshaped
-            # On a real cross-GPU split the contribution adds copy compute ->
-            # accumulator asynchronously; sync both cards before the next tilt
-            # reuses the compute device, else the writes race the next tilt's
-            # kernels (CUDA "unspecified launch failure"). Single-GPU stream
-            # stays on one stream, so the sync is only needed when _split.
-            if _split:
-                # _acc_device is a second GPU (cross-GPU split) OR CPU RAM
-                # (out-of-core). Sync only CUDA devices: a CPU accumulator's blocking
-                # copy already synchronized, and self.device may be MPS/CPU if a
-                # caller forces accumulator_device='cpu' off a CUDA box.
-                if torch.device(self.device).type == "cuda":
-                    torch.cuda.synchronize(self.device)
-                if torch.device(_acc_device).type == "cuda":
-                    torch.cuda.synchronize(_acc_device)
-                # empty_cache helps ONLY the memory-tight split path; on the in-VRAM
-                # path it returns cached blocks and forces the next tilt to
-                # re-cudaMalloc (a per-tilt stall), so gate it here.
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    a_raw = arrays[i]
+                a_is_chunked = _is_mps_chunked_tilt(a_raw)
+                if a_is_chunked:
+                    a = a_raw
+                else:
+                    a = a_raw.to(device=self.device)
+                if (not a_is_chunked) and compile_merge and a.dtype == torch.uint16:
+                    if not compile_uint16_as_int16:
+                        raise ValueError(
+                            "compile_merge=True cannot consume uint16 tilts because "
+                            "torch.compile/inductor does not support torch.uint16. "
+                            "Pass compile_uint16_as_int16=True for count data known to "
+                            "fit in int16, or disable compile_merge."
+                        )
+                    max_count = int(torch.max(a).item())
+                    if max_count > torch.iinfo(torch.int16).max:
+                        raise ValueError(
+                            "compile_merge=True would need to reinterpret a uint16 tilt "
+                            f"as int16, but the maximum count is {max_count}, above "
+                            "32767. Disable compile_merge or load/cast to a supported "
+                            "floating dtype."
+                        )
+                    a_i16 = a.to(torch.int16)
+                    del a
+                    a = a_i16
+                _tilt_profile["load_to_device_seconds"] = _profile_elapsed(_load_t0)
+                _tilt_profile["chunked"] = a_is_chunked
+                a_reshaped = None if a_is_chunked else a.view(Rs, Cs, H * W).permute(2, 0, 1)[None]
+                _band_t0 = _profile_now()
+                _fused_batches = 0
+                _fallback_batches = 0
+                for batch_start in range(0, Rout, batch_size):
+                    batch_end = min(batch_start + batch_size, Rout)
+                    batch_rows = torch.arange(
+                        batch_start, batch_end, dtype=torch.float32, device=self.device
+                    )
+                    if a_is_chunked and use_mlx_fused_merge:
+                        fused = _fused_merge_band_chunked_mlx_metal(
+                            a,
+                            num[batch_start:batch_end] if not _split else None,
+                            w_rs,
+                            batch_start,
+                            batch_end,
+                            Cout,
+                            real_space_padding,
+                            rs_shifts[i],
+                            dp_shifts[i],
+                            _cast,
+                            method,
+                            diffraction_padding,
+                            diffraction_edge_blend,
+                        )
+                    elif use_mlx_fused_merge:
+                        fused = _fused_merge_band_mlx_metal(
+                            a,
+                            num[batch_start:batch_end] if not _split else None,
+                            w_rs,
+                            batch_start,
+                            batch_end,
+                            Cout,
+                            real_space_padding,
+                            rs_shifts[i],
+                            dp_shifts[i],
+                            _cast,
+                            method,
+                            diffraction_padding,
+                            diffraction_edge_blend,
+                        )
+                    else:
+                        fused = None
+                    if fused is not None:
+                        _fused_batches += 1
+                        num[batch_start:batch_end], wi = fused
+                        wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
+                        del wi
+                        continue
+                    _fallback_batches += 1
+                    if a_is_chunked:
+                        raise RuntimeError(
+                            "Chunk-direct MPS merge fallback was needed but no tensor tilt "
+                            "was assembled. Return a torch.Tensor from read() or use the "
+                            "default tensor-backed read path."
+                        )
+    
+                    r_in = (
+                        (batch_rows.unsqueeze(1) - real_space_padding).expand(-1, Cout)
+                        - rs_shifts[i, 0]
+                    )
+                    c_in = c_base_b.expand(batch_end - batch_start, -1) - rs_shifts[i, 1]
+                    c_norm = 2.0 * c_in / (Cs - 1) - 1.0
+                    r_norm = 2.0 * r_in / (Rs - 1) - 1.0
+                    grid_full = torch.stack([c_norm, r_norm], dim=-1).unsqueeze(0)
+                    dp_sample = _sample_tilt_mlx_metal(
+                        a,
+                        batch_start,
+                        batch_end,
+                        Cout,
+                        real_space_padding,
+                        rs_shifts[i],
+                        _cast,
+                    )
+                    if dp_sample is None:
+                        dp_sample = _sample_tilt_constant_bilinear(
+                            a_reshaped,
+                            batch_start,
+                            batch_end,
+                            Cout,
+                            real_space_padding,
+                            rs_shifts[i],
+                            _cast,
+                        )
+                    wi_sample = torch.nn.functional.grid_sample(
+                        w_rs_reshaped, grid_full,
+                        mode="bilinear", padding_mode="zeros", align_corners=True,
+                    )
+                    dp_interp = dp_sample.squeeze(0).view(
+                        H, W, batch_end - batch_start, Cout
+                    ).permute(2, 3, 0, 1)
+                    wi = wi_sample.squeeze(0).squeeze(0)
+                    # dp_interp is already float32 (grid_sample output); the weight
+                    # mul stays float32, so no .float() copy. When there is no
+                    # diffraction padding (Hp==H), the weighted interp IS the FFT
+                    # input - skip allocating + zeroing + scattering a full padded
+                    # buffer every batch (pure waste that was overwritten anyway).
+                    dp_weighted = dp_interp * w_dp[None, None]
+                    if Hp == H and Wp == W:
+                        dp_padded = dp_weighted
+                    else:
+                        dp_padded = torch.zeros(
+                            (batch_end - batch_start, Cout, Hp, Wp),
+                            dtype=torch.float32, device=self.device,
+                        )
+                        dp_padded[:, :, rp0 : rp0 + H, cp0 : cp0 + W] = dp_weighted
+                    del dp_sample, dp_interp, wi_sample, dp_weighted
+                    if _compiled_tail is not None:
+                        num[batch_start:batch_end] = _compiled_tail(
+                            num[batch_start:batch_end],
+                            dp_padded,
+                            wi,
+                            ramps[i] if method == "fourier" else torch.empty(0, device=self.device),
+                            dp_shifts[i : i + 1],
+                        )
+                        wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
+                        del dp_padded, wi
+                        continue
+    
+                    dp_shifted = _shift_diffraction_batch(
+                        dp_padded, method,
+                        ramps[i] if method == "fourier" else None,
+                        dp_shifts[i : i + 1],
+                        batch_end - batch_start, Cout, Hp, Wp,
+                    )
+                    wi_exp = wi[..., None, None]
+                    if _split:
+                        prod = wi_exp * dp_shifted  # weighted product on the compute device
+                        if _acc_is_cpu:
+                            # page-locked staging -> ~7x faster GPU->CPU copy than a
+                            # pageable .to(cpu); same values, so the accumulate stays
+                            # bit-exact vs the in-VRAM addcmul_ on the production path.
+                            stg = _stage[: batch_end - batch_start]
+                            stg.copy_(prod)
+                            num[batch_start:batch_end] += stg
+                        else:
+                            # cross-GPU: a GPU->GPU peer copy is already fast.
+                            num[batch_start:batch_end] += prod.to(_acc_device)
+                        del prod  # ~3.6 GB batch buffer - free before the next batch
+                    elif _acc_over_int_max:
+                        # MPSGraph cannot build a fused multiply-add against an
+                        # accumulator holding more than 2**31 elements (a no-bin
+                        # output is 9.7e9), though it handles the same shapes as two
+                        # separate kernels. Costs one batch-sized temporary.
+                        num[batch_start:batch_end] += wi_exp * dp_shifted
+                    else:
+                        # single device: fuse weight-mul + accumulate into one addcmul_
+                        # kernel (no full-size weighted temporary, no identity .to copy).
+                        num[batch_start:batch_end].addcmul_(wi_exp, dp_shifted)
+                    wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
+                    del dp_padded, dp_shifted, wi, wi_exp
+                _tilt_profile["band_accumulate_seconds"] = _profile_elapsed(_band_t0)
+                _tilt_profile["fused_batches"] = _fused_batches
+                _tilt_profile["fallback_batches"] = _fallback_batches
+                _cleanup_t0 = _profile_now()
+                if a_is_chunked and hasattr(a, "free"):
+                    a.free()
+                del a, a_reshaped, a_raw
+                if isinstance(arrays, _TiltFiles) and not _use_prefetch:
+                    arrays.release()
+                # On a real cross-GPU split the contribution adds copy compute ->
+                # accumulator asynchronously; sync both cards before the next tilt
+                # reuses the compute device, else the writes race the next tilt's
+                # kernels (CUDA "unspecified launch failure"). Single-GPU stream
+                # stays on one stream, so the sync is only needed when _split.
+                if _split:
+                    # _acc_device is a second GPU (cross-GPU split) OR CPU RAM
+                    # (out-of-core). Sync only CUDA devices: a CPU accumulator's blocking
+                    # copy already synchronized, and self.device may be MPS/CPU if a
+                    # caller forces accumulator_device='cpu' off a CUDA box.
+                    if torch.device(self.device).type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    if torch.device(_acc_device).type == "cuda":
+                        torch.cuda.synchronize(_acc_device)
+                    # empty_cache helps ONLY the memory-tight split path; on the in-VRAM
+                    # path it returns cached blocks and forces the next tilt to
+                    # re-cudaMalloc (a per-tilt stall), so gate it here.
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                _tilt_profile["cleanup_seconds"] = _profile_elapsed(_cleanup_t0)
+                _tilt_profile["total_seconds"] = _profile_elapsed(_tilt_t0)
+                if profile_timings is not None:
+                    profile_timings["tilts"].append(_tilt_profile)
+        finally:
+            if _prefetch_executor is not None:
+                _prefetch_executor.shutdown(wait=True)
+        if profile_timings is not None:
+            profile_timings["tilt_loop_seconds"] = _profile_elapsed(_tilt_loop_t0)
         del _stage  # free the (pinned) staging buffer before the divide + scaling
         # Edge contribution + factorized-den divide, one output-row band at a
         # time so den is only ever materialized batch-sized, never full.
+        _edge_t0 = _profile_now()
         edge = edge_w_dp.to(_acc_device)  # (Hp, Wp)
         num += edge[None, None] * pad_val_dp
         wdp_acc = wdp_shifted.to(_acc_device)  # (n, Hp, Wp)
         edge_b = edge[None, None]
+        if profile_timings is not None:
+            profile_timings["edge_fill_seconds"] = _profile_elapsed(_edge_t0)
+        _normalize_t0 = _profile_now()
         for bs in range(0, Rout, batch_size):
             be = min(bs + batch_size, Rout)
             # den_band[r,c,h,w] = sum_i wi_all[i,r,c] * wdp[i,h,w] + edge[h,w]
@@ -2056,11 +2681,35 @@ class MAPEDTorch(AutoSerialize):
             del den_band, mask
         merged = num
         del wi_all, wdp_acc
+        if profile_timings is not None:
+            profile_timings["normalize_seconds"] = _profile_elapsed(_normalize_t0)
 
-        self.im_bf_merged = torch.mean(merged, dim=(2, 3))
-        self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
+        _summary_t0 = _profile_now()
+        if compute_summaries:
+            # MPS reductions over the full no-bin tensor can silently produce
+            # incorrect values once the flattened reduction exceeds the Metal
+            # indexing limit. Keep reductions in scan-row bands; this also mirrors
+            # the preprocess summary path used before merge.
+            summary_band = min(max(1, int(batch_size)), _MPS_PREPROCESS_ROW_BAND)
+            im_bf = torch.empty((Rout, Cout), dtype=torch.float32, device=merged.device)
+            dp_sum = torch.zeros((Hp, Wp), dtype=torch.float32, device=merged.device)
+            for r0 in range(0, Rout, summary_band):
+                r1 = min(r0 + summary_band, Rout)
+                band = merged[r0:r1].contiguous()
+                flat_band = band.reshape((r1 - r0) * Cout, Hp * Wp)
+                im_bf[r0:r1] = flat_band.mean(1).reshape(r1 - r0, Cout)
+                dp_sum += flat_band.sum(0).reshape(Hp, Wp)
+                del band, flat_band
+            self.im_bf_merged = im_bf
+            self.dp_mean_merged = dp_sum / float(Rout * Cout)
+        else:
+            self.im_bf_merged = None
+            self.dp_mean_merged = None
+        if profile_timings is not None:
+            profile_timings["summary_seconds"] = _profile_elapsed(_summary_t0)
 
         # dtype scaling and clipping
+        _dtype_t0 = _profile_now()
         try:
             info = torch.iinfo(dtype_out)
             is_int_dtype = True
@@ -2094,10 +2743,18 @@ class MAPEDTorch(AutoSerialize):
                 merged_out = torch.round(torch.clamp(merged_f, dmin, dmax)).to(dtype=dtype_out)
         else:
             merged_out = merged.to(dtype=dtype_out)
+        if profile_timings is not None:
+            profile_timings["dtype_output_seconds"] = _profile_elapsed(_dtype_t0)
 
+        _wrap_t0 = _profile_now()
         dataset_merged = Dataset4dstem.from_tensor(tensor=merged_out)
-        dataset_merged.im_bf_merged = self.im_bf_merged
-        dataset_merged.dp_mean_merged = self.dp_mean_merged
+        if compute_summaries:
+            dataset_merged.im_bf_merged = self.im_bf_merged
+            dataset_merged.dp_mean_merged = self.dp_mean_merged
+        self.merged = dataset_merged
+        if profile_timings is not None:
+            profile_timings["dataset_wrap_seconds"] = _profile_elapsed(_wrap_t0)
+            profile_timings["total_profiled_seconds"] = _profile_elapsed(_profile_t0)
 
         if plot_result:
             show_2d(
@@ -2107,6 +2764,136 @@ class MAPEDTorch(AutoSerialize):
             )
 
         return dataset_merged
+
+    @staticmethod
+    def _as_torch(obj: Any) -> torch.Tensor:
+        """Pull a Torch tensor out of a dataset or accelerator array."""
+        if torch.is_tensor(obj):
+            return obj
+        tensor = getattr(obj, "tensor", None)
+        if torch.is_tensor(tensor):
+            return tensor
+        data = getattr(obj, "data", obj)
+        if torch.is_tensor(data):
+            return data
+        if hasattr(data, "__dlpack__"):
+            return torch.from_dlpack(data)
+        return torch.as_tensor(data)
+
+    def close(self) -> None:
+        """Release MAPED-owned encoded inputs, output, and viewer resources."""
+        viewer = getattr(self, "viewer", None)
+        if viewer is not None and hasattr(viewer, "close"):
+            viewer.close()
+            self.viewer = None
+        merged = getattr(self, "merged", None)
+        if merged is not None and hasattr(merged, "close"):
+            merged.close()
+            self.merged = None
+        if isinstance(self.datasets, _ResidentTilts):
+            self.datasets.close()
+
+    def show(
+        self,
+        reference: int | None = None,
+        *,
+        labels: Sequence[str] | None = None,
+        dp_scale_mode: str = "log",
+        verbose: bool = False,
+        **show_kwargs: Any,
+    ):
+        """Open the merged result in Show4DSTEM.
+
+        Encoded resident workflows display the packed scaled result directly,
+        without expanding the 4D array. Dense and file-streamed workflows retain
+        the two-panel reference-tilt versus merge view.
+
+        Parameters
+        ----------
+        reference
+            Reference tilt for dense and file-streamed workflows.
+        labels
+            Two frame labels for dense and file-streamed workflows.
+        dp_scale_mode
+            Forwarded to Show4DSTEM (default ``"log"``).
+        verbose
+            Show4DSTEM chatter.
+        **show_kwargs
+            Extra Show4DSTEM kwargs (e.g. ``view_mode="multiple"``).
+
+        Returns
+        -------
+        Show4DSTEM
+            Live viewer (also stored as ``self.viewer``).
+        """
+        if not hasattr(self, "merged") or self.merged is None:
+            raise RuntimeError("Run merge_datasets() (or run()) before show().")
+
+        from quantem.widget import Show4DSTEM
+
+        if isinstance(self.datasets, _ResidentTilts):
+            viewer = Show4DSTEM(
+                self.merged,
+                dp_scale_mode=dp_scale_mode,
+                verbose=verbose,
+                **show_kwargs,
+            )
+            self.viewer = viewer
+            return viewer
+
+        # The widget's own Dataset5dstem, not quantem.diffraction's: Show4DSTEM is
+        # built for it, and the sharded multi-GPU class the merge uses internally
+        # is not the type its viewer paths accept.
+        from quantem.widget.data import Dataset5dstem
+
+        idx = len(self.datasets) // 2 if reference is None else reference
+        merged_t = self._as_torch(self.merged)
+        dev = torch.device(self.device)
+
+        # Drop any still-resident stream tilt, then load the reference onto the
+        # same card as the merge (both stay on GPU).
+        if hasattr(self.datasets, "release"):
+            self.datasets.release()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        ref_t = self._as_torch(self.datasets[idx]).to(device=dev, non_blocking=False)
+        if merged_t.device != dev:
+            merged_t = merged_t.to(device=dev, non_blocking=False)
+
+        if labels is None:
+            labels = ("BEFORE - single tilt", "AFTER - merged")
+        if len(labels) != 2:
+            raise ValueError(f"labels must have length 2; got {len(labels)}")
+
+        show_kwargs = dict(show_kwargs)
+        show_kwargs.setdefault("view_mode", "multiple")
+        show_kwargs.setdefault("columns", 2)
+        show_kwargs.setdefault("page_size", 2)
+
+        # Both panels must share a dtype, and the viewer reads the merge through
+        # numpy, which has no uint16 torch equivalent to interpret. Match the
+        # merge's float32 so the before/after pair is directly comparable.
+        # from_frames requires a shared dtype, and the merge is float32 while a
+        # streamed tilt is native uint16; matching also makes the two panels
+        # directly comparable on screen.
+        # `series` is the numeric series axis, so the human labels go to the
+        # viewer's frame_labels instead.
+        ds5 = Dataset5dstem.from_frames(
+            [ref_t.to(merged_t.dtype), merged_t],
+            series_type="generic",
+            name="MAPED before/after",
+        )
+        viewer = Show4DSTEM(
+            ds5,
+            dp_scale_mode=dp_scale_mode,
+            frame_dim_label="view",
+            frame_labels=list(labels),
+            verbose=verbose,
+            **show_kwargs,
+        )
+        self.viewer = viewer
+        return viewer
 
 
 def shift_images(
@@ -2240,7 +3027,33 @@ def shift_images(
     return out
 
 
-def _grid_sample_tilt(a_reshaped, grid_full, cast_dtype):
+# grid_sample indexes with 32 bits: a single call over more than 2**31 elements
+# is rejected by MPSGraph and is where the no-bin merge fails on an Apple GPU.
+_MAX_GRID_SAMPLE_ELEMENTS = 2**31 - 1
+
+
+# MPSGraph addresses tensor dims with 32 bits, so a fused multiply-add against an
+# accumulator larger than this raises "does not support tensor dims larger than
+# INT_MAX" even though the same shapes work as two separate kernels.
+_MAX_MPS_FUSED_ELEMENTS = 2**31 - 1
+_MPS_PREPROCESS_ROW_BAND = 16
+
+
+@lru_cache(maxsize=8)
+def _compiled_grid_sample(cast_dtype: torch.dtype):
+    def _warp(x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.grid_sample(
+            x.to(cast_dtype),
+            grid.to(cast_dtype),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+
+    return torch.compile(_warp, backend="inductor", dynamic=False)
+
+
+def _grid_sample_tilt(a_reshaped, grid_full, cast_dtype, *, compile_torch: bool = False):
     """Real-space-warp one tilt's diffraction patterns onto the output grid.
 
     ``a_reshaped`` is ``(1, H*W, Rs, Cs)`` - the whole tilt, with the detector
@@ -2258,16 +3071,22 @@ def _grid_sample_tilt(a_reshaped, grid_full, cast_dtype):
       tail can differ at ~1e-4 (sum/mean/std stay within 1e-5). This float-reorder
       is the price of fitting no-bin on one GPU, and only the uint16 path pays it.
     """
-    if a_reshaped.dtype == cast_dtype:
+    grid_sample = _compiled_grid_sample(cast_dtype) if compile_torch else None
+    det, rows, cols = a_reshaped.shape[1], a_reshaped.shape[2], a_reshaped.shape[3]
+    # grid_sample indexes its input with 32 bits, so one call must stay under
+    # 2**31 elements. At no-bin a quarter of the detector is 9216 * 512 * 512 =
+    # 2.4e9, which CUDA tolerates but MPSGraph rejects outright ("does not
+    # support tensor dims larger than INT_MAX"). Take whichever is more slabs:
+    # the historic quarter, or the fewest that fit under the limit.
+    min_slabs = -(-det * rows * cols // _MAX_GRID_SAMPLE_ELEMENTS)
+    if a_reshaped.dtype == cast_dtype and min_slabs <= 1:
+        if grid_sample is not None:
+            return grid_sample(a_reshaped, grid_full)
         return torch.nn.functional.grid_sample(
-            a_reshaped,
-            grid_full.to(cast_dtype),
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
+            a_reshaped, grid_full.to(cast_dtype),
+            mode="bilinear", padding_mode="zeros", align_corners=True,
         )
-    det = a_reshaped.shape[1]
-    slab = max(1, det // 4)
+    slab = max(1, -(-det // max(4, min_slabs)))
     grid_cast = grid_full.to(cast_dtype)
     # Pre-allocate the full (1, det, batch, Cout) output ONCE and write each slab's
     # grid_sample result into its channel slice. The previous torch.cat held all
@@ -2277,12 +3096,659 @@ def _grid_sample_tilt(a_reshaped, grid_full, cast_dtype):
     batch_n, cout_n = grid_cast.shape[1], grid_cast.shape[2]
     out = torch.empty((1, det, batch_n, cout_n), dtype=cast_dtype, device=a_reshaped.device)
     for c0 in range(0, det, slab):
-        a_slab = a_reshaped[:, c0 : c0 + slab].to(cast_dtype)
-        out[:, c0 : c0 + slab] = torch.nn.functional.grid_sample(
-            a_slab, grid_cast, mode="bilinear", padding_mode="zeros", align_corners=True,
-        )
+        a_slab = a_reshaped[:, c0 : c0 + slab]
+        if grid_sample is None:
+            out[:, c0 : c0 + slab] = torch.nn.functional.grid_sample(
+                a_slab.to(cast_dtype), grid_cast,
+                mode="bilinear", padding_mode="zeros", align_corners=True,
+            )
+        else:
+            out[:, c0 : c0 + slab] = grid_sample(a_slab, grid_cast)
         del a_slab
     return out
+
+
+def _sample_tilt_constant_bilinear(
+    a_reshaped: torch.Tensor,
+    batch_start: int,
+    batch_end: int,
+    cout: int,
+    real_space_padding: int,
+    shift_rc: torch.Tensor,
+    cast_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Sample a tilt for one row band using MAPED's constant real-space shift.
+
+    The merge's real-space warp is a rigid sub-pixel translation for every
+    detector channel in a tilt. ``grid_sample`` treats it as a general gather over
+    ``H*W`` channels, which is the dominant MPS cost. This evaluates the same
+    bilinear interpolation by slicing the scan axes directly:
+
+    ``source_row = output_row - real_space_padding - shift_row``
+    ``source_col = output_col - real_space_padding - shift_col``
+
+    The return shape matches ``grid_sample``: ``(1, det, batch, cout)``.
+    """
+    _, det, rows, cols = a_reshaped.shape
+    batch_n = batch_end - batch_start
+    out = torch.zeros((1, det, batch_n, cout), dtype=cast_dtype, device=a_reshaped.device)
+    shift = shift_rc.reshape(-1)
+    row_offset = float(batch_start - real_space_padding) - float(shift[0])
+    col_offset = float(-real_space_padding) - float(shift[1])
+    row_floor = math.floor(row_offset)
+    col_floor = math.floor(col_offset)
+    row_frac = row_offset - row_floor
+    col_frac = col_offset - col_floor
+
+    row_taps = ((row_floor, 1.0 - row_frac), (row_floor + 1, row_frac))
+    col_taps = ((col_floor, 1.0 - col_frac), (col_floor + 1, col_frac))
+    for row_delta, row_weight in row_taps:
+        if row_weight == 0.0:
+            continue
+        row_start = max(0, -row_delta)
+        row_stop = min(batch_n, rows - row_delta)
+        if row_start >= row_stop:
+            continue
+        src_row_start = row_start + row_delta
+        src_row_stop = row_stop + row_delta
+        for col_delta, col_weight in col_taps:
+            weight = row_weight * col_weight
+            if weight == 0.0:
+                continue
+            col_start = max(0, -col_delta)
+            col_stop = min(cout, cols - col_delta)
+            if col_start >= col_stop:
+                continue
+            src_col_start = col_start + col_delta
+            src_col_stop = col_stop + col_delta
+            out[:, :, row_start:row_stop, col_start:col_stop] += (
+                a_reshaped[:, :, src_row_start:src_row_stop, src_col_start:src_col_stop].to(
+                    cast_dtype
+                )
+                * weight
+            )
+    return out
+
+
+@lru_cache(maxsize=1)
+def _mlx_metal_warp_kernel():
+    import mlx.core as mx
+
+    source = r"""
+        uint elem = thread_position_in_grid.x;
+        uint col_o = elem % COUT;
+        uint tmp0 = elem / COUT;
+        uint row_o = tmp0 % BATCH;
+        uint det = tmp0 / BATCH;
+        uint kh = det / KW;
+        uint kw = det - kh * KW;
+
+        float row_src = float(row_o) + params[2] - params[3] - params[0];
+        float col_src = float(col_o) - params[3] - params[1];
+        int r0 = int(floor(row_src));
+        int c0 = int(floor(col_src));
+        float rf = row_src - float(r0);
+        float cf = col_src - float(c0);
+
+        float acc = 0.0f;
+        for (int dr = 0; dr < 2; dr++) {
+            int rr = r0 + dr;
+            if (rr < 0 || rr >= RS) continue;
+            float rw = dr == 0 ? (1.0f - rf) : rf;
+            for (int dc = 0; dc < 2; dc++) {
+                int cc = c0 + dc;
+                if (cc < 0 || cc >= CS) continue;
+                float cw = dc == 0 ? (1.0f - cf) : cf;
+                ulong in_idx = (((ulong(rr) * CS + ulong(cc)) * KH + kh) * KW + kw);
+                acc += float(tilt[in_idx]) * rw * cw;
+            }
+        }
+        out[elem] = acc;
+    """
+    return mx.fast.metal_kernel(
+        name="maped_warp_u16",
+        input_names=["tilt", "params"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+        compile_options={"math_mode": "fast"},
+    )
+
+
+def _sample_tilt_mlx_metal(
+    tilt: torch.Tensor,
+    batch_start: int,
+    batch_end: int,
+    cout: int,
+    real_space_padding: int,
+    shift_rc: torch.Tensor,
+    cast_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Fast MPS-only real-space warp using an MLX custom Metal kernel."""
+    if (
+        tilt.device.type != "mps"
+        or tilt.dtype != torch.uint16
+        or cast_dtype != torch.float32
+        or tilt.ndim != 4
+    ):
+        return None
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+
+    rows, cols, k_rows, k_cols = tilt.shape
+    batch_n = batch_end - batch_start
+    params = torch.tensor(
+        [
+            float(shift_rc.reshape(-1)[0]),
+            float(shift_rc.reshape(-1)[1]),
+            float(batch_start),
+            float(real_space_padding),
+        ],
+        dtype=torch.float32,
+        device=tilt.device,
+    )
+    kernel = _mlx_metal_warp_kernel()
+    out = kernel(
+        inputs=[mx.from_dlpack(tilt), mx.from_dlpack(params)],
+        template=[
+            ("RS", rows),
+            ("CS", cols),
+            ("KH", k_rows),
+            ("KW", k_cols),
+            ("BATCH", batch_n),
+            ("COUT", cout),
+            ("T", mx.uint16),
+        ],
+        grid=(k_rows * k_cols * batch_n * cout, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(k_rows * k_cols, batch_n, cout)],
+        output_dtypes=[mx.float32],
+    )[0]
+    mx.eval(out)
+    return torch.from_dlpack(out).unsqueeze(0)
+
+
+@lru_cache(maxsize=1)
+def _mlx_metal_fused_merge_kernel():
+    import mlx.core as mx
+
+    source = r"""
+        uint elem = thread_position_in_grid.x;
+        uint kw_o = elem % KW;
+        uint tmp0 = elem / KW;
+        uint kh_o = tmp0 % KH;
+        uint tmp1 = tmp0 / KH;
+        uint col_o = tmp1 % COUT;
+        uint row_o = tmp1 / COUT;
+
+        float row_src = float(row_o) + params[4] - params[5] - params[0];
+        float col_src = float(col_o) - params[5] - params[1];
+        int r0 = int(floor(row_src));
+        int c0 = int(floor(col_src));
+        float rf = row_src - float(r0);
+        float cf = col_src - float(c0);
+
+        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
+        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
+        int h0 = int(floor(kh_src));
+        int w0 = int(floor(kw_src));
+        float hf = kh_src - float(h0);
+        float wf = kw_src - float(w0);
+
+        float val = 0.0f;
+        float wi = 0.0f;
+        for (int sr = 0; sr < 2; sr++) {
+            int rr = r0 + sr;
+            if (rr < 0 || rr >= RS) continue;
+            float rw = sr == 0 ? (1.0f - rf) : rf;
+            for (int sc = 0; sc < 2; sc++) {
+                int cc = c0 + sc;
+                if (cc < 0 || cc >= CS) continue;
+                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
+                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
+                for (int dh = 0; dh < 2; dh++) {
+                    int hh = h0 + dh;
+                    if (hh < 0 || hh >= KH) continue;
+                    float hw = dh == 0 ? (1.0f - hf) : hf;
+                    for (int dw = 0; dw < 2; dw++) {
+                        int ww = w0 + dw;
+                        if (ww < 0 || ww >= KW) continue;
+                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
+                        ulong in_idx = (
+                            ((ulong(rr) * CS + ulong(cc)) * KH + ulong(hh))
+                            * KW + ulong(ww)
+                        );
+                        val += float(tilt[in_idx]) * weight;
+                    }
+                }
+            }
+        }
+        out[elem] = num[elem] + wi * val;
+        if (kh_o == 0 && kw_o == 0) {
+            wi_out[row_o * COUT + col_o] = wi;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="maped_fused_merge_u16",
+        input_names=["tilt", "num", "wrs", "params"],
+        output_names=["out", "wi_out"],
+        source=source,
+        ensure_row_contiguous=True,
+        compile_options={"math_mode": "fast"},
+    )
+
+
+def _fused_merge_band_mlx_metal(
+    tilt: torch.Tensor,
+    num_band: torch.Tensor | None,
+    w_rs: torch.Tensor,
+    batch_start: int,
+    batch_end: int,
+    cout: int,
+    real_space_padding: int,
+    real_shift_rc: torch.Tensor,
+    diffraction_shift_rc: torch.Tensor,
+    cast_dtype: torch.dtype,
+    method: str,
+    diffraction_padding: int,
+    diffraction_edge_blend: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused MPS MAPED merge band for the default no-padding bilinear path."""
+    if (
+        num_band is None
+        or tilt.device.type != "mps"
+        or tilt.dtype != torch.uint16
+        or cast_dtype != torch.float32
+        or method != "bilinear"
+        or int(diffraction_padding) != 0
+        or float(diffraction_edge_blend) != 0.0
+        or tilt.ndim != 4
+    ):
+        return None
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+
+    rows, cols, k_rows, k_cols = tilt.shape
+    batch_n = batch_end - batch_start
+    params = torch.tensor(
+        [
+            float(real_shift_rc.reshape(-1)[0]),
+            float(real_shift_rc.reshape(-1)[1]),
+            float(diffraction_shift_rc.reshape(-1)[0]),
+            float(diffraction_shift_rc.reshape(-1)[1]),
+            float(batch_start),
+            float(real_space_padding),
+        ],
+        dtype=torch.float32,
+        device=tilt.device,
+    )
+    kernel = _mlx_metal_fused_merge_kernel()
+    out, wi = kernel(
+        inputs=[
+            mx.from_dlpack(tilt),
+            mx.from_dlpack(num_band),
+            mx.from_dlpack(w_rs),
+            mx.from_dlpack(params),
+        ],
+        template=[
+            ("RS", rows),
+            ("CS", cols),
+            ("KH", k_rows),
+            ("KW", k_cols),
+            ("BATCH", batch_n),
+            ("COUT", cout),
+            ("T", mx.uint16),
+        ],
+        grid=(batch_n * cout * k_rows * k_cols, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[num_band.shape, (batch_n, cout)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    mx.eval(out, wi)
+    return torch.from_dlpack(out), torch.from_dlpack(wi)
+
+
+def _is_mps_chunked_tilt(obj: Any) -> bool:
+    return hasattr(obj, "chunks") and hasattr(obj, "scan_shape") and hasattr(obj, "free")
+
+
+def _chunk_cumulative_lengths(chunks: Sequence[Any]) -> list[int]:
+    total = 0
+    out = [0]
+    for chunk in chunks:
+        total += int(chunk.shape[0])
+        out.append(total)
+    return out
+
+
+def _frame_chunk_index(bounds: Sequence[int], frame: int) -> int:
+    for i in range(len(bounds) - 1):
+        if bounds[i] <= frame < bounds[i + 1]:
+            return i
+    return max(0, len(bounds) - 2)
+
+
+@lru_cache(maxsize=1)
+def _mlx_metal_fused_merge_single_chunk_kernel():
+    import mlx.core as mx
+
+    source = r"""
+        uint elem = thread_position_in_grid.x;
+        uint kw_o = elem % KW;
+        uint tmp0 = elem / KW;
+        uint kh_o = tmp0 % KH;
+        uint tmp1 = tmp0 / KH;
+        uint col_o = tmp1 % COUT;
+        uint row_o = tmp1 / COUT;
+
+        float row_src = float(row_o) + params[4] - params[5] - params[0];
+        float col_src = float(col_o) - params[5] - params[1];
+        int r0 = int(floor(row_src));
+        int c0 = int(floor(col_src));
+        float rf = row_src - float(r0);
+        float cf = col_src - float(c0);
+        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
+        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
+        int h0 = int(floor(kh_src));
+        int w0 = int(floor(kw_src));
+        float hf = kh_src - float(h0);
+        float wf = kw_src - float(w0);
+
+        float val = 0.0f;
+        float wi = 0.0f;
+        for (int sr = 0; sr < 2; sr++) {
+            int rr = r0 + sr;
+            if (rr < 0 || rr >= RS) continue;
+            float rw = sr == 0 ? (1.0f - rf) : rf;
+            for (int sc = 0; sc < 2; sc++) {
+                int cc = c0 + sc;
+                if (cc < 0 || cc >= CS) continue;
+                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
+                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
+                int local_frame = int(uint(rr) * CS + uint(cc)) - FRAME0;
+                for (int dh = 0; dh < 2; dh++) {
+                    int hh = h0 + dh;
+                    if (hh < 0 || hh >= KH) continue;
+                    float hw = dh == 0 ? (1.0f - hf) : hf;
+                    for (int dw = 0; dw < 2; dw++) {
+                        int ww = w0 + dw;
+                        if (ww < 0 || ww >= KW) continue;
+                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
+                        ulong pix = ulong(hh) * KW + ulong(ww);
+                        val += float(chunk[ulong(local_frame) * KH * KW + pix]) * weight;
+                    }
+                }
+            }
+        }
+        out[elem] = num[elem] + wi * val;
+        if (kh_o == 0 && kw_o == 0) wi_out[row_o * COUT + col_o] = wi;
+    """
+    return mx.fast.metal_kernel(
+        name="maped_fused_merge_single_chunk_u16",
+        input_names=["chunk", "num", "wrs", "params"],
+        output_names=["out", "wi_out"],
+        source=source,
+        ensure_row_contiguous=True,
+        compile_options={"math_mode": "fast"},
+    )
+
+
+@lru_cache(maxsize=1)
+def _mlx_metal_fused_merge_three_chunk_kernel():
+    import mlx.core as mx
+
+    source = _mlx_metal_fused_merge_kernel_source_three_chunk()
+    return mx.fast.metal_kernel(
+        name="maped_fused_merge_three_chunk_u16",
+        input_names=["c0buf", "c1buf", "c2buf", "num", "wrs", "params"],
+        output_names=["out", "wi_out"],
+        source=source,
+        ensure_row_contiguous=True,
+        compile_options={"math_mode": "fast"},
+    )
+
+
+def _mlx_metal_fused_merge_kernel_source_three_chunk() -> str:
+    return r"""
+        uint elem = thread_position_in_grid.x;
+        uint kw_o = elem % KW;
+        uint tmp0 = elem / KW;
+        uint kh_o = tmp0 % KH;
+        uint tmp1 = tmp0 / KH;
+        uint col_o = tmp1 % COUT;
+        uint row_o = tmp1 / COUT;
+
+        float row_src = float(row_o) + params[4] - params[5] - params[0];
+        float col_src = float(col_o) - params[5] - params[1];
+        int r0 = int(floor(row_src));
+        int c0 = int(floor(col_src));
+        float rf = row_src - float(r0);
+        float cf = col_src - float(c0);
+        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
+        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
+        int h0 = int(floor(kh_src));
+        int w0 = int(floor(kw_src));
+        float hf = kh_src - float(h0);
+        float wf = kw_src - float(w0);
+
+        float val = 0.0f;
+        float wi = 0.0f;
+        for (int sr = 0; sr < 2; sr++) {
+            int rr = r0 + sr;
+            if (rr < 0 || rr >= RS) continue;
+            float rw = sr == 0 ? (1.0f - rf) : rf;
+            for (int sc = 0; sc < 2; sc++) {
+                int cc = c0 + sc;
+                if (cc < 0 || cc >= CS) continue;
+                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
+                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
+                uint frame = uint(rr) * CS + uint(cc);
+                for (int dh = 0; dh < 2; dh++) {
+                    int hh = h0 + dh;
+                    if (hh < 0 || hh >= KH) continue;
+                    float hw = dh == 0 ? (1.0f - hf) : hf;
+                    for (int dw = 0; dw < 2; dw++) {
+                        int ww = w0 + dw;
+                        if (ww < 0 || ww >= KW) continue;
+                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
+                        ulong pix = ulong(hh) * KW + ulong(ww);
+                        if (frame < N0) {
+                            val += float(c0buf[ulong(frame) * KH * KW + pix]) * weight;
+                        } else if (frame < N0 + N1) {
+                            val += float(c1buf[ulong(frame - N0) * KH * KW + pix]) * weight;
+                        } else {
+                            val += float(c2buf[ulong(frame - N0 - N1) * KH * KW + pix]) * weight;
+                        }
+                    }
+                }
+            }
+        }
+        out[elem] = num[elem] + wi * val;
+        if (kh_o == 0 && kw_o == 0) wi_out[row_o * COUT + col_o] = wi;
+    """
+
+
+def _fused_merge_band_chunked_mlx_metal(
+    tilt: Any,
+    num_band: torch.Tensor | None,
+    w_rs: torch.Tensor,
+    batch_start: int,
+    batch_end: int,
+    cout: int,
+    real_space_padding: int,
+    real_shift_rc: torch.Tensor,
+    diffraction_shift_rc: torch.Tensor,
+    cast_dtype: torch.dtype,
+    method: str,
+    diffraction_padding: int,
+    diffraction_edge_blend: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        num_band is None
+        or num_band.device.type != "mps"
+        or cast_dtype != torch.float32
+        or method != "bilinear"
+        or int(diffraction_padding) != 0
+        or float(diffraction_edge_blend) != 0.0
+    ):
+        return None
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+
+    chunks = [chunk for chunk in tilt.chunks if chunk is not None]
+    if len(chunks) != 3 or any(str(chunk.dtype) != "uint16" for chunk in chunks):
+        return None
+    if not hasattr(tilt, "_mlx_chunks"):
+        tilt._mlx_chunks = [mx.from_dlpack(chunk) for chunk in chunks]
+
+    rows, cols = (int(x) for x in tilt.scan_shape)
+    _, k_rows, k_cols = (int(x) for x in tilt.shape)
+    batch_n = int(batch_end - batch_start)
+    params = torch.tensor(
+        [
+            float(real_shift_rc.reshape(-1)[0]),
+            float(real_shift_rc.reshape(-1)[1]),
+            float(diffraction_shift_rc.reshape(-1)[0]),
+            float(diffraction_shift_rc.reshape(-1)[1]),
+            float(batch_start),
+            float(real_space_padding),
+        ],
+        dtype=torch.float32,
+        device=num_band.device,
+    )
+    bounds = _chunk_cumulative_lengths(chunks)
+    row_min = max(0, math.floor(batch_start - real_space_padding - float(real_shift_rc[0])))
+    row_max = min(rows - 1, math.floor(batch_end - 1 - real_space_padding - float(real_shift_rc[0])) + 1)
+    col_min = max(0, math.floor(-real_space_padding - float(real_shift_rc[1])))
+    col_max = min(cols - 1, math.floor(cout - 1 - real_space_padding - float(real_shift_rc[1])) + 1)
+    frame_min = row_min * cols + col_min
+    frame_max = row_max * cols + col_max
+    c_min = _frame_chunk_index(bounds, frame_min)
+    c_max = _frame_chunk_index(bounds, frame_max)
+    if c_min == c_max:
+        kernel = _mlx_metal_fused_merge_single_chunk_kernel()
+        out, wi = kernel(
+            inputs=[tilt._mlx_chunks[c_min], mx.from_dlpack(num_band), mx.from_dlpack(w_rs), mx.from_dlpack(params)],
+            template=[
+                ("RS", rows),
+                ("CS", cols),
+                ("KH", k_rows),
+                ("KW", k_cols),
+                ("BATCH", batch_n),
+                ("COUT", cout),
+                ("FRAME0", bounds[c_min]),
+                ("T", mx.uint16),
+            ],
+            grid=(batch_n * cout * k_rows * k_cols, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[num_band.shape, (batch_n, cout)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+    else:
+        kernel = _mlx_metal_fused_merge_three_chunk_kernel()
+        out, wi = kernel(
+            inputs=[
+                tilt._mlx_chunks[0],
+                tilt._mlx_chunks[1],
+                tilt._mlx_chunks[2],
+                mx.from_dlpack(num_band),
+                mx.from_dlpack(w_rs),
+                mx.from_dlpack(params),
+            ],
+            template=[
+                ("RS", rows),
+                ("CS", cols),
+                ("KH", k_rows),
+                ("KW", k_cols),
+                ("BATCH", batch_n),
+                ("COUT", cout),
+                ("N0", bounds[1]),
+                ("N1", bounds[2] - bounds[1]),
+                ("T", mx.uint16),
+            ],
+            grid=(batch_n * cout * k_rows * k_cols, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[num_band.shape, (batch_n, cout)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+    mx.eval(out, wi)
+    return torch.from_dlpack(out), torch.from_dlpack(wi)
+
+
+@lru_cache(maxsize=1)
+def _mlx_metal_normalize_kernel():
+    import mlx.core as mx
+
+    source = r"""
+        uint elem = thread_position_in_grid.x;
+        uint kw = elem % KW;
+        uint tmp0 = elem / KW;
+        uint kh = tmp0 % KH;
+        uint tmp1 = tmp0 / KH;
+        uint col = tmp1 % COUT;
+        uint row = tmp1 / COUT;
+
+        float den = edge[kh * KW + kw];
+        for (uint i = 0; i < N; i++) {
+            den += wi_all[(i * ROUT + row) * COUT + col]
+                 * wdp[(i * KH + kh) * KW + kw];
+        }
+        float v = num[elem];
+        out[elem] = den == 0.0f ? 0.0f : v / den;
+    """
+    return mx.fast.metal_kernel(
+        name="maped_normalize",
+        input_names=["num", "wi_all", "wdp", "edge"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+        compile_options={"math_mode": "fast"},
+    )
+
+
+def _normalize_mlx_metal(
+    num: torch.Tensor,
+    wi_all: torch.Tensor,
+    wdp: torch.Tensor,
+    edge: torch.Tensor,
+) -> torch.Tensor | None:
+    if num.device.type != "mps" or num.dtype != torch.float32:
+        return None
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+
+    rout, cout, k_rows, k_cols = (int(x) for x in num.shape)
+    n = int(wi_all.shape[0])
+    kernel = _mlx_metal_normalize_kernel()
+    out = kernel(
+        inputs=[
+            mx.from_dlpack(num),
+            mx.from_dlpack(wi_all),
+            mx.from_dlpack(wdp),
+            mx.from_dlpack(edge),
+        ],
+        template=[
+            ("N", n),
+            ("ROUT", rout),
+            ("COUT", cout),
+            ("KH", k_rows),
+            ("KW", k_cols),
+        ],
+        grid=(rout * cout * k_rows * k_cols, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[num.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+    mx.eval(out)
+    return torch.from_dlpack(out)
 
 
 def tukey_torch(N, alpha=0.5, device=None, dtype=torch.float32):
