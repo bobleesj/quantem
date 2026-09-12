@@ -6,7 +6,7 @@ import MetalScientificNumerics
 /// Calls are serialized by the owner. Images and shifts remain GPU-resident.
 public final class MAPEDNative {
   public let operations: MetalImageOperations
-  public private(set) var sources: [MetalEncodedSource]
+  public private(set) var sources: [any MetalResidentCounts]
   public let shape: [Int]
   public private(set) var dp_mean: [GPUImage] = []
   public private(set) var im_bf: [GPUImage] = []
@@ -19,14 +19,25 @@ public final class MAPEDNative {
   /// Effective scientific settings, grouped by the existing stage names.
   public private(set) var parameters: [String: [String: Any]] = [:]
   public private(set) var scales: [Float] = []
+  private struct MergeWeights {
+    let scan: [Float]
+    let detector: [Float]
+    let scanWeights: [GPUImage]
+    let detectorWeights: [GPUImage]
+    let uncovered: GPUImage
+  }
+  private var mergeWeights: MergeWeights?
   private let ownsSources: Bool
 
-  private init(sources: [MetalEncodedSource], operations: MetalImageOperations, ownsSources: Bool)
+  private init(
+    sources: [any MetalResidentCounts], operations: MetalImageOperations, ownsSources: Bool
+  )
     throws
   {
     guard let first = sources.first,
       sources.allSatisfy({
         $0.shape == first.shape && !$0.isReleased && $0.readyFrames == $0.shape[0] * $0.shape[1]
+          && $0.device.registryID == operations.device.registryID
       })
     else {
       throw Self.invalid("Load at least one acquisition; all tilts must share a 4D shape.")
@@ -55,11 +66,13 @@ public final class MAPEDNative {
     result.timings["load"] = Date.timeIntervalSinceReferenceDate - started
     return result
   }
-  /// Borrow existing encoded acquisitions without changing their lifetime.
+  /// Borrow encoded or bit-packed count acquisitions without changing their lifetime.
   public static func from_resident(
-    _ sources: [MetalEncodedSource], operations: MetalImageOperations
+    _ sources: [any MetalResidentCounts], operations: MetalImageOperations
   ) throws -> MAPEDNative {
-    try MAPEDNative(sources: sources, operations: operations, ownsSources: false)
+    try MAPEDNative(
+      sources: sources.map { try $0.correctedHotPixels() }, operations: operations,
+      ownsSources: false)
   }
   /// Reuse complete-detector and complete-scan means calculated during loading.
   @discardableResult public func preprocess(scale: Float) throws -> MAPEDNative {
@@ -75,10 +88,9 @@ public final class MAPEDNative {
       throw Self.invalid("scale needs a finite nonzero value or one such value per tilt.")
     }
     // As in MAPEDTorch, scale is a summary-display control; it does not change counts.
-    dp_mean = sources.map {
-      GPUImage(buffer: $0.meanDiffraction, rows: shape[2], columns: shape[3])
-    }
-    im_bf = sources.map { GPUImage(buffer: $0.meanBrightField, rows: shape[0], columns: shape[1]) }
+    let means = try sources.map { try $0.countMeans() }
+    dp_mean = means.map { GPUImage(buffer: $0.diffraction, rows: shape[2], columns: shape[3]) }
+    im_bf = means.map { GPUImage(buffer: $0.brightField, rows: shape[0], columns: shape[1]) }
     scales = scale ?? Array(repeating: 1, count: sources.count)
     parameters["preprocess"] = ["scale": scales]
     return self
@@ -144,6 +156,7 @@ public final class MAPEDNative {
     }
     try operations.centerShifts(shifts)
     diffraction_shifts = shifts
+    mergeWeights = nil
     merged?.releaseResidentStorage()
     merged = nil
     parameters["diffraction_align"] = [
@@ -206,6 +219,7 @@ public final class MAPEDNative {
     }
     try operations.centerShifts(shifts, count: n)
     real_space_shifts = shifts
+    mergeWeights = nil
     merged?.releaseResidentStorage()
     merged = nil
     parameters["real_space_align"] = [
@@ -222,6 +236,10 @@ public final class MAPEDNative {
   /// Produce one float32 region using the established resident merge weights.
   /// This is the numerical sampling boundary for independent native parity tests.
   public func merged_region(_ rows: Range<Int>) throws -> GPUImage {
+    try mergedRegion(rows, workspace: nil)
+  }
+  private func mergedRegion(_ rows: Range<Int>, workspace: (GPUImage, GPUImage)?) throws -> GPUImage
+  {
     guard !sources.isEmpty, sources.allSatisfy({ !$0.isReleased }) else {
       throw Self.invalid(
         "Resident inputs are no longer available; read the saved result or load inputs again.")
@@ -235,27 +253,50 @@ public final class MAPEDNative {
       throw Self.invalid(
         "Select nonempty scan rows containing at most 4096 frames inside the acquisition.")
     }
-    let mask = try operations.interiorWindow(rows: shape[0], columns: shape[1])
-    let ones = try operations.image(rows: shape[2], columns: shape[3], value: 1)
-    let scanWeights = try sources.indices.map {
-      try operations.shiftedScanMask(mask, shifts: scan, index: $0)
+    // Small shift arrays are control metadata; cache the GPU weights until
+    // either alignment changes, including changes to an exposed shift buffer.
+    let scanValues = scan.values()
+    let detectorValues = detector.values()
+    if mergeWeights?.scan != scanValues || mergeWeights?.detector != detectorValues {
+      let mask = try operations.interiorWindow(rows: shape[0], columns: shape[1])
+      let ones = try operations.image(rows: shape[2], columns: shape[3], value: 1)
+      let scanWeights = try sources.indices.map {
+        try operations.shiftedScanMask(mask, shifts: scan, index: $0)
+      }
+      let detectorWeights = try sources.indices.map {
+        try operations.shifted(ones, shifts: detector, index: $0)
+      }
+      mergeWeights = MergeWeights(
+        scan: scanValues, detector: detectorValues, scanWeights: scanWeights,
+        detectorWeights: detectorWeights, uncovered: try operations.uncoveredWeight(detectorWeights)
+      )
     }
-    let detectorWeights = try sources.indices.map {
-      try operations.shifted(ones, shifts: detector, index: $0)
+    let weights = mergeWeights!
+    let numerator: GPUImage
+    let denominator: GPUImage
+    if let workspace {
+      // Views expose only the active tail region; scientific reductions never
+      // include stale values outside these row/column dimensions.
+      numerator = GPUImage(
+        buffer: workspace.0.buffer, rows: rows.count * shape[1], columns: shape[2] * shape[3])
+      denominator = GPUImage(
+        buffer: workspace.1.buffer, rows: rows.count * shape[1], columns: shape[2] * shape[3])
+      try operations.fill(numerator)
+      try operations.fill(denominator)
+    } else {
+      numerator = try operations.image(rows: rows.count * shape[1], columns: shape[2] * shape[3])
+      denominator = try operations.image(rows: rows.count * shape[1], columns: shape[2] * shape[3])
     }
-    let edge = try operations.uncoveredWeight(detectorWeights)
-    let numerator = try operations.image(rows: rows.count * shape[1], columns: shape[2] * shape[3])
-    let denominator = try operations.image(
-      rows: rows.count * shape[1], columns: shape[2] * shape[3])
     for index in sources.indices {
       try operations.accumulateTranslated(
         source: sources[index], outputRows: rows,
         scanShifts: scan, detectorShifts: detector, index: index,
-        scanWeight: scanWeights[index], detectorWeight: detectorWeights[index],
+        scanWeight: weights.scanWeights[index], detectorWeight: weights.detectorWeights[index],
         numerator: numerator, denominator: denominator)
       recordPeak()
     }
-    return try operations.finishWeighted(numerator, denominator: denominator, uncovered: edge)
+    return try operations.finishWeighted(
+      numerator, denominator: denominator, uncovered: weights.uncovered)
   }
   /// Merge bounded float32 regions, save globally scaled uint16, then reopen
   /// the complete result in packed GPU memory. Scientific keyword names and
@@ -288,10 +329,16 @@ public final class MAPEDNative {
     let regions = stride(from: 0, to: shape[0], by: rowsPerRegion).map {
       $0..<min(shape[0], $0 + rowsPerRegion)
     }
+    var workspace: (GPUImage, GPUImage)? = (
+      try operations.image(
+        rows: min(shape[0], rowsPerRegion) * shape[1], columns: shape[2] * shape[3]),
+      try operations.image(
+        rows: min(shape[0], rowsPerRegion) * shape[1], columns: shape[2] * shape[3])
+    )
     var started = Date.timeIntervalSinceReferenceDate
     for rows in regions {
       try autoreleasepool {
-        let values = try merged_region(rows)
+        let values = try mergedRegion(rows, workspace: workspace)
         try precision.includeRange(values.buffer, count: values.rows * values.columns)
         recordPeak()
       }
@@ -304,7 +351,7 @@ public final class MAPEDNative {
     for rows in regions {
       try autoreleasepool {
         var phase = Date.timeIntervalSinceReferenceDate
-        let values = try merged_region(rows)
+        let values = try mergedRegion(rows, workspace: workspace)
         generation += Date.timeIntervalSinceReferenceDate - phase
         phase = Date.timeIntervalSinceReferenceDate
         let codes = try precision.convert(values.buffer, count: values.rows * values.columns)
@@ -329,7 +376,8 @@ public final class MAPEDNative {
     let summary: [String: Any] = [
       "version": 1, "source_count": sources.count,
       "hot_pixel_correction": [
-        "methods": ["median"], "applied_to_every_source": true,
+        "methods": sources.map { $0.hotPixelCorrection },
+        "applied_to_every_source": sources.allSatisfy { $0.hotPixelCorrection == "median" },
         "pixel_counts": sources.map { $0.hotPixelIndices.count },
       ],
       "mean_bright_field": [
@@ -350,7 +398,10 @@ public final class MAPEDNative {
       return stride(from: 0, to: flat.count, by: 2).map { [flat[$0], flat[$0 + 1]] }
     }
     let mergeMetadata: [String: Any] = [
-      "version": 1, "backend": "metal", "source_representation": "encoded",
+      "version": 1, "backend": "metal",
+      "source_representation": Set(sources.map { $0.representation.rawValue }).count == 1
+        ? sources[0].representation.rawValue : "mixed",
+      "source_representations": sources.map { $0.representation.rawValue },
       "region_frames": rowsPerRegion * shape[1],
       "released_sources_before_reopen": ownsSources,
       "real_space_shifts_row_column": pairs(real_space_shifts),
@@ -361,6 +412,7 @@ public final class MAPEDNative {
       "quantem_precision_v1": json(report), "quantem_maped_summary_v1": json(summary),
       "quantem_maped_merge_v1": json(mergeMetadata),
     ])
+    workspace = nil
     timings["merge_write"] = Date.timeIntervalSinceReferenceDate - started
     timings["merge_generation_write_pass"] = generation
     timings["precision_conversion"] = conversion
@@ -390,6 +442,7 @@ public final class MAPEDNative {
   public func close() {
     if ownsSources { for source in sources { source.releaseResidentStorage() } }
     sources.removeAll()
+    mergeWeights = nil
     dp_mean.removeAll()
     im_bf.removeAll()
     diffraction_shifts = nil
@@ -399,7 +452,8 @@ public final class MAPEDNative {
   }
   private func recordPeak() {
     peak_metal_bytes = max(
-      peak_metal_bytes, operations.allocatedBytes(), sources.map(\.peakAllocatedBytes).max() ?? 0)
+      peak_metal_bytes, operations.allocatedBytes(),
+      sources.compactMap { ($0 as? MetalEncodedSource)?.peakAllocatedBytes }.max() ?? 0)
   }
   private static func invalid(_ message: String) -> Metal4DSTEMStreamingIOError {
     .invalidRequest(message)

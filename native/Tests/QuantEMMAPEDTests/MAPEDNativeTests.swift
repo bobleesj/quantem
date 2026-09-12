@@ -1,10 +1,218 @@
 import CNativeHDF5
+import Metal
 import Metal4DSTEMStreamingIO
 import MetalScientificNumerics
+import Native4DSTEMIO
 import QuantEMMAPED
 import XCTest
 
 final class MAPEDNativeTests: XCTestCase {
+  func testMergeExportReusesWorkspaceWithPartialFinalRegion() throws {
+    let ops = try MetalImageOperations()
+    let shape = [65, 64, 64, 64]
+    let source = try MetalEncodedSource(shape: shape, device: ops.device)
+    defer { source.releaseResidentStorage() }
+    for frames in [4096, 64] {
+      let raw = ops.device.makeBuffer(length: frames * 4096 * 2, options: .storageModeShared)!
+      let command = ops.queue.makeCommandBuffer()!
+      let fill = command.makeBlitCommandEncoder()!
+      fill.fill(buffer: raw, range: 0..<raw.length, value: 1)
+      fill.endEncoding()
+      command.commit()
+      command.waitUntilCompleted()
+      try source.append(raw, frames: frames, verify: true)
+    }
+    let maped = try MAPEDNative.from_resident([source], operations: ops)
+    defer { maped.close() }
+    try maped.preprocess()
+    try maped.diffraction_origin(sigma: 1)
+    try maped.diffraction_align(edge_blend: 2, upsample_factor: 1)
+    try maped.real_space_align(num_iter: 1, upsample_factor: 1)
+    let expected = try maped.merged_region(64..<65).values()
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let result = try maped.merge_datasets(
+      save_to: folder.appendingPathComponent("tail_master.h5"), verbose: false)
+    XCTAssertEqual(
+      (result.metadata["values"] as? NSNumber)?.uint64Value, UInt64(shape.reduce(1, *)))
+    let scale = result.metadata["scale"] as! Double
+    let offset = result.metadata["offset"] as! Double
+    let rounded = expected.map {
+      Float(((Double($0) - offset) / scale).rounded(.toNearestOrEven) * scale + offset)
+    }
+    let restored = try result.read((64 * 64)..<(65 * 64))
+    let values = Array(
+      UnsafeBufferPointer(
+        start: restored.contents().assumingMemoryBound(to: Float.self), count: expected.count))
+    XCTAssertEqual(values.map(\.bitPattern), rounded.map(\.bitPattern))
+    XCTAssertFalse(source.isReleased)
+  }
+
+  func testBorrowedMaskedUInt32CountsUseMedianWithoutChangingStorage() throws {
+    let fixture = try numpyFixture()
+    let ops = try MetalImageOperations()
+    let raw = (fixture["raw"] as! [Int]).map(UInt32.init)
+    let source = try MaskedCountFixture(
+      shape: fixture["shape"] as! [Int],
+      values: raw, bad: fixture["bad"] as! [Int], device: ops.device)
+    let corrected = try source.correctedHotPixels()
+    let read = try corrected.read(0..<source.readyFrames)
+    XCTAssertEqual(
+      Array(
+        UnsafeBufferPointer(
+          start: read.contents().assumingMemoryBound(to: UInt32.self), count: raw.count)),
+      (fixture["corrected"] as! [Int]).map(UInt32.init))
+    let maped = try MAPEDNative.from_resident([source], operations: ops)
+    try maped.preprocess()
+    XCTAssertEqual(maped.dp_mean[0].values(), (fixture["dp_mean"] as! [Double]).map(Float.init))
+    XCTAssertEqual(maped.im_bf[0].values(), (fixture["im_bf"] as! [Double]).map(Float.init))
+    maped.close()
+    corrected.releaseResidentStorage()
+    XCTAssertFalse(source.isReleased)
+    let original = try source.read(0..<1)
+    for pixel in source.hotPixelIndices {
+      XCTAssertEqual(original.contents().load(fromByteOffset: pixel * 4, as: UInt32.self), 0)
+    }
+    let large = UInt32.max
+    let overflow = try MaskedCountFixture(
+      shape: [1, 1, 3, 3],
+      values: [large - 1, large, large - 1, large, 0, large - 1, large, large - 1, large], bad: [4],
+      device: ops.device)
+    let median = try overflow.correctedHotPixels().read(0..<1)
+    XCTAssertEqual(median.contents().load(fromByteOffset: 16, as: UInt32.self), large - 1)
+    let empty = try MaskedCountFixture(
+      shape: [1, 1, 2, 2], values: [9, 9, 9, 9], bad: [0, 1, 2, 3], device: ops.device)
+    let zero = try empty.correctedHotPixels().read(0..<1)
+    XCTAssertEqual(
+      Array(
+        UnsafeBufferPointer(start: zero.contents().assumingMemoryBound(to: UInt32.self), count: 4)),
+      [0, 0, 0, 0])
+  }
+
+  func testPreparedSamplingMatchesReferenceAtBoundariesAndAfterShiftChanges() throws {
+    let previous = ProcessInfo.processInfo.environment["QUANTEM_GPU_SAMPLING_REFERENCE"]
+    defer {
+      if let previous {
+        setenv("QUANTEM_GPU_SAMPLING_REFERENCE", previous, 1)
+      } else {
+        unsetenv("QUANTEM_GPU_SAMPLING_REFERENCE")
+      }
+    }
+    setenv("QUANTEM_GPU_SAMPLING_REFERENCE", "1", 1)
+    let reference = try MetalImageOperations()
+    unsetenv("QUANTEM_GPU_SAMPLING_REFERENCE")
+    let candidate = try MetalImageOperations()
+    for shape in [[4, 9, 11, 13], [2, 5, 3, 5], [8, 8, 64, 64]] {
+      let frames = shape[0] * shape[1]
+      let pixels = shape[2] * shape[3]
+      for itemBytes in [1, 2] {
+        let source = try MetalEncodedSource(
+          shape: shape, itemBytes: itemBytes, device: candidate.device)
+        defer { source.releaseResidentStorage() }
+        let raw = candidate.device.makeBuffer(
+          length: frames * pixels * itemBytes, options: .storageModeShared)!
+        for i in 0..<(frames * pixels) {
+          if itemBytes == 1 {
+            raw.contents().storeBytes(of: UInt8((i * 37) % 256), toByteOffset: i, as: UInt8.self)
+          } else {
+            raw.contents().storeBytes(
+              of: UInt16((i * 37) % 65536), toByteOffset: i * 2, as: UInt16.self)
+          }
+        }
+        try source.append(raw, frames: frames, verify: true)
+        let scanWeight = try candidate.image(
+          values: (0..<frames).map { Float($0 % 13) / 13 }, rows: shape[0], columns: shape[1])
+        let detectorWeight = try candidate.image(
+          values: (0..<pixels).map { Float($0 % 17) / 17 }, rows: shape[2], columns: shape[3])
+        for shifts: [Float] in [
+          [0, 0, 0, 0], [0.3, -1.7, -0.42, 1.23], [-1, 1, 1, -1], [0, 0, 0, 0],
+        ] {
+          let scan = try candidate.image(values: Array(shifts[0..<2]), rows: 1, columns: 2)
+          let detector = try candidate.image(values: Array(shifts[2..<4]), rows: 1, columns: 2)
+          var outputs: [[UInt32]] = []
+          for operations in [reference, candidate] {
+            let numerator = try operations.image(rows: frames, columns: pixels)
+            let denominator = try operations.image(rows: frames, columns: pixels)
+            try operations.accumulateTranslated(
+              source: source, outputRows: 0..<shape[0],
+              scanShifts: scan, detectorShifts: detector, index: 0,
+              scanWeight: scanWeight, detectorWeight: detectorWeight,
+              numerator: numerator, denominator: denominator)
+            outputs.append((numerator.values() + denominator.values()).map(\.bitPattern))
+          }
+          XCTAssertEqual(
+            outputs[0], outputs[1], "shape=\(shape), bytes=\(itemBytes), shifts=\(shifts)")
+        }
+      }
+    }
+  }
+
+  func testPackedAndEncodedResidentsPreserveCountsAlignmentAndOwnership() throws {
+    let ops = try MetalImageOperations()
+    let shape = [8, 8, 64, 64]
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    var encoded: [MetalEncodedSource] = []
+    var packed: [MetalCompactH5ResidentSource] = []
+    for tilt in 0..<3 {
+      let values = (0..<(64 * 4096)).map {
+        UInt16(($0 * 37 + ($0 / 4096) * 19 + tilt * 113) % 65536)
+      }
+      let raw = ops.device.makeBuffer(length: values.count * 2, options: .storageModeShared)!
+      values.withUnsafeBytes { _ = memcpy(raw.contents(), $0.baseAddress!, $0.count) }
+      let source = try MetalEncodedSource(shape: shape, device: ops.device)
+      try source.append(raw, frames: 64, verify: true)
+      encoded.append(source)
+      let file = folder.appendingPathComponent("tilt-\(tilt)_master.h5")
+      let writer = try MetalHDF5Writer(
+        path: file, shape: shape, runtime: MetalPrecision(device: ops.device))
+      try writer.append(raw, frames: 64)
+      try writer.finish(metadata: [:])
+      let catalog = try Native4DSTEMCatalogBuilder(
+        cacheDirectory: folder.appendingPathComponent("index")
+      ).prepare(input: file)
+      let indexed = try Native4DSTEMIndexedSource.open(dataset: catalog.datasets[0])
+      let resident = try MetalCompactH5Loader.load(source: indexed, device: ops.device)
+      packed.append(resident)
+      let decoded = try resident.read(7..<23)
+      XCTAssertEqual(
+        Array(
+          UnsafeBufferPointer(
+            start: decoded.contents().assumingMemoryBound(to: UInt32.self), count: 16 * 4096)),
+        values[(7 * 4096)..<(23 * 4096)].map(UInt32.init))
+    }
+    defer {
+      encoded.forEach { $0.releaseResidentStorage() }
+      packed.forEach { $0.releaseResidentStorage() }
+    }
+    let reference = try MAPEDNative.from_resident(encoded, operations: ops)
+    let candidate = try MAPEDNative.from_resident(packed, operations: ops)
+    for workflow in [reference, candidate] {
+      try workflow.preprocess()
+      try workflow.diffraction_origin(sigma: 1)
+      try workflow.diffraction_align(edge_blend: 2, upsample_factor: 3)
+      try workflow.real_space_align(num_iter: 1, upsample_factor: 3)
+    }
+    XCTAssertEqual(reference.dp_mean.map { $0.values() }, candidate.dp_mean.map { $0.values() })
+    XCTAssertEqual(reference.im_bf.map { $0.values() }, candidate.im_bf.map { $0.values() })
+    XCTAssertEqual(reference.diffraction_origins, candidate.diffraction_origins)
+    XCTAssertEqual(reference.diffraction_shifts!.values(), candidate.diffraction_shifts!.values())
+    XCTAssertEqual(reference.real_space_shifts!.values(), candidate.real_space_shifts!.values())
+    XCTAssertEqual(
+      try reference.merged_region(0..<8).values(), try candidate.merged_region(0..<8).values())
+    candidate.close()
+    reference.close()
+    XCTAssertTrue(packed.allSatisfy { !$0.isReleased })
+    XCTAssertTrue(encoded.allSatisfy { !$0.isReleased })
+    XCTAssertThrowsError(try packed[0].read(-1..<1))
+    let savedRead = try packed[0].read(0..<1)
+    packed[0].releaseResidentStorage()
+    XCTAssertThrowsError(try packed[0].read(0..<1))
+    XCTAssertEqual(savedRead.contents().load(as: UInt32.self), 0)
+  }
+
   func testEncodedCountsAndMedianMatchNumpy() throws {
     let fixture = try numpyFixture()
     let ops = try MetalImageOperations()
@@ -146,7 +354,21 @@ final class MAPEDNativeTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: folder) }
     let path = folder.appendingPathComponent("scaled_master.h5")
     let writer = try MetalHDF5Writer(path: path, shape: shape, runtime: precision)
-    try writer.append(codes, frames: 17 * 19)
+    var first = 0
+    for frames in [7, 64, 5, 128, 119] {
+      let bytes = frames * 4096 * 2
+      let piece = ops.device.makeBuffer(length: bytes, options: .storageModeShared)!
+      let command = ops.queue.makeCommandBuffer()!
+      let blit = command.makeBlitCommandEncoder()!
+      blit.copy(
+        from: codes, sourceOffset: first * 4096 * 2, to: piece, destinationOffset: 0, size: bytes)
+      blit.endEncoding()
+      command.commit()
+      command.waitUntilCompleted()
+      try writer.append(piece, frames: frames)
+      first += frames
+    }
+    XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
     let json = String(data: try JSONSerialization.data(withJSONObject: report), encoding: .utf8)!
     try writer.finish(metadata: ["quantem_precision_v1": json])
     let reopened = try MetalPackedSource.load(
@@ -159,6 +381,15 @@ final class MAPEDNativeTests: XCTestCase {
     XCTAssertEqual(reopened.metadata["scale"] as? Double, scale)
     reopened.releaseResidentStorage()
     XCTAssertEqual(reopened.residentBytes, 0)
+    let cancelledPath = folder.appendingPathComponent("cancelled_master.h5")
+    let cancelled = try MetalHDF5Writer(path: cancelledPath, shape: shape, runtime: precision)
+    try cancelled.append(codes, frames: 7)
+    cancelled.cancel()
+    XCTAssertThrowsError(try cancelled.finish(metadata: [:]))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: cancelledPath.path))
+    XCTAssertFalse(
+      try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        .contains { $0.hasPrefix(".cancelled_master.h5.") })
   }
   func testFourierRoundTripAndTranslation() throws {
     let ops = try MetalImageOperations()
@@ -271,4 +502,46 @@ final class MAPEDNativeTests: XCTestCase {
     XCTAssertThrowsError(try maped.merged_region(0..<1))
     XCTAssertTrue(sources.allSatisfy { !$0.isReleased })
   }
+}
+
+/// Small independent GPU fixture for an existing resident's exclusion-mask contract.
+private final class MaskedCountFixture: MetalResidentCounts {
+  let shape: [Int]
+  let itemBytes = 4
+  let hotPixelIndices: [Int]
+  let hotPixelCorrection = "exclude"
+  let device: MTLDevice
+  let representation: Metal4DSTEMResidentRepresentation = .packed
+  private var storage: MTLBuffer?
+  var readyFrames: Int { shape[0] * shape[1] }
+  var isReleased: Bool { storage == nil }
+  var residentBytes: Int { storage?.length ?? 0 }
+  init(shape: [Int], values: [UInt32], bad: [Int], device: MTLDevice) throws {
+    self.shape = shape
+    self.hotPixelIndices = bad
+    self.device = device
+    let buffer = device.makeBuffer(length: values.count * 4, options: .storageModeShared)!
+    let pixels = shape[2] * shape[3]
+    for (i, value) in values.enumerated() {
+      buffer.contents().storeBytes(
+        of: bad.contains(i % pixels) ? UInt32(0) : value,
+        toByteOffset: i * 4, as: UInt32.self)
+    }
+    storage = buffer
+  }
+  func encodeRead(_ frames: Range<Int>, into result: MTLBuffer, command: MTLCommandBuffer) throws {
+    guard let storage, frames.lowerBound >= 0, frames.upperBound <= readyFrames else {
+      throw Metal4DSTEMStreamingIOError.invalidRequest("Read live fixture frames.")
+    }
+    let bytes = shape[2] * shape[3] * 4
+    let copy = command.makeBlitCommandEncoder()!
+    copy.copy(
+      from: storage, sourceOffset: frames.lowerBound * bytes, to: result, destinationOffset: 0,
+      size: frames.count * bytes)
+    copy.endEncoding()
+  }
+  func countMeans() throws -> (diffraction: MTLBuffer, brightField: MTLBuffer) {
+    throw Metal4DSTEMStreamingIOError.invalidRequest("Means must use the corrected GPU view.")
+  }
+  func releaseResidentStorage() { storage = nil }
 }

@@ -1,0 +1,220 @@
+{
+  "load_runs": [
+    {
+      "device": "Apple M5 Max",
+      "input_resident_bytes": 7524707756,
+      "pass": 0,
+      "peak_metal_bytes": 8475410432,
+      "setup_seconds": 0.035498976707458496,
+      "tilts": [
+        {
+          "index_seconds": 0.0212399959564209,
+          "resident_bytes": 1073987949,
+          "resident_preparation_seconds": 1.7269160747528076,
+          "source_read_passes": 1,
+          "tilt": 0,
+          "total_seconds": 1.7481560707092285
+        },
+        {
+          "index_seconds": 0.018438100814819336,
+          "resident_bytes": 1058537481,
+          "resident_preparation_seconds": 2.517874002456665,
+          "source_read_passes": 1,
+          "tilt": 1,
+          "total_seconds": 2.5363121032714844
+        },
+        {
+          "index_seconds": 0.019198060035705566,
+          "resident_bytes": 1066769915,
+          "resident_preparation_seconds": 1.950969934463501,
+          "source_read_passes": 1,
+          "tilt": 2,
+          "total_seconds": 1.9701679944992065
+        },
+        {
+          "index_seconds": 0.022920966148376465,
+          "resident_bytes": 1183322576,
+          "resident_preparation_seconds": 2.1086020469665527,
+          "source_read_passes": 1,
+          "tilt": 3,
+          "total_seconds": 2.131523013114929
+        },
+        {
+          "index_seconds": 0.020315051078796387,
+          "resident_bytes": 1057454304,
+          "resident_preparation_seconds": 2.1499909162521362,
+          "source_read_passes": 1,
+          "tilt": 4,
+          "total_seconds": 2.1703059673309326
+        },
+        {
+          "index_seconds": 0.022047996520996094,
+          "resident_bytes": 1054748359,
+          "resident_preparation_seconds": 2.0787469148635864,
+          "source_read_passes": 1,
+          "tilt": 5,
+          "total_seconds": 2.1007949113845825
+        },
+        {
+          "index_seconds": 0.021028995513916016,
+          "resident_bytes": 1029887172,
+          "resident_preparation_seconds": 2.0113919973373413,
+          "source_read_passes": 1,
+          "tilt": 6,
+          "total_seconds": 2.0324209928512573
+        }
+      ],
+      "total_seconds": 14.725429058074951
+    },
+    {
+      "device": "Apple M5 Max",
+      "input_resident_bytes": 7524707756,
+      "pass": 1,
+      "peak_metal_bytes": 8479604736,
+      "setup_seconds": 0.0025070905685424805,
+      "tilts": [
+        {
+          "index_seconds": 0.01933896541595459,
+          "resident_bytes": 1073987949,
+          "resident_preparation_seconds": 1.949228048324585,
+          "source_read_passes": 1,
+          "tilt": 0,
+          "total_seconds": 1.9685670137405396
+        },
+        {
+          "index_seconds": 0.020980000495910645,
+          "resident_bytes": 1058537481,
+          "resident_preparation_seconds": 2.0190149545669556,
+          "source_read_passes": 1,
+          "tilt": 1,
+          "total_seconds": 2.039994955062866
+        },
+        {
+          "index_seconds": 0.024096965789794922,
+          "resident_bytes": 1066769915,
+          "resident_preparation_seconds": 1.990797996520996,
+          "source_read_passes": 1,
+          "tilt": 2,
+          "total_seconds": 2.014894962310791
+        },
+        {
+          "index_seconds": 0.022225022315979004,
+          "resident_bytes": 1183322576,
+          "resident_preparation_seconds": 1.9397059679031372,
+          "source_read_passes": 1,
+          "tilt": 3,
+          "total_seconds": 1.9619309902191162
+        },
+        {
+          "index_seconds": 0.024149060249328613,
+          "resident_bytes": 1057454304,
+          "resident_preparation_seconds": 1.8923559188842773,
+          "source_read_passes": 1,
+          "tilt": 4,
+          "total_seconds": 1.916504979133606
+        },
+        {
+          "index_seconds": 0.025596022605895996,
+          "resident_bytes": 1054748359,
+          "resident_preparation_seconds": 1.8726749420166016,
+          "source_read_passes": 1,
+          "tilt": 5,
+          "total_seconds": 1.8982709646224976
+        },
+        {
+          "index_seconds": 0.02368903160095215,
+          "resident_bytes": 1029887172,
+          "resident_preparation_seconds": 1.8636349439620972,
+          "source_read_passes": 1,
+          "tilt": 6,
+          "total_seconds": 1.8873239755630493
+        }
+      ],
+      "total_seconds": 13.69010603427887
+    },
+    {
+      "device": "Apple M5 Max",
+      "input_resident_bytes": 7524707756,
+      "pass": 2,
+      "peak_metal_bytes": 8483799040,
+      "setup_seconds": 0.00413203239440918,
+      "tilts": [
+        {
+          "index_seconds": 0.025800108909606934,
+          "resident_bytes": 1073987949,
+          "resident_preparation_seconds": 1.885975956916809,
+          "source_read_passes": 1,
+          "tilt": 0,
+          "total_seconds": 1.911776065826416
+        },
+        {
+          "index_seconds": 0.030523061752319336,
+          "resident_bytes": 1058537481,
+          "resident_preparation_seconds": 1.9846059083938599,
+          "source_read_passes": 1,
+          "tilt": 1,
+          "total_seconds": 2.015128970146179
+        },
+        {
+          "index_seconds": 0.03538691997528076,
+          "resident_bytes": 1066769915,
+          "resident_preparation_seconds": 2.0215210914611816,
+          "source_read_passes": 1,
+          "tilt": 2,
+          "total_seconds": 2.0569080114364624
+        },
+        {
+          "index_seconds": 0.042881011962890625,
+          "resident_bytes": 1183322576,
+          "resident_preparation_seconds": 2.0221540927886963,
+          "source_read_passes": 1,
+          "tilt": 3,
+          "total_seconds": 2.065035104751587
+        },
+        {
+          "index_seconds": 0.03036808967590332,
+          "resident_bytes": 1057454304,
+          "resident_preparation_seconds": 1.8764959573745728,
+          "source_read_passes": 1,
+          "tilt": 4,
+          "total_seconds": 1.906864047050476
+        },
+        {
+          "index_seconds": 0.02966594696044922,
+          "resident_bytes": 1054748359,
+          "resident_preparation_seconds": 1.8886960744857788,
+          "source_read_passes": 1,
+          "tilt": 5,
+          "total_seconds": 1.918362021446228
+        },
+        {
+          "index_seconds": 0.02899301052093506,
+          "resident_bytes": 1029887172,
+          "resident_preparation_seconds": 1.8894519805908203,
+          "source_read_passes": 1,
+          "tilt": 6,
+          "total_seconds": 1.9184449911117554
+        }
+      ],
+      "total_seconds": 13.796831011772156
+    }
+  ],
+  "qualification": {
+    "host": "Phil",
+    "device": "Apple M5 Max",
+    "physical_memory_gib": 128,
+    "input_shape": [
+      512,
+      512,
+      192,
+      192
+    ],
+    "tilts": 7,
+    "representation": "encoded",
+    "hot_pixel_correction": "median",
+    "cache_state": "existing index; OS file cache uncontrolled; repeated in one process",
+    "boundary": "sequential raw HDF5 through GPU-corrected encoded residency and summary generation; no merge, export or UI",
+    "revision_note": "2026-09-12 native working tree; diagnostic timing mode, no load algorithm change",
+    "process_peak_footprint_bytes": 8639990736
+  }
+}

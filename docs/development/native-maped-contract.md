@@ -56,3 +56,41 @@ are not an absolute intensity tolerance for every possible future dataset.
 Saved selected DPs must match a float64 NumPy scale/round/restore oracle exactly.
 The [2026-09-12 physical Metal run](../../native/Benchmarks/results/2026-09-12-metal/README.md)
 records the achieved errors and memory measurements.
+
+## Measuring input preparation
+
+Use `MAPED_LOAD_PASSES=3 maped-native-benchmark INPUT_DIRECTORY REPORT_JSON`
+to time each tilt and the seven-tilt total while retaining all seven encoded
+inputs. This benchmark uses the existing sequential public loader. Each tilt's
+resident-preparation time includes file reading, GPU decompression, median
+correction, ANS encoding, and summary generation. Indexing is reported separately;
+alignment, merging, saving, and viewing are excluded.
+
+On Phil's Apple M5 Max, the 2026-09-12 repeats took **14.73, 13.69, and 13.80 s**
+for all seven inputs. Individual tilts in the later two repeats took
+**1.89–2.07 s**. Input residency was **7.008 GiB** and peak Metal allocation was
+**7.901 GiB**. Every source was read once. These are repeated loads with an
+existing index and uncontrolled OS file cache, not a cold-storage guarantee.
+The [per-tilt measurements](../../native/Benchmarks/results/2026-09-12-metal-load/phil-load.json)
+also record process footprint and timing boundaries. This loading benchmark
+does not establish full-workflow memory or parity qualification on a 24 GiB Mac.
+
+A subsequent [full native diagnostic run](../../native/Benchmarks/results/2026-09-12-metal-load/phil-end-to-end-diagnostic.json)
+took **85.71 s** through packed GPU reopening: loading 11.28 s, alignment and
+preparation 0.73 s, range pass 29.86 s, second-pass generation 28.80 s,
+scaled-uint16 conversion/error measurement 1.30 s, GPU HDF5 compression 5.73 s,
+file writing 3.86 s, and packed reopening 4.02 s. Total excludes validation-file
+export and UI rendering. The sampled 150,994,944 float32 values matched the
+frozen native reference bit-for-bit.
+
+This historical run exposed a performance difference from the earlier
+15–16 s merge passes. Restoring separate decode and sampling submissions
+still measured 26.85 and 27.27 s per pass, so combining command buffers does
+not explain most of the difference. Keep these diagnostic timings distinct
+from the earlier measurements; no new speedup or physical 24 GiB qualification
+is established by this run.
+
+The subsequent [native Metal optimization](native-maped-processing-performance.md)
+reduced the complete workflow to **22.56 and 22.87 s**, with unchanged saved
+precision metrics. Use those current measurements; retain the diagnostic run
+above as the before baseline.

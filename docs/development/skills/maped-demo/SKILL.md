@@ -46,6 +46,14 @@ the full packed result; preserve caller-owned inputs from `from_resident`.
 
 ## Qualification and timing
 
+Hardware: **Rodman is an Apple M5 Mac (Mac17,2) with 24 GiB unified memory
+and Torch MPS support**, not an NVIDIA CUDA host. Use Rodman for physical
+24 GiB Mac qualification. Phil is an Apple M5 Max with 128 GiB; a memory cap
+on Phil does not replace a physical Rodman run. Verify hardware and available
+memory before each qualification, and record system swap before and after.
+Rodman's local seven-tilt acquisition differs from Phil's reference data;
+do not compare their timings or error measurements as a paired experiment.
+
 Read [the current Torch MPS inspection and performance qualification](../../mps-maped-inspection-performance.md)
 for commands, exact timing boundaries, and evidence. On physical Phil M5 Max,
 the complete seven-tilt workflow now measured **44.19-47.53 s**, versus a fresh
@@ -111,9 +119,12 @@ Show4DSTEM construction and 16.74 s loading through the first patch. Quote
 construction separately from actual browser interaction. A full BF/mean-DP
 one-pass overview is currently a benchmark experiment, not another public API.
 
-Distinguish **Torch MPS** from **native Swift/Metal**. Native Metal's separately
-qualified run was 67.56 s, 8.81 GiB Metal allocation and 10.13 GiB process
-footprint; its 75 parameter cases and 45 sensitivity intervals are described in
+Distinguish **Torch MPS** from **native Swift/Metal**. Native Metal now completes
+loading through saved scaled-uint16 packed GPU
+reopening in **22.56–22.87 s** on Phil, with **9.73 GiB peak Metal allocation**.
+See [native processing performance](../../native-maped-processing-performance.md);
+the earlier 67.56 s run is historical. The 75 parameter cases and 45 sensitivity
+intervals are described in
 [native parameter qualification](../../native-maped-parameters.md). Do not use
 old 37-second MPS measurements from earlier algorithm ownership arrangements as
 the timing of the current Torch implementation. Windows remains unqualified.
@@ -135,3 +146,10 @@ release only resources belonging to this run when finished.
 
 For reusable execution lessons, use the adjacent
 [Torch resident optimization skill](../torch-resident-optimization/SKILL.md).
+
+Native optimization keeps prepared sampling geometry on the GPU, reuses bounded
+decode/encode/merge/compression storage, and overlaps one compressed-byte file
+write with subsequent GPU work. Preserve the 32-thread prepared sampling dispatch,
+ordered float32 operations, owned public region results, and invalidation after
+shift changes. Never sum overlapping file-write and GPU phase timings. Both
+encoded and bit-packed borrowed sources use the same corrected count contract.

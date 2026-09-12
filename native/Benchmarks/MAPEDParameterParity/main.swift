@@ -1,4 +1,5 @@
 import Foundation
+import Metal4DSTEMStreamingIO
 import MetalScientificNumerics
 import QuantEMMAPED
 
@@ -175,7 +176,9 @@ for test in cases {
   results.append(record)
   let report: [String: Any] = [
     "shape": maped.shape, "cases": results, "peak_metal_bytes": maped.peak_metal_bytes,
-    "source_read_passes": maped.sources.map(\.sourceReadPasses),
+    "source_read_passes": maped.sources.map {
+      ($0 as? MetalEncodedSource)?.sourceReadPasses as Any? ?? NSNull()
+    },
   ]
   try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
     .write(to: output.appendingPathComponent("native.json"))
