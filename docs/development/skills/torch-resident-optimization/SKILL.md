@@ -56,7 +56,15 @@ overview reductions, global-range measurement, scaled conversion, packing,
 saving, reopening, and viewer construction. Constructor or backend frame-read
 timing is not browser rendering or interaction latency.
 
-Exact global scaled uint16 requires the final range. If a full float32 result
+The current MAPED `dtype="scaled_uint16"` workflow automatically calibrates
+each generated region, retaining the full packed result in one merge pass.
+There is no public `scaling` selector. QuantEM.GPU owns conversion, regional
+calibration, file metadata and calibrated reads. Keep MAPED science in Torch.
+Legacy globally scaled files retain their saved calibration. See the
+[scaled-storage contract](../../maped-scaled-storage-api-plan.md) and
+[qualification](../../maped-scaled-storage-performance.md).
+
+When explicitly reproducing an older global policy, the final range is required. If a full float32 result
 cannot remain resident, two bounded passes may be necessary. Do not quote a
 one-pass float32 overview as the latency of the complete scaled resident view.
 Approximate storage error is separate from float32 algorithm parity.

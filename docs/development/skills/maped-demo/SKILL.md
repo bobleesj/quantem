@@ -16,7 +16,7 @@ stale installed wheel. Public representation spelling is **`encoded`**, not
 Use `MAPEDTorch.from_files(files, device="mps")` on Phil or `device="cuda:0"`
 on mjgoat physical GPU0. The normal sequence is `preprocess`,
 `diffraction_origin`, `diffraction_align`, `real_space_align`, and
-`merge_datasets(save_to=..., plot_result=False)`. The result reopens packed;
+`merge_datasets(dtype="scaled_uint16", plot_result=False)`. The result stays packed;
 `maped.show()` provides Show4DSTEM when a viewer is requested. Do not add custom
 readers, binning, or a second workflow API to the ordinary seven-tilt demo.
 
@@ -180,13 +180,15 @@ that region's scaled uint16 codes packed with its own precision metadata.
 On Phil it took 13.26–13.76 s load-through-GPU-ready, excluding saving and UI.
 RMSE is 0.00544976 versus global 0.00695111; output is 6.196 GiB and peak process
 footprint 15.277 GiB. Full packed restoration was audited for all 9.66 billion
-values. No production default or public API changed. Do not treat regional
-codes as globally scaled, or claim viewer/file support until the generic
-cross-region reader, metadata contract and calibrated reductions are qualified.
+values. That native experiment did not change production defaults. The Python
+CUDA/MPS implementation described below now supplies calibrated cross-region
+reads, reductions and versioned files. Never treat regional codes as globally scaled.
 
-The [scaled-storage API proposal](../../maped-scaled-storage-api-plan.md) keeps
-`merge_datasets` and proposes `dtype="scaled_uint16", scaling="regional"`.
-Do not present it as implemented or enable it by default. CUDA, Torch MPS,
-regional file reloads and viewer reductions still require qualification.
-For DP review, follow the matched-intensity and residual-panel procedure in
-the regional experiment document; distinguish storage RMSE from merge parity.
+The [scaled-storage contract](../../maped-scaled-storage-api-plan.md) is now
+implemented for CUDA and Torch MPS using only `dtype="scaled_uint16"`.
+There is no `scaling` keyword. The full output stays packed without saving;
+`save_to` is optional and does not require reopening. Generic file saving streams
+regions in one pass. Preserve calibrated reads, metadata and errors in tests.
+The old global-format files remain readable. Native Swift regional-file loading
+and Live4DSTEM integration are separate work, not implied by Python MPS support.
+See [current timings](../../maped-scaled-storage-performance.md).

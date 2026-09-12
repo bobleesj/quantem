@@ -69,7 +69,7 @@ def test_ans_tilts_match_dense_alignment_and_merge(tmp_path):
             accumulator_device="cuda:0",
         ).tensor
         result = actual.merge_datasets(
-            save_to=tmp_path / "merged_master.h5",
+            dtype="scaled_uint16",
             plot_result=False,
         )
         session = prepare(result)
@@ -80,7 +80,7 @@ def test_ans_tilts_match_dense_alignment_and_merge(tmp_path):
                 session.frame(index),
                 expected_flat[index],
                 rtol=0,
-                atol=report["scale"],
+                atol=max(region["scale"] for region in report["regions"]),
             )
         assert result.metadata["maped_merge"]["source_representation"] == "encoded"
         assert actual.dp_mean_merged.shape == (8, 8)
@@ -143,9 +143,10 @@ def test_from_files_defaults_to_median_corrected_ans_on_cuda(tmp_path):
         )
         assert maped.datasets.sources == []
         assert source.data.is_released
-        assert result.metadata["maped_merge"][
+        assert not result.metadata["maped_merge"][
             "released_sources_before_reopen"
         ]
+        assert len(result.metadata["maped_merge"]["merge_generation_pass_seconds"]) == 1
     finally:
         maped.close()
     assert source.data.is_released

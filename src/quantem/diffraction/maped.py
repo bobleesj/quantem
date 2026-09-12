@@ -935,10 +935,13 @@ def _resident_summaries(sources, device: str):
     mean_dp = session.mean_dp(output="native")
     detector_mask = np.ones(session.detector_shape, dtype=bool)
     detector_sum = session.masked_sum(detector_mask, output="native")
-    if hasattr(mean_dp, "_mtl") and hasattr(detector_sum, "_mtl"):
+    if (
+        callable(getattr(mean_dp, "to_torch", None))
+        and callable(getattr(detector_sum, "to_torch", None))
+    ):
         try:
-            mean_dp_torch = torch.from_numpy(mean_dp.get()).to(device=device)
-            detector_sum_torch = torch.from_numpy(detector_sum.get()).to(device=device)
+            mean_dp_torch = mean_dp.to_torch()
+            detector_sum_torch = detector_sum.to_torch()
             detector_mean_torch = detector_sum_torch / float(
                 math.prod(session.detector_shape)
             )
@@ -1989,13 +1992,16 @@ class MAPEDTorch(AutoSerialize):
             but its sinc kernel rings on the sharp direct-beam disk, leaving a faint
             dotted 'cross' through the center of the merged mean diffraction pattern.
         dtype : str or torch.dtype, optional
-            Output dtype. Resident encoded sources use globally scaled uint16 by
-            default when saving; pass ``"scaled_uint16"`` to state that choice
-            explicitly. In-memory scan-region inspection retains float32.
+            Output storage dtype. ``"scaled_uint16"`` computes the merge in
+            float32 once, then retains calibrated, packed uint16 regions on
+            the GPU. Calibration and region sizes are automatic. Saving uses
+            this storage by default. Float32 scan-region inspection remains available.
         save_to : str, optional
             Output HDF5 path for resident encoded sources. The merge is written in
-            bounded regions and reopened as packed scaled uint16 for live viewing.
-            Omit this for a small in-memory ``scan_region`` inspection.
+            bounded regions with their intensity calibration. The already-resident
+            packed result is retained for viewing without reopening the file.
+            Omit this for resident ``scaled_uint16`` output or a small float32
+            ``scan_region`` inspection.
         scale_output : bool
             If True and dtype is integer, scale to full dynamic range using global max.
         plot_result : bool
@@ -2123,8 +2129,8 @@ class MAPEDTorch(AutoSerialize):
             if str(shift_method).strip().lower() != "bilinear":
                 unsupported.append("shift_method='bilinear'")
             if save_to is None:
-                if dtype not in (None, "float32", torch.float32):
-                    unsupported.append("dtype='float32' for in-memory inspection")
+                if dtype not in (None, "float32", torch.float32, "scaled_uint16"):
+                    unsupported.append("dtype='float32' or 'scaled_uint16'")
             elif dtype not in (None, "scaled_uint16"):
                 unsupported.append("dtype='scaled_uint16'")
             if scale_output:
@@ -2139,7 +2145,7 @@ class MAPEDTorch(AutoSerialize):
 
             from ._maped_resident import ResidentMergeSource
 
-            if save_to is None:
+            if save_to is None and dtype != "scaled_uint16":
                 region = (0, Rs, 0, Cs) if scan_region is None else scan_region
                 if (
                     len(region) != 4
@@ -2195,23 +2201,31 @@ class MAPEDTorch(AutoSerialize):
                 return result
             if scan_region is not None:
                 raise ValueError(
-                    "scan_region selects in-memory inspection; omit it when "
-                    "saving the complete merged acquisition with save_to."
+                    "scan_region selects float32 inspection; omit it for the "
+                    "complete scaled_uint16 result."
                 )
             generated = ResidentMergeSource(
                 arrays.sources,
                 rs_shifts,
                 dp_shifts,
-                close_sources_before_reopen=arrays.owns_sources,
+                close_sources_before_reopen=False,
                 compile_merge=compile_merge,
             )
-            gpu_io.save(
-                save_to,
+            result = gpu_io.load(
                 generated,
                 dtype="scaled_uint16",
                 backend=torch.device(self.device).type,
                 verbose=verbose,
             )
+            if save_to is not None:
+                try:
+                    gpu_io.save(
+                        save_to, result, backend=torch.device(self.device).type,
+                        verbose=verbose,
+                    )
+                except BaseException:
+                    result.close()
+                    raise
             if arrays.owns_sources:
                 for source in arrays.sources:
                     source.close()
@@ -2220,12 +2234,6 @@ class MAPEDTorch(AutoSerialize):
                     torch.cuda.empty_cache()
                 else:
                     torch.mps.empty_cache()
-            result = gpu_io.load(
-                save_to,
-                backend=torch.device(self.device).type,
-                representation="packed",
-                verbose=False,
-            )
             self.merged = result
             if compute_summaries or plot_result:
                 summaries_dp, summaries_bf = _resident_summaries([result], self.device)

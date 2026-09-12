@@ -1,0 +1,2099 @@
+{
+  "backend": "cuda",
+  "timings": {
+    "load": 20.591707543935627,
+    "preprocess": 1.72555408696644,
+    "origin": 0.21465441898908466,
+    "diffraction_align": 0.17084097093902528,
+    "real_space_align": 0.7788898450089619,
+    "merge_pack_summaries": 10.335831417934969,
+    "selected_dp": 0.002943510073237121,
+    "viewer_constructor": 0.7409786449279636
+  },
+  "input_resident_bytes": 8328746912,
+  "output_resident_bytes": 6650857312,
+  "peak": {
+    "allocated_bytes": 20692598784
+  },
+  "load_through_dp_seconds": 33.820421793847345,
+  "precision": {
+    "version": 2,
+    "storage": "scaled_uint16",
+    "source_dtype": "float32",
+    "source_shape": [
+      512,
+      512,
+      192,
+      192
+    ],
+    "regions": [
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1716.4329833984375,
+        "scale": 0.026191088477888723,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01312255859375,
+        "positive_to_zero": 22421529,
+        "changed": 132885849,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006954519206013568,
+        "first_frame": 0,
+        "stop_frame": 4096
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1696.1861572265625,
+        "scale": 0.025882141713993476,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.012941360473632812,
+        "positive_to_zero": 22221043,
+        "changed": 140256535,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.007036561523133848,
+        "first_frame": 4096,
+        "stop_frame": 8192
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1678.094482421875,
+        "scale": 0.02560608045200084,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0128173828125,
+        "positive_to_zero": 22143918,
+        "changed": 140132220,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006953725361593149,
+        "first_frame": 8192,
+        "stop_frame": 12288
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1688.4464111328125,
+        "scale": 0.025764040758874077,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.012939453125,
+        "positive_to_zero": 22547764,
+        "changed": 139809505,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0069838160880713596,
+        "first_frame": 12288,
+        "stop_frame": 16384
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1701.1104736328125,
+        "scale": 0.025957281965862708,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01300048828125,
+        "positive_to_zero": 23911563,
+        "changed": 138849501,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006993983869422968,
+        "first_frame": 16384,
+        "stop_frame": 20480
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1684.75390625,
+        "scale": 0.02570769674601358,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01287841796875,
+        "positive_to_zero": 23927691,
+        "changed": 139114755,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006933522612401215,
+        "first_frame": 20480,
+        "stop_frame": 24576
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1674.972900390625,
+        "scale": 0.02555844816343366,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0128173828125,
+        "positive_to_zero": 23759260,
+        "changed": 139628712,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006908590051131952,
+        "first_frame": 24576,
+        "stop_frame": 28672
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1690.630859375,
+        "scale": 0.025797373302433813,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.012939453125,
+        "positive_to_zero": 23797683,
+        "changed": 140083842,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006984933389591406,
+        "first_frame": 28672,
+        "stop_frame": 32768
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1697.196533203125,
+        "scale": 0.02589755906314374,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0129547119140625,
+        "positive_to_zero": 23777748,
+        "changed": 140632550,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0070287239906318575,
+        "first_frame": 32768,
+        "stop_frame": 36864
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1608.862548828125,
+        "scale": 0.024549668861343174,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0123291015625,
+        "positive_to_zero": 22576183,
+        "changed": 141623005,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006708007587842489,
+        "first_frame": 36864,
+        "stop_frame": 40960
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1552.3970947265625,
+        "scale": 0.023688061260800527,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011844635009765625,
+        "positive_to_zero": 21328224,
+        "changed": 142299774,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006502661138498844,
+        "first_frame": 40960,
+        "stop_frame": 45056
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1537.1514892578125,
+        "scale": 0.023455428233124475,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0117340087890625,
+        "positive_to_zero": 22061184,
+        "changed": 141822633,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006421237617804209,
+        "first_frame": 45056,
+        "stop_frame": 49152
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1618.2763671875,
+        "scale": 0.0246933145218204,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.012359619140625,
+        "positive_to_zero": 23789391,
+        "changed": 141259479,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006730422435552367,
+        "first_frame": 49152,
+        "stop_frame": 53248
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1623.294189453125,
+        "scale": 0.024769881581645305,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01239013671875,
+        "positive_to_zero": 24409364,
+        "changed": 141033443,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006739794860085802,
+        "first_frame": 53248,
+        "stop_frame": 57344
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1555.3099365234375,
+        "scale": 0.023732508377560656,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011871337890625,
+        "positive_to_zero": 23967920,
+        "changed": 141115845,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006465102440223816,
+        "first_frame": 57344,
+        "stop_frame": 61440
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1511.5418701171875,
+        "scale": 0.02306465049389162,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01153564453125,
+        "positive_to_zero": 23107425,
+        "changed": 141558016,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006298457424319051,
+        "first_frame": 61440,
+        "stop_frame": 65536
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1491.2415771484375,
+        "scale": 0.022754887878972115,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011383056640625,
+        "positive_to_zero": 22892416,
+        "changed": 141778115,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006221048464066556,
+        "first_frame": 65536,
+        "stop_frame": 69632
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1433.6309814453125,
+        "scale": 0.021875806537656407,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010986328125,
+        "positive_to_zero": 23109656,
+        "changed": 141225901,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005961873946652737,
+        "first_frame": 69632,
+        "stop_frame": 73728
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1434.2706298828125,
+        "scale": 0.021885566947170407,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010986328125,
+        "positive_to_zero": 23073410,
+        "changed": 141283752,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005966454887506147,
+        "first_frame": 73728,
+        "stop_frame": 77824
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1370.4381103515625,
+        "scale": 0.02091154513392176,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010498046875,
+        "positive_to_zero": 22338502,
+        "changed": 141546679,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005705669355428039,
+        "first_frame": 77824,
+        "stop_frame": 81920
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1174.3984375,
+        "scale": 0.017920171473258563,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00897216796875,
+        "positive_to_zero": 20321489,
+        "changed": 141743337,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.004942486429433596,
+        "first_frame": 81920,
+        "stop_frame": 86016
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1389.3704833984375,
+        "scale": 0.02120043462880045,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0106201171875,
+        "positive_to_zero": 22107807,
+        "changed": 142072571,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0058022363261946985,
+        "first_frame": 86016,
+        "stop_frame": 90112
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1478.5904541015625,
+        "scale": 0.02256184411538205,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01129150390625,
+        "positive_to_zero": 22119725,
+        "changed": 142860541,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006203157920951853,
+        "first_frame": 90112,
+        "stop_frame": 94208
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1472.0205078125,
+        "scale": 0.022461593161097124,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011230945587158203,
+        "positive_to_zero": 22576286,
+        "changed": 142509248,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006162598390716276,
+        "first_frame": 94208,
+        "stop_frame": 98304
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1512.1156005859375,
+        "scale": 0.02307340505967708,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011537551879882812,
+        "positive_to_zero": 23558070,
+        "changed": 141980927,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006310227796920729,
+        "first_frame": 98304,
+        "stop_frame": 102400
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1566.0411376953125,
+        "scale": 0.02389625601122015,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011962890625,
+        "positive_to_zero": 24507954,
+        "changed": 141539851,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0065165792888418955,
+        "first_frame": 102400,
+        "stop_frame": 106496
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1533.1767578125,
+        "scale": 0.023394777718966964,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01171875,
+        "positive_to_zero": 24117558,
+        "changed": 141550390,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006383909892107158,
+        "first_frame": 106496,
+        "stop_frame": 110592
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1471.915771484375,
+        "scale": 0.022459994987172886,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01123046875,
+        "positive_to_zero": 23339615,
+        "changed": 141819083,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006138632816848207,
+        "first_frame": 110592,
+        "stop_frame": 114688
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1411.755126953125,
+        "scale": 0.02154200239495117,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010772705078125,
+        "positive_to_zero": 22340025,
+        "changed": 142094831,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005896025698743003,
+        "first_frame": 114688,
+        "stop_frame": 118784
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1382.0267333984375,
+        "scale": 0.021088376186746586,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01055908203125,
+        "positive_to_zero": 23007012,
+        "changed": 141447002,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005749535311513551,
+        "first_frame": 118784,
+        "stop_frame": 122880
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1328.616943359375,
+        "scale": 0.020273395031042574,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01013946533203125,
+        "positive_to_zero": 23650667,
+        "changed": 140359819,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005489952208489089,
+        "first_frame": 122880,
+        "stop_frame": 126976
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 948.7713623046875,
+        "scale": 0.01447732299236572,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00726318359375,
+        "positive_to_zero": 19950369,
+        "changed": 139891780,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003947047400158462,
+        "first_frame": 126976,
+        "stop_frame": 131072
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 897.71484375,
+        "scale": 0.013698250457770657,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0068511962890625,
+        "positive_to_zero": 19663830,
+        "changed": 139574021,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0037388018626927227,
+        "first_frame": 131072,
+        "stop_frame": 135168
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1147.7581787109375,
+        "scale": 0.0175136671810626,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0087890625,
+        "positive_to_zero": 22664388,
+        "changed": 139348290,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.004777437810157384,
+        "first_frame": 135168,
+        "stop_frame": 139264
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1392.329833984375,
+        "scale": 0.021245591424191274,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010623931884765625,
+        "positive_to_zero": 25272686,
+        "changed": 139196681,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005719465374040418,
+        "first_frame": 139264,
+        "stop_frame": 143360
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1450.4150390625,
+        "scale": 0.022131914840352485,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0111083984375,
+        "positive_to_zero": 24832144,
+        "changed": 139788689,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005984017602819035,
+        "first_frame": 143360,
+        "stop_frame": 147456
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1464.0614013671875,
+        "scale": 0.022340144981569963,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011170387268066406,
+        "positive_to_zero": 25441771,
+        "changed": 139278675,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0060231773787027924,
+        "first_frame": 147456,
+        "stop_frame": 151552
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1495.161376953125,
+        "scale": 0.02281470019002251,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01141357421875,
+        "positive_to_zero": 26939023,
+        "changed": 137953255,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006102642048835644,
+        "first_frame": 151552,
+        "stop_frame": 155648
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1563.01171875,
+        "scale": 0.023850030041199358,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.011962890625,
+        "positive_to_zero": 28506662,
+        "changed": 136818695,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006332708834213931,
+        "first_frame": 155648,
+        "stop_frame": 159744
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1535.9852294921875,
+        "scale": 0.023437632249823568,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01171886920928955,
+        "positive_to_zero": 28413059,
+        "changed": 136360425,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.006212171496560259,
+        "first_frame": 159744,
+        "stop_frame": 163840
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1430.892578125,
+        "scale": 0.02183402118142977,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01092529296875,
+        "positive_to_zero": 27139381,
+        "changed": 136345476,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0057915396101612775,
+        "first_frame": 163840,
+        "stop_frame": 167936
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1447.136962890625,
+        "scale": 0.022081894604266804,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01104736328125,
+        "positive_to_zero": 26796208,
+        "changed": 136686455,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.005870594190169977,
+        "first_frame": 167936,
+        "stop_frame": 172032
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1378.242919921875,
+        "scale": 0.021030638894054703,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.010528564453125,
+        "positive_to_zero": 26734712,
+        "changed": 136369073,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.00557314235729248,
+        "first_frame": 172032,
+        "stop_frame": 176128
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 1335.639404296875,
+        "scale": 0.020380550916256582,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.01019287109375,
+        "positive_to_zero": 27654487,
+        "changed": 135395991,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0053590365375865,
+        "first_frame": 176128,
+        "stop_frame": 180224
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 938.8939819335938,
+        "scale": 0.014326603829001201,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.007171630859375,
+        "positive_to_zero": 23433846,
+        "changed": 135246270,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0038146576597180054,
+        "first_frame": 180224,
+        "stop_frame": 184320
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 845.8933715820312,
+        "scale": 0.012907505479240577,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0064697265625,
+        "positive_to_zero": 22719534,
+        "changed": 135104248,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0034387695209130618,
+        "first_frame": 184320,
+        "stop_frame": 188416
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 854.289794921875,
+        "scale": 0.013035626686837186,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00653076171875,
+        "positive_to_zero": 22982983,
+        "changed": 134972396,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0034710342702501122,
+        "first_frame": 188416,
+        "stop_frame": 192512
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 841.808837890625,
+        "scale": 0.012845179490205616,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0064239501953125,
+        "positive_to_zero": 22980287,
+        "changed": 134888422,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003417239883927225,
+        "first_frame": 192512,
+        "stop_frame": 196608
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 836.1861572265625,
+        "scale": 0.012759382882834553,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00640869140625,
+        "positive_to_zero": 23072328,
+        "changed": 134760608,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033908768245100155,
+        "first_frame": 196608,
+        "stop_frame": 200704
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 833.17236328125,
+        "scale": 0.0127133953350309,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0063629150390625,
+        "positive_to_zero": 23160206,
+        "changed": 134612283,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033757721030195464,
+        "first_frame": 200704,
+        "stop_frame": 204800
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 826.3849487304688,
+        "scale": 0.012609826027778572,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006317138671875,
+        "positive_to_zero": 23202213,
+        "changed": 134531836,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003347565577265637,
+        "first_frame": 204800,
+        "stop_frame": 208896
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 818.69970703125,
+        "scale": 0.01249255675640879,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006256103515625,
+        "positive_to_zero": 23285915,
+        "changed": 134218886,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033141875061697326,
+        "first_frame": 208896,
+        "stop_frame": 212992
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 834.8162231445312,
+        "scale": 0.012738479028679809,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006378173828125,
+        "positive_to_zero": 23773271,
+        "changed": 133807902,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033675744505030345,
+        "first_frame": 212992,
+        "stop_frame": 217088
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 820.85546875,
+        "scale": 0.012525451571679256,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00628662109375,
+        "positive_to_zero": 23863156,
+        "changed": 133273370,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033059028335051645,
+        "first_frame": 217088,
+        "stop_frame": 221184
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 828.1188354492188,
+        "scale": 0.01263628344318637,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00634765625,
+        "positive_to_zero": 24303631,
+        "changed": 132732252,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033225981269913683,
+        "first_frame": 221184,
+        "stop_frame": 225280
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 829.49560546875,
+        "scale": 0.012657291607061113,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00634765625,
+        "positive_to_zero": 24662224,
+        "changed": 132115174,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003317209808011627,
+        "first_frame": 225280,
+        "stop_frame": 229376
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 834.72705078125,
+        "scale": 0.01273711834563592,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006378173828125,
+        "positive_to_zero": 24970169,
+        "changed": 131360916,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033256244273476908,
+        "first_frame": 229376,
+        "stop_frame": 233472
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 844.38818359375,
+        "scale": 0.012884537782768749,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.0064697265625,
+        "positive_to_zero": 25396334,
+        "changed": 130812937,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033557156770860222,
+        "first_frame": 233472,
+        "stop_frame": 237568
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 835.3473510742188,
+        "scale": 0.012746583521388856,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006378173828125,
+        "positive_to_zero": 25468694,
+        "changed": 130516799,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0033130440112422005,
+        "first_frame": 237568,
+        "stop_frame": 241664
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 829.2257690429688,
+        "scale": 0.01265317416713159,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00634765625,
+        "positive_to_zero": 25397276,
+        "changed": 130476676,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0032885805085474695,
+        "first_frame": 241664,
+        "stop_frame": 245760
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 826.30517578125,
+        "scale": 0.01260860877059968,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006317138671875,
+        "positive_to_zero": 25370956,
+        "changed": 130434015,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003277374100169193,
+        "first_frame": 245760,
+        "stop_frame": 249856
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 843.2352905273438,
+        "scale": 0.012866945762223907,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.006439208984375,
+        "positive_to_zero": 25575105,
+        "changed": 130445447,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003344731260644712,
+        "first_frame": 249856,
+        "stop_frame": 253952
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 830.3681030273438,
+        "scale": 0.012670605066412509,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00634765625,
+        "positive_to_zero": 25376615,
+        "changed": 130438311,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.0032926622214316864,
+        "first_frame": 253952,
+        "stop_frame": 258048
+      },
+      {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "intensity_min": 0.0,
+        "intensity_max": 852.9321899414062,
+        "scale": 0.01301491096271315,
+        "offset": 0.0,
+        "values": 150994944,
+        "max_abs_error": 0.00653076171875,
+        "positive_to_zero": 24732941,
+        "changed": 121583911,
+        "overflow": 0,
+        "clipped": 0,
+        "scope": "all merged values",
+        "range_scope": "region",
+        "measurement": "GPU comparison against merged float32 regions",
+        "selection": {
+          "scan_region": null,
+          "detector_region": null
+        },
+        "rmse": 0.003268111787162417,
+        "first_frame": 258048,
+        "stop_frame": 262144
+      }
+    ],
+    "complete": true,
+    "range_scope": "automatic regions",
+    "values": 9663676416,
+    "rmse": 0.005451803402832445,
+    "max_abs_error": 0.01312255859375,
+    "intensity_min": 0.0,
+    "intensity_max": 1716.4329833984375,
+    "changed": 8807257876,
+    "positive_to_zero": 1526544486,
+    "overflow": 0,
+    "clipped": 0
+  },
+  "merge": {
+    "version": 1,
+    "backend": "cuda",
+    "source_representation": "encoded",
+    "region_frames": 4096,
+    "merge_generation_pass_seconds": [
+      5.970064742374234
+    ],
+    "released_sources_before_reopen": false,
+    "real_space_shifts_row_column": [
+      [
+        -4.616904258728027,
+        -0.8799613118171692
+      ],
+      [
+        3.5067529678344727,
+        -6.0192742347717285
+      ],
+      [
+        -4.896536827087402,
+        4.0891242027282715
+      ],
+      [
+        3.4263391494750977,
+        1.0372750759124756
+      ],
+      [
+        0.5491113662719727,
+        -0.1323111653327942
+      ],
+      [
+        7.379342079162598,
+        -3.5345633029937744
+      ],
+      [
+        -5.348105430603027,
+        5.4397101402282715
+      ]
+    ],
+    "diffraction_shifts_row_column": [
+      [
+        -0.2942374348640442,
+        0.2137146145105362
+      ],
+      [
+        0.12114495038986206,
+        0.028999343514442444
+      ],
+      [
+        -0.45224982500076294,
+        0.2256927639245987
+      ],
+      [
+        -0.06160956621170044,
+        -0.002891525626182556
+      ],
+      [
+        0.3620430827140808,
+        -0.2536773681640625
+      ],
+      [
+        0.42293328046798706,
+        -0.16298674046993256
+      ],
+      [
+        -0.09802466630935669,
+        -0.048850998282432556
+      ]
+    ]
+  },
+  "saved": false,
+  "browser_rendering_measured": false
+}

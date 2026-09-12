@@ -12,7 +12,7 @@ from quantem.diffraction import MAPEDTorch
 
 
 def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
-    shape = (33, 33, 2, 4)
+    shape = (65, 65, 2, 4)
     values = (
         np.arange(np.prod(shape), dtype=np.uint32).reshape(shape) * 13 % 701
     ).astype(np.uint16)
@@ -67,7 +67,7 @@ def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
         maped.real_space_shifts = torch.zeros((1, 2), device="mps")
         maped.diffraction_shifts = torch.zeros((1, 2), device="mps")
         result = maped.merge_datasets(
-            save_to=tmp_path / "merged_master.h5", plot_result=False
+            dtype="scaled_uint16", plot_result=False
         )
         expected[0] = 0
         expected[-1] = 0
@@ -79,7 +79,7 @@ def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
                 result.data.frame(index),
                 expected.reshape(-1, *shape[2:])[index],
                 rtol=0,
-                atol=report["scale"],
+                atol=max(region["scale"] for region in report["regions"]),
             )
         assert source.data.is_released
         assert result.metadata["maped_merge"]["backend"] == "mps"
@@ -145,7 +145,7 @@ def test_repeated_region_passes_preserve_float32_values(tmp_path):
             assert report["values"] == expected.numel()
             assert report["overflow"] == report["clipped"] == 0
             actual = loaded.read().reshape_as(expected)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=report["scale"])
+            torch.testing.assert_close(actual, expected, rtol=0, atol=max(region["scale"] for region in report["regions"]))
     finally:
         generated.close()
         for source in sources:

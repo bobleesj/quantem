@@ -1,5 +1,8 @@
 # CUDA MAPED processing before export
 
+Historical qualification. The current full resident workflow is documented in
+[scaled uint16 storage](maped-scaled-storage-api-plan.md); it no longer needs saving or reopening.
+
 The notebook uses the same `MAPEDTorch` sequence on CUDA and MPS. Change
 `device="cuda:0"` to `device="mps"`; representation and region scheduling stay
 automatic. Encoded inputs use the ANS count codec. Scientific processing stays

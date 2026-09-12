@@ -1,129 +1,88 @@
-# Proposed MAPED scaled-storage API
+# MAPED scaled uint16 storage
 
-Status: proposal. Native Metal regional storage has a full-data benchmark;
-CUDA and Torch MPS adoption and generic file/viewer support are not implemented.
-The existing default stays unchanged. The [measured native experiment](native-maped-regional-storage.md)
-explains its precision, timing, memory, and limitations.
-
-## Scientist-facing decision
-
-Keep float32 scientific computation and choose how the merged result is stored.
-Extend `merge_datasets`; do not introduce a regional MAPED class or a new merge
-function. Reuse `dtype` for storage precision and add one explicit `scaling`
-choice. The proposed calls below are not runnable in the current public API:
+Implemented for the Python CUDA and Torch MPS workflow. This supersedes the
+initial proposal: there is no `scaling` argument. The existing `dtype` expresses
+the scientist's storage choice; calibration and scheduling remain automatic.
 
 ```python
-# Proposed: full output resident on the GPU, no file required.
-merged = maped.merge_datasets(
-    dtype="scaled_uint16", scaling="regional", plot_result=False,
-)
-maped.show()
-
-# Proposed: same scientific result and precision policy, additionally saved.
-merged = maped.merge_datasets(
-    dtype="scaled_uint16", scaling="regional",
-    save_to="merged_master.h5", plot_result=False,
-)
+merged = maped.merge_datasets(dtype="scaled_uint16", plot_result=False)
+viewer = maped.show()
 ```
 
-| Choice | Meaning | Consequence |
-|---|---|---|
-| `dtype="scaled_uint16", scaling="global"` | One scale and offset for the entire output | Existing complete-source range policy; normally two bounded merge passes |
-| `dtype="scaled_uint16", scaling="regional"` | Each bounded scan region has its own scale and offset | One merge pass; local error bounds; usually finer precision in dimmer regions |
-| `dtype="float32"` | Preserve float32 output values | No scaled-integer storage error; full residency may exceed the available memory |
+All seven inputs remain encoded while MAPED performs one bounded float32 merge.
+QuantEM.GPU measures each produced region, converts it to calibrated uint16,
+and retains its packed codes. MAPED-owned inputs are then released. The complete
+merged output stays resident for viewing, without a file or a second merge.
+Borrowed inputs remain caller-owned. Float32 alignment, interpolation weights,
+and accumulation order are unchanged. Ordinary small float32 `scan_region`
+inspection remains available through the existing method.
 
-For scaled uint16, `scaling` defaults to `"global"` to preserve the established
-contract. Explicit `scaling` with another dtype is an error with a corrective
-message. Existing `dtype=None` and unrelated `scale_output` behavior must be
-preserved; `scale_output` must not be silently repurposed as storage scaling.
-Support for the full resident no-file path must be implemented explicitly; the
-current resident Python API otherwise asks for a file for a complete merge.
+## Saving and loading
 
-The source backend remains the backend already selected on the MAPED object:
-CUDA, Torch MPS, or native Metal. All input residents remain encoded by default;
-merged uint16 output remains packed by default. Scientists should not select
-codecs, call decoding functions, provide region sizes, or pass backend flags at
-each stage. The automatic region schedule is recorded for reproducibility.
-
-Keep existing result types. Logical reads return calibrated intensities, with
-float32 reconstruction where needed. Stored uint16 codes are not detector counts
-and must never be presented as calibrated intensities without their scale.
-The small status message should report the storage policy, resident size, RMSE,
-maximum error, and overflow count; detailed region reports belong in metadata.
-For example: `regional scaled_uint16 | 6.20 GiB | RMSE 0.00545 | max 0.0131 | overflow 0`.
-The numerical values here describe the qualified acquisition, not universal defaults.
-
-## QuantEM.GPU owns the reusable support
-
-MAPED owns alignment, interpolation weights, and scientific stage order.
-QuantEM.GPU owns precision conversion, packed residency, calibrated reads and
-reductions, metadata validation, and save/load. Regional storage must be reusable
-by other scientific algorithms. Do not add `quantem.gpu.maped_merge_*` functions
-or put backend kernels in the Python MAPED algorithm.
-
-Extend the existing generic save boundary consistently:
+Save during merging with the existing `save_to` argument, or save the returned
+resident later without repeating MAPED or applying another precision conversion:
 
 ```python
-# Proposed generic IO extension; not implemented yet.
-gpu_io.save(path, source, dtype="scaled_uint16", scaling="regional")
+from quantem.gpu import io
 
-# Existing load shape; future regional files detect their calibration metadata.
-loaded = gpu_io.load(path, representation="packed")
+io.save("merged_master.h5", merged)
+reopened = io.load("merged_master.h5")
+patch = reopened.read(scan_region=(252, 260, 252, 260))
 ```
 
-No `scaling` argument is needed to read a saved file: the persisted calibration
-is authoritative. Loading cannot invent a global scale for regional codes.
-The native implementation should extend its existing packed source to hold
-per-region calibration and support ordinary whole-array coordinates. The Python
-boundary must provide the same logical reads without requiring MAPED or viewers
-to reconstruct region tables. Reuse the current precision conversion and packing
-kernels; the experiment already composes those operations successfully.
+The existing viewer consumes the loaded source. DP reads, means, detector sums,
+and center-of-mass calculations operate in calibrated intensity units. Raw
+uint16 codes are storage values, not detector counts. No caller selects regions,
+codecs, or scales for reading. A bounded region read returns independently owned
+Torch storage on the source accelerator.
 
-## Calibration and file contract
+Generic `io.save(path, source, dtype="scaled_uint16")` streams conversion and
+writing without retaining the complete packed output. Generic
+`io.load(source, dtype="scaled_uint16")` retains the complete packed result.
+Sources can be files, GPU arrays, or existing generated sources with declared
+`shape`, `dtype`, and ordered `blocks()`. Scientific generation stays in QuantEM;
+precision conversion, packing, calibrated queries and file IO belong to
+QuantEM.GPU. No MAPED kernels or algorithm executor were added to QuantEM.GPU.
 
-For each region, preserve consecutive frame boundaries, scale and offset with
-sufficient precision, intensity units, finite range, source float32 dtype,
-stored uint16 dtype, count, error metrics, and correction/merge provenance.
-Preserve the full logical 4D shape and axes. Persist the realized region schedule;
-reloading must reproduce the same values even if a different GPU would choose
-a different batch size for new work.
+## Precision and persisted calibration
 
-Use a versioned, generic calibration schema, distinct from the existing global
-precision record. New readers detect it. Readers without support must reject the
-file explicitly. Do not export regionally scaled codes with only the old global
-scale attribute. A successful save must preserve calibration and data together,
-with incomplete output never admitted as complete.
+Each stored region records its frame bounds, scale, offset, original range,
+source dtype, and GPU-measured error report. The version-2 precision record also
+contains full geometry, total RMSE, maximum error, changed values and overflow.
+Conversion rounds to the nearest code with ties to even; reading reconstructs
+float32 intensities from that region's calibration. The realized schedule is
+saved, so reloading on another GPU does not recalibrate existing codes.
 
-Cross-region slices, detector reductions, BF/ADF/DPC summaries, ROI means and
-exports must use calibrated intensities. Where calibration can be applied after
-a reduction algebraically, include the correct offset contribution and selected
-pixel count. Otherwise restore bounded float32 values on the GPU before reducing.
-Do not compare or sum raw code values from regions with different scales.
+The error is relative to the corresponding float32 source, not ground-truth
+scientific accuracy. Smaller local ranges can lower storage error; they do not
+improve the underlying float32 merge. Changing the generation schedule can
+change storage rounding. The saved schedule and scales preserve reproducibility.
+The brief status line reports stored size, RMSE, maximum error and overflow;
+detailed calibration stays in `merged.metadata["precision"]`.
 
-For Show4DSTEM and Live4DSTEM, keep the existing viewer entry point. The source
-reader handles regional calibration; the renderer must receive calibrated values
-or an explicitly supported scale-aware GPU source. Independent per-image display
-normalization must not hide precision differences in a validation comparison.
-UI integration remains a separate task from this API proposal.
+Legacy globally scaled files still load with their original calibration.
+Version-2 files retain the existing precision-attribute discovery path so older
+Python readers reject the unsupported version instead of showing raw codes.
+The existing native Swift global file reader does not yet accept this new
+regional file format. Native Metal regional benchmarking remains separate;
+Live4DSTEM integration is not part of this change.
 
-## Required qualification before adoption
+Cropped reloads retain the original region audit metrics and label them as saved,
+not newly measured error statistics for the crop. Saving such a selection
+preserves its selected geometry and calibration. The HDF5 codec's existing
+multiple-of-eight detector-element restriction still applies. MPS rejects
+float32 subnormal inputs rather than silently flushing their intensities.
 
-- Same float32 fixture on CUDA, Torch MPS, and native Metal: independently verify
-  scale, offset, round-to-even uint16 codes and restored values against NumPy.
-  Include zeros, constant regions, signed finite values, ties, high dynamic range,
-  partial final regions, nonfinite/subnormal handling, and explicit unsupported errors.
-- Full MAPED results: retain frozen alignment and parameter-sensitivity tests;
-  compare storage error to each backend's float32 result separately from existing
-  cross-backend float32 execution tolerances. Threshold crossings can change codes
-  when the input float32 values differ; do not conflate that with codec failure.
-- Read tests: exact local restoration, slices crossing region boundaries,
-  reordered/selected frames, detector subsets, scalar and image reductions, and
-  fresh-versus-saved equivalence with matching metadata and ownership behavior.
-- Viewing: paired float32/global/regional DPs with shared intensity limits and
-  signed residual limits; exercise moves across region boundaries, BF maps and
-  numerical readouts. Native DP read latency alone is not viewer qualification.
-- Full-scale performance and memory on each physical target, including a 24 GiB
-  Mac. Report loading, processing, optional saving and rendering separately.
+## Qualification
 
-The native experiment achieved 13.26–13.76 s without saving/rendering and lower
-storage RMSE. It establishes feasibility, not completed CUDA/MPS/file/UI parity.
+The shared NumPy oracle checks the same input values on CUDA and MPS: exact
+codes and restored float32 values, signed/constant regions, rounding ties and
+wide dynamic ranges. Workflow tests cover cross-region and detector selections,
+BF/mean-DP and center-of-mass products, independent read ownership, full
+save/reload equality, one-pass generated saving, and legacy global archives.
+Existing MAPED dense-versus-resident and median hot-pixel tests also pass.
+These checks distinguish storage parity from backend-specific float32 merge
+rounding; they do not claim identical full MAPED arrays across GPU architectures.
+
+See the [public-workflow measurements](maped-scaled-storage-performance.md)
+and [matched DP review](native-maped-regional-storage.md#matched-diffraction-pattern-review).

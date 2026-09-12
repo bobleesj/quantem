@@ -1,5 +1,8 @@
 # Faster MPS MAPED and inspection before saving
 
+Historical qualification. The current full resident workflow is documented in
+[scaled uint16 storage](maped-scaled-storage-api-plan.md); it no longer needs saving or reopening.
+
 The seven-tilt Torch MPS workflow took about 75 seconds because exporting
 required two complete float32 merges, precision measurement, compression,
 writing, and reopening. A compressed 7 GiB input is not a 7 GiB calculation:
