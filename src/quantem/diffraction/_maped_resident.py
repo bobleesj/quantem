@@ -69,7 +69,7 @@ def _weights(
     shape: tuple[int, int, int, int],
     real_space_shifts: torch.Tensor,
     diffraction_shifts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct the established MAPED scan and detector weights in Torch."""
     rows, columns, detector_rows, detector_columns = shape
     device = real_space_shifts.device
@@ -86,6 +86,7 @@ def _weights(
     )
     real_weights = []
     detector_weights = []
+    detector_grids = []
     detector_ones = torch.ones(
         (1, 1, detector_rows, detector_columns),
         dtype=torch.float32,
@@ -113,10 +114,15 @@ def _weights(
             ),
             dim=-1,
         )[None]
+        detector_grids.append(grid[0])
         detector_weights.append(
             F.grid_sample(detector_ones, grid, align_corners=True)[0, 0].clamp(0, 1)
         )
-    return torch.stack(real_weights), torch.stack(detector_weights)
+    return (
+        torch.stack(real_weights),
+        torch.stack(detector_weights),
+        torch.stack(detector_grids),
+    )
 
 
 def _automatic_region_frames(
@@ -205,42 +211,16 @@ def _sample_scan_rows(
     return output
 
 
-def _shift_detector(values: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+def _shift_detector(values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     """Apply MAPED's established constant bilinear detector shift."""
     frames, rows, columns = values.shape
-    output = torch.zeros_like(values)
-    row_offset = -float(shift[0]) * float(rows - 1) / float(rows)
-    column_offset = -float(shift[1]) * float(columns - 1) / float(columns)
-    row_floor = math.floor(row_offset)
-    column_floor = math.floor(column_offset)
-    row_fraction = row_offset - row_floor
-    column_fraction = column_offset - column_floor
-    for row_delta, row_weight in (
-        (row_floor, 1 - row_fraction),
-        (row_floor + 1, row_fraction),
-    ):
-        output_row0 = max(0, -row_delta)
-        output_row1 = min(rows, rows - row_delta)
-        if output_row0 >= output_row1 or row_weight == 0:
-            continue
-        for column_delta, column_weight in (
-            (column_floor, 1 - column_fraction),
-            (column_floor + 1, column_fraction),
-        ):
-            output_column0 = max(0, -column_delta)
-            output_column1 = min(columns, columns - column_delta)
-            weight = row_weight * column_weight
-            if output_column0 >= output_column1 or weight == 0:
-                continue
-            output[:, output_row0:output_row1, output_column0:output_column1].add_(
-                values[
-                    :,
-                    output_row0 + row_delta : output_row1 + row_delta,
-                    output_column0 + column_delta : output_column1 + column_delta,
-                ],
-                alpha=weight,
-            )
-    return output
+    return F.grid_sample(
+        values[:, None],
+        grid[None].expand(frames, rows, columns, 2),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )[:, 0]
 
 
 class ResidentMergeSource:
@@ -292,7 +272,7 @@ class ResidentMergeSource:
         self.real_space_shifts = real_space_shifts
         self.diffraction_shifts = diffraction_shifts
         self.region_frames = _automatic_region_frames(self.shape, device)
-        self.real_weights, self.detector_weights = _weights(
+        self.real_weights, self.detector_weights, self.detector_grids = _weights(
             self.shape, real_space_shifts, diffraction_shifts
         )
         self.detector_edge = 1 - self.detector_weights.sum(0).clamp(0, 1)
@@ -366,7 +346,7 @@ class ResidentMergeSource:
                     )
                 shifted = _shift_detector(
                     sampled.reshape(-1, detector_rows, detector_columns),
-                    self.diffraction_shifts[index],
+                    self.detector_grids[index],
                 ).reshape_as(sampled)
                 del sampled
                 weight = self.real_weights[
@@ -397,4 +377,5 @@ class ResidentMergeSource:
         """Release Torch planning tensors while leaving source ownership unchanged."""
         self.real_weights = None
         self.detector_weights = None
+        self.detector_grids = None
         self.detector_edge = None
