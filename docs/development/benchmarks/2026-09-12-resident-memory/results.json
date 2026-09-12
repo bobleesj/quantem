@@ -1,0 +1,371 @@
+{
+  "cuda-after": {
+    "backend": "cuda",
+    "timings": {
+      "load": 15.454453311045654,
+      "preprocess": 1.3330616069724783,
+      "origin": 0.21419209998566657,
+      "diffraction_align": 0.15617473993916065,
+      "real_space_align": 0.7808312749257311,
+      "merge_pack_summaries": 9.11310334596783,
+      "selected_dp": 0.002063321997411549,
+      "viewer_constructor": 0.5477994550019503
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6650857312,
+    "peak": {
+      "allocated_bytes": 20367540224
+    },
+    "load_through_dp_seconds": 27.05387970083393,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832445,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "cuda-before": {
+    "backend": "cuda",
+    "timings": {
+      "load": 18.112893759040162,
+      "preprocess": 1.3475170530145988,
+      "origin": 0.20660488202702254,
+      "diffraction_align": 0.17992741998750716,
+      "real_space_align": 0.8130166210466996,
+      "merge_pack_summaries": 9.25334717403166,
+      "selected_dp": 0.0008332459256052971,
+      "viewer_constructor": 0.6509052239125594
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6650857312,
+    "peak": {
+      "allocated_bytes": 20887633920
+    },
+    "load_through_dp_seconds": 29.914140155073255,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832445,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "cuda-cache": {
+    "backend": "cuda",
+    "timings": {
+      "load": 18.202026814920828,
+      "preprocess": 1.3505721859401092,
+      "origin": 0.2244998519308865,
+      "diffraction_align": 0.16649195505306125,
+      "real_space_align": 0.9270277040777728,
+      "merge_pack_summaries": 9.300726689980365,
+      "selected_dp": 0.0047486580442637205,
+      "viewer_constructor": 0.4449294719379395
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6650857312,
+    "peak": {
+      "allocated_bytes": 20180893696
+    },
+    "load_through_dp_seconds": 30.176093859947287,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832446,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "cuda-subregions-compiled": {
+    "backend": "cuda",
+    "timings": {
+      "load": 26.883129305089824,
+      "preprocess": 2.364401469938457,
+      "origin": 0.3150579889770597,
+      "diffraction_align": 0.2455827429657802,
+      "real_space_align": 1.0238957339897752,
+      "merge_pack_summaries": 11.647449526004493,
+      "selected_dp": 0.0010030989069491625,
+      "viewer_constructor": 0.3331263659056276
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6650857312,
+    "peak": {
+      "allocated_bytes": 18475909120
+    },
+    "load_through_dp_seconds": 42.48051986587234,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832445,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "cuda-subregions": {
+    "backend": "cuda",
+    "timings": {
+      "load": 8.859151185955852,
+      "preprocess": 0.9471014619339257,
+      "origin": 0.18488320196047425,
+      "diffraction_align": 0.10811935097444803,
+      "real_space_align": 0.22650795290246606,
+      "merge_pack_summaries": 6.240598548087291,
+      "selected_dp": 0.0005418129730969667,
+      "viewer_constructor": 0.24974895094055682
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6650857312,
+    "peak": {
+      "allocated_bytes": 18589155328
+    },
+    "load_through_dp_seconds": 16.566903514787555,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832446,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "mps-after": {
+    "backend": "mps",
+    "timings": {
+      "load": 9.977716041001258,
+      "preprocess": 2.440614249993814,
+      "origin": 0.049829083000076935,
+      "diffraction_align": 0.05771299998741597,
+      "real_space_align": 0.5425800000084564,
+      "merge_pack_summaries": 11.650343957997393,
+      "selected_dp": 0.0002613749820739031,
+      "viewer_constructor": 0.21743941699969582
+    },
+    "input_resident_bytes": 7514269468,
+    "output_resident_bytes": 6652474512,
+    "peak": {
+      "allocated_bytes": 19100237824
+    },
+    "load_through_dp_seconds": 24.71905770697049,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "mps-before": {
+    "backend": "mps",
+    "timings": {
+      "load": 10.201575957995374,
+      "preprocess": 2.4885768329841085,
+      "origin": 0.06260454200673848,
+      "diffraction_align": 0.060186332993907854,
+      "real_space_align": 0.5536819169938099,
+      "merge_pack_summaries": 11.821755332988687,
+      "selected_dp": 0.00032637501135468483,
+      "viewer_constructor": 0.215986499999417
+    },
+    "input_resident_bytes": 7514269468,
+    "output_resident_bytes": 6652474512,
+    "peak": {
+      "allocated_bytes": 19208273920
+    },
+    "load_through_dp_seconds": 25.18870729097398,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "mps-cache": {
+    "backend": "mps",
+    "timings": {
+      "load": 10.917616833001375,
+      "preprocess": 3.204778499988606,
+      "origin": 0.07250337500590831,
+      "diffraction_align": 0.0765449579921551,
+      "real_space_align": 0.6826275829807855,
+      "merge_pack_summaries": 17.659137749986257,
+      "selected_dp": 0.00030545800109393895,
+      "viewer_constructor": 0.2283316660032142
+    },
+    "input_resident_bytes": 7514269468,
+    "output_resident_bytes": 6652474512,
+    "peak": {
+      "allocated_bytes": 18189680640
+    },
+    "load_through_dp_seconds": 32.61351445695618,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    }
+  },
+  "mps-subregions-compiled": {
+    "backend": "mps",
+    "timings": {
+      "load": 10.86611649999395,
+      "preprocess": 3.01315179199446,
+      "origin": 0.053907624998828396,
+      "diffraction_align": 0.055678125005215406,
+      "real_space_align": 0.545192165998742,
+      "merge_pack_summaries": 16.02672250001342,
+      "selected_dp": 0.0003022919991053641,
+      "viewer_constructor": 0.30364133400144055
+    },
+    "input_resident_bytes": 7514269468,
+    "output_resident_bytes": 6652474512,
+    "peak": {
+      "allocated_bytes": 18470092800
+    },
+    "load_through_dp_seconds": 30.56107100000372,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    }
+  }
+}

@@ -468,6 +468,7 @@ class ResidentMergeSource:
             del denominator, zero
             generation_seconds += time.perf_counter() - started
             yield numerator.reshape(-1, detector_rows, detector_columns)
+            del numerator
         self._pass_generation_seconds.append(generation_seconds)
         self._update_merge_metadata()
 

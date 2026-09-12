@@ -45,3 +45,41 @@ Evidence and the reproducible public-API benchmark are in
 [the benchmark directory](benchmarks/2026-09-12-scaled-storage/).
 See the [storage contract](maped-scaled-storage-api-plan.md) for current API,
 file metadata and native Swift integration boundaries.
+
+
+## Follow-up: shorten temporary buffer lifetimes
+
+The accepted change avoids copying an already-float32 CUDA array during
+restoration and releases consumed generator blocks before requesting the next
+region. MAPED arithmetic, 4096-frame calibration regions, codecs and public
+parameters are unchanged. All seven encoded inputs and the full scaled output
+remain resident during generation.
+
+| Same-workflow trial | CUDA peak / processing | MPS peak / processing |
+|---|---:|---:|
+| Before | 19.45 GiB / 9.25 s | 17.89 GiB / 11.82 s |
+| Copy/lifetime changes, accepted | 18.97 GiB / 9.11 s | 17.79 GiB / 11.65 s |
+| Also flush allocator caches once, not adopted | 18.79 GiB / 9.30 s | 16.94 GiB / 17.66 s |
+| Also assemble 4096-frame storage regions from 2048-frame compute blocks, not adopted | 17.21 GiB / 11.65 s | 17.20 GiB / 16.03 s |
+
+Processing includes merge, conversion, packing and output summaries, excluding
+loading and saving. These are exploratory single runs, not controlled repeated
+speedup estimates. Background services and cache state varied. An earlier
+subregion prototype accidentally disabled MPS compilation and took 27.76 s;
+its CUDA 6.24 s result is not evidence for a portable speedup.
+
+For the accepted change, the full MPS precision report was identical to the
+baseline. CUDA differed only in 41 regional RMSE values at floating reduction
+roundoff (approximately 1e-18); ranges, scales, counts and maximum errors were
+unchanged. Report equality alone does not prove whole-volume bitwise parity.
+GPU precision and resident MAPED tests validate the unchanged conversion and
+scientific paths. No tolerance was relaxed.
+
+The stored inputs plus complete output alone occupy about 13.95 GiB on CUDA
+and 13.20 GiB on MPS. A materially lower peak needs less simultaneous live
+storage or a better workspace strategy; compression of the inputs alone does
+not remove float32 processing buffers. The existing hardware-accounting and
+physical-laptop qualification limitations above still apply.
+
+Compact measurements and rejected prototype wrappers are retained in
+[the memory experiment directory](benchmarks/2026-09-12-resident-memory/).

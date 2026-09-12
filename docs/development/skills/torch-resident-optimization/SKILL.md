@@ -85,3 +85,16 @@ Approximate storage error is separate from float32 algorithm parity.
 These are measured examples, not universal latency or cross-device parity
 promises. Keep benchmark scripts, evidence, notebook examples, and this skill
 in the same repository; local skill discovery may link to this directory.
+
+
+## Generator lifetime and storage calibration
+
+Release consumed block references before advancing a producer: a generator
+suspended at `yield` can otherwise retain the previous GPU region while the
+next is allocated. Avoid dtype copies when an already-float32 array can be
+shared safely. Validate ownership across subsequent reads and source closure.
+Do not assume a smaller computation region is free: assembling the original
+calibration region adds memory traffic, and explicit region selection may
+bypass compiled interior paths. Cache flushing can lower sampled memory while
+hurting latency. Keep these changes only with measured evidence; see the
+[resident memory trials](../../maped-scaled-storage-performance.md#follow-up-shorten-temporary-buffer-lifetimes).
