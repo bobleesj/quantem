@@ -1,0 +1,80 @@
+{
+  "timings": {
+    "load": 8.456179053988308,
+    "preprocess": 1.1210509550292045,
+    "diffraction_origin": 0.18247217999305576,
+    "diffraction_align": 0.10521417309064418,
+    "real_space_align": 0.24842474004253745,
+    "patch": 0.1159547169227153,
+    "viewer_construction": 0.20363246800843626,
+    "single_dp_merge": 0.01384872302878648,
+    "overview_range_0": 5.71923703502398,
+    "overview_range_1": 5.768361294991337,
+    "overview_range_2": 5.795370825915597
+  },
+  "passes": [
+    {
+      "min": 0.0,
+      "max": 1716.4329833984375,
+      "bf_sum": 247512.61601287127,
+      "dp_sum": 34806.46160908416
+    },
+    {
+      "min": 0.0,
+      "max": 1716.4329833984375,
+      "bf_sum": 247512.61601287127,
+      "dp_sum": 34806.46160908416
+    },
+    {
+      "min": 0.0,
+      "max": 1716.4329833984375,
+      "bf_sum": 247512.61601287127,
+      "dp_sum": 34806.46160908416
+    }
+  ],
+  "peak_process_bytes": 13589544960,
+  "compiled": false,
+  "torch": "2.10.0+cu130",
+  "device": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "inputs": [
+    {
+      "representation": "encoded",
+      "bytes": 1188582681,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1172877237,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1181853799,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1302163772,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1171135948,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1168257843,
+      "reads": 1
+    },
+    {
+      "representation": "encoded",
+      "bytes": 1143875632,
+      "reads": 1
+    }
+  ],
+  "region_frames": 4096,
+  "passed": true,
+  "peak_torch_allocated": 3655116800,
+  "peak_torch_reserved": 3707764736
+}

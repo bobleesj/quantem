@@ -26,6 +26,8 @@ The [Torch MPS inspection and performance report](docs/development/mps-maped-ins
 records inspection before saving, the faster complete workflow, memory use,
 and full-output checks. The [earlier qualification](docs/development/mps-maped-merge-performance.md)
 retains the previous execution baseline.
+
+See [CUDA processing and the notebook API](docs/development/cuda-maped-processing-performance.md) for the matching GPU0 workflow.
 The [MAPED demo skill](docs/development/skills/maped-demo/SKILL.md) keeps the
 execution and qualification instructions beside the code.
 

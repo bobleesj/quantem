@@ -69,6 +69,24 @@ native counts; do not reinterpret signed integers or loosen the parity gate.
 GPU IO uses one MPS min/max reduction to measure the range, validated against
 nonfinite and strided inputs, with the established bounded writer queue.
 
+## Current CUDA processing qualification
+
+Read [CUDA processing before export](../../cuda-maped-processing-performance.md).
+The pure-Torch first-tap initialization change removes a full zero-fill and
+readback. Two paired complete CUDA merges improved 6.27 s to 5.79–5.83 s,
+with all 9.66 billion float32 values exact in each audit. Complete merge,
+BF/mean-DP summaries, and global range took 5.72–5.92 s after preparation
+(1.66–1.68 s). Loading measured 8.46–13.14 s, not the desired 3–4 s.
+Peak process memory was at most 13.21 GiB including the paired audit.
+
+CUDA keeps eager interpolation: the MPS compiled form failed exact CUDA
+parity and was rejected. Smaller 2048-frame regions were slower. Preserve
+4096-frame automatic scheduling and the zero-copy DLPack read already used
+on CUDA. This update changes no QuantEM.GPU API or implementation. Keep
+complete overview benchmark timing separate from full scaled-uint16 viewing
+and from actual browser rendering. The notebook includes exact float32 region
+inspection before optional full export.
+
 ## Inspect before saving
 
 After alignment, use the existing merge method with a selected scan region:

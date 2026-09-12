@@ -1,0 +1,42 @@
+{
+  "reference_quantem": "a71d41fd",
+  "reference_sha256": "8a8066350da1ba8f548c06531ae3d70ab80796e72fd45da96a46decd3df19aed",
+  "quantem_gpu_revision": "57b6aade7f435553aa6613dfb0ed3a128565ab79",
+  "rejected_compilation": {
+    "max_abs_error": 0.01171875,
+    "fixture": "seven full-range uint16 synthetic inputs; fractional scan and detector shifts",
+    "promoted": false
+  },
+  "checks": {
+    "cuda": {
+      "passed": 7,
+      "skipped": 2
+    },
+    "mps_resident_preview_boundary": {
+      "passed": 9,
+      "skipped": 1
+    },
+    "mps_ordered_scan": {
+      "passed": 1,
+      "skipped": 1
+    }
+  },
+  "notebook": {
+    "kernel_execution_passed": true,
+    "browser_interaction_tested": false,
+    "load_seconds": 9.21,
+    "alignment_seconds": 1.81,
+    "patch_seconds": 0.225,
+    "export_reopen_seconds": 33.77,
+    "storage_rmse": 0.006954265,
+    "max_abs_error": 0.01318359,
+    "clipped": 0
+  },
+  "limits": {
+    "torch_allocation_cap_bytes": 25769803776,
+    "physical_memory_gb": 96,
+    "desktop_workload_present": true,
+    "forced_cold_file_cache": false,
+    "full_unsaved_scaled_view_implemented": false
+  }
+}

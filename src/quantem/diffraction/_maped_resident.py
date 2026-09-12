@@ -182,7 +182,7 @@ def _sample_scan_rows(
         )
         if out is None else out
     )
-    output.zero_()
+    initialized = False
     row_offset = -float(shift[0])
     column_offset = -float(shift[1])
     row_floor = math.floor(row_offset)
@@ -223,16 +223,25 @@ def _sample_scan_rows(
             source_column1 = (
                 output_first_column + output_column1 + column_delta - decoded_first_column
             )
-            output[
-                output_row0:output_row1,
-                output_column0:output_column1,
-            ].add_(
-                values[
-                    source_row0:source_row1,
-                    source_column0:source_column1,
-                ],
-                alpha=weight,
-            )
+            destination = output[
+                output_row0:output_row1, output_column0:output_column1
+            ]
+            source = values[
+                source_row0:source_row1, source_column0:source_column1
+            ]
+            if not initialized:
+                # The first valid tap initializes its rectangle directly. Only
+                # uncovered borders need zeros; avoid a full memset and readback.
+                output[:output_row0].zero_()
+                output[output_row1:].zero_()
+                output[output_row0:output_row1, :output_column0].zero_()
+                output[output_row0:output_row1, output_column1:].zero_()
+                torch.mul(source, weight, out=destination)
+                initialized = True
+            else:
+                destination.add_(source, alpha=weight)
+    if not initialized:
+        output.zero_()
     return output
 
 
