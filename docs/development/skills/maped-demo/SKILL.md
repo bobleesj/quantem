@@ -132,3 +132,6 @@ The local notebook belongs under
 identities out of tracked artifacts. For native port changes, apply the adjacent
 `port-torch-scientific-workflows` skill. Check GPU ownership before compute and
 release only resources belonging to this run when finished.
+
+For reusable execution lessons, use the adjacent
+[Torch resident optimization skill](../torch-resident-optimization/SKILL.md).
