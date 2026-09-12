@@ -107,3 +107,6 @@ reaches complete packed GPU residency in 13.26–13.76 s without saving. It chan
 storage precision intentionally and does not change the default global-scale
 contract; production readers and formats must support per-region calibration
 before adoption.
+
+See the [scaled-storage API proposal](maped-scaled-storage-api-plan.md) for the
+experimental regional precision policy and its remaining qualification gates.

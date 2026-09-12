@@ -183,3 +183,10 @@ footprint 15.277 GiB. Full packed restoration was audited for all 9.66 billion
 values. No production default or public API changed. Do not treat regional
 codes as globally scaled, or claim viewer/file support until the generic
 cross-region reader, metadata contract and calibrated reductions are qualified.
+
+The [scaled-storage API proposal](../../maped-scaled-storage-api-plan.md) keeps
+`merge_datasets` and proposes `dtype="scaled_uint16", scaling="regional"`.
+Do not present it as implemented or enable it by default. CUDA, Torch MPS,
+regional file reloads and viewer reductions still require qualification.
+For DP review, follow the matched-intensity and residual-panel procedure in
+the regional experiment document; distinguish storage RMSE from merge parity.

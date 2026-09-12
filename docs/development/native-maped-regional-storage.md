@@ -103,3 +103,39 @@ Live4DSTEM UI integration remains a separate task.
 
 Evidence: [audit](../../native/Benchmarks/results/2026-09-12-regional-storage/audit.json)
 and [timing repeats](../../native/Benchmarks/results/2026-09-12-regional-storage/timings.json).
+
+## Matched diffraction-pattern review
+
+The [API proposal](maped-scaled-storage-api-plan.md) describes the intended
+scientist-facing option, calibration contract, and CUDA/MPS qualification gates.
+It is a proposal, not a newly available public API.
+
+The real-data comparison selects zero-based scan coordinates `(4, 256)`,
+`(252, 256)`, and `(508, 256)`. It compares the same float32 merged values
+with GPU-restored global and regional scaled uint16 values. All intensity
+panels share a logarithmic display range; all signed residual panels share
+limits of ±0.014. No per-pattern normalization is applied.
+
+| Scan coordinate | Global storage RMSE | Regional storage RMSE |
+|---|---:|---:|
+| (4, 256) | 0.00692956 | 0.00692956 |
+| (252, 256) | 0.00706356 | 0.00395049 |
+| (508, 256) | 0.00619344 | 0.00322112 |
+
+The first selected region uses the global scale and has identical error.
+The other two use smaller steps. This is reduced storage error relative to
+float32, not improved scientific accuracy of the float32 merge itself.
+These three examples supplement the full-output audit; they do not replace it.
+
+For this 512×512 acquisition, set `MAPED_REGIONAL_DP_DIRECTORY` to a local
+output directory alongside the full-audit environment options above. The native
+benchmark exports three float32 buffers per selected DP. Then run on an MPS Mac:
+
+```sh
+python native/Benchmarks/render_regional_dp_comparison.py DP_DIRECTORY REVIEW_DIRECTORY
+```
+
+The renderer computes differences and metrics on MPS and uses the CPU only for
+file reading and figure rendering. It writes `dp-comparison.png` and
+`dp-metrics.json`. Acquisition images stay in the local review directory;
+only anonymous numerical evidence and the reproduction procedure are published.

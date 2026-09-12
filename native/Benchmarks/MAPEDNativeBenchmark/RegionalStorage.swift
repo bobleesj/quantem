@@ -61,9 +61,33 @@ func benchmarkRegionalStorage(_ maped: MAPEDNative) throws -> [String: Any] {
       peak = max(peak, maped.peak_metal_bytes, device.currentAllocatedSize)
       if let reference, let verification {
         phase = Date.timeIntervalSinceReferenceDate
-        _ = try reference.convert(values.buffer, count: count)
+        let globalCodes = try reference.convert(values.buffer, count: count)
         let expected = try precision.restore(codes, count: count)
         let actual = try packed.read(0..<(localShape[0] * localShape[1]))
+        if let directory = ProcessInfo.processInfo.environment["MAPED_REGIONAL_DP_DIRECTORY"],
+          shape[0] == 512, shape[1] == 512, [0, 248, 504].contains(first) {
+          let folder = URL(fileURLWithPath: directory)
+          try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+          let frame = 4 * shape[1] + 256
+          let pixels = shape[2] * shape[3]
+          let selectedCodes = device.makeBuffer(length: pixels * 2, options: .storageModeShared)!
+          let copy = maped.operations.queue.makeCommandBuffer()!
+          let blit = copy.makeBlitCommandEncoder()!
+          blit.copy(from: globalCodes, sourceOffset: frame * pixels * 2,
+            to: selectedCodes, destinationOffset: 0, size: pixels * 2)
+          blit.endEncoding()
+          copy.commit()
+          copy.waitUntilCompleted()
+          guard copy.status == .completed else { fatalError("DP export copy failed.") }
+          let globalDP = try reference.restore(selectedCodes, count: pixels)
+          let prefix = "row-\(first + 4)-col-256"
+          for (name, buffer, offset) in [
+            ("float32", values.buffer, frame * pixels * 4),
+            ("global", globalDP, 0), ("regional", actual, frame * pixels * 4)] {
+            try Data(bytes: buffer.contents().advanced(by: offset), count: pixels * 4)
+              .write(to: folder.appendingPathComponent("\(prefix)-\(name).f32"))
+          }
+        }
         let error = device.makeBuffer(length: 4, options: .storageModeShared)!
         error.contents().storeBytes(of: UInt32(0), as: UInt32.self)
         let command = maped.operations.queue.makeCommandBuffer()!
