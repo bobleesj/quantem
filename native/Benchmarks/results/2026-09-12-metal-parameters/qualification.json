@@ -1,0 +1,45 @@
+{
+  "date": "2026-09-12",
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_gib": 128
+  },
+  "torch_version": "2.13.0",
+  "torch_revision": "cf30153c4c131c8164ee7798e5022d810682e2cb",
+  "quantem_reference_revision": "4a7a5033b12537d9efa6b3f708e2697b8886ce58",
+  "quantem_gpu_revision": "6c171565569f2b9b4bd5987e50789a53ddc6b520",
+  "native_compute": "Metal, float32/complex64; no Torch/Python runtime",
+  "test_oracles": "Torch MPS and independent NumPy fixtures; CPU fallback disabled",
+  "tests": {
+    "parameter_cases": 75,
+    "sensitivity_intervals": 45,
+    "rejected_merge_cases": 7,
+    "native_hardware_tests": 7,
+    "torch_mps_hardware_tests": 3,
+    "infrastructure_checks": 30,
+    "backend_boundary_tests": 3,
+    "mps_precision_hardware_tests": 7,
+    "all_reported_tests_executed": true
+  },
+  "full_workflow_peak_process_footprint_bytes": 10875097288,
+  "unexecuted_platforms": [
+    "Windows GPU runtime"
+  ],
+  "timing_scope": "one full native export/reopen after the parameter sweep; validation exports excluded",
+  "post_sweep_change": "Added a checked allocation bound before converting padding to an integer; the native hardware suite was repeated. Numerical operations and qualified parameter choices are unchanged.",
+  "parameter_run_source_sha256": {
+    "native/Sources/QuantEMMAPED/MAPEDNative.swift": "dbd8859777c2d9fba5fa12a7dc03a9f7e829959db618aa247eb931ecef1f2768",
+    "native/Sources/QuantEMMAPED/MAPEDPadValue.swift": "ad94e73e9b5697393ccc246d103786f3de4f21da2c26f12a17a504902adfe8ad",
+    "native/Tests/parameter_cases.json": "abb40bdf5b84b85cebdbfbf46529865ebb2d4f54b527c400f9c3a280deb86ecf",
+    "native/Tests/QuantEMMAPEDTests/Fixtures/torch_mps_parameters.json": "c7402e0fbb3acd712598630e12958aaf2b9d8b21bac2507c1f0eaadf300a72ab",
+    "src/quantem/diffraction/maped.py": "de4251a564139226449220ed7ce449039db3174145810e9ebb55823f299580cb"
+  },
+  "final_source_sha256": {
+    "native/Sources/QuantEMMAPED/MAPEDNative.swift": "9562f5de18b68cc13e5a5fd2a3488dc90462e5829226a8fbb0397161733b11d4",
+    "native/Sources/QuantEMMAPED/MAPEDPadValue.swift": "ad94e73e9b5697393ccc246d103786f3de4f21da2c26f12a17a504902adfe8ad",
+    "native/Tests/parameter_cases.json": "abb40bdf5b84b85cebdbfbf46529865ebb2d4f54b527c400f9c3a280deb86ecf",
+    "native/Tests/QuantEMMAPEDTests/Fixtures/torch_mps_parameters.json": "c7402e0fbb3acd712598630e12958aaf2b9d8b21bac2507c1f0eaadf300a72ab",
+    "src/quantem/diffraction/maped.py": "de4251a564139226449220ed7ce449039db3174145810e9ebb55823f299580cb"
+  }
+}

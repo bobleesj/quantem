@@ -87,3 +87,18 @@ def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
         if result is not None:
             result.close()
         maped.close()
+
+
+@pytest.mark.parametrize("origins", [(31, 32), [(31, 32), (30, 33)]])
+def test_manual_origins_align_on_the_requested_gpu(origins):
+    """Manual origins keep radial coordinate grids on the selected accelerator."""
+    values = torch.arange(8 * 8 * 64 * 64, device="mps").reshape(8, 8, 64, 64)
+    first = ((values * 37) % 251).float()
+    second = ((values * 37 + 13) % 251).float()
+    maped = MAPEDTorch.from_datasets([first, second])
+    maped.device = "mps"
+    maped.preprocess(plot_summary=False)
+    maped.diffraction_origin(origins=origins, plot_origins=False)
+    maped.diffraction_align(upsample_factor=3, plot_aligned=False)
+    assert maped.diffraction_shifts.device.type == "mps"
+    assert torch.isfinite(maped.diffraction_shifts).all()

@@ -1,3 +1,4 @@
+import CNativeHDF5
 import Metal4DSTEMStreamingIO
 import MetalScientificNumerics
 import QuantEMMAPED
@@ -57,6 +58,45 @@ final class MAPEDNativeTests: XCTestCase {
       XCTAssertEqual(shift[0], -3, accuracy: 0.001)
       XCTAssertEqual(shift[1], 4, accuracy: 0.001)
     }
+  }
+  func testAdvancedNumericsMatchFrozenTorchMPS() throws {
+    let path = Bundle.module.url(
+      forResource: "torch_mps_parameters", withExtension: "json", subdirectory: "Fixtures")!
+    let fixture = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
+    let ops = try MetalImageOperations()
+    func image(_ rows: Int, _ columns: Int) throws -> GPUImage {
+      try ops.image(
+        values: (0..<(rows * columns)).map { Float(($0 * 37) % 251 - 125) * 0.03125 },
+        rows: rows, columns: columns)
+    }
+    func check(_ actual: GPUImage, _ observation: [String: Any]) {
+      let values = actual.values()
+      let indices = observation["indices"] as! [Int]
+      if actual.isComplex {
+        for (index, expected) in zip(indices, observation["values"] as! [[Double]]) {
+          XCTAssertEqual(values[2 * index], Float(expected[0]))
+          XCTAssertEqual(values[2 * index + 1], Float(expected[1]))
+        }
+      } else {
+        for (index, expected) in zip(indices, observation["values"] as! [Double]) {
+          XCTAssertEqual(values[index], Float(expected))
+        }
+      }
+    }
+    let raw = try image(512, 512)
+    for (sigma, observation) in fixture["gradient"] as! [String: [String: Any]] {
+      check(try ops.gradientMagnitude(raw, sigma: Double(sigma)!), observation)
+    }
+    check(try ops.fourier(image(520, 520)), fixture["fft"] as! [String: Any])
+    for (edge, observation) in fixture["windows"] as! [String: [String: Any]] {
+      check(
+        try ops.window(
+          ops.image(rows: 192, columns: 192, value: 1),
+          kind: 1, edge_blend: Double(edge)!), observation)
+    }
+    check(
+      try ops.centered(raw, window: ops.image(rows: 512, columns: 512, value: 1)),
+      fixture["centered"] as! [String: Any])
   }
   private func numpyFixture() throws -> [String: Any] {
     let path = Bundle.module.url(
@@ -150,5 +190,85 @@ final class MAPEDNativeTests: XCTestCase {
     for (index, expected) in zip(fixture["indices"] as! [Int], fixture["values"] as! [Double]) {
       XCTAssertEqual(translated[index], Float(expected), accuracy: 2e-7, "Boundary pixel \(index)")
     }
+  }
+  func testParameterChangesAndSavedProvenance() throws {
+    let ops = try MetalImageOperations()
+    let shape = [8, 8, 64, 64]
+    var sources: [MetalEncodedSource] = []
+    for index in 0..<2 {
+      let values = (0..<shape.reduce(1, *)).map { UInt16(($0 * 37 + index * 13) % 251) }
+      let raw = ops.device.makeBuffer(length: values.count * 2, options: .storageModeShared)!
+      values.withUnsafeBytes { _ = memcpy(raw.contents(), $0.baseAddress!, $0.count) }
+      let source = try MetalEncodedSource(shape: shape, device: ops.device)
+      try source.append(raw, frames: 64, verify: true)
+      sources.append(source)
+    }
+    defer { for source in sources { source.releaseResidentStorage() } }
+    let maped = try MAPEDNative.from_resident(sources, operations: ops)
+    defer { maped.close() }
+    XCTAssertThrowsError(try maped.preprocess(scale: 0))
+    XCTAssertThrowsError(try maped.preprocess(scale: [1]))
+    try maped.preprocess(scale: 2)
+    XCTAssertEqual(maped.scales, [2, 2])
+    try maped.diffraction_origin(origins: (31, 32))
+    XCTAssertEqual(maped.diffraction_origins, [[31, 32], [31, 32]])
+    try maped.diffraction_align(edge_blend: 2, upsample_factor: 3)
+    try maped.real_space_align(num_iter: 1, edge_filter: false, edge_sigma: 0)
+    XCTAssertThrowsError(try maped.real_space_align(num_images: 0))
+    XCTAssertThrowsError(try maped.real_space_align(num_iter: 0))
+    XCTAssertThrowsError(try maped.real_space_align(edge_sigma: 0))
+    XCTAssertThrowsError(try maped.real_space_align(max_shift: Double.greatestFiniteMagnitude))
+    XCTAssertThrowsError(try maped.diffraction_origin(origins: [[31, 32]]))
+    XCTAssertThrowsError(try maped.merged_region(0..<0))
+    let original = try maped.merged_region(0..<1).values()
+    try maped.real_space_align(num_images: 1, num_iter: 1, edge_filter: false, edge_sigma: 0)
+    try maped.real_space_align(num_iter: 1, edge_filter: false, edge_sigma: 0)
+    XCTAssertEqual(try maped.merged_region(0..<1).values(), original)
+
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let first = try maped.merge_datasets(
+      shift_method: " BILINEAR ", save_to: directory.appendingPathComponent("first_master.h5"),
+      verbose: false)
+    let firstBuffer = try first.read(0..<1)
+    let expected = Array(
+      UnsafeBufferPointer(
+        start: firstBuffer.contents().assumingMemoryBound(to: Float.self), count: 4096))
+    let savedText = qh5_read_root_attribute(
+      directory.appendingPathComponent("first_master.h5").path, "quantem_maped_merge_v1")!
+    let saved =
+      try JSONSerialization.jsonObject(
+        with: Data(String(cString: savedText).utf8)) as! [String: Any]
+    qh5_free_error(savedText)
+    let savedParameters = saved["parameters"] as! [String: [String: Any]]
+    XCTAssertEqual(savedParameters["preprocess"]?["scale"] as? [Float], [2, 2])
+    XCTAssertEqual(
+      savedParameters["diffraction_origin"]?["origins"] as? [[Int]], [[31, 32], [31, 32]])
+    XCTAssertEqual(savedParameters["real_space_align"]?["edge_filter"] as? Bool, false)
+    XCTAssertTrue(sources.allSatisfy { !$0.isReleased })
+    XCTAssertThrowsError(
+      try maped.merge_datasets(
+        save_to: directory.appendingPathComponent("first_master.h5"), verbose: false))
+    XCTAssertFalse(first.isReleased)
+    XCTAssertTrue(maped.merged === first)
+    let second = try maped.merge_datasets(
+      diffraction_pad_val: 0.5, dtype: "scaled_uint16",
+      save_to: directory.appendingPathComponent("second_master.h5"), verbose: false)
+    XCTAssertTrue(first.isReleased)
+    let buffer = try second.read(0..<1)
+    XCTAssertEqual(
+      Array(
+        UnsafeBufferPointer(
+          start: buffer.contents().assumingMemoryBound(to: Float.self), count: 4096)),
+      expected)
+    XCTAssertEqual(maped.parameters["real_space_align"]?["edge_filter"] as? Bool, false)
+    XCTAssertEqual(maped.parameters["real_space_align"]?["edge_sigma"] as? Double, 0)
+    try maped.real_space_align(num_iter: 1, edge_filter: false, edge_sigma: 0)
+    XCTAssertTrue(second.isReleased)
+    XCTAssertNil(maped.merged)
+    maped.close()
+    XCTAssertThrowsError(try maped.merged_region(0..<1))
+    XCTAssertTrue(sources.allSatisfy { !$0.isReleased })
   }
 }

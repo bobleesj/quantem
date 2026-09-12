@@ -1689,8 +1689,8 @@ class MAPEDTorch(AutoSerialize):
             )[None, :]
         )
 
-        r = torch.fft.fftfreq(H, 1.0 / float(H))[:, None]
-        c = torch.fft.fftfreq(W, 1.0 / float(W))[None, :]
+        r = torch.fft.fftfreq(H, 1.0 / float(H), device=self.device)[:, None]
+        c = torch.fft.fftfreq(W, 1.0 / float(W), device=self.device)[None, :]
 
         n = len(self.dp_mean)
         self.diffraction_shifts = torch.zeros((n, 2), device=self.device, dtype=torch.float32)
@@ -1887,8 +1887,6 @@ class MAPEDTorch(AutoSerialize):
         shifts = torch.zeros((n, 2), dtype=torch.float32, device=self.device)
 
         for _ in range(int(num_iter)):
-            G_list = torch.empty((n, Hp, Wp), dtype=torch.complex128)
-
             # shift images to current guess
             ims_a = shift_images_torch(base_pad, shifts)
             ims_mean = torch.sum(ims_a * w_h_pad, dim=(1, 2)) / w_h_sum

@@ -16,6 +16,9 @@ public final class MAPEDNative {
   public private(set) var peak_metal_bytes = 0
   public private(set) var timings: [String: Double] = [:]
   public private(set) var merged: MetalPackedSource?
+  /// Effective scientific settings, grouped by the existing stage names.
+  public private(set) var parameters: [String: [String: Any]] = [:]
+  public private(set) var scales: [Float] = []
   private let ownsSources: Bool
 
   private init(sources: [MetalEncodedSource], operations: MetalImageOperations, ownsSources: Bool)
@@ -59,22 +62,44 @@ public final class MAPEDNative {
     try MAPEDNative(sources: sources, operations: operations, ownsSources: false)
   }
   /// Reuse complete-detector and complete-scan means calculated during loading.
+  @discardableResult public func preprocess(scale: Float) throws -> MAPEDNative {
+    try preprocess(scale: Array(repeating: scale, count: sources.count))
+  }
   @discardableResult public func preprocess(scale: [Float]? = nil) throws -> MAPEDNative {
-    if let scale, scale.count != sources.count || scale.contains(0) {
-      throw Self.invalid("scale needs one nonzero value per tilt.")
+    guard !sources.isEmpty, sources.allSatisfy({ !$0.isReleased }) else {
+      throw Self.invalid(
+        "Load resident inputs before preprocessing; owned inputs are released after saving.")
+    }
+    if let scale, scale.count != sources.count || scale.contains(where: { !$0.isFinite || $0 == 0 })
+    {
+      throw Self.invalid("scale needs a finite nonzero value or one such value per tilt.")
     }
     // As in MAPEDTorch, scale is a summary-display control; it does not change counts.
     dp_mean = sources.map {
       GPUImage(buffer: $0.meanDiffraction, rows: shape[2], columns: shape[3])
     }
     im_bf = sources.map { GPUImage(buffer: $0.meanBrightField, rows: shape[0], columns: shape[1]) }
+    scales = scale ?? Array(repeating: 1, count: sources.count)
+    parameters["preprocess"] = ["scale": scales]
     return self
   }
-  @discardableResult public func diffraction_origin(origins: [[Int]]? = nil, sigma: Float? = nil)
+  @discardableResult public func diffraction_origin(origins: (Int, Int), sigma: Double? = nil)
+    throws -> MAPEDNative
+  {
+    try diffraction_origin(
+      origins: Array(repeating: [origins.0, origins.1], count: sources.count), sigma: sigma)
+  }
+  @discardableResult public func diffraction_origin(origins: [[Int]]? = nil, sigma: Double? = nil)
     throws -> MAPEDNative
   {
     guard !dp_mean.isEmpty else {
       throw Self.invalid("Run preprocess() before diffraction_origin().")
+    }
+    if let sigma {
+      guard sigma.isFinite, sigma <= 0 || 2 * sigma < Double(min(shape[2], shape[3])) else {
+        throw Self.invalid(
+          "sigma must be finite with reflection padding smaller than the detector; got \(sigma).")
+      }
     }
     if let origins {
       guard origins.count == sources.count, origins.allSatisfy({ $0.count == 2 }) else {
@@ -86,16 +111,22 @@ public final class MAPEDNative {
         try operations.origin(operations.gaussian($0, sigma: sigma ?? 0))
       }
     }
+    parameters["diffraction_origin"] = [
+      "origins": origins as Any? ?? NSNull(), "sigma": sigma as Any? ?? NSNull(),
+    ]
     return self
   }
   /// Align weighted mean diffraction patterns and center the resulting shifts.
   /// `padding` and `pad_val` are presentation-only in the reference implementation.
   @discardableResult public func diffraction_align(
-    edge_blend: Float = 16, padding: Int? = nil, pad_val: String = "min",
-    upsample_factor: Int = 100, weight_scale: Float = 0.125
+    edge_blend: Double = 16, padding: Int? = nil, pad_val: MAPEDPadValue = "min",
+    upsample_factor: Int = 100, weight_scale: Double = 0.125
   ) throws -> MAPEDNative {
     guard diffraction_origins.count == sources.count else {
       throw Self.invalid("Run diffraction_origin() before diffraction_align().")
+    }
+    guard !sources.isEmpty, edge_blend.isFinite, weight_scale.isFinite else {
+      throw Self.invalid("Use loaded inputs and finite diffraction edge_blend and weight_scale.")
     }
     let started = Date.timeIntervalSinceReferenceDate
     let shifts = try operations.image(rows: sources.count, columns: 2)
@@ -113,24 +144,43 @@ public final class MAPEDNative {
     }
     try operations.centerShifts(shifts)
     diffraction_shifts = shifts
+    merged?.releaseResidentStorage()
+    merged = nil
+    parameters["diffraction_align"] = [
+      "edge_blend": edge_blend, "padding": padding as Any? ?? NSNull(),
+      "pad_val": pad_val.metadata, "upsample_factor": upsample_factor, "weight_scale": weight_scale,
+    ]
     timings["diffraction_align"] = Date.timeIntervalSinceReferenceDate - started
     recordPeak()
     return self
   }
   /// Iteratively align mean bright-field images against their current average.
   @discardableResult public func real_space_align(
-    num_images: Int? = nil, num_iter: Int = 3, edge_blend: Float = 1,
-    padding: Int? = nil, pad_val: String = "median", upsample_factor: Int = 100,
-    max_shift: Float? = nil, shift_method: String = "bilinear", edge_filter: Bool = true,
-    edge_sigma: Float = 2, hanning_filter: Bool = false
+    num_images: Int? = nil, num_iter: Int = 3, edge_blend: Double = 1,
+    padding: Int? = nil, pad_val: MAPEDPadValue = "median", upsample_factor: Int = 100,
+    max_shift: Double? = nil, shift_method: String = "bilinear", edge_filter: Bool = true,
+    edge_sigma: Double = 2, hanning_filter: Bool = false
   ) throws -> MAPEDNative {
     guard !im_bf.isEmpty else { throw Self.invalid("Run preprocess() before real_space_align().") }
     let n = min(num_images ?? sources.count, sources.count)
-    guard n > 0, num_iter > 0, edge_sigma > 0 else {
-      throw Self.invalid("Use positive num_images, num_iter, and edge_sigma.")
+    guard n > 0, num_iter > 0, !edge_filter || (edge_sigma.isFinite && edge_sigma > 0),
+      edge_blend.isFinite, max_shift?.isFinite != false
+    else {
+      throw Self.invalid(
+        "Use positive num_images and num_iter, finite padding controls, and positive edge_sigma when edge_filter is enabled."
+      )
+    }
+    let paddingValue = ceil(max_shift ?? edge_blend) + 4
+    let paddedRows = Double(shape[0]) + 2 * paddingValue
+    let paddedColumns = Double(shape[1]) + 2 * paddingValue
+    guard paddingValue >= 0,
+      paddedRows * paddedColumns * 8 <= Double(operations.device.maxBufferLength)
+    else {
+      throw Self.invalid(
+        "Correlation padding exceeds the device limit; reduce max_shift or edge_blend.")
     }
     let started = Date.timeIntervalSinceReferenceDate
-    let pad = Int(ceil(max_shift ?? edge_blend)) + 4
+    let pad = Int(paddingValue)
     let ones = try operations.image(rows: shape[0], columns: shape[1], value: 1)
     let window = try operations.window(ones, kind: hanning_filter ? 2 : 0, padding: pad)
     let base = try im_bf.prefix(n).map { image in
@@ -145,10 +195,7 @@ public final class MAPEDNative {
             operations.centered(
               operations.shifted(image, shifts: shifts, index: index), window: window))
         }
-        var reference = spectra[0]
-        for index in 1..<n {
-          reference = try operations.blendSpectrum(reference, spectra[index], count: index)
-        }
+        let reference = try operations.mean(spectra)
         for index in 1..<n {
           let shift = try operations.correlation(
             reference, spectra[index], upsample_factor: upsample_factor)
@@ -159,6 +206,15 @@ public final class MAPEDNative {
     }
     try operations.centerShifts(shifts, count: n)
     real_space_shifts = shifts
+    merged?.releaseResidentStorage()
+    merged = nil
+    parameters["real_space_align"] = [
+      "num_images": num_images as Any? ?? NSNull(), "num_iter": num_iter,
+      "edge_blend": edge_blend, "padding": padding as Any? ?? NSNull(),
+      "pad_val": pad_val.metadata, "upsample_factor": upsample_factor,
+      "max_shift": max_shift as Any? ?? NSNull(), "shift_method": shift_method,
+      "edge_filter": edge_filter, "edge_sigma": edge_sigma, "hanning_filter": hanning_filter,
+    ]
     timings["real_space_align"] = Date.timeIntervalSinceReferenceDate - started
     recordPeak()
     return self
@@ -166,6 +222,10 @@ public final class MAPEDNative {
   /// Produce one float32 region using the established resident merge weights.
   /// This is the numerical sampling boundary for independent native parity tests.
   public func merged_region(_ rows: Range<Int>) throws -> GPUImage {
+    guard !sources.isEmpty, sources.allSatisfy({ !$0.isReleased }) else {
+      throw Self.invalid(
+        "Resident inputs are no longer available; read the saved result or load inputs again.")
+    }
     guard let scan = real_space_shifts, let detector = diffraction_shifts else {
       throw Self.invalid("Run diffraction_align() and real_space_align() before merging.")
     }
@@ -201,25 +261,28 @@ public final class MAPEDNative {
   /// the complete result in packed GPU memory. Scientific keyword names and
   /// the supported resident subset match MAPEDTorch.merge_datasets.
   @discardableResult public func merge_datasets(
-    real_space_padding: Int = 0, real_space_edge_blend: Float = 1,
-    diffraction_padding: Int = 0, diffraction_edge_blend: Float = 0,
-    diffraction_pad_val: String = "min", shift_method: String = "bilinear",
+    real_space_padding: Int = 0, real_space_edge_blend: Double = 1,
+    diffraction_padding: Int = 0, diffraction_edge_blend: Double = 0,
+    diffraction_pad_val: MAPEDPadValue = "min", shift_method: String = "bilinear",
     dtype: String? = nil, save_to: URL, scale_output: Bool = false,
     verbose: Bool = true
   ) throws -> MetalPackedSource {
     guard real_space_padding == 0, real_space_edge_blend == 1,
       diffraction_padding == 0, diffraction_edge_blend == 0,
-      shift_method == "bilinear", dtype == nil || dtype == "scaled_uint16", !scale_output
+      shift_method.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "bilinear",
+      dtype == nil || dtype == "scaled_uint16", !scale_output
     else {
       throw Self.invalid(
         "Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage."
       )
     }
-    guard !sources.isEmpty, merged == nil else {
-      throw Self.invalid("Load fresh inputs before merging another result.")
+    guard !sources.isEmpty, sources.allSatisfy({ !$0.isReleased }) else {
+      throw Self.invalid("Load resident inputs before merging another result.")
     }
     let precision = try MetalPrecision(device: operations.device)
     let writer = try MetalHDF5Writer(path: save_to, shape: shape, runtime: precision)
+    merged?.releaseResidentStorage()
+    merged = nil
     // Fixed 4096-frame ceiling matches the established resident workflow.
     let rowsPerRegion = max(1, 4096 / shape[1])
     let regions = stride(from: 0, to: shape[0], by: rowsPerRegion).map {
@@ -252,6 +315,12 @@ public final class MAPEDNative {
       }
     }
     let report = try precision.finish()
+    parameters["merge_datasets"] = [
+      "real_space_padding": real_space_padding, "real_space_edge_blend": real_space_edge_blend,
+      "diffraction_padding": diffraction_padding, "diffraction_edge_blend": diffraction_edge_blend,
+      "diffraction_pad_val": diffraction_pad_val.metadata, "shift_method": shift_method,
+      "dtype": dtype as Any? ?? NSNull(), "scale_output": scale_output,
+    ]
     func json(_ value: Any) throws -> String {
       String(
         data: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
@@ -286,6 +355,7 @@ public final class MAPEDNative {
       "released_sources_before_reopen": ownsSources,
       "real_space_shifts_row_column": pairs(real_space_shifts),
       "diffraction_shifts_row_column": pairs(diffraction_shifts),
+      "parameters": parameters,
     ]
     try writer.finish(metadata: [
       "quantem_precision_v1": json(report), "quantem_maped_summary_v1": json(summary),
@@ -322,6 +392,8 @@ public final class MAPEDNative {
     sources.removeAll()
     dp_mean.removeAll()
     im_bf.removeAll()
+    diffraction_shifts = nil
+    real_space_shifts = nil
     merged?.releaseResidentStorage()
     merged = nil
   }

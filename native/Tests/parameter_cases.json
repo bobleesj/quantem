@@ -1,0 +1,672 @@
+{
+  "version": 1,
+  "reference": "MAPEDTorch encoded resident workflow",
+  "comparison": {
+    "shift_max_absolute": 0.01,
+    "same_shift_rtol": 3e-06,
+    "same_shift_atol": 2e-05,
+    "aligned_dp_rmse": 0.001
+  },
+  "sample_positions": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      256
+    ],
+    [
+      0,
+      511
+    ],
+    [
+      248,
+      0
+    ],
+    [
+      248,
+      256
+    ],
+    [
+      248,
+      511
+    ],
+    [
+      511,
+      0
+    ],
+    [
+      511,
+      256
+    ],
+    [
+      511,
+      511
+    ]
+  ],
+  "cases": [
+    {
+      "id": "defaults",
+      "effect": "baseline"
+    },
+    {
+      "id": "preprocess_scale_2p0",
+      "preprocess": {
+        "scale": 2.0
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "preprocess_scale_[1, 2, 3, 4, 5, 6, 7]",
+      "preprocess": {
+        "scale": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ]
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "diffraction_origin_sigma_neg1",
+      "diffraction_origin": {
+        "sigma": -1
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_0",
+      "diffraction_origin": {
+        "sigma": 0
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_0p5",
+      "diffraction_origin": {
+        "sigma": 0.5
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_1",
+      "diffraction_origin": {
+        "sigma": 1
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_1p5",
+      "diffraction_origin": {
+        "sigma": 1.5
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_2",
+      "diffraction_origin": {
+        "sigma": 2
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_sigma_4",
+      "diffraction_origin": {
+        "sigma": 4
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_origin_origins_[92, 89]",
+      "diffraction_origin": {
+        "origins": [
+          92,
+          89
+        ]
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "manual_origins_per_tilt",
+      "diffraction_origin": {
+        "origins": [
+          [
+            92,
+            89
+          ],
+          [
+            93,
+            89
+          ],
+          [
+            92,
+            89
+          ],
+          [
+            93,
+            89
+          ],
+          [
+            92,
+            89
+          ],
+          [
+            93,
+            89
+          ],
+          [
+            92,
+            89
+          ]
+        ]
+      },
+      "effect": "origin_only"
+    },
+    {
+      "id": "diffraction_align_edge_blend_0",
+      "diffraction_align": {
+        "edge_blend": 0
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_1",
+      "diffraction_align": {
+        "edge_blend": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_2",
+      "diffraction_align": {
+        "edge_blend": 2
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_8",
+      "diffraction_align": {
+        "edge_blend": 8
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_32",
+      "diffraction_align": {
+        "edge_blend": 32
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_96",
+      "diffraction_align": {
+        "edge_blend": 96
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_edge_blend_128",
+      "diffraction_align": {
+        "edge_blend": 128
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_1",
+      "diffraction_align": {
+        "upsample_factor": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_2",
+      "diffraction_align": {
+        "upsample_factor": 2
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_3",
+      "diffraction_align": {
+        "upsample_factor": 3
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_10",
+      "diffraction_align": {
+        "upsample_factor": 10
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_50",
+      "diffraction_align": {
+        "upsample_factor": 50
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_upsample_factor_200",
+      "diffraction_align": {
+        "upsample_factor": 200
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_align_weight_scale_0p05",
+      "diffraction_align": {
+        "weight_scale": 0.05
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "diffraction_align_weight_scale_1p0",
+      "diffraction_align": {
+        "weight_scale": 1.0
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "diffraction_align_padding_4",
+      "diffraction_align": {
+        "padding": 4
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "diffraction_align_pad_val_max",
+      "diffraction_align": {
+        "pad_val": "max"
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "real_space_align_num_images_1",
+      "real_space_align": {
+        "num_images": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_images_3",
+      "real_space_align": {
+        "num_images": 3
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_images_5",
+      "real_space_align": {
+        "num_images": 5
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_images_7",
+      "real_space_align": {
+        "num_images": 7
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_images_9",
+      "real_space_align": {
+        "num_images": 9
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_iter_1",
+      "real_space_align": {
+        "num_iter": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_iter_5",
+      "real_space_align": {
+        "num_iter": 5
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_iter_10",
+      "real_space_align": {
+        "num_iter": 10
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_num_iter_20",
+      "real_space_align": {
+        "num_iter": 20
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_blend_0",
+      "real_space_align": {
+        "edge_blend": 0
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_blend_2",
+      "real_space_align": {
+        "edge_blend": 2
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_blend_5",
+      "real_space_align": {
+        "edge_blend": 5
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_blend_12",
+      "real_space_align": {
+        "edge_blend": 12
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_max_shift_0",
+      "real_space_align": {
+        "max_shift": 0
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_max_shift_4",
+      "real_space_align": {
+        "max_shift": 4
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_max_shift_12",
+      "real_space_align": {
+        "max_shift": 12
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_filter_false",
+      "real_space_align": {
+        "edge_filter": false
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_sigma_0p25",
+      "real_space_align": {
+        "edge_sigma": 0.25
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_sigma_0p5",
+      "real_space_align": {
+        "edge_sigma": 0.5
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_sigma_1",
+      "real_space_align": {
+        "edge_sigma": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_sigma_3",
+      "real_space_align": {
+        "edge_sigma": 3
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_edge_sigma_4",
+      "real_space_align": {
+        "edge_sigma": 4
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_hanning_filter_true",
+      "real_space_align": {
+        "hanning_filter": true
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_1",
+      "real_space_align": {
+        "upsample_factor": 1
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_2",
+      "real_space_align": {
+        "upsample_factor": 2
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_3",
+      "real_space_align": {
+        "upsample_factor": 3
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_10",
+      "real_space_align": {
+        "upsample_factor": 10
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_50",
+      "real_space_align": {
+        "upsample_factor": 50
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_upsample_factor_200",
+      "real_space_align": {
+        "upsample_factor": 200
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_space_align_padding_4",
+      "real_space_align": {
+        "padding": 4
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "real_space_align_pad_val_max",
+      "real_space_align": {
+        "pad_val": "max"
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "real_space_align_shift_method_fourier",
+      "real_space_align": {
+        "shift_method": "fourier"
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "unfiltered_zero_sigma",
+      "real_space_align": {
+        "edge_filter": false,
+        "edge_sigma": 0
+      },
+      "effect": "interaction",
+      "equivalent_to": "real_space_align_edge_filter_false"
+    },
+    {
+      "id": "unfiltered_large_sigma",
+      "real_space_align": {
+        "edge_filter": false,
+        "edge_sigma": 300
+      },
+      "effect": "interaction",
+      "equivalent_to": "real_space_align_edge_filter_false"
+    },
+    {
+      "id": "max_shift_overrides_edge",
+      "real_space_align": {
+        "max_shift": 4,
+        "edge_blend": 12
+      },
+      "effect": "interaction",
+      "equivalent_to": "real_space_align_max_shift_4"
+    },
+    {
+      "id": "filtered_hann",
+      "real_space_align": {
+        "edge_filter": true,
+        "edge_sigma": 1,
+        "hanning_filter": true,
+        "num_iter": 10
+      },
+      "effect": "interaction"
+    },
+    {
+      "id": "qualified_seven_tilt",
+      "diffraction_origin": {
+        "sigma": 1
+      },
+      "diffraction_align": {
+        "edge_blend": 2
+      },
+      "real_space_align": {
+        "num_iter": 20,
+        "edge_blend": 5,
+        "padding": 2,
+        "hanning_filter": true
+      },
+      "effect": "interaction"
+    },
+    {
+      "id": "real_sigma_0p499999999",
+      "real_space_align": {
+        "edge_sigma": 0.499999999
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_sigma_0p500000001",
+      "real_space_align": {
+        "edge_sigma": 0.500000001
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_sigma_0p999999999",
+      "real_space_align": {
+        "edge_sigma": 0.999999999
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_sigma_1p000000001",
+      "real_space_align": {
+        "edge_sigma": 1.000000001
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_edge_0p999999999",
+      "real_space_align": {
+        "edge_blend": 0.999999999
+      },
+      "effect": "active"
+    },
+    {
+      "id": "real_edge_1p000000001",
+      "real_space_align": {
+        "edge_blend": 1.000000001
+      },
+      "effect": "active"
+    },
+    {
+      "id": "diffraction_numeric_pad",
+      "diffraction_align": {
+        "pad_val": 0.5
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "real_numeric_pad",
+      "real_space_align": {
+        "pad_val": 0.5
+      },
+      "effect": "inactive"
+    },
+    {
+      "id": "return_defaults",
+      "effect": "repeat",
+      "equivalent_to": "defaults"
+    }
+  ],
+  "rejected_merge_cases": [
+    {
+      "id": "reject_real_space_padding",
+      "options": {
+        "real_space_padding": 1
+      }
+    },
+    {
+      "id": "reject_real_space_edge_blend",
+      "options": {
+        "real_space_edge_blend": 2
+      }
+    },
+    {
+      "id": "reject_diffraction_padding",
+      "options": {
+        "diffraction_padding": 1
+      }
+    },
+    {
+      "id": "reject_diffraction_edge_blend",
+      "options": {
+        "diffraction_edge_blend": 1
+      }
+    },
+    {
+      "id": "reject_shift_method",
+      "options": {
+        "shift_method": "fourier"
+      }
+    },
+    {
+      "id": "reject_dtype",
+      "options": {
+        "dtype": "float16"
+      }
+    },
+    {
+      "id": "reject_scale_output",
+      "options": {
+        "scale_output": true
+      }
+    }
+  ]
+}

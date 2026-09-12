@@ -17,6 +17,7 @@ let package = Package(
   products: [
     .library(name: "QuantEMMAPED", targets: ["QuantEMMAPED"]),
     .executable(name: "maped-native-benchmark", targets: ["MAPEDNativeBenchmark"]),
+    .executable(name: "maped-parameter-parity", targets: ["MAPEDParameterParity"]),
   ],
   dependencies: [infrastructure],
   targets: [
@@ -30,6 +31,9 @@ let package = Package(
     .executableTarget(
       name: "MAPEDNativeBenchmark", dependencies: ["QuantEMMAPED"],
       path: "native/Benchmarks/MAPEDNativeBenchmark"),
+    .executableTarget(
+      name: "MAPEDParameterParity", dependencies: ["QuantEMMAPED"],
+      path: "native/Benchmarks/MAPEDParameterParity"),
     .testTarget(
       name: "QuantEMMAPEDTests", dependencies: ["QuantEMMAPED"],
       path: "native/Tests/QuantEMMAPEDTests", resources: [.copy("Fixtures")]),

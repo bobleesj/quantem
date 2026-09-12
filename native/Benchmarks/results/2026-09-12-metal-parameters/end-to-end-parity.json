@@ -1,0 +1,239 @@
+{
+  "comparisons": {
+    "dp_mean_0": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 863.9277954101562,
+      "exact": true
+    },
+    "dp_mean_1": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1119.9654541015625,
+      "exact": true
+    },
+    "dp_mean_2": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 953.060302734375,
+      "exact": true
+    },
+    "dp_mean_3": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 709.0562133789062,
+      "exact": true
+    },
+    "dp_mean_4": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 856.64892578125,
+      "exact": true
+    },
+    "dp_mean_5": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 867.507568359375,
+      "exact": true
+    },
+    "dp_mean_6": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1248.892333984375,
+      "exact": true
+    },
+    "im_bf_0": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 0.9998915195465088,
+      "exact": true
+    },
+    "im_bf_1": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1.0231119394302368,
+      "exact": true
+    },
+    "im_bf_2": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1.0200737714767456,
+      "exact": true
+    },
+    "im_bf_3": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1.0200737714767456,
+      "exact": true
+    },
+    "im_bf_4": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1.0149197578430176,
+      "exact": true
+    },
+    "im_bf_5": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 0.9881184697151184,
+      "exact": true
+    },
+    "im_bf_6": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 1.0158419609069824,
+      "exact": true
+    },
+    "diffraction_shifts": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 0.4521157443523407,
+      "exact": true
+    },
+    "real_space_shifts": {
+      "max_absolute": 0.0,
+      "rmse": 0.0,
+      "reference_max": 7.3794121742248535,
+      "exact": true
+    },
+    "merge_same_shifts": {
+      "max_absolute": 0.000244140625,
+      "rmse": 6.239645813366224e-07,
+      "reference_max": 948.7850952148438,
+      "exact": false
+    },
+    "merge_independent_alignment": {
+      "max_absolute": 0.000244140625,
+      "rmse": 6.239645813366224e-07,
+      "reference_max": 948.7850952148438,
+      "exact": false
+    }
+  },
+  "timings": {
+    "load": 10.879441124998266,
+    "preprocess": 3.5778775840008166,
+    "diffraction_origin": 0.015988540995749645,
+    "diffraction_align": 0.05424324999330565,
+    "real_space_align": 0.5370234169968171,
+    "merge_with_native_shifts": 0.5791454579884885,
+    "merge_with_torch_shifts": 0.5736118329950841,
+    "python_reopen_native_export": 3.854677041992545
+  },
+  "diffraction_shifts": [
+    [
+      -0.2943551242351532,
+      0.2137102335691452
+    ],
+    [
+      0.1211264431476593,
+      0.028895780444145203
+    ],
+    [
+      -0.4521157443523407,
+      0.22584860026836395
+    ],
+    [
+      -0.06151363253593445,
+      -0.0028577595949172974
+    ],
+    [
+      0.3620322048664093,
+      -0.2536817193031311
+    ],
+    [
+      0.4228842556476593,
+      -0.16294534504413605
+    ],
+    [
+      -0.09805843234062195,
+      -0.0489698201417923
+    ]
+  ],
+  "real_space_shifts": [
+    [
+      -4.6165900230407715,
+      -0.8806326985359192
+    ],
+    [
+      3.5068840980529785,
+      -6.0155205726623535
+    ],
+    [
+      -4.8973822593688965,
+      4.0883307456970215
+    ],
+    [
+      3.4263787269592285,
+      1.0366342067718506
+    ],
+    [
+      0.5495171546936035,
+      -0.1313346028327942
+    ],
+    [
+      7.3794121742248535,
+      -3.5359671115875244
+    ],
+    [
+      -5.3482184410095215,
+      5.4384894371032715
+    ]
+  ],
+  "diffraction_origins": [
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      93,
+      89
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      90
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      89
+    ]
+  ],
+  "native_export_python_parity": "three selected DPs exact against float64 NumPy scaling oracle",
+  "saved_precision": {
+    "changed": 8807272287,
+    "clipped": 0,
+    "complete": true,
+    "intensity_max": 1716.4195556640625,
+    "intensity_min": 0,
+    "max_abs_error": 0.01312255859375,
+    "measurement": "GPU comparison against source",
+    "offset": 0,
+    "overflow": 0,
+    "positive_to_zero": 1813736950,
+    "range_scope": "complete source",
+    "rmse": 0.0069511099718511105,
+    "scale": 0.02619088358379587,
+    "scope": "all saved values",
+    "source_dtype": "float32",
+    "source_shape": [
+      512,
+      512,
+      192,
+      192
+    ],
+    "storage": "scaled_uint16",
+    "values": 9663676416,
+    "version": 1
+  }
+}

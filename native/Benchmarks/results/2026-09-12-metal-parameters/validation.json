@@ -1,0 +1,37 @@
+[
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_real_space_padding",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_real_space_edge_blend",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_diffraction_padding",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_diffraction_edge_blend",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_shift_method",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_dtype",
+    "rejected" : true
+  },
+  {
+    "error" : "invalidRequest(\"Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage.\")",
+    "id" : "reject_scale_output",
+    "rejected" : true
+  }
+]

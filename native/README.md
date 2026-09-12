@@ -50,11 +50,13 @@ and native viewer integration are outside this implementation.
 Some established parameters affect plots only; their scientific meaning is
 preserved. See the [numerical contract](../docs/development/native-maped-contract.md)
 for the normalized-grid interpolation convention and currently inactive options.
+The [parameter contract and sensitivity tests](../docs/development/native-maped-parameters.md)
+explain every scientific control, shared case sweeps, and saved provenance.
 
 ## Build and test
 
 Use the QuantEM repository as the working directory on a Mac. SwiftPM resolves
-QuantEM.GPU from its `main` branch by default (tested revision `7e5a9529`).
+QuantEM.GPU from its `main` branch by default (tested revision `6c171565`).
 To work with both repositories locally, point the package at that checkout:
 
 ```bash
@@ -113,3 +115,14 @@ scaling oracle exactly. Scaled-storage RMSE over the entire output is
 `0.00695231`, with no clipping or overflow.
 
 See the [retained measurements and qualification limits](Benchmarks/results/2026-09-12-metal/README.md).
+
+
+## Parameter qualification
+
+The [expanded parameter run](Benchmarks/results/2026-09-12-metal-parameters/README.md)
+qualifies 75 settings, 45 sensitivity intervals, seven rejected merge options,
+and repeated changes on the same encoded inputs. It includes scan-boundary DPs.
+Both shift arrays were bit-identical to Torch MPS for every case; the worst
+sampled float32 DP RMSE was 1.47e-6. This finite matrix is not a proof for every
+possible dataset or parameter value. The original benchmark above remains a
+historical measurement; use the expanded run for current code measurements.

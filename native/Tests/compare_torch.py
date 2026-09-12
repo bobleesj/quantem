@@ -40,12 +40,18 @@ def merge_region(maped, rows, real_shifts, diffraction_shifts):
         offset = int(torch.floor(-real_shifts[index, 0]).item())
         first = max(0, rows[0] + offset)
         stop = min(shape[0], rows[1] + offset + 1)
-        decoded = source.read(scan_region=(first, stop, 0, shape[1]))
-        sampled = _sample_scan_rows(
-            decoded, decoded_first_row=first, output_first_row=rows[0],
-            output_stop_row=rows[1], shift=real_shifts[index],
-        )
-        del decoded
+        if first < stop:
+            decoded = source.read(scan_region=(first, stop, 0, shape[1]))
+            sampled = _sample_scan_rows(
+                decoded, decoded_first_row=first, output_first_row=rows[0],
+                output_stop_row=rows[1], shift=real_shifts[index],
+            )
+            del decoded
+        else:
+            sampled = torch.zeros(
+                (rows[1] - rows[0], *shape[1:]),
+                dtype=torch.float32, device=real_shifts.device,
+            )
         shifted = _shift_detector(sampled.reshape(-1, *shape[2:]), grids[index]).reshape_as(sampled)
         del sampled
         weight = real_weights[index, rows[0]:rows[1], :, None, None]
