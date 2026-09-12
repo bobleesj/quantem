@@ -1954,7 +1954,6 @@ class MAPEDTorch(AutoSerialize):
         compile_merge: bool | None = None,
         compile_uint16_as_int16: bool = True,
         compute_summaries: bool = True,
-        use_mlx_fused_merge: bool | None = None,
         prefetch_tilts: bool = False,
         profile_timings: dict[str, Any] | None = None,
         **plot_kwargs: Any,
@@ -2022,10 +2021,6 @@ class MAPEDTorch(AutoSerialize):
             If True, compute merged BF and mean-DP summaries after merging. Disable
             for latency-critical live viewing when only the merged 4D tensor is
             needed.
-        use_mlx_fused_merge : bool, optional
-            Use the MLX custom Metal fused merge kernel for the default MPS uint16
-            bilinear no-padding path. If None, the kernel is tried automatically
-            when its exact preconditions are met.
         prefetch_tilts : bool
             If True for file-backed streams, load the next tilt on a background
             thread while the current tilt is being accumulated. This can hide HDF5
@@ -2119,19 +2114,37 @@ class MAPEDTorch(AutoSerialize):
                     "Encoded resident MAPED writes its bounded result as scaled "
                     "uint16; provide save_to='merged_master.h5'."
                 )
-            from quantem.gpu.maped import merge as gpu_merge
+            from quantem.gpu import io as gpu_io
 
-            result = gpu_merge(
+            from ._maped_resident import ResidentMergeSource
+
+            generated = ResidentMergeSource(
                 arrays.sources,
                 rs_shifts,
                 dp_shifts,
-                save_to=save_to,
+                close_sources_before_reopen=arrays.owns_sources,
+            )
+            gpu_io.save(
+                save_to,
+                generated,
                 dtype="scaled_uint16",
-                close_sources=arrays.owns_sources,
+                backend=torch.device(self.device).type,
                 verbose=verbose,
             )
             if arrays.owns_sources:
+                for source in arrays.sources:
+                    source.close()
                 arrays.sources = []
+                if torch.device(self.device).type == "cuda":
+                    torch.cuda.empty_cache()
+                else:
+                    torch.mps.empty_cache()
+            result = gpu_io.load(
+                save_to,
+                backend=torch.device(self.device).type,
+                representation="packed",
+                verbose=False,
+            )
             self.merged = result
             if compute_summaries or plot_result:
                 summaries_dp, summaries_bf = _resident_summaries([result], self.device)
@@ -2290,11 +2303,6 @@ class MAPEDTorch(AutoSerialize):
                 and method == "fourier"
             )
         compile_merge = bool(compile_merge)
-        use_mlx_fused_merge = (
-            torch.device(self.device).type == "mps"
-            if use_mlx_fused_merge is None
-            else bool(use_mlx_fused_merge)
-        )
 
         # Determine batch size. Auto-pick from free VRAM so the merge fits without
         # the caller tuning it. Bigger batches are faster; smaller cut peak memory.
@@ -2424,12 +2432,8 @@ class MAPEDTorch(AutoSerialize):
                         _prefetch_future = None
                 else:
                     a_raw = arrays[i]
-                a_is_chunked = _is_mps_chunked_tilt(a_raw)
-                if a_is_chunked:
-                    a = a_raw
-                else:
-                    a = a_raw.to(device=self.device)
-                if (not a_is_chunked) and compile_merge and a.dtype == torch.uint16:
+                a = a_raw.to(device=self.device)
+                if compile_merge and a.dtype == torch.uint16:
                     if not compile_uint16_as_int16:
                         raise ValueError(
                             "compile_merge=True cannot consume uint16 tilts because "
@@ -2449,63 +2453,16 @@ class MAPEDTorch(AutoSerialize):
                     del a
                     a = a_i16
                 _tilt_profile["load_to_device_seconds"] = _profile_elapsed(_load_t0)
-                _tilt_profile["chunked"] = a_is_chunked
-                a_reshaped = None if a_is_chunked else a.view(Rs, Cs, H * W).permute(2, 0, 1)[None]
+                _tilt_profile["chunked"] = False
+                a_reshaped = a.view(Rs, Cs, H * W).permute(2, 0, 1)[None]
                 _band_t0 = _profile_now()
-                _fused_batches = 0
                 _fallback_batches = 0
                 for batch_start in range(0, Rout, batch_size):
                     batch_end = min(batch_start + batch_size, Rout)
                     batch_rows = torch.arange(
                         batch_start, batch_end, dtype=torch.float32, device=self.device
                     )
-                    if a_is_chunked and use_mlx_fused_merge:
-                        fused = _fused_merge_band_chunked_mlx_metal(
-                            a,
-                            num[batch_start:batch_end] if not _split else None,
-                            w_rs,
-                            batch_start,
-                            batch_end,
-                            Cout,
-                            real_space_padding,
-                            rs_shifts[i],
-                            dp_shifts[i],
-                            _cast,
-                            method,
-                            diffraction_padding,
-                            diffraction_edge_blend,
-                        )
-                    elif use_mlx_fused_merge:
-                        fused = _fused_merge_band_mlx_metal(
-                            a,
-                            num[batch_start:batch_end] if not _split else None,
-                            w_rs,
-                            batch_start,
-                            batch_end,
-                            Cout,
-                            real_space_padding,
-                            rs_shifts[i],
-                            dp_shifts[i],
-                            _cast,
-                            method,
-                            diffraction_padding,
-                            diffraction_edge_blend,
-                        )
-                    else:
-                        fused = None
-                    if fused is not None:
-                        _fused_batches += 1
-                        num[batch_start:batch_end], wi = fused
-                        wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
-                        del wi
-                        continue
                     _fallback_batches += 1
-                    if a_is_chunked:
-                        raise RuntimeError(
-                            "Chunk-direct MPS merge fallback was needed but no tensor tilt "
-                            "was assembled. Return a torch.Tensor from read() or use the "
-                            "default tensor-backed read path."
-                        )
     
                     r_in = (
                         (batch_rows.unsqueeze(1) - real_space_padding).expand(-1, Cout)
@@ -2515,8 +2472,8 @@ class MAPEDTorch(AutoSerialize):
                     c_norm = 2.0 * c_in / (Cs - 1) - 1.0
                     r_norm = 2.0 * r_in / (Rs - 1) - 1.0
                     grid_full = torch.stack([c_norm, r_norm], dim=-1).unsqueeze(0)
-                    dp_sample = _sample_tilt_mlx_metal(
-                        a,
+                    dp_sample = _sample_tilt_constant_bilinear(
+                        a_reshaped,
                         batch_start,
                         batch_end,
                         Cout,
@@ -2524,16 +2481,6 @@ class MAPEDTorch(AutoSerialize):
                         rs_shifts[i],
                         _cast,
                     )
-                    if dp_sample is None:
-                        dp_sample = _sample_tilt_constant_bilinear(
-                            a_reshaped,
-                            batch_start,
-                            batch_end,
-                            Cout,
-                            real_space_padding,
-                            rs_shifts[i],
-                            _cast,
-                        )
                     wi_sample = torch.nn.functional.grid_sample(
                         w_rs_reshaped, grid_full,
                         mode="bilinear", padding_mode="zeros", align_corners=True,
@@ -2602,11 +2549,8 @@ class MAPEDTorch(AutoSerialize):
                     wi_all[i, batch_start:batch_end] = wi.to(_acc_device)
                     del dp_padded, dp_shifted, wi, wi_exp
                 _tilt_profile["band_accumulate_seconds"] = _profile_elapsed(_band_t0)
-                _tilt_profile["fused_batches"] = _fused_batches
                 _tilt_profile["fallback_batches"] = _fallback_batches
                 _cleanup_t0 = _profile_now()
-                if a_is_chunked and hasattr(a, "free"):
-                    a.free()
                 del a, a_reshaped, a_raw
                 if isinstance(arrays, _TiltFiles) and not _use_prefetch:
                     arrays.release()
@@ -3148,587 +3092,6 @@ def _sample_tilt_constant_bilinear(
                 * weight
             )
     return out
-
-
-@lru_cache(maxsize=1)
-def _mlx_metal_warp_kernel():
-    import mlx.core as mx
-
-    source = r"""
-        uint elem = thread_position_in_grid.x;
-        uint col_o = elem % COUT;
-        uint tmp0 = elem / COUT;
-        uint row_o = tmp0 % BATCH;
-        uint det = tmp0 / BATCH;
-        uint kh = det / KW;
-        uint kw = det - kh * KW;
-
-        float row_src = float(row_o) + params[2] - params[3] - params[0];
-        float col_src = float(col_o) - params[3] - params[1];
-        int r0 = int(floor(row_src));
-        int c0 = int(floor(col_src));
-        float rf = row_src - float(r0);
-        float cf = col_src - float(c0);
-
-        float acc = 0.0f;
-        for (int dr = 0; dr < 2; dr++) {
-            int rr = r0 + dr;
-            if (rr < 0 || rr >= RS) continue;
-            float rw = dr == 0 ? (1.0f - rf) : rf;
-            for (int dc = 0; dc < 2; dc++) {
-                int cc = c0 + dc;
-                if (cc < 0 || cc >= CS) continue;
-                float cw = dc == 0 ? (1.0f - cf) : cf;
-                ulong in_idx = (((ulong(rr) * CS + ulong(cc)) * KH + kh) * KW + kw);
-                acc += float(tilt[in_idx]) * rw * cw;
-            }
-        }
-        out[elem] = acc;
-    """
-    return mx.fast.metal_kernel(
-        name="maped_warp_u16",
-        input_names=["tilt", "params"],
-        output_names=["out"],
-        source=source,
-        ensure_row_contiguous=True,
-        compile_options={"math_mode": "fast"},
-    )
-
-
-def _sample_tilt_mlx_metal(
-    tilt: torch.Tensor,
-    batch_start: int,
-    batch_end: int,
-    cout: int,
-    real_space_padding: int,
-    shift_rc: torch.Tensor,
-    cast_dtype: torch.dtype,
-) -> torch.Tensor | None:
-    """Fast MPS-only real-space warp using an MLX custom Metal kernel."""
-    if (
-        tilt.device.type != "mps"
-        or tilt.dtype != torch.uint16
-        or cast_dtype != torch.float32
-        or tilt.ndim != 4
-    ):
-        return None
-    try:
-        import mlx.core as mx
-    except ImportError:
-        return None
-
-    rows, cols, k_rows, k_cols = tilt.shape
-    batch_n = batch_end - batch_start
-    params = torch.tensor(
-        [
-            float(shift_rc.reshape(-1)[0]),
-            float(shift_rc.reshape(-1)[1]),
-            float(batch_start),
-            float(real_space_padding),
-        ],
-        dtype=torch.float32,
-        device=tilt.device,
-    )
-    kernel = _mlx_metal_warp_kernel()
-    out = kernel(
-        inputs=[mx.from_dlpack(tilt), mx.from_dlpack(params)],
-        template=[
-            ("RS", rows),
-            ("CS", cols),
-            ("KH", k_rows),
-            ("KW", k_cols),
-            ("BATCH", batch_n),
-            ("COUT", cout),
-            ("T", mx.uint16),
-        ],
-        grid=(k_rows * k_cols * batch_n * cout, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(k_rows * k_cols, batch_n, cout)],
-        output_dtypes=[mx.float32],
-    )[0]
-    mx.eval(out)
-    return torch.from_dlpack(out).unsqueeze(0)
-
-
-@lru_cache(maxsize=1)
-def _mlx_metal_fused_merge_kernel():
-    import mlx.core as mx
-
-    source = r"""
-        uint elem = thread_position_in_grid.x;
-        uint kw_o = elem % KW;
-        uint tmp0 = elem / KW;
-        uint kh_o = tmp0 % KH;
-        uint tmp1 = tmp0 / KH;
-        uint col_o = tmp1 % COUT;
-        uint row_o = tmp1 / COUT;
-
-        float row_src = float(row_o) + params[4] - params[5] - params[0];
-        float col_src = float(col_o) - params[5] - params[1];
-        int r0 = int(floor(row_src));
-        int c0 = int(floor(col_src));
-        float rf = row_src - float(r0);
-        float cf = col_src - float(c0);
-
-        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
-        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
-        int h0 = int(floor(kh_src));
-        int w0 = int(floor(kw_src));
-        float hf = kh_src - float(h0);
-        float wf = kw_src - float(w0);
-
-        float val = 0.0f;
-        float wi = 0.0f;
-        for (int sr = 0; sr < 2; sr++) {
-            int rr = r0 + sr;
-            if (rr < 0 || rr >= RS) continue;
-            float rw = sr == 0 ? (1.0f - rf) : rf;
-            for (int sc = 0; sc < 2; sc++) {
-                int cc = c0 + sc;
-                if (cc < 0 || cc >= CS) continue;
-                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
-                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
-                for (int dh = 0; dh < 2; dh++) {
-                    int hh = h0 + dh;
-                    if (hh < 0 || hh >= KH) continue;
-                    float hw = dh == 0 ? (1.0f - hf) : hf;
-                    for (int dw = 0; dw < 2; dw++) {
-                        int ww = w0 + dw;
-                        if (ww < 0 || ww >= KW) continue;
-                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
-                        ulong in_idx = (
-                            ((ulong(rr) * CS + ulong(cc)) * KH + ulong(hh))
-                            * KW + ulong(ww)
-                        );
-                        val += float(tilt[in_idx]) * weight;
-                    }
-                }
-            }
-        }
-        out[elem] = num[elem] + wi * val;
-        if (kh_o == 0 && kw_o == 0) {
-            wi_out[row_o * COUT + col_o] = wi;
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="maped_fused_merge_u16",
-        input_names=["tilt", "num", "wrs", "params"],
-        output_names=["out", "wi_out"],
-        source=source,
-        ensure_row_contiguous=True,
-        compile_options={"math_mode": "fast"},
-    )
-
-
-def _fused_merge_band_mlx_metal(
-    tilt: torch.Tensor,
-    num_band: torch.Tensor | None,
-    w_rs: torch.Tensor,
-    batch_start: int,
-    batch_end: int,
-    cout: int,
-    real_space_padding: int,
-    real_shift_rc: torch.Tensor,
-    diffraction_shift_rc: torch.Tensor,
-    cast_dtype: torch.dtype,
-    method: str,
-    diffraction_padding: int,
-    diffraction_edge_blend: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Fused MPS MAPED merge band for the default no-padding bilinear path."""
-    if (
-        num_band is None
-        or tilt.device.type != "mps"
-        or tilt.dtype != torch.uint16
-        or cast_dtype != torch.float32
-        or method != "bilinear"
-        or int(diffraction_padding) != 0
-        or float(diffraction_edge_blend) != 0.0
-        or tilt.ndim != 4
-    ):
-        return None
-    try:
-        import mlx.core as mx
-    except ImportError:
-        return None
-
-    rows, cols, k_rows, k_cols = tilt.shape
-    batch_n = batch_end - batch_start
-    params = torch.tensor(
-        [
-            float(real_shift_rc.reshape(-1)[0]),
-            float(real_shift_rc.reshape(-1)[1]),
-            float(diffraction_shift_rc.reshape(-1)[0]),
-            float(diffraction_shift_rc.reshape(-1)[1]),
-            float(batch_start),
-            float(real_space_padding),
-        ],
-        dtype=torch.float32,
-        device=tilt.device,
-    )
-    kernel = _mlx_metal_fused_merge_kernel()
-    out, wi = kernel(
-        inputs=[
-            mx.from_dlpack(tilt),
-            mx.from_dlpack(num_band),
-            mx.from_dlpack(w_rs),
-            mx.from_dlpack(params),
-        ],
-        template=[
-            ("RS", rows),
-            ("CS", cols),
-            ("KH", k_rows),
-            ("KW", k_cols),
-            ("BATCH", batch_n),
-            ("COUT", cout),
-            ("T", mx.uint16),
-        ],
-        grid=(batch_n * cout * k_rows * k_cols, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[num_band.shape, (batch_n, cout)],
-        output_dtypes=[mx.float32, mx.float32],
-    )
-    mx.eval(out, wi)
-    return torch.from_dlpack(out), torch.from_dlpack(wi)
-
-
-def _is_mps_chunked_tilt(obj: Any) -> bool:
-    return hasattr(obj, "chunks") and hasattr(obj, "scan_shape") and hasattr(obj, "free")
-
-
-def _chunk_cumulative_lengths(chunks: Sequence[Any]) -> list[int]:
-    total = 0
-    out = [0]
-    for chunk in chunks:
-        total += int(chunk.shape[0])
-        out.append(total)
-    return out
-
-
-def _frame_chunk_index(bounds: Sequence[int], frame: int) -> int:
-    for i in range(len(bounds) - 1):
-        if bounds[i] <= frame < bounds[i + 1]:
-            return i
-    return max(0, len(bounds) - 2)
-
-
-@lru_cache(maxsize=1)
-def _mlx_metal_fused_merge_single_chunk_kernel():
-    import mlx.core as mx
-
-    source = r"""
-        uint elem = thread_position_in_grid.x;
-        uint kw_o = elem % KW;
-        uint tmp0 = elem / KW;
-        uint kh_o = tmp0 % KH;
-        uint tmp1 = tmp0 / KH;
-        uint col_o = tmp1 % COUT;
-        uint row_o = tmp1 / COUT;
-
-        float row_src = float(row_o) + params[4] - params[5] - params[0];
-        float col_src = float(col_o) - params[5] - params[1];
-        int r0 = int(floor(row_src));
-        int c0 = int(floor(col_src));
-        float rf = row_src - float(r0);
-        float cf = col_src - float(c0);
-        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
-        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
-        int h0 = int(floor(kh_src));
-        int w0 = int(floor(kw_src));
-        float hf = kh_src - float(h0);
-        float wf = kw_src - float(w0);
-
-        float val = 0.0f;
-        float wi = 0.0f;
-        for (int sr = 0; sr < 2; sr++) {
-            int rr = r0 + sr;
-            if (rr < 0 || rr >= RS) continue;
-            float rw = sr == 0 ? (1.0f - rf) : rf;
-            for (int sc = 0; sc < 2; sc++) {
-                int cc = c0 + sc;
-                if (cc < 0 || cc >= CS) continue;
-                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
-                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
-                int local_frame = int(uint(rr) * CS + uint(cc)) - FRAME0;
-                for (int dh = 0; dh < 2; dh++) {
-                    int hh = h0 + dh;
-                    if (hh < 0 || hh >= KH) continue;
-                    float hw = dh == 0 ? (1.0f - hf) : hf;
-                    for (int dw = 0; dw < 2; dw++) {
-                        int ww = w0 + dw;
-                        if (ww < 0 || ww >= KW) continue;
-                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
-                        ulong pix = ulong(hh) * KW + ulong(ww);
-                        val += float(chunk[ulong(local_frame) * KH * KW + pix]) * weight;
-                    }
-                }
-            }
-        }
-        out[elem] = num[elem] + wi * val;
-        if (kh_o == 0 && kw_o == 0) wi_out[row_o * COUT + col_o] = wi;
-    """
-    return mx.fast.metal_kernel(
-        name="maped_fused_merge_single_chunk_u16",
-        input_names=["chunk", "num", "wrs", "params"],
-        output_names=["out", "wi_out"],
-        source=source,
-        ensure_row_contiguous=True,
-        compile_options={"math_mode": "fast"},
-    )
-
-
-@lru_cache(maxsize=1)
-def _mlx_metal_fused_merge_three_chunk_kernel():
-    import mlx.core as mx
-
-    source = _mlx_metal_fused_merge_kernel_source_three_chunk()
-    return mx.fast.metal_kernel(
-        name="maped_fused_merge_three_chunk_u16",
-        input_names=["c0buf", "c1buf", "c2buf", "num", "wrs", "params"],
-        output_names=["out", "wi_out"],
-        source=source,
-        ensure_row_contiguous=True,
-        compile_options={"math_mode": "fast"},
-    )
-
-
-def _mlx_metal_fused_merge_kernel_source_three_chunk() -> str:
-    return r"""
-        uint elem = thread_position_in_grid.x;
-        uint kw_o = elem % KW;
-        uint tmp0 = elem / KW;
-        uint kh_o = tmp0 % KH;
-        uint tmp1 = tmp0 / KH;
-        uint col_o = tmp1 % COUT;
-        uint row_o = tmp1 / COUT;
-
-        float row_src = float(row_o) + params[4] - params[5] - params[0];
-        float col_src = float(col_o) - params[5] - params[1];
-        int r0 = int(floor(row_src));
-        int c0 = int(floor(col_src));
-        float rf = row_src - float(r0);
-        float cf = col_src - float(c0);
-        float kh_src = float(kh_o) - params[2] * float(KH - 1) / float(KH);
-        float kw_src = float(kw_o) - params[3] * float(KW - 1) / float(KW);
-        int h0 = int(floor(kh_src));
-        int w0 = int(floor(kw_src));
-        float hf = kh_src - float(h0);
-        float wf = kw_src - float(w0);
-
-        float val = 0.0f;
-        float wi = 0.0f;
-        for (int sr = 0; sr < 2; sr++) {
-            int rr = r0 + sr;
-            if (rr < 0 || rr >= RS) continue;
-            float rw = sr == 0 ? (1.0f - rf) : rf;
-            for (int sc = 0; sc < 2; sc++) {
-                int cc = c0 + sc;
-                if (cc < 0 || cc >= CS) continue;
-                float sw = rw * (sc == 0 ? (1.0f - cf) : cf);
-                wi += float(wrs[uint(rr) * CS + uint(cc)]) * sw;
-                uint frame = uint(rr) * CS + uint(cc);
-                for (int dh = 0; dh < 2; dh++) {
-                    int hh = h0 + dh;
-                    if (hh < 0 || hh >= KH) continue;
-                    float hw = dh == 0 ? (1.0f - hf) : hf;
-                    for (int dw = 0; dw < 2; dw++) {
-                        int ww = w0 + dw;
-                        if (ww < 0 || ww >= KW) continue;
-                        float weight = sw * hw * (dw == 0 ? (1.0f - wf) : wf);
-                        ulong pix = ulong(hh) * KW + ulong(ww);
-                        if (frame < N0) {
-                            val += float(c0buf[ulong(frame) * KH * KW + pix]) * weight;
-                        } else if (frame < N0 + N1) {
-                            val += float(c1buf[ulong(frame - N0) * KH * KW + pix]) * weight;
-                        } else {
-                            val += float(c2buf[ulong(frame - N0 - N1) * KH * KW + pix]) * weight;
-                        }
-                    }
-                }
-            }
-        }
-        out[elem] = num[elem] + wi * val;
-        if (kh_o == 0 && kw_o == 0) wi_out[row_o * COUT + col_o] = wi;
-    """
-
-
-def _fused_merge_band_chunked_mlx_metal(
-    tilt: Any,
-    num_band: torch.Tensor | None,
-    w_rs: torch.Tensor,
-    batch_start: int,
-    batch_end: int,
-    cout: int,
-    real_space_padding: int,
-    real_shift_rc: torch.Tensor,
-    diffraction_shift_rc: torch.Tensor,
-    cast_dtype: torch.dtype,
-    method: str,
-    diffraction_padding: int,
-    diffraction_edge_blend: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if (
-        num_band is None
-        or num_band.device.type != "mps"
-        or cast_dtype != torch.float32
-        or method != "bilinear"
-        or int(diffraction_padding) != 0
-        or float(diffraction_edge_blend) != 0.0
-    ):
-        return None
-    try:
-        import mlx.core as mx
-    except ImportError:
-        return None
-
-    chunks = [chunk for chunk in tilt.chunks if chunk is not None]
-    if len(chunks) != 3 or any(str(chunk.dtype) != "uint16" for chunk in chunks):
-        return None
-    if not hasattr(tilt, "_mlx_chunks"):
-        tilt._mlx_chunks = [mx.from_dlpack(chunk) for chunk in chunks]
-
-    rows, cols = (int(x) for x in tilt.scan_shape)
-    _, k_rows, k_cols = (int(x) for x in tilt.shape)
-    batch_n = int(batch_end - batch_start)
-    params = torch.tensor(
-        [
-            float(real_shift_rc.reshape(-1)[0]),
-            float(real_shift_rc.reshape(-1)[1]),
-            float(diffraction_shift_rc.reshape(-1)[0]),
-            float(diffraction_shift_rc.reshape(-1)[1]),
-            float(batch_start),
-            float(real_space_padding),
-        ],
-        dtype=torch.float32,
-        device=num_band.device,
-    )
-    bounds = _chunk_cumulative_lengths(chunks)
-    row_min = max(0, math.floor(batch_start - real_space_padding - float(real_shift_rc[0])))
-    row_max = min(rows - 1, math.floor(batch_end - 1 - real_space_padding - float(real_shift_rc[0])) + 1)
-    col_min = max(0, math.floor(-real_space_padding - float(real_shift_rc[1])))
-    col_max = min(cols - 1, math.floor(cout - 1 - real_space_padding - float(real_shift_rc[1])) + 1)
-    frame_min = row_min * cols + col_min
-    frame_max = row_max * cols + col_max
-    c_min = _frame_chunk_index(bounds, frame_min)
-    c_max = _frame_chunk_index(bounds, frame_max)
-    if c_min == c_max:
-        kernel = _mlx_metal_fused_merge_single_chunk_kernel()
-        out, wi = kernel(
-            inputs=[tilt._mlx_chunks[c_min], mx.from_dlpack(num_band), mx.from_dlpack(w_rs), mx.from_dlpack(params)],
-            template=[
-                ("RS", rows),
-                ("CS", cols),
-                ("KH", k_rows),
-                ("KW", k_cols),
-                ("BATCH", batch_n),
-                ("COUT", cout),
-                ("FRAME0", bounds[c_min]),
-                ("T", mx.uint16),
-            ],
-            grid=(batch_n * cout * k_rows * k_cols, 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[num_band.shape, (batch_n, cout)],
-            output_dtypes=[mx.float32, mx.float32],
-        )
-    else:
-        kernel = _mlx_metal_fused_merge_three_chunk_kernel()
-        out, wi = kernel(
-            inputs=[
-                tilt._mlx_chunks[0],
-                tilt._mlx_chunks[1],
-                tilt._mlx_chunks[2],
-                mx.from_dlpack(num_band),
-                mx.from_dlpack(w_rs),
-                mx.from_dlpack(params),
-            ],
-            template=[
-                ("RS", rows),
-                ("CS", cols),
-                ("KH", k_rows),
-                ("KW", k_cols),
-                ("BATCH", batch_n),
-                ("COUT", cout),
-                ("N0", bounds[1]),
-                ("N1", bounds[2] - bounds[1]),
-                ("T", mx.uint16),
-            ],
-            grid=(batch_n * cout * k_rows * k_cols, 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[num_band.shape, (batch_n, cout)],
-            output_dtypes=[mx.float32, mx.float32],
-        )
-    mx.eval(out, wi)
-    return torch.from_dlpack(out), torch.from_dlpack(wi)
-
-
-@lru_cache(maxsize=1)
-def _mlx_metal_normalize_kernel():
-    import mlx.core as mx
-
-    source = r"""
-        uint elem = thread_position_in_grid.x;
-        uint kw = elem % KW;
-        uint tmp0 = elem / KW;
-        uint kh = tmp0 % KH;
-        uint tmp1 = tmp0 / KH;
-        uint col = tmp1 % COUT;
-        uint row = tmp1 / COUT;
-
-        float den = edge[kh * KW + kw];
-        for (uint i = 0; i < N; i++) {
-            den += wi_all[(i * ROUT + row) * COUT + col]
-                 * wdp[(i * KH + kh) * KW + kw];
-        }
-        float v = num[elem];
-        out[elem] = den == 0.0f ? 0.0f : v / den;
-    """
-    return mx.fast.metal_kernel(
-        name="maped_normalize",
-        input_names=["num", "wi_all", "wdp", "edge"],
-        output_names=["out"],
-        source=source,
-        ensure_row_contiguous=True,
-        compile_options={"math_mode": "fast"},
-    )
-
-
-def _normalize_mlx_metal(
-    num: torch.Tensor,
-    wi_all: torch.Tensor,
-    wdp: torch.Tensor,
-    edge: torch.Tensor,
-) -> torch.Tensor | None:
-    if num.device.type != "mps" or num.dtype != torch.float32:
-        return None
-    try:
-        import mlx.core as mx
-    except ImportError:
-        return None
-
-    rout, cout, k_rows, k_cols = (int(x) for x in num.shape)
-    n = int(wi_all.shape[0])
-    kernel = _mlx_metal_normalize_kernel()
-    out = kernel(
-        inputs=[
-            mx.from_dlpack(num),
-            mx.from_dlpack(wi_all),
-            mx.from_dlpack(wdp),
-            mx.from_dlpack(edge),
-        ],
-        template=[
-            ("N", n),
-            ("ROUT", rout),
-            ("COUT", cout),
-            ("KH", k_rows),
-            ("KW", k_cols),
-        ],
-        grid=(rout * cout * k_rows * k_cols, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[num.shape],
-        output_dtypes=[mx.float32],
-    )[0]
-    mx.eval(out)
-    return torch.from_dlpack(out)
 
 
 def tukey_torch(N, alpha=0.5, device=None, dtype=torch.float32):
