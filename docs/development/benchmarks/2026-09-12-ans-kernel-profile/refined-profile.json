@@ -1,0 +1,110 @@
+{
+  "gpu:count probability table initialization": [
+    71,
+    0.007149916724301875
+  ],
+  "gpu:ANS encode": [
+    288,
+    1.289137583662523
+  ],
+  "gpu:ANS compact": [
+    288,
+    0.49941091673099436
+  ],
+  "gpu:ANS detector total": [
+    7,
+    0.9460923749429639
+  ],
+  "gpu:ANS mean diffraction": [
+    7,
+    0.00011170830111950636
+  ],
+  "gpu:ANS detector reduction": [
+    7,
+    1.23995433334494
+  ],
+  "gpu:ANS detector mean": [
+    7,
+    0.0001387916854582727
+  ],
+  "gpu:ANS Torch range read": [
+    448,
+    1.039302250253968
+  ],
+  "producer_wait": [
+    64,
+    1.796451333008008
+  ],
+  "gpu:precision tensor range": [
+    64,
+    0.3547316667099949
+  ],
+  "range_wall": [
+    64,
+    0.38464716699672863
+  ],
+  "gpu:precision encode_measure": [
+    64,
+    0.6502292499644682
+  ],
+  "report_scalars": [
+    64,
+    0.27636062493547797
+  ],
+  "encode_measure_wall": [
+    64,
+    1.3379694130562712
+  ],
+  "conversion": [
+    64,
+    1.727613164926879
+  ],
+  "output_ans": [
+    64,
+    1.082930709264474
+  ],
+  "gpu:ANS range decode": [
+    196,
+    0.33032016656943597
+  ],
+  "ans_decode": [
+    196,
+    1.3721348347608
+  ],
+  "gpu:precision mean": [
+    64,
+    0.1204794583900366
+  ],
+  "output_mean_dp": [
+    1,
+    0.8734865830047056
+  ],
+  "gpu:precision restore": [
+    1,
+    3.8333237171173096e-06
+  ],
+  "gpu:precision detector": [
+    64,
+    0.07507695839740336
+  ],
+  "output_detector": [
+    1,
+    0.7415298339910805
+  ],
+  "gpu:precision Torch transfer": [
+    4,
+    1.3541663065552711e-05
+  ],
+  "gpu:precision range_read": [
+    1,
+    4.250003257766366e-06
+  ],
+  "gpu:precision frame": [
+    67,
+    0.0009105416247621179
+  ],
+  "gpu:precision reduce": [
+    64,
+    0.0008703748171683401
+  ]
+}

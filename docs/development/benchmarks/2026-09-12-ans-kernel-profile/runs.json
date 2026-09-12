@@ -1,0 +1,142 @@
+[
+  {
+    "trial": "before",
+    "timings": {
+      "load": 11.26694108301308,
+      "preprocess": 2.430488374986453,
+      "origin": 0.05718787497607991,
+      "diffraction_align": 0.07017479199566878,
+      "real_space_align": 0.5639728749811184,
+      "merge_pack_summaries": 14.534098750009434,
+      "selected_dp": 0.0013539170031435788,
+      "viewer_constructor": 0.3006427919899579
+    },
+    "load_through_dp_seconds": 28.924217666964978,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18440601600
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "after",
+    "timings": {
+      "load": 10.73075333298766,
+      "preprocess": 2.433813125011511,
+      "origin": 0.052566500002285466,
+      "diffraction_align": 0.060472667013527825,
+      "real_space_align": 0.597227499994915,
+      "merge_pack_summaries": 14.07038858300075,
+      "selected_dp": 0.001417749997926876,
+      "viewer_constructor": 0.2987217500049155
+    },
+    "load_through_dp_seconds": 27.946639458008576,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18365841408
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "refined",
+    "timings": {
+      "load": 10.84060679099639,
+      "preprocess": 2.3881007909949403,
+      "origin": 0.05823966700700112,
+      "diffraction_align": 0.070628207991831,
+      "real_space_align": 0.58752812500461,
+      "merge_pack_summaries": 14.020125791983446,
+      "selected_dp": 0.0012348750024102628,
+      "viewer_constructor": 0.2848657089925837
+    },
+    "load_through_dp_seconds": 27.96646424898063,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18441338880
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "reciprocal",
+    "timings": {
+      "load": 10.721619916002965,
+      "preprocess": 2.3850916670053266,
+      "origin": 0.06091479101451114,
+      "diffraction_align": 0.07769354101037607,
+      "real_space_align": 0.5820786249823868,
+      "merge_pack_summaries": 14.021149374981178,
+      "selected_dp": 0.0013188339944463223,
+      "viewer_constructor": 0.28652533298009075
+    },
+    "load_through_dp_seconds": 27.84986674899119,
+    "input_resident_bytes": 7514329276,
+    "output_resident_bytes": 6556676758,
+    "peak": {
+      "allocated_bytes": 18480168960
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "fused",
+    "timings": {
+      "load": 10.593308582989266,
+      "preprocess": 2.56391333299689,
+      "origin": 0.05468062500585802,
+      "diffraction_align": 0.06972133400267921,
+      "real_space_align": 0.5852329579938669,
+      "merge_pack_summaries": 15.082958707993384,
+      "selected_dp": 0.0015117499860934913,
+      "viewer_constructor": 0.28915095899719745
+    },
+    "load_through_dp_seconds": 28.951327290968038,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18059722752
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "batched",
+    "timings": {
+      "load": 11.179274082998745,
+      "preprocess": 2.375265374983428,
+      "origin": 0.06357220897916704,
+      "diffraction_align": 0.06588170799659565,
+      "real_space_align": 0.6008926250215154,
+      "merge_pack_summaries": 13.385080667008879,
+      "selected_dp": 0.0016098750056698918,
+      "viewer_constructor": 0.28343033298733644
+    },
+    "load_through_dp_seconds": 27.671576541994,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18365825024
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  },
+  {
+    "trial": "final_uninstrumented",
+    "timings": {
+      "load": 11.517630457994528,
+      "preprocess": 2.4037069579935633,
+      "origin": 0.0580474580056034,
+      "diffraction_align": 0.06478129100287333,
+      "real_space_align": 0.5860750839929096,
+      "merge_pack_summaries": 13.684597791987471,
+      "selected_dp": 0.0015241669898387045,
+      "viewer_constructor": 0.28713441599393263
+    },
+    "load_through_dp_seconds": 28.316363207966788,
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18059689984
+    },
+    "precision_sha256": "0fc8f836f9f7c74179276b22cb8097be65dd3e65c162f8e9f6551eb2c95969a6"
+  }
+]

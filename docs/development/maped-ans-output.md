@@ -17,8 +17,9 @@ uses bit packing. Native Swift workflow changes are outside this qualification.
 
 QuantEM.GPU encodes the existing scaled uint16 codes with its native count-ANS
 implementations. CUDA calibrated queries use bounded ANS reads and GPU
-reductions. Metal calibrated queries decode only needed ranges before applying
-the same existing compensated calibration and reduction kernels. Mean/BF
+reductions. Metal calibrated mean-DP queries accumulate directly from ANS with the same
+compensated summation order. Other queries decode only needed ranges before
+applying calibration and reduction kernels. Mean/BF
 queries traverse bounded regions. Returned Torch reads retain independent
 ownership after later queries and source closure. MAPED float32 algorithm code
 and storage calibration are unchanged. No CPU scientific fallback was added.
@@ -72,3 +73,48 @@ checks.
 
 [Compact evidence and reproduction commands](benchmarks/2026-09-12-ans-output/)
 are retained alongside the original benchmark scripts and notebook.
+
+## Follow-up: native MPS range and ANS mean kernels
+
+The no-file API above automatically uses the optimized kernels. Range,
+finiteness and subnormal checks now share one native scan and a small final
+reduction, avoiding full-size Torch validation intermediates. The mean DP is
+accumulated directly from ANS without materializing decoded uint16 regions;
+all regions share one ordered command submission. Calibration and compensated
+summation order are preserved. MAPED science remains Torch.
+
+With all seven inputs retained (6.998 GiB), the final uninstrumented M5 Max run:
+
+| Stage | Time |
+|---|---:|
+| Load seven inputs into ANS residency | 11.52 s |
+| Preprocess and align | 3.11 s |
+| Merge, scale, ANS encode and summaries | 13.68 s |
+| Selected DP | 1.52 ms |
+| Load through selected DP | 28.32 s |
+| Viewer construction, additional | 0.29 s |
+
+Output residency was 6.106 GiB and sampled native driver peak was 16.82 GiB.
+This retained-input path has not been qualified on a physical 16 GB Mac.
+
+The profiled candidate measured conversion including its error report at
+1.70 s and output ANS encoding at 1.08 s, both included in its 13.39 s merge
+stage. Pending Torch producer work was timed separately. Direct mean-DP
+queries averaged 0.29 s across two calls versus 0.87 s for the previous path.
+These component numbers are from a separate profiled run, not an additive
+breakdown of the final run. The original merge stage was 14.53 s; full candidate
+runs varied from 13.39 to 15.08 s during tuning. End-to-end improvement is modest
+and not statistically established. The 48.51 s saved/reopened result is a
+different workflow, not the before-time for this optimization.
+
+The full merged mean DP matches the previous decoded GPU reduction exactly.
+Every complete precision report, including the final run, equals the frozen
+baseline. 24 focused MPS precision/regional and MAPED tests passed. They cover strided ranges, nonfinite/subnormal policy,
+ANS interval boundaries, calibrated products and saved regional data. This does
+not claim every merged float32 voxel was compared bitwise. CUDA and native
+Swift behavior were not changed or newly qualified in this follow-up.
+
+[Kernel trial records and reproduction](benchmarks/2026-09-12-ans-kernel-profile/)
+include the rejected reciprocal-division experiment, which did not improve
+ANS encoding time. Further large gains require profiling the Torch producer,
+input reads and IO rather than attributing the whole workflow to ANS.

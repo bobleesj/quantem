@@ -225,3 +225,16 @@ GPU bitshuffle/LZ4; reopening scaled files creates ANS residency with unchanged
 codes and calibration. Native Swift integration requires separate qualification.
 See [ANS output evidence](../../maped-ans-output.md) for memory and latency;
 ANS is not guaranteed to be smaller or faster for every intensity distribution.
+
+
+## ANS kernel timing boundaries
+
+Use the existing public API; scaled uint16 ANS output selects optimized native
+MPS range checks and direct ANS mean-DP accumulation automatically. Keep MAPED
+science in Torch. Separate pending Torch producer time from conversion timing;
+otherwise synchronization makes conversion appear to own earlier computation.
+Do not add nested GPU/wall counters or claim saved/reopened time is the baseline
+for a no-file result. Recent all-seven retained measurements: about 28 s through
+a selected DP, about 13.4-13.7 s merge/conversion/ANS/summaries, and about 1.1 s
+output ANS encoding on M5 Max. These are individual runs, not universal targets.
+See [kernel evidence](../../maped-ans-output.md#follow-up-native-mps-range-and-ans-mean-kernels).
