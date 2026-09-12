@@ -18,6 +18,10 @@ one place. Start with the interactive tutorial to understand the alignment,
 bounded merge, encoded residency, and globally scaled uint16 output before
 running the full dataset.
 
+For Python-free execution on Apple GPUs, see the
+[native MAPED code and tests](native/README.md). It retains the scientific
+workflow and parameter names while using QuantEM.GPU for native infrastructure.
+
 ## License
 
 quantem is free and open source software, distributed under the [MIT License](LICENSE).

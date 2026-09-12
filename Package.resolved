@@ -1,0 +1,15 @@
+{
+  "originHash" : "e626906764c54807327946957dd534e5879286ba36b43a24c725681c37f5f212",
+  "pins" : [
+    {
+      "identity" : "quantem.gpu",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/bobleesj/quantem.gpu.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "7e5a95293252f47681d699faeaa08e402a1440c3"
+      }
+    }
+  ],
+  "version" : 3
+}

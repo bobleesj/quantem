@@ -208,4 +208,6 @@ widget/scripts/
 !widget/scripts/build.mjs
 widget/tests/integration/
 widget/tests/snapshots/
-
+# Swift Package Manager keeps build products outside scientific source control.
+.build/
+.swiftpm/
