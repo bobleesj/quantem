@@ -1,0 +1,70 @@
+{
+  "load_runs" : [
+    {
+      "device" : "Apple M5 Max",
+      "input_resident_bytes" : 7524707756,
+      "pass" : 0,
+      "peak_metal_bytes" : 8449359872,
+      "setup_seconds" : 0.025187969207763672,
+      "tilts" : [
+        {
+          "index_seconds" : 0.018067002296447754,
+          "resident_bytes" : 1073987949,
+          "resident_preparation_seconds" : 1.5240379571914673,
+          "source_read_passes" : 1,
+          "tilt" : 0,
+          "total_seconds" : 1.542104959487915
+        },
+        {
+          "index_seconds" : 0.019039034843444824,
+          "resident_bytes" : 1058537481,
+          "resident_preparation_seconds" : 1.5479040145874023,
+          "source_read_passes" : 1,
+          "tilt" : 1,
+          "total_seconds" : 1.5669440031051636
+        },
+        {
+          "index_seconds" : 0.015447020530700684,
+          "resident_bytes" : 1066769915,
+          "resident_preparation_seconds" : 1.5112210512161255,
+          "source_read_passes" : 1,
+          "tilt" : 2,
+          "total_seconds" : 1.5266680717468262
+        },
+        {
+          "index_seconds" : 0.013961911201477051,
+          "resident_bytes" : 1183322576,
+          "resident_preparation_seconds" : 1.5159690380096436,
+          "source_read_passes" : 1,
+          "tilt" : 3,
+          "total_seconds" : 1.5299309492111206
+        },
+        {
+          "index_seconds" : 0.014994025230407715,
+          "resident_bytes" : 1057454304,
+          "resident_preparation_seconds" : 1.5170780420303345,
+          "source_read_passes" : 1,
+          "tilt" : 4,
+          "total_seconds" : 1.5320720672607422
+        },
+        {
+          "index_seconds" : 0.016410946846008301,
+          "resident_bytes" : 1054748359,
+          "resident_preparation_seconds" : 1.5197889804840088,
+          "source_read_passes" : 1,
+          "tilt" : 5,
+          "total_seconds" : 1.5361999273300171
+        },
+        {
+          "index_seconds" : 0.015728950500488281,
+          "resident_bytes" : 1029887172,
+          "resident_preparation_seconds" : 1.5116590261459351,
+          "source_read_passes" : 1,
+          "tilt" : 6,
+          "total_seconds" : 1.5273879766464233
+        }
+      ],
+      "total_seconds" : 10.786719918251038
+    }
+  ]
+}

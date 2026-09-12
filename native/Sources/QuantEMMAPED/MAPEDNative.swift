@@ -298,7 +298,7 @@ public final class MAPEDNative {
     return try operations.finishWeighted(
       numerator, denominator: denominator, uncovered: weights.uncovered)
   }
-  /// Merge bounded float32 regions, save globally scaled uint16, then reopen
+  /// Merge bounded float32 regions, save globally scaled uint16, and retain
   /// the complete result in packed GPU memory. Scientific keyword names and
   /// the supported resident subset match MAPEDTorch.merge_datasets.
   @discardableResult public func merge_datasets(
@@ -348,6 +348,12 @@ public final class MAPEDNative {
     started = Date.timeIntervalSinceReferenceDate
     var generation = 0.0
     var conversion = 0.0
+    var packing = 0.0
+    // Keep the exact codes already produced by conversion. This reuses the
+    // generic packed-source builder and avoids rereading the saved file.
+    let retainedResult =
+      ProcessInfo.processInfo.environment["MAPED_REOPEN_REFERENCE"] == "1"
+      ? nil : try MetalPackedSource(shape: shape, precision: precision)
     for rows in regions {
       try autoreleasepool {
         var phase = Date.timeIntervalSinceReferenceDate
@@ -357,6 +363,9 @@ public final class MAPEDNative {
         let codes = try precision.convert(values.buffer, count: values.rows * values.columns)
         conversion += Date.timeIntervalSinceReferenceDate - phase
         try writer.append(codes, frames: rows.count * shape[1])
+        phase = Date.timeIntervalSinceReferenceDate
+        try retainedResult?.append(codes, frames: rows.count * shape[1])
+        packing += Date.timeIntervalSinceReferenceDate - phase
         recordPeak()
         peak_metal_bytes = max(peak_metal_bytes, writer.peakAllocatedBytes)
       }
@@ -403,7 +412,8 @@ public final class MAPEDNative {
         ? sources[0].representation.rawValue : "mixed",
       "source_representations": sources.map { $0.representation.rawValue },
       "region_frames": rowsPerRegion * shape[1],
-      "released_sources_before_reopen": ownsSources,
+      "released_sources_before_reopen": retainedResult == nil && ownsSources,
+      "retained_packed_output": retainedResult != nil,
       "real_space_shifts_row_column": pairs(real_space_shifts),
       "diffraction_shifts_row_column": pairs(diffraction_shifts),
       "parameters": parameters,
@@ -416,6 +426,7 @@ public final class MAPEDNative {
     timings["merge_write"] = Date.timeIntervalSinceReferenceDate - started
     timings["merge_generation_write_pass"] = generation
     timings["precision_conversion"] = conversion
+    timings["output_packing"] = packing
     timings["hdf5_compression"] = writer.compressionSeconds
     timings["hdf5_write"] = writer.writeSeconds
     if ownsSources {
@@ -423,14 +434,20 @@ public final class MAPEDNative {
       sources.removeAll()
     }
     started = Date.timeIntervalSinceReferenceDate
-    let index = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("QuantEM/Index")
-    let result = try MetalPackedSource.load(
-      path: save_to, device: operations.device, indexDirectory: index)
+    let result: MetalPackedSource
+    if let retainedResult {
+      result = retainedResult
+    } else {
+      let index = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("QuantEM/Index")
+      result = try MetalPackedSource.load(
+        path: save_to, device: operations.device, indexDirectory: index)
+    }
     merged = result
     recordPeak()
     peak_metal_bytes = max(peak_metal_bytes, result.peakAllocatedBytes)
-    timings["reopen_packed"] = Date.timeIntervalSinceReferenceDate - started
+    timings["reopen_packed"] =
+      retainedResult == nil ? Date.timeIntervalSinceReferenceDate - started : 0
     if verbose {
       print(
         String(

@@ -1,5 +1,9 @@
 # Native Metal MAPED processing performance
 
+The subsequent [IO optimization](native-maped-io-performance.md) retains packed
+output during saving and removes reopening. The results below describe the
+preceding save/reopen implementation and remain its frozen baseline.
+
 On the physical Apple M5 Max (128 GiB), the complete seven-tilt workflow now
 finishes in **22.56 and 22.87 seconds**, versus the retained **85.71-second**
 diagnostic baseline. This includes input preparation, alignment, both bounded

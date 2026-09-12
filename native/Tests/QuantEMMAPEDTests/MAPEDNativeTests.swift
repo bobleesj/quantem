@@ -46,6 +46,37 @@ final class MAPEDNativeTests: XCTestCase {
       UnsafeBufferPointer(
         start: restored.contents().assumingMemoryBound(to: Float.self), count: expected.count))
     XCTAssertEqual(values.map(\.bitPattern), rounded.map(\.bitPattern))
+    XCTAssertEqual(maped.timings["reopen_packed"], 0)
+    let reopened = try MetalPackedSource.load(
+      path: folder.appendingPathComponent("tail_master.h5"), device: ops.device,
+      indexDirectory: folder.appendingPathComponent("index"))
+    defer { reopened.releaseResidentStorage() }
+    for frames in [0..<1, 4095..<4097, 4159..<4160] {
+      let retained = try result.read(frames)
+      let disk = try reopened.read(frames)
+      XCTAssertEqual(memcmp(retained.contents(), disk.contents(), frames.count * 4096 * 4), 0)
+    }
+    XCTAssertEqual(result.metadata["rmse"] as? Double, reopened.metadata["rmse"] as? Double)
+    let prepared = try Native4DSTEMCatalogBuilder(
+      cacheDirectory: folder.appendingPathComponent("index")
+    )
+    .prepare(input: folder.appendingPathComponent("tail_master.h5"))
+    let indexed = try Native4DSTEMIndexedSource.open(dataset: prepared.datasets[0])
+    var consumed = 0
+    XCTAssertThrowsError(
+      try MetalHDF5Reader.read(
+        source: indexed, device: ops.device,
+        maximumFrames: 64, shouldCancel: { consumed > 0 }
+      ) { _, frames in
+        consumed += frames.count
+      })
+    XCTAssertEqual(consumed, 64)
+    enum ConsumerFailure: Error { case expected }
+    XCTAssertThrowsError(
+      try MetalHDF5Reader.read(
+        source: indexed, device: ops.device,
+        maximumFrames: 64
+      ) { _, _ in throw ConsumerFailure.expected })
     XCTAssertFalse(source.isReleased)
   }
 

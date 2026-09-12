@@ -39,7 +39,9 @@ The resident merge supports the same bounded subset: bilinear shifts, zero scan
 and detector padding, scan edge blend 1, detector edge blend 0, and globally
 scaled uint16 output. Other merge choices must fail explicitly. Compute the
 global output range, then recompute and write bounded regions. Retain all inputs
-until both passes complete; release owned inputs before packed reopening.
+until both passes complete. Build the packed output from the existing scaled
+codes during saving, then release owned inputs. The diagnostic lower-memory
+reference releases inputs before reopening the saved file.
 
 Qualification compares intermediate summaries, origins, shifts, sampled merge
 regions, saved/restored intensities, precision metrics, and source lifecycle.
@@ -94,3 +96,8 @@ The subsequent [native Metal optimization](native-maped-processing-performance.m
 reduced the complete workflow to **22.56 and 22.87 s**, with unchanged saved
 precision metrics. Use those current measurements; retain the diagnostic run
 above as the before baseline.
+
+The latest [IO optimization](native-maped-io-performance.md) removes input read
+waits and the output reread using existing infrastructure. It preserves both
+precise merge passes; retaining packed output increases peak Metal allocation
+to 15.424 GiB on the qualification acquisition.

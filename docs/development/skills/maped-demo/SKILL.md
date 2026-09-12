@@ -153,3 +153,21 @@ write with subsequent GPU work. Preserve the 32-thread prepared sampling dispatc
 ordered float32 operations, owned public region results, and invalidation after
 shift changes. Never sum overlapping file-write and GPU phase timings. Both
 encoded and bit-packed borrowed sources use the same corrected count contract.
+
+## Native IO follow-up
+
+Use [native IO performance](../../native-maped-io-performance.md) for the latest
+Metal behavior: one bounded compressed read ahead, and direct retention through
+`MetalPackedSource.append` while saving. Do not reread the output just to view it.
+Keep the same public stage sequence and both precise float32 merge passes.
+The native count codec expanded exact float byte planes in the tested cache
+probe; it does not qualify a single-merge float ANS cache.
+
+Same-session totals were 28.82 s retained versus 30.02/32.58 s reopening under
+active host services; an initial retained run took 25.65 s. Do not compare those
+absolute totals to the earlier 22.56–22.87 s runs without matching conditions.
+Peak Metal allocation is 15.424 GiB and measured process footprint 16.734 GiB,
+so this trades the previous approximate 14 GiB target for less IO while staying
+below 24 GiB in the Phil measurement. Physical Rodman qualification is separate.
+The output's saved chunks and precision report remain exact. Keep the lower
+memory reference diagnostic available for comparisons and larger acquisitions.

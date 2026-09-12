@@ -185,6 +185,54 @@ if let requested = ProcessInfo.processInfo.environment["MAPED_PROCESSING_PASSES"
   }
   document["processing_pass_seconds"] = seconds
 }
+// Diagnostic only: measure the existing count codec on the exact byte planes
+// of float32 regions. This is not a public floating-point resident API.
+if ProcessInfo.processInfo.environment["MAPED_FLOAT_CACHE_PROBE"] == "1" {
+  var records: [[String: Any]] = []
+  for first in [0, 248, 504] {
+    try autoreleasepool {
+      let region = try maped.merged_region(first..<(first + 8))
+      let cache = try MetalEncodedSource(
+        shape: [4096, 1, maped.shape[2], maped.shape[3] * 4],
+        itemBytes: 1, device: maped.operations.device)
+      let began = Date.timeIntervalSinceReferenceDate
+      try cache.append(region.buffer, frames: 4096)
+      let encodedSeconds = Date.timeIntervalSinceReferenceDate - began
+      let readStarted = Date.timeIntervalSinceReferenceDate
+      let restored = try cache.read(0..<4096)
+      let readSeconds = Date.timeIntervalSinceReferenceDate - readStarted
+      let library = try maped.operations.device.makeLibrary(
+        source: MetalCountResources.source("resident_utilities"), options: nil)
+      let pipeline = try maped.operations.device.makeComputePipelineState(
+        function: library.makeFunction(name: "count_verify")!)
+      let error = maped.operations.device.makeBuffer(length: 4, options: .storageModeShared)!
+      error.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+      let command = maped.operations.queue.makeCommandBuffer()!
+      let encoder = command.makeComputeCommandEncoder()!
+      encoder.setComputePipelineState(pipeline)
+      encoder.setBuffer(region.buffer, offset: 0, index: 0)
+      encoder.setBuffer(restored, offset: 0, index: 1)
+      encoder.setBuffer(error, offset: 0, index: 2)
+      var bytes = UInt32(region.rows * region.columns * 4)
+      encoder.setBytes(&bytes, length: 4, index: 3)
+      encoder.dispatchThreads(
+        MTLSize(width: Int(bytes), height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+      encoder.endEncoding()
+      command.commit()
+      command.waitUntilCompleted()
+      guard command.status == .completed, error.contents().load(as: UInt32.self) == 0
+      else { fatalError("Float byte cache round-trip failed.") }
+      records.append([
+        "first_row": first, "encoded_bytes": cache.residentBytes,
+        "raw_bytes": Int(bytes), "encode_seconds": encodedSeconds,
+        "read_seconds": readSeconds, "exact": true,
+      ])
+      cache.releaseResidentStorage()
+    }
+  }
+  document["float_byte_cache_probe"] = records
+}
 let validationStarted = Date.timeIntervalSinceReferenceDate
 if ProcessInfo.processInfo.environment["MAPED_VALIDATE_WEIGHTS"] == "1" {
   let operations = maped.operations
