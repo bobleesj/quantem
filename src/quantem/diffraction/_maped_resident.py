@@ -288,6 +288,7 @@ class ResidentMergeSource:
         *,
         close_sources_before_reopen: bool,
         compile_merge: bool | None = None,
+        compute_region_frames: int | None = None,
     ) -> None:
         self.sources = list(sources)
         if not self.sources:
@@ -340,6 +341,7 @@ class ResidentMergeSource:
                     for index, column_weight in enumerate((1 - column_fraction, column_fraction))
                 ]))
         self.region_frames = _automatic_region_frames(self.shape, device)
+        self._compute_region_frames = compute_region_frames
         self.real_weights, self.detector_weights, self.detector_grids = _weights(
             self.shape, real_space_shifts, diffraction_shifts
         )
@@ -375,12 +377,44 @@ class ResidentMergeSource:
     def blocks(
         self, scan_region: tuple[int, int, int, int] | None = None
     ) -> Iterator[torch.Tensor]:
-        """Yield complete row-aligned MAPED regions using only Torch math."""
+        """Yield calibrated storage regions from bounded Torch computation."""
+        compute_frames = self._compute_region_frames
+        if (
+            scan_region is not None
+            or compute_frames is None
+            or compute_frames >= self.region_frames
+        ):
+            yield from self._compute_blocks(scan_region, self.region_frames)
+            return
+        total = math.prod(self.shape[:2])
+        first = count = 0
+        output = None
+        for values in self._compute_blocks(None, compute_frames):
+            cursor = 0
+            while cursor < values.shape[0]:
+                if output is None:
+                    output = torch.empty(
+                        (min(self.region_frames, total - first), *self.shape[2:]),
+                        dtype=torch.float32, device=self._torch_device,
+                    )
+                length = min(values.shape[0] - cursor, output.shape[0] - count)
+                output[count:count + length].copy_(values[cursor:cursor + length])
+                cursor += length
+                count += length
+                if count == output.shape[0]:
+                    yield output
+                    first += count
+                    count = 0
+                    output = None
+            del values
+
+    def _compute_blocks(self, scan_region, region_frames) -> Iterator[torch.Tensor]:
+        """Evaluate unchanged float32 merge arithmetic on row-aligned blocks."""
         rows, columns, detector_rows, detector_columns = self.shape
         row_start, row_stop, column_start, column_stop = (
             (0, rows, 0, columns) if scan_region is None else scan_region
         )
-        rows_per_region = max(1, self.region_frames // columns)
+        rows_per_region = max(1, region_frames // columns)
         generation_seconds = 0.0
         sampled_workspace = torch.empty(
             (

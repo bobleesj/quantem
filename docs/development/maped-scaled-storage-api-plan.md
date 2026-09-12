@@ -27,7 +27,7 @@ alignment, interpolation and accumulation still use float32.
 | `merge_datasets(dtype="scaled_uint16")` | Complete packed, calibrated output; float32 reconstructed reads; measured storage rounding |
 | `merge_datasets(dtype="float32", scan_region=...)` | Float32 region without additional storage rounding; at most 4096 scan positions |
 | `merge_datasets()` | Existing float32 inspection behavior; a large scan needs an explicit small region |
-| `merge_datasets(save_to=...)` | Scaled uint16 by default; keeps the packed resident and saves its calibration |
+| `merge_datasets(save_to=...)` | Scaled uint16 by default; streams to disk, releases owned inputs, then reopens the complete packed result |
 
 QuantEM.GPU IO additionally supports **float16** storage. That does not make
 `merge_datasets(dtype="float16")` a supported resident MAPED call. The two
@@ -40,6 +40,28 @@ Use only `scaled_uint16`; `uint16_scaled` is not an alias. `dtype` does not choo
 ANS versus bit packing, a GPU backend, or MAPED's scientific parameters.
 Packing itself is exact relative to the chosen stored values. The result's
 precision report describes before/after storage error, not physical accuracy.
+
+## Lower-memory saved workflow
+
+```python
+merged = maped.merge_datasets(
+    save_to="merged_master.h5", dtype="scaled_uint16", plot_result=False
+)
+maped.show()
+```
+
+For `from_files` inputs, saving avoids holding all input and output codes at
+once. Torch computation uses smaller internal batches while retaining the same
+storage-calibration boundaries. QuantEM.GPU streams the converted regions to
+HDF5, then loads the complete result after MAPED releases its owned inputs.
+Sources supplied through `from_resident` remain borrowed and cannot receive
+this input-release memory saving automatically. The no-file call still retains
+both inputs and output during merging and needs more memory.
+
+The first measured saved workflow peaked at 11.89 GiB on a larger MPS machine
+under a 12 GiB Torch cap. This is a candidate for 16 GB Macs, not physical-device
+qualification; browser rendering and system memory pressure require testing.
+See [measurements](maped-16gb-memory.md).
 
 ## Saving and loading
 

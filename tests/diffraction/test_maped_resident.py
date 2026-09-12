@@ -143,7 +143,7 @@ def test_from_files_defaults_to_median_corrected_ans_on_cuda(tmp_path):
         )
         assert maped.datasets.sources == []
         assert source.data.is_released
-        assert not result.metadata["maped_merge"][
+        assert result.metadata["maped_merge"][
             "released_sources_before_reopen"
         ]
         assert len(result.metadata["maped_merge"]["merge_generation_pass_seconds"]) == 1

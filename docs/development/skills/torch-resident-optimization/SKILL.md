@@ -98,3 +98,15 @@ calibration region adds memory traffic, and explicit region selection may
 bypass compiled interior paths. Cache flushing can lower sampled memory while
 hurting latency. Keep these changes only with measured evidence; see the
 [resident memory trials](../../maped-scaled-storage-performance.md#follow-up-shorten-temporary-buffer-lifetimes).
+
+
+## Smaller MPS machines
+
+Use the existing `merge_datasets(save_to="merged_master.h5",
+dtype="scaled_uint16", plot_result=False)` when input/output overlap is too
+large. Owned inputs are released before the full packed result is reopened;
+borrowed sources remain caller-owned. Keep float32 computation and original
+storage-calibration boundaries even when computation batches are smaller.
+Measure native loading peaks independently: a Torch cap does not cap all Metal
+allocations. The 11.89 GiB larger-machine experiment is not physical 16 GB Mac
+qualification. See [the memory investigation](../../maped-16gb-memory.md).

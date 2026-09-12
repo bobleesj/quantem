@@ -83,3 +83,7 @@ physical-laptop qualification limitations above still apply.
 
 Compact measurements and rejected prototype wrappers are retained in
 [the memory experiment directory](benchmarks/2026-09-12-resident-memory/).
+
+For the subsequent saved workflow that reduces MPS peak to 11.81–11.89 GiB,
+see [the smaller-Mac investigation](maped-16gb-memory.md). It adds disk IO;
+the no-file measurements above describe the original resident workflow.

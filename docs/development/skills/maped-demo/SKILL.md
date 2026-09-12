@@ -201,3 +201,15 @@ inspection. QuantEM.GPU IO also supports `float16`; do not advertise it as a
 resident MAPED merge keyword. Keep `scaled_uint16` as the single spelling.
 Scaled reads reconstruct float32 calibrated intensities; they do not recover
 rounding losses. Keep storage RMSE distinct from scientific algorithm parity.
+
+
+## Smaller MPS machines
+
+Use the existing `merge_datasets(save_to="merged_master.h5",
+dtype="scaled_uint16", plot_result=False)` when input/output overlap is too
+large. Owned inputs are released before the full packed result is reopened;
+borrowed sources remain caller-owned. Keep float32 computation and original
+storage-calibration boundaries even when computation batches are smaller.
+Measure native loading peaks independently: a Torch cap does not cap all Metal
+allocations. The 11.89 GiB larger-machine experiment is not physical 16 GB Mac
+qualification. See [the memory investigation](../../maped-16gb-memory.md).

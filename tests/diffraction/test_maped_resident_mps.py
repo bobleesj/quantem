@@ -11,7 +11,8 @@ pytest.importorskip("Metal")
 from quantem.diffraction import MAPEDTorch
 
 
-def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
+@pytest.mark.parametrize("saved", [False, True])
+def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path, saved):
     shape = (65, 65, 2, 4)
     values = (
         np.arange(np.prod(shape), dtype=np.uint32).reshape(shape) * 13 % 701
@@ -64,10 +65,31 @@ def test_from_files_defaults_to_ans_and_merges_late_region(tmp_path):
             rtol=0,
             atol=1e-5,
         )
+        if saved:
+            from quantem.diffraction._maped_resident import ResidentMergeSource
+
+            shifts = torch.tensor([[0.25, -0.75]], device="mps")
+            direct = ResidentMergeSource(
+                [source], shifts, shifts, close_sources_before_reopen=False,
+                compile_merge=False,
+            )
+            bounded = ResidentMergeSource(
+                [source], shifts, shifts, close_sources_before_reopen=False,
+                compile_merge=False, compute_region_frames=130,
+            )
+            # Uneven work/storage boundaries preserve every float32 value.
+            try:
+                expected_merge = torch.cat(list(direct.blocks()))
+                actual_merge = torch.cat(list(bounded.blocks()))
+                assert torch.equal(actual_merge, expected_merge)
+            finally:
+                direct.close()
+                bounded.close()
         maped.real_space_shifts = torch.zeros((1, 2), device="mps")
         maped.diffraction_shifts = torch.zeros((1, 2), device="mps")
         result = maped.merge_datasets(
-            dtype="scaled_uint16", plot_result=False
+            dtype="scaled_uint16", plot_result=False,
+            save_to=tmp_path / "merged_master.h5" if saved else None,
         )
         expected[0] = 0
         expected[-1] = 0

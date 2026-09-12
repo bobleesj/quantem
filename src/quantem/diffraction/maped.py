@@ -2007,8 +2007,10 @@ class MAPEDTorch(AutoSerialize):
             an alias. Nonresident merging retains its existing dtype behavior.
         save_to : str, optional
             Output HDF5 path for resident encoded sources. The merge is written in
-            bounded regions with their intensity calibration. The already-resident
-            packed result is retained for viewing without reopening the file.
+            bounded regions with their intensity calibration. Owned input tilts
+            are released before the complete packed output is reopened for viewing.
+            This reduces simultaneous input/output residency at the cost of disk IO.
+            Borrowed input sources remain caller-owned and resident.
             Omit this for resident ``scaled_uint16`` output or a small float32
             ``scan_region`` inspection.
         scale_output : bool
@@ -2217,24 +2219,25 @@ class MAPEDTorch(AutoSerialize):
                 arrays.sources,
                 rs_shifts,
                 dp_shifts,
-                close_sources_before_reopen=False,
+                close_sources_before_reopen=save_to is not None and arrays.owns_sources,
                 compile_merge=compile_merge,
+                compute_region_frames=2048 if save_to is not None else None,
             )
-            result = gpu_io.load(
-                generated,
-                dtype="scaled_uint16",
-                backend=torch.device(self.device).type,
-                verbose=verbose,
-            )
-            if save_to is not None:
-                try:
-                    gpu_io.save(
-                        save_to, result, backend=torch.device(self.device).type,
-                        verbose=verbose,
+            try:
+                if save_to is None:
+                    result = gpu_io.load(
+                        generated, dtype="scaled_uint16",
+                        backend=torch.device(self.device).type, verbose=verbose,
                     )
-                except BaseException:
-                    result.close()
-                    raise
+                else:
+                    # Stream completed regions before releasing the inputs and
+                    # reopening the complete calibrated result for inspection.
+                    gpu_io.save(
+                        save_to, generated, dtype="scaled_uint16",
+                        backend=torch.device(self.device).type, verbose=verbose,
+                    )
+            finally:
+                generated.close()
             if arrays.owns_sources:
                 for source in arrays.sources:
                     source.close()
@@ -2243,6 +2246,11 @@ class MAPEDTorch(AutoSerialize):
                     torch.cuda.empty_cache()
                 else:
                     torch.mps.empty_cache()
+            if save_to is not None:
+                result = gpu_io.load(
+                    save_to, dtype="scaled_uint16",
+                    backend=torch.device(self.device).type, verbose=verbose,
+                )
             self.merged = result
             if compute_summaries or plot_result:
                 summaries_dp, summaries_bf = _resident_summaries([result], self.device)
