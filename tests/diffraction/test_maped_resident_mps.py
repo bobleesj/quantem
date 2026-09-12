@@ -102,3 +102,51 @@ def test_manual_origins_align_on_the_requested_gpu(origins):
     maped.diffraction_align(upsample_factor=3, plot_aligned=False)
     assert maped.diffraction_shifts.device.type == "mps"
     assert torch.isfinite(maped.diffraction_shifts).all()
+
+
+def test_repeated_region_passes_preserve_float32_values(tmp_path):
+    """Two-pass saving preserves earlier strips while reusing working memory."""
+    from quantem.gpu import io
+
+    from quantem.diffraction._maped_resident import ResidentMergeSource
+
+    shape = (17, 13, 8, 8)
+    indices = torch.arange(np.prod(shape), device="mps").reshape(shape)
+    sources = [
+        io.FourDSTEMData(((indices * 13 + index * 17) % 701).to(torch.uint16), {})
+        for index in range(7)
+    ]
+    shifts = torch.tensor(
+        [[0, 0], [-1.25, 0.6], [0.75, -1.4], [2.3, 1.1], [-2.1, -0.2], [19, 0], [-18, 1]],
+        device="mps",
+    )
+    diffraction = torch.tensor(
+        [[0, 0], [0.4, -0.7], [-0.25, 0.5], [0.1, 0.2], [1.2, -0.1], [0, 0], [0.3, -0.1]],
+        device="mps",
+    )
+    generated = ResidentMergeSource(
+        sources, shifts, diffraction, close_sources_before_reopen=False
+    )
+    generated.region_frames = 2 * shape[1]
+    try:
+        first_pass = list(generated.blocks())
+        expected = torch.cat(first_pass).clone()
+        # Keep every yielded strip alive through another complete pass. A reused
+        # output buffer would silently overwrite these earlier scientific values.
+        observed = torch.cat(list(generated.blocks()))
+        assert torch.equal(torch.cat(first_pass), expected)
+        assert torch.equal(observed, expected)
+        assert observed.dtype == torch.float32
+        assert torch.isfinite(observed).all()
+        output = tmp_path / "repeated_master.h5"
+        io.save(output, generated, dtype="scaled_uint16", backend="mps", verbose=False)
+        with io.load(output, backend="mps", verbose=False) as loaded:
+            report = loaded.metadata["precision"]
+            assert report["values"] == expected.numel()
+            assert report["overflow"] == report["clipped"] == 0
+            actual = loaded.read().reshape_as(expected)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=report["scale"])
+    finally:
+        generated.close()
+        for source in sources:
+            source.close()

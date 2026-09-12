@@ -22,6 +22,11 @@ For Python-free execution on Apple GPUs, see the
 [native MAPED code and tests](native/README.md). It retains the scientific
 workflow and parameter names while using QuantEM.GPU for native infrastructure.
 
+The [Torch MPS performance and parity report](docs/development/mps-maped-merge-performance.md)
+records the current complete workflow, memory use, and full-output checks.
+The [MAPED demo skill](docs/development/skills/maped-demo/SKILL.md) keeps the
+execution and qualification instructions beside the code.
+
 ## License
 
 quantem is free and open source software, distributed under the [MIT License](LICENSE).

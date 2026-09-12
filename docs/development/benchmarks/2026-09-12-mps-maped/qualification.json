@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-12",
+  "baseline_quantem_revision": "519a5a3f9a56052a68dc49916effa32de2de4ca9",
+  "baseline_quantem_gpu_revision": "6c171565569f2b9b4bd5987e50789a53ddc6b520",
+  "source_files_sha256": {
+    "src/quantem/diffraction/_maped_resident.py": "763dbf9cc2aa14679dc14798e7dc9e86ab327e0e0d5e76fa24527f58dffa6679",
+    "src/quantem/gpu/io/_precision.py": "fd8e21d273a409d309cd1d65015cb8b56c500395fff3a7fc3e729dfdf2af67e0",
+    "src/quantem/gpu/io/backends/mps/precision.py": "8d2c5720b026af40bccbec969acf5e22522b437162a31a6dec0ed1a55b0f435c",
+    "src/quantem/gpu/io/save.py": "c8be271305cbc98523925a92593a51b87c38281be402c2fba6ec4f561996432c"
+  },
+  "float32_values_compared": 9663676416,
+  "float32_exact": true,
+  "saved_chunks_compared_per_run": 262144,
+  "saved_chunks_exact_in_both_runs": true,
+  "maximum_process_footprint_bytes": [
+    15626883584,
+    15670972544
+  ],
+  "process_footprint_measurement": "macOS /usr/bin/time -l; includes subsequent parity checks",
+  "allocation_limit_bytes": 25769803776,
+  "physical_host_memory_gb": 128,
+  "swaps_in_both_final_runs": 0,
+  "tests": {
+    "mps_maped_and_boundary": 7,
+    "mps_precision": 7,
+    "cuda_maped_and_boundary": 5,
+    "cuda_precision_and_compressed_hdf5_contracts": 25
+  },
+  "all_reported_tests_executed": true,
+  "lint": {
+    "quantem": "passed",
+    "gpu_existing_findings": 17,
+    "gpu_new_findings": 0,
+    "diff_checks": "passed"
+  },
+  "science": "same parameters, corrected encoded inputs, full detector, float32 arithmetic and original accumulation order",
+  "scope": "Torch MPS optimization. Native Swift/Metal not changed. CUDA regression checks are not a CUDA speed claim.",
+  "quantem_gpu_revision": "af7e4988946a0683a1420e8ba1409eab1ff7da3f"
+}
