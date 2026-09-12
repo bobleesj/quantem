@@ -17,6 +17,30 @@ Borrowed inputs remain caller-owned. Float32 alignment, interpolation weights,
 and accumulation order are unchanged. Ordinary small float32 `scan_region`
 inspection remains available through the existing method.
 
+## Meaning of `dtype` in MAPED
+
+For resident CUDA/MPS inputs, `dtype` controls the merged result's storage;
+alignment, interpolation and accumulation still use float32.
+
+| Call | Result |
+|---|---|
+| `merge_datasets(dtype="scaled_uint16")` | Complete packed, calibrated output; float32 reconstructed reads; measured storage rounding |
+| `merge_datasets(dtype="float32", scan_region=...)` | Float32 region without additional storage rounding; at most 4096 scan positions |
+| `merge_datasets()` | Existing float32 inspection behavior; a large scan needs an explicit small region |
+| `merge_datasets(save_to=...)` | Scaled uint16 by default; keeps the packed resident and saves its calibration |
+
+QuantEM.GPU IO additionally supports **float16** storage. That does not make
+`merge_datasets(dtype="float16")` a supported resident MAPED call. The two
+reduced-precision IO choices have different meanings: float16 stores rounded
+floating-point intensities, while scaled uint16 stores calibrated integer
+codes. Both reconstruct float32 values when read. Reconstruction does not undo
+storage rounding. Plain uint16 is not a substitute for scaled uint16.
+
+Use only `scaled_uint16`; `uint16_scaled` is not an alias. `dtype` does not choose
+ANS versus bit packing, a GPU backend, or MAPED's scientific parameters.
+Packing itself is exact relative to the chosen stored values. The result's
+precision report describes before/after storage error, not physical accuracy.
+
 ## Saving and loading
 
 Save during merging with the existing `save_to` argument, or save the returned

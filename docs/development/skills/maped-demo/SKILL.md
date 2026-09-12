@@ -192,3 +192,12 @@ regions in one pass. Preserve calibrated reads, metadata and errors in tests.
 The old global-format files remain readable. Native Swift regional-file loading
 and Live4DSTEM integration are separate work, not implied by Python MPS support.
 See [current timings](../../maped-scaled-storage-performance.md).
+
+## Precision vocabulary
+
+Document `dtype` as the output storage choice, not MAPED calculation precision.
+Resident MAPED supports complete `scaled_uint16` output and bounded `float32`
+inspection. QuantEM.GPU IO also supports `float16`; do not advertise it as a
+resident MAPED merge keyword. Keep `scaled_uint16` as the single spelling.
+Scaled reads reconstruct float32 calibrated intensities; they do not recover
+rounding losses. Keep storage RMSE distinct from scientific algorithm parity.

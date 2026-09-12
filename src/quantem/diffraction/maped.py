@@ -1995,7 +1995,16 @@ class MAPEDTorch(AutoSerialize):
             Output storage dtype. ``"scaled_uint16"`` computes the merge in
             float32 once, then retains calibrated, packed uint16 regions on
             the GPU. Calibration and region sizes are automatic. Saving uses
-            this storage by default. Float32 scan-region inspection remains available.
+            this storage by default. This does not reduce the precision of
+            alignment, interpolation, or float32 accumulation. Reads reconstruct
+            float32 intensities from the stored codes and calibration; rounding
+            error is recorded in the result's ``metadata["precision"]``.
+            For resident inputs, ``None`` without ``save_to`` and explicit
+            ``"float32"`` retain exact float32 scan-region inspection (at most
+            4096 scan positions). ``None`` with ``save_to`` selects scaled
+            uint16. Float16 IO is supported by QuantEM.GPU, but is not a
+            supported resident MAPED merge option. ``"uint16_scaled"`` is not
+            an alias. Nonresident merging retains its existing dtype behavior.
         save_to : str, optional
             Output HDF5 path for resident encoded sources. The merge is written in
             bounded regions with their intensity calibration. The already-resident
