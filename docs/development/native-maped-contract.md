@@ -101,3 +101,9 @@ The latest [IO optimization](native-maped-io-performance.md) removes input read
 waits and the output reread using existing infrastructure. It preserves both
 precise merge passes; retaining packed output increases peak Metal allocation
 to 15.424 GiB on the qualification acquisition.
+
+An [experimental regional-scale single merge](native-maped-regional-storage.md)
+reaches complete packed GPU residency in 13.26–13.76 s without saving. It changes
+storage precision intentionally and does not change the default global-scale
+contract; production readers and formats must support per-region calibration
+before adoption.

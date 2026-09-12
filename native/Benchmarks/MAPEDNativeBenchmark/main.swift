@@ -112,6 +112,14 @@ var document: [String: Any] = [
   "diffraction_shifts": maped.diffraction_shifts!.values(),
   "real_space_shifts": maped.real_space_shifts!.values(),
 ]
+if ProcessInfo.processInfo.environment["MAPED_REGIONAL_STORAGE"] == "1" {
+  document["regional_storage"] = try benchmarkRegionalStorage(maped)
+  document["total_wall_seconds"] = Date.timeIntervalSinceReferenceDate - started
+  try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+    .write(to: report)
+  print("Regional storage experiment complete")
+  exit(0)
+}
 if ProcessInfo.processInfo.environment["MAPED_FULL_PARITY"] == "1" {
   let original = ProcessInfo.processInfo.environment["QUANTEM_GPU_SAMPLING_REFERENCE"]
   setenv("QUANTEM_GPU_SAMPLING_REFERENCE", "1", 1)

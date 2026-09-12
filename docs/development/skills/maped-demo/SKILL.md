@@ -171,3 +171,15 @@ so this trades the previous approximate 14 GiB target for less IO while staying
 below 24 GiB in the Phil measurement. Physical Rodman qualification is separate.
 The output's saved chunks and precision report remain exact. Keep the lower
 memory reference diagnostic available for comparisons and larger acquisitions.
+
+## Experimental single-merge regional storage
+
+The [regional storage experiment](../../native-maped-regional-storage.md) retains
+all inputs encoded, merges each 4096-frame region once in float32, then keeps
+that region's scaled uint16 codes packed with its own precision metadata.
+On Phil it took 13.26–13.76 s load-through-GPU-ready, excluding saving and UI.
+RMSE is 0.00544976 versus global 0.00695111; output is 6.196 GiB and peak process
+footprint 15.277 GiB. Full packed restoration was audited for all 9.66 billion
+values. No production default or public API changed. Do not treat regional
+codes as globally scaled, or claim viewer/file support until the generic
+cross-region reader, metadata contract and calibrated reductions are qualified.
