@@ -1,0 +1,187 @@
+{
+  "cuda": {
+    "backend": "cuda",
+    "timings": {
+      "load": 8.331226120935753,
+      "preprocess": 0.9523654390359297,
+      "origin": 0.20034237299114466,
+      "diffraction_align": 0.10622679209336638,
+      "real_space_align": 0.22792435996234417,
+      "merge_pack_summaries": 6.391166604007594,
+      "selected_dp": 0.0011378650087863207,
+      "viewer_constructor": 2.20324056991376
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6748110346,
+    "peak": {
+      "allocated_bytes": 20749221888
+    },
+    "load_through_dp_seconds": 16.21038955403492,
+    "saved": false,
+    "browser_rendering_measured": false,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832445,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    },
+    "precision_comparison": "Only regional RMSE reduction roundoff differed from CUDA baseline; maximum observed difference 4.34e-18 in first run"
+  },
+  "cuda-final": {
+    "backend": "cuda",
+    "timings": {
+      "load": 8.123202744987793,
+      "preprocess": 0.9544239989481866,
+      "origin": 0.17490365507546812,
+      "diffraction_align": 0.10609726700931787,
+      "real_space_align": 0.22651197400409728,
+      "merge_pack_summaries": 6.037252355017699,
+      "selected_dp": 0.002049650065600872,
+      "viewer_constructor": 1.0128786669811234
+    },
+    "input_resident_bytes": 8328746912,
+    "output_resident_bytes": 6748110346,
+    "peak": {
+      "allocated_bytes": 20721958912
+    },
+    "load_through_dp_seconds": 15.624441645108163,
+    "saved": false,
+    "browser_rendering_measured": false,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005451803402832445,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.4329833984375,
+      "changed": 8807257876,
+      "positive_to_zero": 1526544486,
+      "overflow": 0,
+      "clipped": 0
+    },
+    "precision_comparison": "Only regional RMSE reduction roundoff differed from CUDA baseline; maximum observed difference 4.34e-18 in first run"
+  },
+  "mps": {
+    "backend": "mps",
+    "timings": {
+      "load": 11.169217292015674,
+      "preprocess": 2.379146209015744,
+      "origin": 0.05701287498231977,
+      "diffraction_align": 0.07172974999411963,
+      "real_space_align": 0.5919239579816349,
+      "merge_pack_summaries": 14.215488707995974,
+      "selected_dp": 0.0013372499961405993,
+      "viewer_constructor": 0.3056099579844158
+    },
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6556136086,
+    "peak": {
+      "allocated_bytes": 18555125760
+    },
+    "load_through_dp_seconds": 28.485856041981606,
+    "saved": false,
+    "browser_rendering_measured": false,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    },
+    "precision_comparison": "All precision fields identical to MPS baseline"
+  },
+  "mps-saved": {
+    "stage_peaks": {
+      "load": 9261350912,
+      "preprocess": 8135196672,
+      "origin": 7579303936,
+      "diffraction_align": 7581499392,
+      "real_space_align": 8918564864,
+      "merge_pack_summaries": 12681035776,
+      "viewer_constructor": 6611009536
+    },
+    "backend": "mps",
+    "timings": {
+      "load": 11.882784749992425,
+      "preprocess": 3.790621792024467,
+      "origin": 0.05791470900294371,
+      "diffraction_align": 0.06374712500837632,
+      "real_space_align": 0.639233708003303,
+      "merge_pack_summaries": 32.074891958007356,
+      "selected_dp": 0.0017412079905625433,
+      "viewer_constructor": 0.41593483299948275
+    },
+    "input_resident_bytes": 7514270140,
+    "output_resident_bytes": 6575813782,
+    "peak": {
+      "allocated_bytes": 12681035776
+    },
+    "load_through_dp_seconds": 48.51093525002943,
+    "saved": true,
+    "browser_rendering_measured": false,
+    "precision_summary": {
+      "version": 2,
+      "storage": "scaled_uint16",
+      "source_dtype": "float32",
+      "source_shape": [
+        512,
+        512,
+        192,
+        192
+      ],
+      "complete": true,
+      "range_scope": "automatic regions",
+      "values": 9663676416,
+      "rmse": 0.005449762560450884,
+      "max_abs_error": 0.01312255859375,
+      "intensity_min": 0.0,
+      "intensity_max": 1716.41943359375,
+      "changed": 8807257934,
+      "positive_to_zero": 1531128399,
+      "overflow": 0,
+      "clipped": 0
+    },
+    "precision_comparison": "All precision fields identical to MPS baseline"
+  }
+}

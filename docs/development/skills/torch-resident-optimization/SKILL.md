@@ -110,3 +110,15 @@ storage-calibration boundaries even when computation batches are smaller.
 Measure native loading peaks independently: a Torch cap does not cap all Metal
 allocations. The 11.89 GiB larger-machine experiment is not physical 16 GB Mac
 qualification. See [the memory investigation](../../maped-16gb-memory.md).
+
+
+## Scaled output uses ANS
+
+Python CUDA and Torch MPS `dtype="scaled_uint16"` now default to ANS-resident
+codes (`representation="encoded"`, `resident_codec="ans"`). Do not describe
+current scaled output as bit-packed. Earlier measurements above retain their
+historical codec. Float16 still uses bit packing. HDF5 disk compression remains
+GPU bitshuffle/LZ4; reopening scaled files creates ANS residency with unchanged
+codes and calibration. Native Swift integration requires separate qualification.
+See [ANS output evidence](../../maped-ans-output.md) for memory and latency;
+ANS is not guaranteed to be smaller or faster for every intensity distribution.

@@ -11,11 +11,19 @@ viewer = maped.show()
 
 All seven inputs remain encoded while MAPED performs one bounded float32 merge.
 QuantEM.GPU measures each produced region, converts it to calibrated uint16,
-and retains its packed codes. MAPED-owned inputs are then released. The complete
+and retains its ANS-encoded codes. MAPED-owned inputs are then released. The complete
 merged output stays resident for viewing, without a file or a second merge.
 Borrowed inputs remain caller-owned. Float32 alignment, interpolation weights,
 and accumulation order are unchanged. Ordinary small float32 `scan_region`
 inspection remains available through the existing method.
+
+Scaled output now defaults to **ANS residency** on Python CUDA and Torch MPS,
+matching the encoded input default. Scaling and compression are separate:
+scaling produces measured rounding; ANS preserves those uint16 codes exactly.
+The HDF5 disk format still uses GPU bitshuffle/LZ4 and saved calibration. A
+reopened scaled file becomes ANS-resident without recalibration. Native Swift
+workflow parity is not established by these Python changes. See
+[ANS measurements](maped-ans-output.md).
 
 ## Meaning of `dtype` in MAPED
 
@@ -24,10 +32,10 @@ alignment, interpolation and accumulation still use float32.
 
 | Call | Result |
 |---|---|
-| `merge_datasets(dtype="scaled_uint16")` | Complete packed, calibrated output; float32 reconstructed reads; measured storage rounding |
+| `merge_datasets(dtype="scaled_uint16")` | Complete ANS-encoded, calibrated output; float32 reconstructed reads; measured storage rounding |
 | `merge_datasets(dtype="float32", scan_region=...)` | Float32 region without additional storage rounding; at most 4096 scan positions |
 | `merge_datasets()` | Existing float32 inspection behavior; a large scan needs an explicit small region |
-| `merge_datasets(save_to=...)` | Scaled uint16 by default; streams to disk, releases owned inputs, then reopens the complete packed result |
+| `merge_datasets(save_to=...)` | Scaled uint16 by default; streams to disk, releases owned inputs, then reopens the complete ANS-encoded result |
 
 QuantEM.GPU IO additionally supports **float16** storage. That does not make
 `merge_datasets(dtype="float16")` a supported resident MAPED call. The two
@@ -84,7 +92,7 @@ Torch storage on the source accelerator.
 
 Generic `io.save(path, source, dtype="scaled_uint16")` streams conversion and
 writing without retaining the complete packed output. Generic
-`io.load(source, dtype="scaled_uint16")` retains the complete packed result.
+`io.load(source, dtype="scaled_uint16")` retains the complete ANS-encoded result.
 Sources can be files, GPU arrays, or existing generated sources with declared
 `shape`, `dtype`, and ordered `blocks()`. Scientific generation stays in QuantEM;
 precision conversion, packing, calibrated queries and file IO belong to

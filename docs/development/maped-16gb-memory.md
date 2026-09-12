@@ -76,3 +76,7 @@ and generic GPU IO own the memory behavior.
 
 The repeat public run peaked at 11.81 GiB and took 38.44 s through the selected
 DP. Its complete precision report again matched the baseline.
+
+The subsequent [ANS residency update](maped-ans-output.md) preserves this
+saved workflow and measured 11.81 GiB peak, but took 48.51 s in its first full
+run. The measurements above are the preceding bit-packed-output baseline.

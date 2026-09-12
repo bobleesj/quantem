@@ -1993,7 +1993,7 @@ class MAPEDTorch(AutoSerialize):
             dotted 'cross' through the center of the merged mean diffraction pattern.
         dtype : str or torch.dtype, optional
             Output storage dtype. ``"scaled_uint16"`` computes the merge in
-            float32 once, then retains calibrated, packed uint16 regions on
+            float32 once, then retains calibrated, ANS-encoded uint16 regions on
             the GPU. Calibration and region sizes are automatic. Saving uses
             this storage by default. This does not reduce the precision of
             alignment, interpolation, or float32 accumulation. Reads reconstruct
@@ -2008,7 +2008,7 @@ class MAPEDTorch(AutoSerialize):
         save_to : str, optional
             Output HDF5 path for resident encoded sources. The merge is written in
             bounded regions with their intensity calibration. Owned input tilts
-            are released before the complete packed output is reopened for viewing.
+            are released before the complete encoded output is reopened for viewing.
             This reduces simultaneous input/output residency at the cost of disk IO.
             Borrowed input sources remain caller-owned and resident.
             Omit this for resident ``scaled_uint16`` output or a small float32
@@ -2834,7 +2834,7 @@ class MAPEDTorch(AutoSerialize):
     ):
         """Open the merged result in Show4DSTEM.
 
-        Encoded resident workflows display the packed scaled result or an unsaved
+        Encoded resident workflows display the ANS-encoded scaled result or an unsaved
         float32 scan-region inspection directly. Dense and file-streamed workflows retain
         the two-panel reference-tilt versus merge view.
 
