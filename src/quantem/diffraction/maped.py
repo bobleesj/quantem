@@ -2119,39 +2119,19 @@ class MAPEDTorch(AutoSerialize):
                     "Encoded resident MAPED writes its bounded result as scaled "
                     "uint16; provide save_to='merged_master.h5'."
                 )
-            from quantem.gpu import io as gpu_io
-            from quantem.gpu._maped import resident_merge
+            from quantem.gpu.maped import merge as gpu_merge
 
-            generated = resident_merge(
+            result = gpu_merge(
                 arrays.sources,
                 rs_shifts,
                 dp_shifts,
-            )
-            generated.release_sources_before_reopen = bool(arrays.owns_sources)
-            gpu_io.save(
-                save_to,
-                generated,
+                save_to=save_to,
                 dtype="scaled_uint16",
-                backend=torch.device(self.device).type,
+                close_sources=arrays.owns_sources,
                 verbose=verbose,
             )
             if arrays.owns_sources:
-                # Release MAPED-owned inputs after io.save finishes and before
-                # io.load reopens the packed result, so both complete resident
-                # representations never overlap. Preserve borrowed sources.
-                for source in arrays.sources:
-                    source.close()
                 arrays.sources = []
-                if torch.device(self.device).type == "cuda":
-                    torch.cuda.empty_cache()
-                elif torch.device(self.device).type == "mps":
-                    torch.mps.empty_cache()
-            result = gpu_io.load(
-                save_to,
-                backend=torch.device(self.device).type,
-                representation="packed",
-                verbose=False,
-            )
             self.merged = result
             if compute_summaries or plot_result:
                 summaries_dp, summaries_bf = _resident_summaries([result], self.device)

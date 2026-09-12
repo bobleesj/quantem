@@ -22,3 +22,17 @@ def test_maped_has_no_native_cuda_dependencies() -> None:
 
     assert imported_roots.isdisjoint({"cupy", "pynvml"})
     assert not native_kernel_attributes
+
+
+def test_maped_uses_only_public_quantem_gpu_modules() -> None:
+    """Cross-package calls use stable QuantEM.GPU contracts."""
+    source = Path(maped_module.__file__).read_text()
+    tree = ast.parse(source)
+    private_imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module
+        and node.module.startswith("quantem.gpu._")
+    }
+    assert not private_imports
