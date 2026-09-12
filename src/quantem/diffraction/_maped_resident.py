@@ -159,6 +159,9 @@ def _sample_scan_rows(
     output_stop_row: int,
     shift: torch.Tensor | Sequence[float],
     out: torch.Tensor | None = None,
+    decoded_first_column: int = 0,
+    output_first_column: int = 0,
+    output_stop_column: int | None = None,
 ) -> torch.Tensor:
     """Apply one rigid bilinear scan shift to a decoded row range."""
     decoded_rows, columns, detector_rows, detector_columns = values.shape
@@ -167,9 +170,13 @@ def _sample_scan_rows(
     if values.dtype not in (torch.uint8, torch.uint16, torch.float32):
         values = values.to(torch.float32)
     output_rows = output_stop_row - output_first_row
+    output_columns = (
+        columns if output_stop_column is None
+        else output_stop_column - output_first_column
+    )
     output = (
         torch.empty(
-            (output_rows, columns, detector_rows, detector_columns),
+            (output_rows, output_columns, detector_rows, detector_columns),
             dtype=torch.float32,
             device=values.device,
         )
@@ -200,13 +207,22 @@ def _sample_scan_rows(
         source_row0 = output_first_row + output_row0 + row_delta - decoded_first_row
         source_row1 = output_first_row + output_row1 + row_delta - decoded_first_row
         for column_delta, column_weight in column_taps:
-            output_column0 = max(0, -column_delta)
-            output_column1 = min(columns, columns - column_delta)
+            output_column0 = max(
+                0, decoded_first_column - output_first_column - column_delta
+            )
+            output_column1 = min(
+                output_columns,
+                decoded_first_column + columns - output_first_column - column_delta,
+            )
             weight = row_weight * column_weight
             if output_column0 >= output_column1 or weight == 0:
                 continue
-            source_column0 = output_column0 + column_delta
-            source_column1 = output_column1 + column_delta
+            source_column0 = (
+                output_first_column + output_column0 + column_delta - decoded_first_column
+            )
+            source_column1 = (
+                output_first_column + output_column1 + column_delta - decoded_first_column
+            )
             output[
                 output_row0:output_row1,
                 output_column0:output_column1,
@@ -232,6 +248,19 @@ def _shift_detector(values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     )[:, 0]
 
 
+@torch.compile(fullgraph=True, dynamic=False)
+def _sample_scan_interior(
+    values: torch.Tensor, columns: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    """Fuse four ordered scan taps without specializing on shift values."""
+    output = torch.zeros_like(values[:-1])
+    output.addcmul_(values[:-1, columns[0]], weights[0, None, :, None, None])
+    output.addcmul_(values[:-1, columns[1]], weights[1, None, :, None, None])
+    output.addcmul_(values[1:, columns[0]], weights[2, None, :, None, None])
+    output.addcmul_(values[1:, columns[1]], weights[3, None, :, None, None])
+    return output
+
+
 class ResidentMergeSource:
     """Re-readable Torch MAPED blocks consumed by ``quantem.gpu.io.save``."""
 
@@ -249,6 +278,7 @@ class ResidentMergeSource:
         diffraction_shifts: torch.Tensor,
         *,
         close_sources_before_reopen: bool,
+        compile_merge: bool | None = None,
     ) -> None:
         self.sources = list(sources)
         if not self.sources:
@@ -283,6 +313,23 @@ class ResidentMergeSource:
         # Scalar displacements only: reading each scalar in the region loop
         # would wait for previously queued accelerator work on every tilt.
         self._scan_shifts = real_space_shifts.detach().cpu().tolist()
+        self._compile_scan = device.type == "mps" and compile_merge is not False
+        self._scan_columns = []
+        self._scan_weights = []
+        if self._compile_scan:
+            column = torch.arange(self.shape[1], device=device)
+            for row_shift, column_shift in self._scan_shifts:
+                row_fraction = -row_shift - math.floor(-row_shift)
+                column_floor = math.floor(-column_shift)
+                column_fraction = -column_shift - column_floor
+                indices = torch.stack((column + column_floor, column + column_floor + 1))
+                valid = ((indices >= 0) & (indices < self.shape[1])).to(torch.float32)
+                self._scan_columns.append(indices.clamp(0, self.shape[1] - 1))
+                self._scan_weights.append(torch.stack([
+                    valid[index] * (row_weight * column_weight)
+                    for row_weight in (1 - row_fraction, row_fraction)
+                    for index, column_weight in enumerate((1 - column_fraction, column_fraction))
+                ]))
         self.region_frames = _automatic_region_frames(self.shape, device)
         self.real_weights, self.detector_weights, self.detector_grids = _weights(
             self.shape, real_space_shifts, diffraction_shifts
@@ -316,35 +363,72 @@ class ResidentMergeSource:
         }
         self.save_metadata["quantem_maped_merge_v1"] = json.dumps(record)
 
-    def blocks(self) -> Iterator[torch.Tensor]:
+    def blocks(
+        self, scan_region: tuple[int, int, int, int] | None = None
+    ) -> Iterator[torch.Tensor]:
         """Yield complete row-aligned MAPED regions using only Torch math."""
         rows, columns, detector_rows, detector_columns = self.shape
+        row_start, row_stop, column_start, column_stop = (
+            (0, rows, 0, columns) if scan_region is None else scan_region
+        )
         rows_per_region = max(1, self.region_frames // columns)
         generation_seconds = 0.0
         sampled_workspace = torch.empty(
-            (min(rows, rows_per_region), columns, detector_rows, detector_columns),
+            (
+                min(row_stop - row_start, rows_per_region),
+                column_stop - column_start,
+                detector_rows,
+                detector_columns,
+            ),
             dtype=torch.float32,
             device=self._torch_device,
         )
-        for output_row0 in range(0, rows, rows_per_region):
-            output_row1 = min(rows, output_row0 + rows_per_region)
+        for output_row0 in range(row_start, row_stop, rows_per_region):
+            output_row1 = min(row_stop, output_row0 + rows_per_region)
             started = time.perf_counter()
             numerator = None
             for index, source in enumerate(self.sources):
                 shift = self._scan_shifts[index]
                 row_offset = math.floor(-shift[0])
+                column_offset = math.floor(-shift[1])
                 decoded_row0 = max(0, output_row0 + row_offset)
                 decoded_row1 = min(rows, output_row1 - 1 + row_offset + 2)
-                if decoded_row0 < decoded_row1:
-                    decoded = source.read(scan_region=(decoded_row0, decoded_row1, 0, columns))
-                    sampled = _sample_scan_rows(
-                        decoded,
-                        decoded_first_row=decoded_row0,
-                        output_first_row=output_row0,
-                        output_stop_row=output_row1,
-                        shift=shift,
-                        out=sampled_workspace[: output_row1 - output_row0],
+                decoded_column0 = max(0, column_start + column_offset)
+                decoded_column1 = min(columns, column_stop + column_offset + 1)
+                if column_start == 0 and column_stop == columns:
+                    decoded_column0, decoded_column1 = 0, columns
+                if decoded_row0 < decoded_row1 and decoded_column0 < decoded_column1:
+                    decoded = source.read(
+                        scan_region=(
+                            decoded_row0, decoded_row1, decoded_column0, decoded_column1
+                        )
                     )
+                    if (
+                        self._compile_scan
+                        and scan_region is None
+                        and (output_row1 - output_row0) * columns >= 2048
+                        and decoded_row0 == output_row0 + row_offset
+                        and decoded_row1 == output_row1 + row_offset + 1
+                        and (shift[0] != int(shift[0]) or shift[1] != int(shift[1]))
+                    ):
+                        # The compiler does not accept native uint16. This single
+                        # exact cast lets it fuse all four float32 tap updates.
+                        sampled = _sample_scan_interior(
+                            decoded.to(torch.float32),
+                            self._scan_columns[index], self._scan_weights[index],
+                        )
+                    else:
+                        sampled = _sample_scan_rows(
+                            decoded,
+                            decoded_first_row=decoded_row0,
+                            output_first_row=output_row0,
+                            output_stop_row=output_row1,
+                            shift=shift,
+                            out=sampled_workspace[: output_row1 - output_row0],
+                            decoded_first_column=decoded_column0,
+                            output_first_column=column_start,
+                            output_stop_column=column_stop,
+                        )
                     del decoded
                 else:
                     sampled = sampled_workspace[: output_row1 - output_row0]
@@ -354,7 +438,9 @@ class ResidentMergeSource:
                     self.detector_grids[index],
                 ).reshape_as(sampled)
                 del sampled
-                weight = self.real_weights[index, output_row0:output_row1, :, None, None]
+                weight = self.real_weights[
+                    index, output_row0:output_row1, column_start:column_stop, None, None
+                ]
                 if numerator is None:
                     numerator = shifted.mul_(weight)
                 else:
@@ -363,7 +449,7 @@ class ResidentMergeSource:
             assert numerator is not None
             denominator = torch.einsum(
                 "nrc,nhw->rchw",
-                self.real_weights[:, output_row0:output_row1],
+                self.real_weights[:, output_row0:output_row1, column_start:column_stop],
                 self.detector_weights,
             )
             denominator += self.detector_edge[None, None]
@@ -382,3 +468,5 @@ class ResidentMergeSource:
         self.detector_weights = None
         self.detector_grids = None
         self.detector_edge = None
+        self._scan_columns = []
+        self._scan_weights = []

@@ -1,5 +1,10 @@
 # MPS MAPED merge qualification, 2026-09-12
 
+The later [inspection and performance qualification](mps-maped-inspection-performance.md)
+adds no-save region inspection and reduces full execution to 44-48 seconds.
+The measurements below describe the earlier implementation and remain retained
+as its historical baseline.
+
 The Torch MPS workflow retains all seven corrected encoded inputs, merges
 bounded float32 regions twice, saves globally scaled uint16, and reopens the
 complete packed output. Public methods and scientific parameters are unchanged.

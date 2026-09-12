@@ -46,21 +46,52 @@ the full packed result; preserve caller-owned inputs from `from_resident`.
 
 ## Qualification and timing
 
-Read [the current Torch MPS qualification](../../mps-maped-merge-performance.md)
-for exact commands, evidence, and timing boundaries. On physical Phil M5 Max,
-the current seven-tilt workflow measured **77.26-89.67 s**, versus **120.52 s**
-before. A paired complete float32 merge measured **48.37 -> 34.50 s**. All
-9.66 billion float32 values and all 262,144 saved DP chunks were exact.
-GPU allocations peaked below **13.8 GiB**, process footprint below **14.6 GiB**,
+Read [the current Torch MPS inspection and performance qualification](../../mps-maped-inspection-performance.md)
+for commands, exact timing boundaries, and evidence. On physical Phil M5 Max,
+the complete seven-tilt workflow now measured **44.19-47.53 s**, versus a fresh
+**75.44 s** control. A paired complete float32 merge measured **19.93 -> 10.02 s**.
+All 9.66 billion float32 values and all 262,144 saved DP chunks were exact.
+GPU allocations peaked below **13.8 GiB**, process footprint below **14.8 GiB**,
 with a 24 GiB allocation cap on a 128 GB machine. This is not a physical 24 GB
-laptop run or a promised latency. Input residency was 6.998 GiB, output 5.679 GiB.
+laptop run or a promised latency. Input residency is 6.998 GiB, output 5.679 GiB.
+The [earlier qualification](../../mps-maped-merge-performance.md) retains the
+77-90 second implementation as historical evidence.
 
-Torch already prepared weights once. The new speed comes primarily from
-converting native counts during float32 accumulation instead of materializing
-four overlapping float copies, plus reusable working storage and fewer waits.
-The GPU IO writer uses bounded backpressure and overlaps writing with compute.
-Do not reintroduce per-tilt scalar GPU reads, per-tap float copies, or periodic
-full write-queue drains without a measured reason.
+QuantEM.GPU now decodes resident count regions directly into Torch-owned MPS
+storage. The native queue waits before returning an independently owned tensor;
+never reintroduce a decoded-count copy through a NumPy view or release a
+Torch-owned buffer manually. MAPED fuses its four ordered scan-interpolation
+taps with Torch compilation for large interior regions. Keep shift indices and
+weights as tensor inputs, and use fixed shapes within the pass: dynamic-shape
+compilation was substantially slower. Preserve eager edge handling and the
+`compile_merge=False` control. The compiler needs one exact float32 cast from
+native counts; do not reinterpret signed integers or loosen the parity gate.
+GPU IO uses one MPS min/max reduction to measure the range, validated against
+nonfinite and strided inputs, with the established bounded writer queue.
+
+## Inspect before saving
+
+After alignment, use the existing merge method with a selected scan region:
+
+```python
+patch = maped.merge_datasets(
+    scan_region=(252, 260, 252, 260), plot_result=False,
+)
+maped.show()
+# Keep the same seven resident inputs for another patch or full export.
+merged = maped.merge_datasets(save_to="merged_master.h5", plot_result=False)
+```
+
+Regions use full aligned-scan coordinates and exclusive stops. The patch retains
+all detector pixels and float32 precision. No file, global scaling, or reopening
+is needed. A bounded inspection contains at most 4096 scan positions. It does
+not certify the uninspected scan area. The public result records `scan_region`
+in its merge metadata, and all owned inputs remain alive until full saving or
+`maped.close()`. Existing save calls and scientific parameters are unchanged.
+The final measured 8x8 patch took 0.085 s after alignment, with 0.126 s for
+Show4DSTEM construction and 16.74 s loading through the first patch. Quote
+construction separately from actual browser interaction. A full BF/mean-DP
+one-pass overview is currently a benchmark experiment, not another public API.
 
 Distinguish **Torch MPS** from **native Swift/Metal**. Native Metal's separately
 qualified run was 67.56 s, 8.81 GiB Metal allocation and 10.13 GiB process

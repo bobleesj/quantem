@@ -1,0 +1,60 @@
+{
+  "timings": {
+    "load": 12.490790500000003,
+    "preprocess": 3.292735167007777,
+    "diffraction_origin": 0.08068970899330452,
+    "diffraction_align": 0.08423324998875614,
+    "real_space_align": 0.7057605000009062,
+    "patch_0": 0.08526658300252166,
+    "show4dstem_construction": 0.12603325000964105,
+    "selected_dp": 0.0001961250090971589,
+    "patch_1": 0.042472083994653076,
+    "patch_2": 0.037061708004330285,
+    "patch_3": 0.019659750003484078,
+    "complete_overview_experiment": 14.774021709003136
+  },
+  "peak_metal_bytes": 14792507392,
+  "input_bytes": 7514269468,
+  "load_through_first_patch_seconds": 16.739940833998844,
+  "viewer_type": "Show4DSTEM",
+  "inputs_retained_after_inspection": true,
+  "patch_bytes": [
+    9437184,
+    9437184,
+    9437184,
+    147456
+  ],
+  "selected_regions": [
+    [
+      252,
+      260,
+      252,
+      260
+    ],
+    [
+      0,
+      8,
+      0,
+      8
+    ],
+    [
+      504,
+      512,
+      504,
+      512
+    ],
+    [
+      256,
+      257,
+      256,
+      257
+    ]
+  ],
+  "preview_peak_metal_bytes": 14792507392,
+  "patch_float32_parity": {
+    "exact": true,
+    "values": 7114752
+  },
+  "overview_pixels": 299008,
+  "passed": true
+}

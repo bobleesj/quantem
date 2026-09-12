@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from functools import lru_cache
+import json
 import math
-from pathlib import Path
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Self, Sequence
 
 import numpy as np
@@ -1954,6 +1955,7 @@ class MAPEDTorch(AutoSerialize):
         compute_summaries: bool = True,
         prefetch_tilts: bool = False,
         profile_timings: dict[str, Any] | None = None,
+        scan_region: tuple[int, int, int, int] | None = None,
         **plot_kwargs: Any,
     ) -> Any:
         """
@@ -1988,10 +1990,12 @@ class MAPEDTorch(AutoSerialize):
             dotted 'cross' through the center of the merged mean diffraction pattern.
         dtype : str or torch.dtype, optional
             Output dtype. Resident encoded sources use globally scaled uint16 by
-            default; pass ``"scaled_uint16"`` to state that choice explicitly.
+            default when saving; pass ``"scaled_uint16"`` to state that choice
+            explicitly. In-memory scan-region inspection retains float32.
         save_to : str, optional
             Output HDF5 path for resident encoded sources. The merge is written in
             bounded regions and reopened as packed scaled uint16 for live viewing.
+            Omit this for a small in-memory ``scan_region`` inspection.
         scale_output : bool
             If True and dtype is integer, scale to full dynamic range using global max.
         plot_result : bool
@@ -2008,9 +2012,9 @@ class MAPEDTorch(AutoSerialize):
             card. Pass 'cpu' or a second GPU to force it.
         compile_merge : bool, optional
             Compile experimental merge kernels with ``torch.compile``. If None, this
-            is enabled only for MPS Fourier-shift merges and disabled elsewhere so
-            CUDA's bit-exact baseline and the faster MPS bilinear path are unchanged
-            by default.
+            fuses large interior scan regions for encoded MPS inputs. It also
+            enables MPS Fourier-shift merges. Other dense and streamed bilinear
+            paths remain eager by default.
         compile_uint16_as_int16 : bool
             When compiling a uint16 tilt, convert it to int16 after verifying the
             counts fit in int16. Inductor does not support uint16, and int16 is
@@ -2026,13 +2030,29 @@ class MAPEDTorch(AutoSerialize):
             memory by up to one resident tilt.
         profile_timings : dict, optional
             If provided, populated with synchronized phase timings for profiling.
+        scan_region : tuple of int, optional
+            Inspect this region of an encoded resident merge without saving:
+            ``(row_start, row_stop, column_start, column_stop)``, exclusive stops
+            in the full aligned scan coordinates. All resident inputs and the full
+            alignment remain available for another inspection or later saving.
+            The returned region retains the complete detector and float32
+            intensities. Select at most 4096 scan positions for bounded memory.
+            This option is only available without ``save_to``.
         **plot_kwargs
             Passed to show_2d.
 
         Returns
         -------
-        Dataset4dstem
-            Merged dataset.
+        Dataset4dstem or quantem.gpu.io.FourDSTEMData
+            Merged dataset, or an accelerator-resident selected float32 region.
+
+        Examples
+        --------
+        Inspect aligned resident inputs before saving the complete result:
+
+        >>> patch = maped.merge_datasets(scan_region=(252, 260, 252, 260), plot_result=False)
+        >>> maped.show()
+        >>> merged = maped.merge_datasets(save_to="merged_master.h5", plot_result=False)
         """
 
         if shift_method == "fourier":
@@ -2049,6 +2069,11 @@ class MAPEDTorch(AutoSerialize):
             raise RuntimeError("Run diffraction_align() first so self.diffraction_shifts exists.")
 
         arrays = self.datasets
+        if scan_region is not None and not isinstance(arrays, _ResidentTilts):
+            raise ValueError(
+                "scan_region inspection requires encoded resident inputs; "
+                "load them with MAPEDTorch.from_files()."
+            )
         n = len(arrays)
         if n == 0:
             raise RuntimeError("No datasets found in self.datasets.")
@@ -2097,7 +2122,10 @@ class MAPEDTorch(AutoSerialize):
                 unsupported.append("diffraction_edge_blend=0")
             if str(shift_method).strip().lower() != "bilinear":
                 unsupported.append("shift_method='bilinear'")
-            if dtype not in (None, "scaled_uint16"):
+            if save_to is None:
+                if dtype not in (None, "float32", torch.float32):
+                    unsupported.append("dtype='float32' for in-memory inspection")
+            elif dtype not in (None, "scaled_uint16"):
                 unsupported.append("dtype='scaled_uint16'")
             if scale_output:
                 unsupported.append("scale_output=False")
@@ -2107,20 +2135,75 @@ class MAPEDTorch(AutoSerialize):
                     + ", ".join(unsupported)
                     + "."
                 )
-            if save_to is None:
-                raise ValueError(
-                    "Encoded resident MAPED writes its bounded result as scaled "
-                    "uint16; provide save_to='merged_master.h5'."
-                )
             from quantem.gpu import io as gpu_io
 
             from ._maped_resident import ResidentMergeSource
 
+            if save_to is None:
+                region = (0, Rs, 0, Cs) if scan_region is None else scan_region
+                if (
+                    len(region) != 4
+                    or any(not isinstance(value, (int, np.integer)) for value in region)
+                    or not (0 <= region[0] < region[1] <= Rs)
+                    or not (0 <= region[2] < region[3] <= Cs)
+                ):
+                    raise ValueError(
+                        f"scan_region={region} must be (row_start, row_stop, "
+                        f"column_start, column_stop) inside {(Rs, Cs)}."
+                    )
+                row0, row1, column0, column1 = map(int, region)
+                if (row1 - row0) * (column1 - column0) > 4096:
+                    raise ValueError(
+                        "A full float32 merge is too large for bounded inspection. "
+                        "Select scan_region with at most 4096 scan positions, or "
+                        "provide save_to='merged_master.h5' for the complete output."
+                    )
+                generated = ResidentMergeSource(
+                    arrays.sources, rs_shifts, dp_shifts,
+                    close_sources_before_reopen=False,
+                )
+                try:
+                    parts = list(generated.blocks((row0, row1, column0, column1)))
+                    values = parts[0] if len(parts) == 1 else torch.cat(parts)
+                    values = values.reshape(row1 - row0, column1 - column0, H, W)
+                    metadata = {
+                        key.removeprefix("quantem_").removesuffix("_v1"): json.loads(value)
+                        for key, value in generated.save_metadata.items()
+                    }
+                    metadata.update(
+                        representation="dense", residency="device",
+                        working_shape=tuple(values.shape), working_dtype="float32",
+                    )
+                    metadata["maped_merge"]["scan_region"] = list(region)
+                    result = gpu_io.FourDSTEMData(values, metadata)
+                finally:
+                    generated.close()
+                self.merged = result
+                if compute_summaries or plot_result:
+                    self.im_bf_merged = values.mean(dim=(-2, -1))
+                    self.dp_mean_merged = values.flatten(0, 1).mean(dim=0)
+                else:
+                    self.im_bf_merged = self.dp_mean_merged = None
+                if profile_timings is not None:
+                    profile_timings["total_profiled_seconds"] = _profile_elapsed(_profile_t0)
+                if plot_result:
+                    show_2d(
+                        [[self.im_bf_merged, self.dp_mean_merged]],
+                        title=[["Merged Region Bright Field", "Merged Region Mean Diffraction Pattern"]],
+                        **plot_kwargs,
+                    )
+                return result
+            if scan_region is not None:
+                raise ValueError(
+                    "scan_region selects in-memory inspection; omit it when "
+                    "saving the complete merged acquisition with save_to."
+                )
             generated = ResidentMergeSource(
                 arrays.sources,
                 rs_shifts,
                 dp_shifts,
                 close_sources_before_reopen=arrays.owns_sources,
+                compile_merge=compile_merge,
             )
             gpu_io.save(
                 save_to,
@@ -2726,8 +2809,8 @@ class MAPEDTorch(AutoSerialize):
     ):
         """Open the merged result in Show4DSTEM.
 
-        Encoded resident workflows display the packed scaled result directly,
-        without expanding the 4D array. Dense and file-streamed workflows retain
+        Encoded resident workflows display the packed scaled result or an unsaved
+        float32 scan-region inspection directly. Dense and file-streamed workflows retain
         the two-panel reference-tilt versus merge view.
 
         Parameters

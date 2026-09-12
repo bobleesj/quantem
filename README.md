@@ -22,8 +22,10 @@ For Python-free execution on Apple GPUs, see the
 [native MAPED code and tests](native/README.md). It retains the scientific
 workflow and parameter names while using QuantEM.GPU for native infrastructure.
 
-The [Torch MPS performance and parity report](docs/development/mps-maped-merge-performance.md)
-records the current complete workflow, memory use, and full-output checks.
+The [Torch MPS inspection and performance report](docs/development/mps-maped-inspection-performance.md)
+records inspection before saving, the faster complete workflow, memory use,
+and full-output checks. The [earlier qualification](docs/development/mps-maped-merge-performance.md)
+retains the previous execution baseline.
 The [MAPED demo skill](docs/development/skills/maped-demo/SKILL.md) keeps the
 execution and qualification instructions beside the code.
 

@@ -30,6 +30,7 @@ def main():
     parser.add_argument("inputs", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--reference-read", type=Path, help="Frozen GPU IO bounded-read module.")
     parser.add_argument("--compare-with", type=Path, help="A completed baseline output directory.")
     parser.add_argument(
         "--mode", choices=("baseline", "optimized", "parity", "profile"), required=True
@@ -43,8 +44,20 @@ def main():
     spec = importlib.util.spec_from_file_location("reference_resident", args.reference)
     reference = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reference)
+    from quantem.gpu.io import _read
+
+    current_read = _read.read
+    reference_read = current_read
+    if args.reference_read:
+        read_spec = importlib.util.spec_from_file_location("reference_read", args.reference_read)
+        frozen_read = importlib.util.module_from_spec(read_spec)
+        read_spec.loader.exec_module(frozen_read)
+        reference_read = frozen_read.read
     if args.mode == "baseline":
-        _maped_resident.ResidentMergeSource = reference.ResidentMergeSource
+        _read.read = reference_read
+        _maped_resident.ResidentMergeSource = (
+            lambda *a, compile_merge=None, **kw: reference.ResidentMergeSource(*a, **kw)
+        )
         from quantem.gpu.io.backends.mps import precision
 
         precision_spec = importlib.util.spec_from_file_location(
@@ -62,6 +75,10 @@ def main():
         "mode": args.mode,
         "torch": torch.__version__,
         "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+        "reference_read_sha256": (
+            hashlib.sha256(args.reference_read.read_bytes()).hexdigest()
+            if args.reference_read else None
+        ),
         "timings": {},
         "peaks": {},
     }
@@ -190,7 +207,11 @@ def main():
                 for name in order:
                     torch.mps.synchronize()
                     phase = time.perf_counter()
-                    pair[name] = next(iterators[name])
+                    _read.read = reference_read if name == "reference" else current_read
+                    try:
+                        pair[name] = next(iterators[name])
+                    finally:
+                        _read.read = current_read
                     torch.mps.synchronize()
                     durations[name].append(time.perf_counter() - phase)
                 expected, actual = pair["reference"], pair["optimized"]

@@ -150,3 +150,42 @@ def test_repeated_region_passes_preserve_float32_values(tmp_path):
         generated.close()
         for source in sources:
             source.close()
+
+
+def test_compiled_scan_regions_preserve_counts_and_changed_shifts():
+    """Large regions keep exact float32 results when alignment parameters change."""
+    from quantem.gpu import io
+
+    from quantem.diffraction._maped_resident import ResidentMergeSource
+
+    shape = (17, 256, 8, 8)
+    indices_t = torch.arange(np.prod(shape), device="mps").reshape(shape)
+    sources = [
+        io.FourDSTEMData(((indices_t * 13 + index * 17) % 65536).to(torch.uint16), {})
+        for index in range(7)
+    ]
+    shifts_t = torch.tensor(
+        [[0, 0], [-1.25, 0.6], [0.75, -1.4], [2.3, 1.1], [-2.1, -0.2], [1.7, 0.3], [-1.8, 1.2]],
+        device="mps",
+    )
+    diffraction_t = shifts_t * 0.1
+    try:
+        for displacement in (0.0, 0.35):
+            before = ResidentMergeSource(
+                sources, shifts_t + displacement, diffraction_t,
+                close_sources_before_reopen=False, compile_merge=False,
+            )
+            after = ResidentMergeSource(
+                sources, shifts_t + displacement, diffraction_t,
+                close_sources_before_reopen=False, compile_merge=True,
+            )
+            before.region_frames = after.region_frames = 2048
+            try:
+                for expected_t, actual_t in zip(before.blocks(), after.blocks(), strict=True):
+                    assert torch.equal(actual_t, expected_t)
+            finally:
+                before.close()
+                after.close()
+    finally:
+        for source in sources:
+            source.close()

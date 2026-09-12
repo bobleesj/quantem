@@ -1,0 +1,364 @@
+{
+  "mode": "optimized",
+  "torch": "2.13.0",
+  "reference_sha256": "763dbf9cc2aa14679dc14798e7dc9e86ab327e0e0d5e76fa24527f58dffa6679",
+  "reference_read_sha256": "f86036fba5bd75ab7f5e41cc8656c6cbb185bb02dbc886a8c2710d5ca374cea2",
+  "timings": {
+    "load": 12.196174083001097,
+    "preprocess": 2.7339774170104647,
+    "diffraction_origin": 0.0941439580055885,
+    "diffraction_align": 0.07844712500809692,
+    "real_space_align": 0.6147554170020157,
+    "range_pass": 10.277852125000209,
+    "save_including_range": 27.795056165996357,
+    "reopen": 3.3370807909959694,
+    "merge_save_reopen": 31.810449333002907
+  },
+  "peaks": {
+    "metal_allocated_bytes": 14689501184,
+    "mps_driver_bytes": 14689501184,
+    "mps_tensor_bytes": 4026670592,
+    "maximum_rss_bytes": 5608947712
+  },
+  "device": "Apple M5 Max",
+  "inputs": [
+    {
+      "representation": "encoded",
+      "resident_bytes": 1072496765,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1057046297,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1065278731,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1181831392,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1055963120,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1053257175,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    },
+    {
+      "representation": "encoded",
+      "resident_bytes": 1028395988,
+      "read_passes": 1,
+      "hot_pixel_correction": "median"
+    }
+  ],
+  "shape": [
+    512,
+    512,
+    192,
+    192
+  ],
+  "diffraction_origins": [
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      93,
+      89
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      90
+    ],
+    [
+      92,
+      89
+    ],
+    [
+      92,
+      89
+    ]
+  ],
+  "diffraction_shifts": [
+    [
+      -0.2943551242351532,
+      0.2137102335691452
+    ],
+    [
+      0.1211264431476593,
+      0.028895780444145203
+    ],
+    [
+      -0.4521157443523407,
+      0.22584860026836395
+    ],
+    [
+      -0.06151363253593445,
+      -0.0028577595949172974
+    ],
+    [
+      0.3620322048664093,
+      -0.2536817193031311
+    ],
+    [
+      0.4228842556476593,
+      -0.16294534504413605
+    ],
+    [
+      -0.09805843234062195,
+      -0.0489698201417923
+    ]
+  ],
+  "real_space_shifts": [
+    [
+      -4.6165900230407715,
+      -0.8806326985359192
+    ],
+    [
+      3.5068840980529785,
+      -6.0155205726623535
+    ],
+    [
+      -4.8973822593688965,
+      4.0883307456970215
+    ],
+    [
+      3.4263787269592285,
+      1.0366342067718506
+    ],
+    [
+      0.5495171546936035,
+      -0.1313346028327942
+    ],
+    [
+      7.3794121742248535,
+      -3.5359671115875244
+    ],
+    [
+      -5.3482184410095215,
+      5.4384894371032715
+    ]
+  ],
+  "summary_sha256": {
+    "im_bf": [
+      "f8f4f16b0f48de2d2c5c0735121ecca30b300c998564bf3880208ab2123425cb",
+      "6f4c56d6ca479b13225cd6711fab745e92eca374eb23d15d9106f70ce20443b1",
+      "c1322e5e9c0d817f592628ea3125a700b72141452a91292f5fb964f9c14e62f9",
+      "5218133552003d3d40675ecdafcefe370c37d3d784a9336aa3d4309f15cbed57",
+      "94b3513b026f194156fbe14a6d5bc4e02e17adadf3fbc49e5c4d4c14d763c682",
+      "ed79ad5458eac4858c240fc79ab342d7a1113cb82f0b72541a0cc61c4713a045",
+      "ca7908422b6caa9d4b640729cea5a6debd36bd0289555fb70e46252ad6db9354"
+    ],
+    "dp_mean": [
+      "2458b24cb3f9b171409c261202c8b9597b528529365c0634e6f1916a00ece8ec",
+      "b9b9324e0eb496a0fb0f4766a27e5c80a44b6ab2f586ca61bca19ea5439a656d",
+      "307023b8329707602ec1713b8211c8c0cf8818c4e35062589f882bf592f718b6",
+      "abff207db357b25b8057d482d3c9c72f4972f04aedf12830baa1577475916b87",
+      "4924a4ca4731b2fa604d7d3f9b7a7797282fdf25574ba8fc0f0e61a87604aa9e",
+      "e709e67c3bb67a480ebba7fe3b700487914555832833d3c19b366150b06baaa5",
+      "522b40bdf57ab48a7e40a5e0aedb546d6eec3f04c882939370e70a26e8438c54"
+    ]
+  },
+  "precision": {
+    "version": 1,
+    "storage": "scaled_uint16",
+    "source_dtype": "float32",
+    "source_shape": [
+      512,
+      512,
+      192,
+      192
+    ],
+    "intensity_min": 0.0,
+    "intensity_max": 1716.41943359375,
+    "scale": 0.0261908817211223,
+    "offset": 0.0,
+    "values": 9663676416,
+    "max_abs_error": 0.01318359375,
+    "positive_to_zero": 1813736949,
+    "changed": 8807271081,
+    "overflow": 0,
+    "clipped": 0,
+    "scope": "all merged values",
+    "range_scope": "complete merged output",
+    "measurement": "GPU comparison against merged float32 regions",
+    "selection": {
+      "scan_region": null,
+      "detector_region": null
+    },
+    "rmse": 0.006951109748621411
+  },
+  "output_resident_bytes": 6097600864,
+  "merge": {
+    "version": 1,
+    "backend": "mps",
+    "source_representation": "encoded",
+    "region_frames": 4096,
+    "merge_generation_pass_seconds": [
+      8.185863830978633,
+      8.241987084111315
+    ],
+    "released_sources_before_reopen": true,
+    "real_space_shifts_row_column": [
+      [
+        -4.6165900230407715,
+        -0.8806326985359192
+      ],
+      [
+        3.5068840980529785,
+        -6.0155205726623535
+      ],
+      [
+        -4.8973822593688965,
+        4.0883307456970215
+      ],
+      [
+        3.4263787269592285,
+        1.0366342067718506
+      ],
+      [
+        0.5495171546936035,
+        -0.1313346028327942
+      ],
+      [
+        7.3794121742248535,
+        -3.5359671115875244
+      ],
+      [
+        -5.3482184410095215,
+        5.4384894371032715
+      ]
+    ],
+    "diffraction_shifts_row_column": [
+      [
+        -0.2943551242351532,
+        0.2137102335691452
+      ],
+      [
+        0.1211264431476593,
+        0.028895780444145203
+      ],
+      [
+        -0.4521157443523407,
+        0.22584860026836395
+      ],
+      [
+        -0.06151363253593445,
+        -0.0028577595949172974
+      ],
+      [
+        0.3620322048664093,
+        -0.2536817193031311
+      ],
+      [
+        0.4228842556476593,
+        -0.16294534504413605
+      ],
+      [
+        -0.09805843234062195,
+        -0.0489698201417923
+      ]
+    ]
+  },
+  "profile": {
+    "version": 1,
+    "backend": "mps",
+    "source_representation": "encoded",
+    "region_frames": 4096,
+    "merge_generation_pass_seconds": [
+      8.185863830978633,
+      8.241987084111315
+    ],
+    "released_sources_before_reopen": true,
+    "real_space_shifts_row_column": [
+      [
+        -4.6165900230407715,
+        -0.8806326985359192
+      ],
+      [
+        3.5068840980529785,
+        -6.0155205726623535
+      ],
+      [
+        -4.8973822593688965,
+        4.0883307456970215
+      ],
+      [
+        3.4263787269592285,
+        1.0366342067718506
+      ],
+      [
+        0.5495171546936035,
+        -0.1313346028327942
+      ],
+      [
+        7.3794121742248535,
+        -3.5359671115875244
+      ],
+      [
+        -5.3482184410095215,
+        5.4384894371032715
+      ]
+    ],
+    "diffraction_shifts_row_column": [
+      [
+        -0.2943551242351532,
+        0.2137102335691452
+      ],
+      [
+        0.1211264431476593,
+        0.028895780444145203
+      ],
+      [
+        -0.4521157443523407,
+        0.22584860026836395
+      ],
+      [
+        -0.06151363253593445,
+        -0.0028577595949172974
+      ],
+      [
+        0.3620322048664093,
+        -0.2536817193031311
+      ],
+      [
+        0.4228842556476593,
+        -0.16294534504413605
+      ],
+      [
+        -0.09805843234062195,
+        -0.0489698201417923
+      ]
+    ],
+    "total_profiled_seconds": 31.81033516599564
+  },
+  "owned_inputs_released": true,
+  "workflow_seconds": 47.53414120900561,
+  "saved_chunk_parity": {
+    "chunks": 262144,
+    "exact": true
+  },
+  "passed": true
+}
