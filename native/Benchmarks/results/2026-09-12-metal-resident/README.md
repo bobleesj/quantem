@@ -17,7 +17,7 @@ separate task. The canonical API and timing table are in [native/README.md](../.
 ## Reproduction
 
 Use matching local QuantEM and QuantEM.GPU checkouts on the Apple M5 Max test host. Use the QuantEM commit containing this report and QuantEM.GPU
-`2e847b44e0bb85bbf87151690d99975150567d3d`, recorded in `Package.resolved`.
+`34d2e6dcf69f05890ca3947ee39ca290d956d6a8`, recorded in `Package.resolved`.
 The tests used the local dependency override with that implementation.
 
 ```bash
