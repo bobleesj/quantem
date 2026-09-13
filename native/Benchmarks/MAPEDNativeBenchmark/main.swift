@@ -92,7 +92,26 @@ if let requested = ProcessInfo.processInfo.environment["MAPED_LOAD_PASSES"],
   exit(0)
 }
 let started = Date.timeIntervalSinceReferenceDate
-let maped = try MAPEDNative.from_files(files)
+let representation = ProcessInfo.processInfo.environment["MAPED_INPUT_REPRESENTATION"] ?? "encoded"
+guard ["encoded", "packed"].contains(representation) else {
+  fatalError("MAPED_INPUT_REPRESENTATION must be encoded or packed")
+}
+let maped: MAPEDNative
+var borrowed: [MetalCompactH5ResidentSource] = []
+if representation == "packed" {
+  let operations = try MetalImageOperations()
+  let index = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("QuantEM/Index", isDirectory: true)
+  for file in files {
+    let catalog = try Native4DSTEMCatalogBuilder(cacheDirectory: index).prepare(input: file)
+    let source = try Native4DSTEMIndexedSource.open(dataset: catalog.datasets[0])
+    borrowed.append(try MetalCompactH5Loader.load(source: source, device: operations.device))
+  }
+  maped = try MAPEDNative.from_resident(borrowed, operations: operations)
+} else {
+  maped = try MAPEDNative.from_files(files)
+}
+let loadWall = Date.timeIntervalSinceReferenceDate - started
 print(
   "Encoded inputs ready: \(maped.sources.reduce(0) { $0 + $1.residentBytes }) bytes",
   terminator: "\n")
@@ -103,6 +122,7 @@ try maped.real_space_align(num_iter: 20, edge_blend: 5, padding: 2, hanning_filt
 let alignmentWall = Date.timeIntervalSinceReferenceDate - started
 var document: [String: Any] = [
   "timings": maped.timings, "alignment_wall_seconds": alignmentWall,
+  "input_representation": representation, "load_wall_seconds": loadWall,
   "peak_metal_bytes": maped.peak_metal_bytes, "shape": maped.shape,
   "input_resident_bytes": maped.sources.reduce(0) { $0 + $1.residentBytes },
   "source_read_passes": maped.sources.map {
@@ -112,6 +132,37 @@ var document: [String: Any] = [
   "diffraction_shifts": maped.diffraction_shifts!.values(),
   "real_space_shifts": maped.real_space_shifts!.values(),
 ]
+if ProcessInfo.processInfo.environment["MAPED_NATIVE_DISPLAY"] == "1" {
+  let output = try maped.merge_datasets(dtype: "scaled_uint16")
+  let ready = Date.timeIntervalSinceReferenceDate - started
+  let phase = Date.timeIntervalSinceReferenceDate
+  _ = try output.read((252 * maped.shape[1] + 256)..<(252 * maped.shape[1] + 257))
+  document["display_ready_seconds"] = ready
+  document["selected_dp_seconds"] = Date.timeIntervalSinceReferenceDate - phase
+  document["precision"] = output.metadata
+  document["output_resident_bytes"] = output.residentBytes
+  document["timings"] = maped.timings
+  document["peak_metal_bytes"] = maped.peak_metal_bytes
+  if let folder = ProcessInfo.processInfo.environment["MAPED_NATIVE_EXPORTS"] {
+    let root = URL(fileURLWithPath: folder)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let scaled = root.appendingPathComponent("scaled_master.h5")
+    var start = Date.timeIntervalSinceReferenceDate
+    try output.save(to: scaled)
+    document["scaled_save_seconds"] = Date.timeIntervalSinceReferenceDate - start
+    document["scaled_file_bytes"] = try scaled.resourceValues(forKeys: [.fileSizeKey]).fileSize!
+    let float = root.appendingPathComponent("float_master.h5")
+    start = Date.timeIntervalSinceReferenceDate
+    _ = try maped.merge_datasets(dtype: "float32", save_to: float)
+    document["float32_recompute_save_seconds"] = Date.timeIntervalSinceReferenceDate - start
+    document["float32_file_bytes"] = try float.resourceValues(forKeys: [.fileSizeKey]).fileSize!
+  }
+  try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+    .write(to: report)
+  maped.close()
+  borrowed.forEach { $0.releaseResidentStorage() }
+  exit(0)
+}
 if ProcessInfo.processInfo.environment["MAPED_REGIONAL_STORAGE"] == "1" {
   document["regional_storage"] = try benchmarkRegionalStorage(maped)
   document["total_wall_seconds"] = Date.timeIntervalSinceReferenceDate - started

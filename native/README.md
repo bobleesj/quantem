@@ -22,30 +22,46 @@ try maped.diffraction_align(edge_blend: 2)
 try maped.real_space_align(
   num_iter: 20, edge_blend: 5, padding: 2, hanning_filter: true
 )
-let merged = try maped.merge_datasets(
-  save_to: URL(fileURLWithPath: "/path/to/new/merged_master.h5")
-)
+let merged = try maped.merge_datasets(dtype: "scaled_uint16")
 let pattern = try merged.read((256 * 512 + 256)..<(256 * 512 + 257))
 ```
 
-All inputs remain encoded on the GPU. Median correction and complete-detector
-bright-field means match the Python workflow. Merging uses float32 workspaces
-of at most 4096 frames: first measure the global range, then recompute, convert,
-measure the restored-value error, and write compressed HDF5. Owned inputs are
-released before the complete output is reopened in packed GPU memory. Borrowed
-`from_resident` inputs remain owned by their caller.
+All seven inputs remain encoded on the GPU. Median correction and
+complete-detector bright-field means follow the Python workflow. Bounded
+float32 regions are merged once, converted to scaled uint16, and losslessly
+ANS-encoded for viewing. Conversion is approximate; ANS preserves the resulting
+codes exactly. Automatic region scales and error statistics are retained in
+`merged.metadata`; callers do not choose a scaling region.
 
-The output uses the existing `quantem_precision_v1`, `quantem_maped_summary_v1`,
-and `quantem_maped_merge_v1` attributes. Python `quantem.gpu.io.load` can reopen
-it directly. The result keeps the global scale, offset, RMSE, maximum error,
-positive-to-zero count, and both shift arrays. The normal completion message
-is one line.
+Saving is optional:
 
-Current resident merging supports bilinear shifts, zero padding, scan edge
-blend 1, detector edge blend 0, and scaled uint16 output. Other choices raise
-an explicit error. Native HDF5 currently requires a detector pixel count
-divisible by 4096, including the tested 192×192 detector. Float16 native export
-and native viewer integration are outside this implementation.
+```swift
+// Save existing display codes and calibration, without another merge.
+try merged.save(to: URL(fileURLWithPath: "/path/to/new/scaled_master.h5"))
+
+// Export original float32 merge values, recomputed from retained inputs.
+// Upcasting the display codes cannot recover their discarded precision.
+try maped.merge_datasets(
+  dtype: "float32", save_to: URL(fileURLWithPath: "/path/to/new/float_master.h5")
+)
+```
+
+The float32 export also returns a scaled display result. It does not allocate a
+complete dense float32 dataset. Use a new path for each export. Saved attributes
+record calibration/error statistics for scaled storage, MAPED parameters,
+shifts, median correction, and bright-field summary conventions.
+
+For the established call that supplies `save_to` but omits `dtype`, the earlier
+global-scale, two-pass save/reopen path remains available. Specify
+`dtype: "scaled_uint16"` for the resident single-pass workflow above.
+
+Resident merging currently supports bilinear shifts, zero padding, scan edge
+blend 1 and detector edge blend 0. Unsupported merge options raise an error;
+shared parameter names do not imply every Torch option is implemented. Native
+HDF5 export requires detector pixel counts divisible by 4096, including the
+tested 192×192 detector. Float16 export and viewer integration are outside this
+implementation. Native scaled-file reopening is tested; float32-file reopening
+was qualified through the Python MPS loader, not a native application viewer.
 
 Some established parameters affect plots only; their scientific meaning is
 preserved. See the [numerical contract](../docs/development/native-maped-contract.md)
@@ -56,7 +72,8 @@ explain every scientific control, shared case sweeps, and saved provenance.
 ## Build and test
 
 Use the QuantEM repository as the working directory on a Mac. SwiftPM resolves
-QuantEM.GPU from its `main` branch by default (tested revision `6c171565`).
+QuantEM.GPU from its `main` branch by default. The checked-in dependency lock pins the qualified
+QuantEM.GPU revision; keep that lock when reproducing this run.
 To work with both repositories locally, point the package at that checkout:
 
 ```bash
@@ -80,42 +97,47 @@ and selected saved diffraction patterns through the Python loader.
 Fixtures under `Tests/QuantEMMAPEDTests/Fixtures` are independent expectations.
 Do not regenerate them to silence a failure.
 
-## Measured seven-tilt workflow
+## Current seven-tilt qualification
 
-Physical Apple M5 Max, 40 GPU cores, 128 GB unified memory; seven acquisitions
-with a 512×512 scan and 192×192 detector, measured on 2026-09-12:
+the Apple M5 Max test host, Apple M5 Max (40 GPU cores, 128 GB), 512×512 scan, 192×192 detector,
+2026-09-12. Native Swift/Metal; no Python or Torch runtime in processing.
 
 | Stage | Seconds |
 | --- | ---: |
-| Load, median-correct, encode, and calculate summaries | 8.28 |
-| Diffraction and real-space alignment | 0.53 |
-| Merge to measure the global range | 13.34 |
-| Merge again, convert, compress, and save | 22.70 |
-| Reopen the full packed output | 3.44 |
-| **Complete workflow** | **48.34** |
+| Load, median correction, ANS and summaries | 7.93 |
+| Alignment and preparation remainder | 0.73 |
+| Float32 merge | 6.97 |
+| Display conversion and error measurement | 1.03 |
+| ANS encode display | 1.30 |
+| **Display ready, including loading** | **18.00** |
+| One selected DP read | 0.0078 |
 
-The 22.70-second write stage includes 14.23 seconds generating merged values,
-**0.83 seconds converting and measuring precision**, 3.13 seconds compressing,
-and 4.50 seconds writing HDF5. These components are included in the total;
-they are not additional stages. Each input HDF5 is read once. Both merge
-passes operate on the resident encoded inputs.
+A final repeat completed in **24.85 s**: loading 9.06 s, alignment/preparation
+0.89 s, merging 11.27 s, precision conversion 1.67 s and encoding 1.95 s.
+The memory peak and whole-output display RMSE were unchanged. These two runs
+establish an observed **18–25 s** range, not a fixed latency guarantee.
 
-Encoded inputs occupy **7.01 GiB**; the fully reopened output occupies
-**5.68 GiB**. Peak Metal allocation was **8.78 GiB** and process footprint
-**10.09 GiB**. These are overlapping memory measurements, not additive.
-The measured allocation fits a 24 GB budget, but this was a 128 GB Mac;
-performance on a physical 24 GB machine remains to be measured.
+The input resident size is 7.01 GiB; display output is 6.13 GiB. Sampled peak
+Metal allocation is **14.76 GiB** with all inputs retained. This is not a
+16 GB Mac qualification: process overhead and the OS also need memory.
 
-All summary pixels match Torch MPS exactly. The largest shift difference is
-0.00346 pixel; floating-point alignment is numerically equivalent within the
-declared tolerance, not bit-identical. With common shifts, the 150,994,944-value
-merged region passes `rtol=3e-6, atol=2e-5` with RMSE `6.17e-7`. Three saved DPs
-reopened through the Python GPU loader match an independent float64 NumPy
-scaling oracle exactly. Scaled-storage RMSE over the entire output is
-`0.00695231`, with no clipping or overflow.
+Optional scaled export is **6.05 GiB**, measured at **22.47 s**. Optional exact
+float32 export is **32.98 GiB**, measured at **40.32 s** including recomputation
+and display conversion. Both write timings use a shared network filesystem;
+they are excluded from display-ready time and are not local SSD benchmarks.
+The float32 logical array is 36 GiB. There is no claim of lossless 4× compression.
 
-See the [retained measurements and qualification limits](Benchmarks/results/2026-09-12-metal/README.md).
+All 75 parameter cases and 45 sensitivity intervals passed the existing Torch
+MPS gates. Five full scan rows (94,371,840 values) from saved files passed GPU
+checks: native float32 against Torch at `atol=2e-5, rtol=3e-6`, and scaled output
+against the saved float32 within its rounding bound. This is numerical float32
+parity, not bit-identical cross-backend merging. Whole-output display RMSE was
+approximately 0.00545. Twelve native tests passed, including ANS scaled-save
+reopening across calibration boundaries.
 
+See [the integration handoff](Benchmarks/results/2026-09-12-metal-resident/README.md)
+for retained evidence and remaining qualifications. Older save-first results
+remain in [the historical report](Benchmarks/results/2026-09-12-metal/README.md).
 
 ## Parameter qualification
 
@@ -126,3 +148,11 @@ Both shift arrays were bit-identical to Torch MPS for every case; the worst
 sampled float32 DP RMSE was 1.47e-6. This finite matrix is not a proof for every
 possible dataset or parameter value. The original benchmark above remains a
 historical measurement; use the expanded run for current code measurements.
+
+## Input representations
+
+ANS (`encoded`) remains the default. The existing `from_resident` also accepts
+bit-packed counts. See the [six-combination audit](../docs/development/benchmarks/2026-09-12-representation-matrix/README.md)
+for the CUDA and native mask fixes, measured timings, and the remaining Torch
+MPS ordinary-HDF5 packed-loader gap. Do not treat all six combinations as fully
+qualified yet. The display dtype remains independent of the input codec.

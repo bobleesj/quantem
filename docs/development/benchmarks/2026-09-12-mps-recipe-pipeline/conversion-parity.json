@@ -1,0 +1,10 @@
+{
+  "load_seconds": 11.565622666006675,
+  "trials": [],
+  "conversion_parity": {
+    "values": 9663676416,
+    "code_mismatches": 0,
+    "maximum_regional_rmse_absolute_difference": 2.76487773648304e-12,
+    "counters_and_calibration_exact": true
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "load_seconds": 12.173269124992657,
+  "trials": [
+    {
+      "rows": 8,
+      "merge_seconds": 13.009958787908545,
+      "conversion_seconds": 3.8776162858703174,
+      "processing_seconds": 16.891174917022,
+      "query_seconds": 0.001900249975733459,
+      "output_bytes": 6680914680,
+      "sampled_driver_peak_bytes": 17845518336,
+      "precision": {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "complete": true,
+        "range_scope": "automatic regions",
+        "values": 9663676416,
+        "rmse": 0.00535207252482241,
+        "max_abs_error": 0.01312255859375,
+        "intensity_min": 0.0,
+        "intensity_max": 1716.4332275390625,
+        "changed": 8807256530,
+        "positive_to_zero": 1509537522,
+        "overflow": 0,
+        "clipped": 0,
+        "region_count": 256
+      }
+    },
+    {
+      "rows": 16,
+      "merge_seconds": 13.746653958078241,
+      "conversion_seconds": 4.090467669011559,
+      "processing_seconds": 17.842181249987334,
+      "query_seconds": 0.0031850830127950758,
+      "output_bytes": 6680914680,
+      "sampled_driver_peak_bytes": 21112897536,
+      "precision": {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "complete": true,
+        "range_scope": "automatic regions",
+        "values": 9663676416,
+        "rmse": 0.00535207252482241,
+        "max_abs_error": 0.01312255859375,
+        "intensity_min": 0.0,
+        "intensity_max": 1716.4332275390625,
+        "changed": 8807256530,
+        "positive_to_zero": 1509537522,
+        "overflow": 0,
+        "clipped": 0,
+        "region_count": 256
+      }
+    },
+    {
+      "rows": 4,
+      "merge_seconds": 14.15785255288938,
+      "conversion_seconds": 3.992512413096847,
+      "processing_seconds": 18.154321874986636,
+      "query_seconds": 0.002016207989072427,
+      "output_bytes": 6680914680,
+      "sampled_driver_peak_bytes": 16427876352,
+      "precision": {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "complete": true,
+        "range_scope": "automatic regions",
+        "values": 9663676416,
+        "rmse": 0.00535207252482241,
+        "max_abs_error": 0.01312255859375,
+        "intensity_min": 0.0,
+        "intensity_max": 1716.4332275390625,
+        "changed": 8807256530,
+        "positive_to_zero": 1509537522,
+        "overflow": 0,
+        "clipped": 0,
+        "region_count": 256
+      }
+    },
+    {
+      "rows": 8,
+      "merge_seconds": 14.387162291939603,
+      "conversion_seconds": 4.0961467051529326,
+      "processing_seconds": 18.4866449169931,
+      "query_seconds": 0.0019273329817224294,
+      "output_bytes": 6680914680,
+      "sampled_driver_peak_bytes": 17845534720,
+      "precision": {
+        "version": 2,
+        "storage": "scaled_uint16",
+        "source_dtype": "float32",
+        "source_shape": [
+          512,
+          512,
+          192,
+          192
+        ],
+        "complete": true,
+        "range_scope": "automatic regions",
+        "values": 9663676416,
+        "rmse": 0.00535207252482241,
+        "max_abs_error": 0.01312255859375,
+        "intensity_min": 0.0,
+        "intensity_max": 1716.4332275390625,
+        "changed": 8807256530,
+        "positive_to_zero": 1509537522,
+        "overflow": 0,
+        "clipped": 0,
+        "region_count": 256
+      }
+    }
+  ],
+  "float32_parity": {
+    "values": 9663676416,
+    "bit_mismatches": 0
+  }
+}

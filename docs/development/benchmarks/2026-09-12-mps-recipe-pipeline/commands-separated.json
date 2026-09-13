@@ -1,0 +1,67 @@
+{
+  "load_seconds": 11.273109624977224,
+  "trials": [],
+  "profile": {
+    "decode": 1.4237999990873504,
+    "_sample_scan_interior": 2.413992460613372,
+    "_shift_detector": 1.857907037716359,
+    "_sample_scan_rows": 0.1126107930613216,
+    "source_range": 0.5455103012791369,
+    "_accumulate_measurement": 0.09590109376586042,
+    "encode_measure": 0.8999692899233196,
+    "ans": 1.1703842148126569
+  },
+  "profile_wall_seconds": 12.707519875024445,
+  "command_timings": {
+    "loading: count probability table initialization": {
+      "calls": 7,
+      "complete_wall_seconds": 0.03260179303470068,
+      "gpu_seconds": 0.0008527500031050295
+    },
+    "loading: ANS encode": {
+      "calls": 224,
+      "complete_wall_seconds": 3.651298112963559,
+      "gpu_seconds": 1.0011555414821487
+    },
+    "loading: ANS compact": {
+      "calls": 224,
+      "complete_wall_seconds": 0.4337285863584839,
+      "gpu_seconds": 0.29275254160165787
+    },
+    "processing: ANS Torch range read": {
+      "calls": 448,
+      "complete_wall_seconds": 1.3115704738302156,
+      "gpu_seconds": 1.136491375073092
+    },
+    "processing: precision tensor range": {
+      "calls": 256,
+      "complete_wall_seconds": 0.5030942010344006,
+      "gpu_seconds": 0.38100812476477586
+    },
+    "processing: precision encode_measure": {
+      "calls": 256,
+      "complete_wall_seconds": 0.7706878661119845,
+      "gpu_seconds": 0.2830979163700249
+    },
+    "processing: precision measure_reduce": {
+      "calls": 256,
+      "complete_wall_seconds": 0.06716137393959798,
+      "gpu_seconds": 0.027566625096369535
+    },
+    "processing: count probability table initialization": {
+      "calls": 256,
+      "complete_wall_seconds": 0.07122308627003804,
+      "gpu_seconds": 0.02408945860224776
+    },
+    "processing: ANS encode": {
+      "calls": 256,
+      "complete_wall_seconds": 0.6427003301796503,
+      "gpu_seconds": 0.25510025018593296
+    },
+    "processing: ANS compact": {
+      "calls": 256,
+      "complete_wall_seconds": 0.34305995889008045,
+      "gpu_seconds": 0.2038997917843517
+    }
+  }
+}

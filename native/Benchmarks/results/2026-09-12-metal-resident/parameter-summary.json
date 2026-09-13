@@ -1,0 +1,48 @@
+{
+  "passed": true,
+  "cases": 75,
+  "sensitivity_intervals": 45,
+  "limits": {
+    "shift_max_absolute": 0.01,
+    "same_shift_rtol": 3e-06,
+    "same_shift_atol": 2e-05,
+    "aligned_dp_rmse": 0.001
+  },
+  "validation": [
+    {
+      "id": "reject_real_space_padding",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_real_space_edge_blend",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_diffraction_padding",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_diffraction_edge_blend",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_shift_method",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_dtype",
+      "torch_rejected": true,
+      "passed": true
+    },
+    {
+      "id": "reject_scale_output",
+      "torch_rejected": true,
+      "passed": true
+    }
+  ]
+}

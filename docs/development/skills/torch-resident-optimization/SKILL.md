@@ -135,3 +135,15 @@ for a no-file result. Recent all-seven retained measurements: about 28 s through
 a selected DP, about 13.4-13.7 s merge/conversion/ANS/summaries, and about 1.1 s
 output ANS encoding on M5 Max. These are individual runs, not universal targets.
 See [kernel evidence](../../maped-ans-output.md#follow-up-native-mps-range-and-ans-mean-kernels).
+
+## Preserve one MAPED workflow
+
+Use the existing `MAPEDTorch.from_files`, alignment methods, `merge_datasets`
+and `show` API. Hardware recipe experiments and private codec probes must not
+become a second notebook API. Native precision tuning is automatic infrastructure;
+scientists should not need decoding, cache or kernel parameters to obtain it.
+Keep MAPED-specific request policy and scientific sequencing outside QuantEM.GPU,
+including remote integrations. Audit existing remote services before claiming the
+whole repository satisfies this boundary; generic precision-only changes do not
+prove that older integrations are clean. See the [API ownership audit](../../maped-api-ownership.md)
+and its explicitly recorded remote-service exception.

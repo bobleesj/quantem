@@ -298,20 +298,126 @@ public final class MAPEDNative {
     return try operations.finishWeighted(
       numerator, denominator: denominator, uncovered: weights.uncovered)
   }
-  /// Merge bounded float32 regions, save globally scaled uint16, and retain
-  /// the complete result in packed GPU memory. Scientific keyword names and
+  private var summaryMetadata: [String: Any] {
+    [
+      "version": 1, "source_count": sources.count,
+      "hot_pixel_correction": [
+        "methods": sources.map { $0.hotPixelCorrection },
+        "applied_to_every_source": sources.allSatisfy { $0.hotPixelCorrection == "median" },
+        "pixel_counts": sources.map { $0.hotPixelIndices.count },
+      ],
+      "mean_bright_field": [
+        "operation": "arithmetic_mean", "reduction_axes": ["detector_row", "detector_column"],
+        "divisor": shape[2] * shape[3], "output_shape": Array(shape[0..<2]),
+        "detector_selection": "complete_detector", "alignment_role": "real_space",
+        "invalid_pixel_policy": "stored detector-mask pixels use their local 3x3 median",
+      ],
+      "mean_diffraction_pattern": [
+        "operation": "arithmetic_mean", "reduction_axes": ["scan_row", "scan_column"],
+        "divisor": shape[0] * shape[1], "output_shape": Array(shape[2..<4]),
+        "invalid_pixel_policy": "stored detector-mask pixels use their local 3x3 median",
+      ],
+      "intensity_normalization": "none",
+    ]
+  }
+
+  /// Compute float32 once and retain a calibrated ANS viewing result.
+  /// Exact float32 export is written from the computation, never from display codes.
+  private func mergeResident(dtype: String?, padValue: MAPEDPadValue, saveTo: URL?, verbose: Bool)
+    throws -> MetalPackedSource
+  {
+    if dtype == "float32" && saveTo == nil {
+      throw Self.invalid(
+        "Choose save_to for a full float32 export; use scaled_uint16 for resident viewing.")
+    }
+    let runtime = try MetalPrecision(device: operations.device)
+    let output = try MetalPackedSource(shape: shape, precision: runtime)
+    let writer = try (dtype == "float32" ? saveTo : nil).map {
+      try MetalHDF5Writer(path: $0, shape: shape, runtime: runtime, dtype: "float32")
+    }
+    let started = Date.timeIntervalSinceReferenceDate
+    let rowsPerRegion = max(1, 4096 / shape[1])
+    var generation = 0.0
+    var conversion = 0.0
+    var encoding = 0.0
+    for first in stride(from: 0, to: shape[0], by: rowsPerRegion) {
+      try autoreleasepool {
+        let rows = first..<min(shape[0], first + rowsPerRegion)
+        var phase = Date.timeIntervalSinceReferenceDate
+        let values = try merged_region(rows)
+        generation += Date.timeIntervalSinceReferenceDate - phase
+        try writer?.append(values.buffer, frames: rows.count * shape[1])
+        phase = Date.timeIntervalSinceReferenceDate
+        let calibration = try MetalPrecision(device: operations.device)
+        try calibration.includeRange(values.buffer, count: values.rows * values.columns)
+        try calibration.calibrate(shape: [rows.count, shape[1], shape[2], shape[3]])
+        let codes = try calibration.convert(values.buffer, count: values.rows * values.columns)
+        try calibration.finish()
+        conversion += Date.timeIntervalSinceReferenceDate - phase
+        phase = Date.timeIntervalSinceReferenceDate
+        try output.append(codes, frames: rows.count * shape[1], calibration: calibration)
+        encoding += Date.timeIntervalSinceReferenceDate - phase
+        recordPeak()
+      }
+    }
+    parameters["merge_datasets"] = [
+      "dtype": dtype ?? "scaled_uint16",
+      "real_space_padding": 0, "real_space_edge_blend": 1,
+      "diffraction_padding": 0, "diffraction_edge_blend": 0,
+      "shift_method": "bilinear", "diffraction_pad_val": padValue.metadata, "scale_output": false,
+    ]
+    func pairs(_ image: GPUImage?) -> [[Float]] {
+      let values = image!.values()
+      return stride(from: 0, to: values.count, by: 2).map { [values[$0], values[$0 + 1]] }
+    }
+    let provenance: [String: Any] = [
+      "version": 1, "backend": "metal",
+      "parameters": parameters, "region_frames": rowsPerRegion * shape[1],
+      "real_space_shifts_row_column": pairs(real_space_shifts),
+      "diffraction_shifts_row_column": pairs(diffraction_shifts),
+      "hot_pixel_correction": sources.map { $0.hotPixelCorrection },
+    ]
+    var attributes = [
+      "quantem_maped_merge_v1": String(
+        data: try JSONSerialization.data(withJSONObject: provenance, options: [.sortedKeys]),
+        encoding: .utf8)!
+    ]
+    attributes["quantem_maped_summary_v1"] = String(
+      data: try JSONSerialization.data(withJSONObject: summaryMetadata, options: [.sortedKeys]),
+      encoding: .utf8)!
+    output.attributes = attributes
+    try writer?.finish(metadata: attributes)
+    if let saveTo, dtype != "float32" { try output.save(to: saveTo, metadata: attributes) }
+    merged?.releaseResidentStorage()
+    merged = output
+    timings["merge_float32"] = generation
+    timings["precision_conversion"] = conversion
+    timings["output_encoding"] = encoding
+    timings["merge_total"] = Date.timeIntervalSinceReferenceDate - started
+    // Retain inputs for subsequent scientific parameter changes or exact exports.
+    if verbose {
+      print(
+        String(
+          format: "Merged | scaled_uint16 | %.3f GiB ANS | RMSE %.7g",
+          Double(output.residentBytes) / pow(2, 30), output.metadata["rmse"] as! Double))
+    }
+    return output
+  }
+
+  /// Merge bounded float32 regions and retain a scaled uint16 ANS display result.
+  /// Saving is optional; float32 export writes original merge values. Scientific keyword names and
   /// the supported resident subset match MAPEDTorch.merge_datasets.
   @discardableResult public func merge_datasets(
     real_space_padding: Int = 0, real_space_edge_blend: Double = 1,
     diffraction_padding: Int = 0, diffraction_edge_blend: Double = 0,
     diffraction_pad_val: MAPEDPadValue = "min", shift_method: String = "bilinear",
-    dtype: String? = nil, save_to: URL, scale_output: Bool = false,
+    dtype: String? = nil, save_to: URL? = nil, scale_output: Bool = false,
     verbose: Bool = true
   ) throws -> MetalPackedSource {
     guard real_space_padding == 0, real_space_edge_blend == 1,
       diffraction_padding == 0, diffraction_edge_blend == 0,
       shift_method.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "bilinear",
-      dtype == nil || dtype == "scaled_uint16", !scale_output
+      dtype == nil || dtype == "scaled_uint16" || dtype == "float32", !scale_output
     else {
       throw Self.invalid(
         "Native resident merging supports bilinear shifts, zero padding, scan edge blend 1, detector edge blend 0, and scaled_uint16 storage."
@@ -320,6 +426,11 @@ public final class MAPEDNative {
     guard !sources.isEmpty, sources.allSatisfy({ !$0.isReleased }) else {
       throw Self.invalid("Load resident inputs before merging another result.")
     }
+    if save_to == nil || dtype == "float32" || dtype == "scaled_uint16" {
+      return try mergeResident(
+        dtype: dtype, padValue: diffraction_pad_val, saveTo: save_to, verbose: verbose)
+    }
+    let save_to = save_to!
     let precision = try MetalPrecision(device: operations.device)
     let writer = try MetalHDF5Writer(path: save_to, shape: shape, runtime: precision)
     merged?.releaseResidentStorage()
@@ -382,26 +493,7 @@ public final class MAPEDNative {
         data: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
         encoding: .utf8)!
     }
-    let summary: [String: Any] = [
-      "version": 1, "source_count": sources.count,
-      "hot_pixel_correction": [
-        "methods": sources.map { $0.hotPixelCorrection },
-        "applied_to_every_source": sources.allSatisfy { $0.hotPixelCorrection == "median" },
-        "pixel_counts": sources.map { $0.hotPixelIndices.count },
-      ],
-      "mean_bright_field": [
-        "operation": "arithmetic_mean", "reduction_axes": ["detector_row", "detector_column"],
-        "divisor": shape[2] * shape[3], "output_shape": Array(shape[0..<2]),
-        "detector_selection": "complete_detector", "alignment_role": "real_space",
-        "invalid_pixel_policy": "stored detector-mask pixels use their local 3x3 median",
-      ],
-      "mean_diffraction_pattern": [
-        "operation": "arithmetic_mean", "reduction_axes": ["scan_row", "scan_column"],
-        "divisor": shape[0] * shape[1], "output_shape": Array(shape[2..<4]),
-        "invalid_pixel_policy": "stored detector-mask pixels use their local 3x3 median",
-      ],
-      "intensity_normalization": "none",
-    ]
+    let summary = summaryMetadata
     func pairs(_ values: GPUImage?) -> [[Float]] {
       let flat = values!.values()
       return stride(from: 0, to: flat.count, by: 2).map { [flat[$0], flat[$0 + 1]] }

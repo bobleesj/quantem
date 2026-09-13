@@ -1,0 +1,15 @@
+{
+  "load_seconds": 11.901243250002153,
+  "trials": [],
+  "profile": {
+    "decode": 2.165681211219635,
+    "_sample_scan_interior": 2.594178590894444,
+    "_shift_detector": 3.352026624052087,
+    "_sample_scan_rows": 0.11558149999473244,
+    "source_range": 0.683782080624951,
+    "_accumulate_measurement": 0.08362650382332504,
+    "encode_measure": 1.6285413469013292,
+    "ans": 1.3570996659982484
+  },
+  "profile_wall_seconds": 17.251462584012188
+}

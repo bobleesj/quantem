@@ -1,0 +1,55 @@
+{
+  "backend": "cuda",
+  "representation": "packed",
+  "timings": {
+    "load": 5.382918353076093,
+    "preprocess": 2.07440540404059,
+    "origin": 0.17033743602223694,
+    "diffraction_align": 0.09720253699924797,
+    "real_space_align": 0.21288097405340523,
+    "merge_pack_summaries": 4.979070376954041,
+    "selected_dp": 0.0019037059973925352
+  },
+  "input_resident_bytes": 19975402120,
+  "output_resident_bytes": 6748110346,
+  "peak": {
+    "allocated_bytes": 32702988288
+  },
+  "load_through_dp_seconds": 12.918718787143007,
+  "saved": false,
+  "browser_rendering_measured": false,
+  "representation_parity": {
+    "counts": true,
+    "dp_mean": true,
+    "im_bf": true,
+    "real_space_shifts": true,
+    "diffraction_shifts": true,
+    "display_dp": true
+  },
+  "representation_difference": {
+    "counts": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    },
+    "dp_mean": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    },
+    "im_bf": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    },
+    "real_space_shifts": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    },
+    "diffraction_shifts": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    },
+    "display_dp": {
+      "max_abs": 0.0,
+      "rmse": 0.0
+    }
+  }
+}

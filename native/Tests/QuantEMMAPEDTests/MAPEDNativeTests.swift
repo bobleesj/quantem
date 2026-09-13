@@ -7,6 +7,61 @@ import QuantEMMAPED
 import XCTest
 
 final class MAPEDNativeTests: XCTestCase {
+  func testRegionalANSDisplaySaveAndReopen() throws {
+    let ops = try MetalImageOperations()
+    let runtime = try MetalPrecision(device: ops.device)
+    let output = try MetalPackedSource(shape: [2, 2, 64, 64], precision: runtime)
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    for value: Float in [1.25, 100.5] {
+      let image = try ops.image(rows: 2, columns: 4096, value: value)
+      let calibration = try MetalPrecision(device: ops.device)
+      try calibration.includeRange(image.buffer, count: 8192)
+      try calibration.calibrate(shape: [1, 2, 64, 64])
+      let codes = try calibration.convert(image.buffer, count: 8192)
+      try calibration.finish()
+      try output.append(codes, frames: 2, calibration: calibration)
+    }
+    let path = folder.appendingPathComponent("scaled_master.h5")
+    try output.save(to: path)
+    let restored = try MetalPackedSource.load(
+      path: path, device: ops.device, indexDirectory: folder.appendingPathComponent("index"))
+    defer {
+      output.releaseResidentStorage()
+      restored.releaseResidentStorage()
+    }
+    let expected = try output.read(1..<3)
+    let observed = try restored.read(1..<3)
+    let library = try ops.device.makeLibrary(
+      source: """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void compare(device uint* a [[buffer(0)]], device uint* b [[buffer(1)]],
+          device atomic_uint* error [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+          if (a[i] != b[i]) atomic_fetch_add_explicit(error, 1u, memory_order_relaxed);
+        }
+        """, options: nil)
+    let pipeline = try ops.device.makeComputePipelineState(
+      function: library.makeFunction(name: "compare")!)
+    let error = ops.device.makeBuffer(length: 4, options: .storageModeShared)!
+    error.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+    let command = ops.queue.makeCommandBuffer()!
+    let encoder = command.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(pipeline)
+    encoder.setBuffer(expected, offset: 0, index: 0)
+    encoder.setBuffer(observed, offset: 0, index: 1)
+    encoder.setBuffer(error, offset: 0, index: 2)
+    encoder.dispatchThreads(
+      MTLSize(width: 8192, height: 1, depth: 1),
+      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    encoder.endEncoding()
+    command.commit()
+    command.waitUntilCompleted()
+    XCTAssertEqual(command.status, .completed)
+    XCTAssertEqual(error.contents().load(as: UInt32.self), 0)
+  }
+
   func testMergeExportReusesWorkspaceWithPartialFinalRegion() throws {
     let ops = try MetalImageOperations()
     let shape = [65, 64, 64, 64]

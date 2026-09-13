@@ -1,0 +1,21 @@
+{
+  "alignment_wall_seconds": 8.65909993648529,
+  "display_ready_seconds": 17.9969699382782,
+  "float32_file_bytes": 35407095516,
+  "float32_recompute_save_seconds": 40.315792083740234,
+  "input_resident_bytes": 7524707756,
+  "output_resident_bytes": 6585496466,
+  "peak_metal_bytes": 15845294080,
+  "scaled_file_bytes": 6493953821,
+  "scaled_save_seconds": 22.473949909210205,
+  "selected_dp_seconds": 0.00775909423828125,
+  "timings": {
+    "diffraction_align": 0.047590017318725586,
+    "load": 7.926627039909363,
+    "merge_float32": 6.96877646446228,
+    "merge_total": 9.29280400276184,
+    "output_encoding": 1.2968769073486328,
+    "precision_conversion": 1.0259058475494385,
+    "real_space_align": 0.6539310216903687
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "backend": "cuda",
+  "representation": "encoded",
+  "timings": {
+    "load": 7.548393776989542,
+    "preprocess": 0.8303841780871153,
+    "origin": 0.17129550501704216,
+    "diffraction_align": 0.09770736389327794,
+    "real_space_align": 0.22932332009077072,
+    "merge_pack_summaries": 5.238512820098549,
+    "selected_dp": 0.0019626059802249074
+  },
+  "input_resident_bytes": 8328746912,
+  "output_resident_bytes": 6748110346,
+  "peak": {
+    "allocated_bytes": 20417871872
+  },
+  "load_through_dp_seconds": 14.117579570156522,
+  "saved": false,
+  "browser_rendering_measured": false
+}

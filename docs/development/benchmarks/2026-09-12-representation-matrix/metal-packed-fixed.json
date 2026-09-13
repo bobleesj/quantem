@@ -1,0 +1,33 @@
+{
+  "alignment_wall_seconds": 18.970023036003113,
+  "display_ready_seconds": 32.48914706707001,
+  "input_representation": "packed",
+  "input_resident_bytes": 12054500532,
+  "load_wall_seconds": 7.165536046028137,
+  "output_resident_bytes": 6585496466,
+  "peak_metal_bytes": 20711325696,
+  "selected_dp_seconds": 0.004514932632446289,
+  "shape": [
+    512,
+    512,
+    192,
+    192
+  ],
+  "source_read_passes": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "timings": {
+    "diffraction_align": 0.04526698589324951,
+    "merge_float32": 10.895865082740784,
+    "merge_total": 13.515522003173828,
+    "output_encoding": 1.4349050521850586,
+    "precision_conversion": 1.1837317943572998,
+    "real_space_align": 0.6528339385986328
+  }
+}

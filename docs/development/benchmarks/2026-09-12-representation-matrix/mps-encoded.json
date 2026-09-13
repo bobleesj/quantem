@@ -1,0 +1,21 @@
+{
+  "backend": "mps",
+  "representation": "encoded",
+  "timings": {
+    "load": 13.629163583012996,
+    "preprocess": 3.4246713329921477,
+    "origin": 0.07659487501950935,
+    "diffraction_align": 0.08990641700802371,
+    "real_space_align": 0.6193680420110468,
+    "merge_pack_summaries": 19.802504708990455,
+    "selected_dp": 0.0015406669990625232
+  },
+  "input_resident_bytes": 7514270140,
+  "output_resident_bytes": 6556136086,
+  "peak": {
+    "allocated_bytes": 18479628288
+  },
+  "load_through_dp_seconds": 37.64374962603324,
+  "saved": false,
+  "browser_rendering_measured": false
+}

@@ -1,0 +1,15 @@
+{
+  "display_ready_seconds": 24.852321982383728,
+  "alignment_wall_seconds": 9.95169997215271,
+  "peak_metal_bytes": 15845294080,
+  "selected_dp_seconds": 0.00766599178314209,
+  "timings": {
+    "diffraction_align": 0.062220096588134766,
+    "load": 9.058541893959045,
+    "merge_float32": 11.27316415309906,
+    "merge_total": 14.895831942558289,
+    "output_encoding": 1.9467556476593018,
+    "precision_conversion": 1.6737265586853027,
+    "real_space_align": 0.7925649881362915
+  }
+}
