@@ -189,6 +189,11 @@ def fixed_overlap_ncc(
 
 
 def soften_and_lowpass(images, weights=None, lowpass=0.0, ramp=0):
+    """Bounding-box taper and Gaussian low-pass.
+
+    ``lowpass`` is the real-space Gaussian sigma in pixels; ``ramp`` is the
+    linear edge-taper width, also in pixels.
+    """
     masks = (weights > 0.5) if weights is not None else torch.ones_like(images, dtype=torch.bool)
     out = torch.empty_like(images)
     for idx in range(images.shape[0]):
@@ -213,7 +218,8 @@ def soften_and_lowpass(images, weights=None, lowpass=0.0, ramp=0):
     if lowpass:
         fr = fftfreq(images.shape[1], device=images.device, dtype=images.dtype)[:, None]
         fc = torch.fft.rfftfreq(images.shape[2], device=images.device, dtype=images.dtype)[None, :]
-        kernel = torch.exp(-0.5 * lowpass ** 2 * (fr ** 2 + fc ** 2))
+        sigma_cycles = 2.0 * math.pi * lowpass
+        kernel = torch.exp(-0.5 * sigma_cycles ** 2 * (fr ** 2 + fc ** 2))
         out = torch.fft.irfft2(torch.fft.rfft2(out) * kernel, s=out.shape[-2:])
     return out
 
