@@ -368,3 +368,55 @@ def refit_adaptive(fit, image, n_sigma=2.0, iterations=3, max_move_frac=0.175,
               f"{np.nanmedian(out['radius_used']):.2f} px, median sigma "
               f"{np.median(out['sigma'][out['good']]):.2f} px, {n_failed} failed")
     return out
+
+
+def bond_statistics(fit):
+    good = fit["good"]
+    index = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(fit["a"], fit["b"])) if good[i]}
+    scale = fit["px_nm"] * 1000.0
+    clouds, lengths = [], []
+    third = fit["third"]
+    for da, db in ((1, 0), (-1, 0), (0, 1), (0, -1), third, (-third[0], -third[1])):
+        vectors = [(np.array([fit["x"][j] - fit["x"][i], fit["y"][j] - fit["y"][i]]) * scale)
+                   for (a, b), i in index.items()
+                   if (j := index.get((a + da, b + db))) is not None]
+        if not vectors:
+            continue
+        vectors = np.asarray(vectors)
+
+        keep = np.ones(len(vectors), dtype=bool)
+        for _ in range(3):
+            center = vectors[keep].mean(0)
+            radius = np.linalg.norm(vectors - center, axis=1)
+            rms = np.sqrt(np.mean(radius[keep] ** 2))
+            new_keep = radius < 4.0 * rms
+            if new_keep.sum() < 16 or (new_keep == keep).all():
+                break
+            keep = new_keep
+        vectors = vectors[keep]
+        mean = vectors.mean(0)
+        clouds.append(dict(vectors=vectors, mean=mean, deviations=vectors - mean,
+                           sigma_2d=float(np.sqrt(((vectors - mean) ** 2).sum(1).mean()))))
+        lengths.append(np.linalg.norm(vectors, axis=1))
+    return dict(clouds=clouds,
+                mean_length=float(np.concatenate(lengths).mean()),
+                sigma_mean=float(np.mean([c["sigma_2d"] for c in clouds])),
+                deviations=np.concatenate([c["deviations"] for c in clouds]))
+
+def cloud_ellipse(cloud, n_sigma=2.0, ellipse_scale=5.0):
+    dev = cloud["deviations"]
+    values, vectors = np.linalg.eigh(np.cov(dev[:, 1], dev[:, 0]))
+    order = np.argsort(values)[::-1]
+    values, vectors = values[order], vectors[:, order]
+    semi = n_sigma * ellipse_scale * np.sqrt(np.maximum(values, 0))
+    return (cloud["mean"][::-1], 2 * semi, np.degrees(np.arctan2(vectors[1, 0], vectors[0, 0])),
+            semi, vectors)
+
+def cloud_half_extent(stats, **kw):
+    out = 0.0
+    for cloud in stats["clouds"]:
+        _, _, _, semi, vectors = cloud_ellipse(cloud, **kw)
+        out = max(out,
+                  abs(cloud["mean"][1]) + np.hypot(semi[0] * vectors[0, 0], semi[1] * vectors[0, 1]),
+                  abs(cloud["mean"][0]) + np.hypot(semi[0] * vectors[1, 0], semi[1] * vectors[1, 1]))
+    return out
