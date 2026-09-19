@@ -13,6 +13,7 @@ import quantem.imaging.drift.preprocess as preprocessing
 import quantem.imaging.drift.report as report
 from quantem.imaging.drift.core import knots as drift_knots
 from quantem.imaging.drift.core.warping import (
+    soften_and_lowpass,
     backward_warp_grid_search,
     cross_corr_batch,
     fixed_overlap_ncc,
@@ -127,6 +128,10 @@ def _delivered_candidate(
     max_image_shift,
     upsample_factor,
     bridge=None,
+    lowpass=0.0,
+    lowpass_ramp=0,
+    subpixel="dft",
+    cost_taper=0,
 ):
     """Score one affine rate after the translation applied to the final image."""
     correction.knots = [knot.clone() for knot in starting_knots]
@@ -137,6 +142,9 @@ def _delivered_candidate(
             max_image_shift,
             upsample_factor,
             fixed_indices=fixed_set,
+            lowpass=lowpass,
+            ramp=lowpass_ramp,
+            subpixel=subpixel,
         )
         rate = rate - bridge
     _apply_affine_rate(correction, rate, fixed_set)
@@ -145,7 +153,14 @@ def _delivered_candidate(
         max_image_shift,
         upsample_factor,
         fixed_indices=fixed_set,
+        lowpass=lowpass,
+        ramp=lowpass_ramp,
+        subpixel=subpixel,
+        return_weights=bool(cost_taper),
     )
+    if cost_taper:
+        warped, cost_weights = warped
+        warped = soften_and_lowpass(warped, cost_weights, 0.0, cost_taper)
     return (
         float(_scan_disagreement(warped, 0).mean().cpu()),
         [knot.clone() for knot in correction.knots],
@@ -161,6 +176,10 @@ def _delivered_candidates(
     fixed_set,
     max_image_shift,
     upsample_factor,
+    lowpass=0.0,
+    lowpass_ramp=0,
+    subpixel="dft",
+    cost_taper=0,
 ):
     """Score a two-image affine neighborhood together when memory permits."""
     def sequential():
@@ -172,6 +191,10 @@ def _delivered_candidates(
                 fixed_set,
                 max_image_shift,
                 upsample_factor,
+                lowpass=lowpass,
+                lowpass_ramp=lowpass_ramp,
+                subpixel=subpixel,
+                cost_taper=cost_taper,
             )
             for rate in rates
         ]
@@ -226,6 +249,8 @@ def _delivered_candidates(
         torch.stack(first_warps, dim=1),
         upsample_factor,
         max_image_shift,
+        lowpass=lowpass,
+        ramp=lowpass_ramp,
     )
     final_warps = []
     for image_index, (row_candidates, col_candidates) in enumerate(
@@ -279,6 +304,11 @@ def correct_affine(
     verbose: bool = True,
     downsample: int | str = "auto",
     chunk_size: int | None = None,
+    lowpass=0.0,
+    lowpass_ramp=0,
+    subpixel="dft",
+    cost_taper=0,
+    refine_divisor=None,
 ):
     """Automatically correct the dominant linear drift between scans.
 
@@ -508,6 +538,8 @@ def correct_affine(
             self,
             fixed_set=fixed_set,
             max_image_shift=max_image_shift,
+            lowpass=lowpass,
+            lowpass_ramp=lowpass_ramp,
             show_combined=show_combined,
             show_scans=show_scans,
             show_knots=show_knots,
@@ -568,6 +600,10 @@ def correct_affine(
             max_image_shift,
             chunk_size,
             fixed_indices=fixed_set,
+            lowpass=lowpass,
+            lowpass_ramp=lowpass_ramp,
+            subpixel=subpixel,
+            cost_taper=cost_taper,
             progress_desc=f"Affine {label.lower()}" if verbose else None,
         )
         _apply_affine_rate(self, candidates[best_idx], fixed_set)
@@ -589,7 +625,7 @@ def correct_affine(
 
     drift_total, coarse_margin = _search_and_apply(drift_vectors, "Coarse search")
     if refine:
-        drift_fine = drift_vectors / (num_tests - 1)
+        drift_fine = drift_vectors / (refine_divisor or (num_tests - 1))
         dt, refine_margin = _search_and_apply(
             drift_fine, "Refine search", accumulated_drift=drift_total
         )
@@ -801,6 +837,8 @@ def automatic_affine_search(
     upsample_factor: int,
     chunk_size: int | None,
     pyramid_downsample: int | str,
+    lowpass=0.0,
+    lowpass_ramp=0,
 ):
     """Find the affine drift basin cheaply, then verify the delivered result.
 
@@ -1080,6 +1118,8 @@ def automatic_affine_search(
             fixed_set,
             native_shift,
             upsample_factor,
+            lowpass=lowpass,
+            lowpass_ramp=lowpass_ramp,
         )
         validation_status.update(status)
         row_trials = []
@@ -1107,6 +1147,8 @@ def automatic_affine_search(
                 fixed_set,
                 native_shift,
                 upsample_factor,
+            lowpass=lowpass,
+            lowpass_ramp=lowpass_ramp,
             )
             validation_status.update(status)
             for rate, result in zip(
@@ -1137,6 +1179,8 @@ def automatic_affine_search(
             native_shift,
             upsample_factor,
             zero_bridge,
+            lowpass=lowpass,
+            lowpass_ramp=lowpass_ramp,
         )
         cache[("zero_bridge",)] = zero_result
         best_key, best_result = min(cache.items(), key=lambda item: item[1][0])
@@ -1272,6 +1316,8 @@ def automatic_affine_search(
                 fixed_set,
                 native_shift,
                 upsample_factor,
+                lowpass=lowpass,
+                lowpass_ramp=lowpass_ramp,
             )
             seed_results.append(
                 (
@@ -1330,6 +1376,8 @@ def automatic_affine_search(
                         fixed_set,
                         native_shift,
                         upsample_factor,
+                        lowpass=lowpass,
+                        lowpass_ramp=lowpass_ramp,
                     )
                     local_results.append(
                         (result[0], rate.copy(), result[1], result[2])
@@ -1494,6 +1542,10 @@ def grid_search_batch(
     fixed_indices=None,
     progress_desc=None,
     fixed_overlap_check=False,
+    lowpass=0.0,
+    lowpass_ramp=0,
+    subpixel="dft",
+    cost_taper=0,
 ):
     """Evaluate all candidate drift vectors in parallel.
 
@@ -1611,6 +1663,7 @@ def grid_search_batch(
                 torch.cuda.reset_peak_memory_stats(device)
             # Warp each image (fixed → expand once, moving → drift-shifted)
             warped_images = []
+            shift_batch = []
             for img_idx in range(n_images):
                 image_t, row_base, col_base, scanline_offset = base_data[img_idx]
                 row_candidates = (
@@ -1621,7 +1674,7 @@ def grid_search_batch(
                     col_base[None]
                     + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
                 )
-                warped, _ = drift_knots.bilinear_kde_batch(
+                warped, warped_weights = drift_knots.bilinear_kde_batch(
                     row_candidates,
                     col_candidates,
                     image_t,
@@ -1629,6 +1682,11 @@ def grid_search_batch(
                     self.kde_sigma,
                     self.pad_value[img_idx],
                 )
+                if lowpass or lowpass_ramp:
+                    shift_batch.append(
+                        soften_and_lowpass(warped, warped_weights, lowpass, lowpass_ramp))
+                if cost_taper:
+                    warped = soften_and_lowpass(warped, warped_weights, 0.0, cost_taper)
                 warped_images.append(warped)
             # Score all unique pairs and sum costs
             chunk_cost = torch.zeros(chunk_end - chunk_start, dtype=dtype, device=device)
@@ -1641,6 +1699,9 @@ def grid_search_batch(
                         upsample_factor,
                         max_shift_mask=shift_mask,
                         freq_grids=freq_grids,
+                        shift_images=((shift_batch[i], shift_batch[j])
+                                      if shift_batch else None),
+                        subpixel=subpixel,
                     )
                     if fixed_overlap_check:
                         pair_cost, _, _ = fixed_overlap_ncc(

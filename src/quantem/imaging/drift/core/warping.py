@@ -32,6 +32,8 @@ def cross_corr_batch(
     upsample_factor: int,
     max_shift_mask: torch.Tensor | None = None,
     freq_grids: tuple[torch.Tensor, torch.Tensor] | None = None,
+    shift_images: tuple[torch.Tensor, torch.Tensor] | None = None,
+    subpixel: str = "dft",
 ) -> torch.Tensor:
     """Score test drift vectors by cross-correlation alignment cost.
 
@@ -76,9 +78,12 @@ def cross_corr_batch(
     _, num_rows, num_cols = ref_images.shape
     dtype = ref_images.dtype
     mov_fft = fft2(mov_images)
-    cross_corr_fft = fft2(ref_images) * mov_fft.conj()
+    if shift_images is None:
+        cross_corr_fft = fft2(ref_images) * mov_fft.conj()
+    else:
+        cross_corr_fft = fft2(shift_images[0]) * fft2(shift_images[1]).conj()
     image_shifts = _translation_from_cross_correlation(
-        cross_corr_fft, upsample_factor, max_shift_mask
+        cross_corr_fft, upsample_factor, max_shift_mask, subpixel
     )
     if freq_grids is not None:
         freq_row, freq_col = freq_grids
@@ -183,10 +188,44 @@ def fixed_overlap_ncc(
     return 1.0 - best_ncc, image_shifts, best_ncc - ncc[:, margin, margin]
 
 
+def soften_and_lowpass(images, weights=None, lowpass=0.0, ramp=0):
+    masks = (weights > 0.5) if weights is not None else torch.ones_like(images, dtype=torch.bool)
+    out = torch.empty_like(images)
+    for idx in range(images.shape[0]):
+        mask = masks[idx]
+        window = torch.zeros(mask.shape, dtype=images.dtype, device=images.device)
+        rows = torch.nonzero(mask.any(1)).flatten()
+        cols = torch.nonzero(mask.any(0)).flatten()
+        if rows.numel() and cols.numel():
+            def profile(n):
+                t = torch.ones(n, dtype=images.dtype, device=images.device)
+                k = min(int(ramp), n // 2)
+                if k:
+                    u = torch.arange(1, k + 1, dtype=images.dtype, device=images.device) / k
+                    t[:k], t[-k:] = u, u.flip(0)
+                return t
+            r0, r1 = int(rows[0]), int(rows[-1]) + 1
+            c0, c1 = int(cols[0]), int(cols[-1]) + 1
+            window[r0:r1, c0:c1] = profile(r1 - r0)[:, None] * profile(c1 - c0)[None, :]
+        weight = window * mask
+        mean = (images[idx] * weight).sum() / weight.sum() if weight.sum() > 0 else 0.0
+        out[idx] = torch.where(mask, images[idx] - mean, torch.zeros_like(images[idx])) * window
+    if lowpass:
+        fr = fftfreq(images.shape[1], device=images.device, dtype=images.dtype)[:, None]
+        fc = torch.fft.rfftfreq(images.shape[2], device=images.device, dtype=images.dtype)[None, :]
+        kernel = torch.exp(-0.5 * lowpass ** 2 * (fr ** 2 + fc ** 2))
+        out = torch.fft.irfft2(torch.fft.rfft2(out) * kernel, s=out.shape[-2:])
+    return out
+
+
 def translate_align(
     warped_images: torch.Tensor,
     upsample_factor: int,
     max_image_shift: float | None,
+    weights: torch.Tensor | None = None,
+    lowpass: float = 0.0,
+    ramp: int = 0,
+    subpixel: str = "dft",
 ) -> torch.Tensor:
     """Pairwise translation alignment of warped images via cross-correlation.
 
@@ -216,6 +255,8 @@ def translate_align(
     num_images, num_rows, num_cols = warped_images.shape
     dtype = warped_images.dtype
     device = warped_images.device
+    if lowpass or ramp:
+        warped_images = soften_and_lowpass(warped_images, weights, lowpass, ramp)
     image_shifts = torch.zeros(num_images, 2, dtype=dtype, device=device)
     ref_fft = fft2(warped_images[0])
     # Reject bad correlation peaks from noise or periodicity
@@ -224,14 +265,18 @@ def translate_align(
     if max_image_shift is not None:
         dist_row = fftfreq(num_rows, 1.0 / num_rows, device=device, dtype=dtype)
         dist_col = fftfreq(num_cols, 1.0 / num_cols, device=device, dtype=dtype)
-        shift_mask = dist_row[:, None] ** 2 + dist_col[None, :] ** 2 >= max_image_shift ** 2
+        if isinstance(max_image_shift, (tuple, list)):
+            shift_mask = (dist_row.abs()[:, None] > float(max_image_shift[0])) | (
+                dist_col.abs()[None, :] > float(max_image_shift[1]))
+        else:
+            shift_mask = dist_row[:, None] ** 2 + dist_col[None, :] ** 2 >= max_image_shift ** 2
     freq_row = fftfreq(num_rows, device=device, dtype=dtype)[:, None]
     freq_col = fftfreq(num_cols, device=device, dtype=dtype)[None, :]
     for img_idx in range(1, num_images):
         mov_fft = fft2(warped_images[img_idx])
         cross_corr_fft = ref_fft * mov_fft.conj()
         image_shifts[img_idx] = _translation_from_cross_correlation(
-            cross_corr_fft[None], upsample_factor, shift_mask
+            cross_corr_fft[None], upsample_factor, shift_mask, subpixel
         )[0]
         # Apply the recovered shift to current image via Fourier shift theorem,
         # then blend into running average so later images align to the cumulative mean
@@ -250,6 +295,9 @@ def translate_align_pair_batch(
     warped_pairs: torch.Tensor,
     upsample_factor: int,
     max_image_shift: float | None,
+    weight_pairs: torch.Tensor | None = None,
+    lowpass: float = 0.0,
+    ramp: int = 0,
 ) -> torch.Tensor:
     """Solve translations for a batch of independent two-image pairs.
 
@@ -280,6 +328,12 @@ def translate_align_pair_batch(
     num_pairs, _, num_rows, num_cols = warped_pairs.shape
     dtype = warped_pairs.dtype
     device = warped_pairs.device
+    if lowpass or ramp:
+        flat = warped_pairs.reshape(-1, num_rows, num_cols)
+        flat_w = (weight_pairs.reshape(-1, num_rows, num_cols)
+                  if weight_pairs is not None else None)
+        warped_pairs = soften_and_lowpass(flat, flat_w, lowpass, ramp).reshape(
+            warped_pairs.shape)
     ref_fft = fft2(warped_pairs[:, 0])
     mov_fft = fft2(warped_pairs[:, 1])
     cross_corr_fft = ref_fft * mov_fft.conj()
@@ -316,6 +370,9 @@ def warp_and_translate(
     fixed_indices: frozenset[int] | None = None,
     imgs_t_override: list[torch.Tensor] | None = None,
     return_weights: bool = False,
+    lowpass: float = 0.0,
+    ramp: int = 0,
+    subpixel: str = "dft",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Warp scans to their shared canvas and remove residual translation.
 
@@ -368,7 +425,8 @@ def warp_and_translate(
             correction.imgs_warped.array[:] = warped_t.cpu().numpy()
         return (warped_t, weights_t) if return_weights else warped_t
 
-    shifts_t = translate_align(warped_t, upsample_factor, max_image_shift)
+    shifts_t = translate_align(warped_t, upsample_factor, max_image_shift,
+                               weights_t, lowpass, ramp, subpixel)
     if fixed_set:
         fixed_idx_list = sorted(fixed_set)
         anchor = shifts_t[fixed_idx_list].mean(0)
@@ -393,7 +451,10 @@ def warp_and_translate(
 def align_translation(
     self,
     *,
-    max_image_shift: float | None | str = "auto",
+    max_image_shift: float | None | str | tuple[float, float] = "auto",
+    lowpass: float = 0.0,
+    ramp: int = 0,
+    subpixel: str = "dft",
     fixed_scans: list[int] | None = None,
     show_combined: bool = True,
     show_scans: bool = False,
@@ -462,6 +523,11 @@ def align_translation(
             min(self.imgs[0].shape[:2])
             * (0.0625 if reference_alignment else 0.25),
         )
+    elif max_image_shift == "wrap":
+        max_image_shift = (float(self.shape[1] - self.imgs[0].shape[0]),
+                           float(self.shape[2] - self.imgs[0].shape[1]))
+    elif isinstance(max_image_shift, (tuple, list)):
+        max_image_shift = (float(max_image_shift[0]), float(max_image_shift[1]))
     elif isinstance(max_image_shift, str):
         raise ValueError(
             "max_image_shift must be 'auto', None, or a non-negative "
@@ -481,6 +547,9 @@ def align_translation(
         max_image_shift=max_image_shift,
         upsample_factor=8,
         fixed_indices=fixed_set,
+        lowpass=lowpass,
+        ramp=ramp,
+        subpixel=subpixel,
     )
     translations = np.asarray(
         [
@@ -883,13 +952,15 @@ def _translation_from_cross_correlation(
     cross_corr_fft: torch.Tensor,
     upsample_factor: int,
     max_shift_mask: torch.Tensor | None,
+    subpixel: str = "dft",
 ) -> torch.Tensor:
     # Keep every solver on one integer → parabolic → DFT refinement and the
     # same centered (row, col) shift convention.
     num_images, num_rows, num_cols = cross_corr_fft.shape
     cross_corr = ifft2(cross_corr_fft).real
     if max_shift_mask is not None:
-        cross_corr.masked_fill_(max_shift_mask[None], 0.0)
+        fill = cross_corr.flatten(1).min(dim=1).values[:, None, None]
+        cross_corr = torch.where(max_shift_mask[None], fill.expand_as(cross_corr), cross_corr)
     peak_flat_idx = cross_corr.flatten(1).argmax(dim=1)
     peak_row = peak_flat_idx // num_cols
     peak_col = peak_flat_idx % num_cols
@@ -897,9 +968,12 @@ def _translation_from_cross_correlation(
     refined_row, refined_col = _parabolic_peak_2d(
         cross_corr, peak_row, peak_col, num_rows, num_cols, batch_idx
     )
-    shifts = _dft_refine_shifts(
-        cross_corr_fft, refined_row, refined_col, upsample_factor
-    )
+    if subpixel == "parabola":
+        shifts = torch.stack([refined_row, refined_col], dim=1)
+    else:
+        shifts = _dft_refine_shifts(
+            cross_corr_fft, refined_row, refined_col, upsample_factor
+        )
     shifts[:, 0] = ((shifts[:, 0] + num_rows / 2) % num_rows) - num_rows / 2
     shifts[:, 1] = ((shifts[:, 1] + num_cols / 2) % num_cols) - num_cols / 2
     return shifts
@@ -939,9 +1013,6 @@ def _dft_refine_shifts(
     num_test_drifts = cross_corr_fft.shape[0]
     dtype = peak_row.dtype
     batch_idx = torch.arange(num_test_drifts, device=cross_corr_fft.device)
-    # Evaluate the correlation surface at 1/upsample_factor pixel spacing
-    # in a small window around each coarse peak - gives actual values,
-    # not the parabolic approximation from step 1
     upsampled_corr = _dft_upsample_batch(
         cross_corr_fft, upsample_factor, torch.stack([peak_row, peak_col], dim=1)
     )
@@ -949,9 +1020,6 @@ def _dft_refine_shifts(
     peak_flat_idx = upsampled_corr.flatten(1).argmax(dim=1)
     local_row = peak_flat_idx // upsample_size
     local_col = peak_flat_idx % upsample_size
-    # Final parabolic fit on the dense grid for last fraction of precision.
-    # Peaks at the edge of the upsampled window can't use the 3-point stencil
-    # (no neighbor on one side), so those are masked and kept at integer position
     can_refine = (
         (local_row >= 1)
         & (local_row < upsample_size - 1)
@@ -971,12 +1039,10 @@ def _dft_refine_shifts(
         upsampled_corr[batch_idx, local_row, (local_col + 1).clamp(max=upsample_size - 1)],
         mask=can_refine,
     )
-    # Convert upsampled-grid position back to image-pixel coordinates:
-    # patch center is at index patch_radius in the upsampled grid,
-    # so (local_row - patch_radius) / upsample_factor = offset from coarse peak
+
     patch_radius = math.ceil(1.5 * upsample_factor)
     image_shifts = torch.zeros(num_test_drifts, 2, dtype=dtype, device=cross_corr_fft.device)
-    # local_row/col are int from argmax - cast to float for sub-pixel arithmetic
+
     image_shifts[:, 0] = peak_row + (local_row.to(dtype) - patch_radius + d_row_fine) / upsample_factor
     image_shifts[:, 1] = peak_col + (local_col.to(dtype) - patch_radius + d_col_fine) / upsample_factor
     return image_shifts
@@ -1039,11 +1105,6 @@ def _dft_upsample_batch(
     # (N,P,M) @ (N,M,K) @ (N,K,P) -> (N,P,P)
     return (kern_row @ cross_corr_fft @ kern_col).real
 
-# ---------------------------------------------------------------------------
-# Primitives - lowest-level operations
-# ---------------------------------------------------------------------------
-
-
 def _parabolic_peak_2d(
     cross_corr: torch.Tensor,
     peak_row: torch.Tensor,
@@ -1052,38 +1113,13 @@ def _parabolic_peak_2d(
     num_cols: int,
     batch_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Refine an integer cross-correlation peak to sub-pixel precision.
-
-    Extracts the 3-point stencil along each axis and fits a parabola.
-    Without this, the DFT upsample window would be centered on the
-    integer peak which may be up to 0.5 px away from the true peak,
-    causing the upsampled patch to miss the true maximum.
-
-    Parameters
-    ----------
-    cross_corr : torch.Tensor
-        Batched correlation map, shape ``(N, num_rows, num_cols)``.
-    peak_row, peak_col : torch.Tensor
-        Integer peak positions, shape ``(N,)``.
-    num_rows, num_cols : int
-        Dimensions for periodic wrapping.
-    batch_idx : torch.Tensor
-        Batch indices, ``torch.arange(N)``.
-
-    Returns
-    -------
-    refined_row, refined_col : torch.Tensor
-        Sub-pixel peak positions in [0, N) coordinates.
-    """
+    """Refine an integer cross-correlation peak to sub-pixel precision."""
     dtype = cross_corr.dtype
     val_center = cross_corr[batch_idx, peak_row, peak_col]
     val_row_m1 = cross_corr[batch_idx, (peak_row - 1) % num_rows, peak_col]
     val_row_p1 = cross_corr[batch_idx, (peak_row + 1) % num_rows, peak_col]
     val_col_m1 = cross_corr[batch_idx, peak_row, (peak_col - 1) % num_cols]
     val_col_p1 = cross_corr[batch_idx, peak_row, (peak_col + 1) % num_cols]
-    # peak_row/col are int from argmax - cast to float for sub-pixel addition.
-    # Double modulo handles tiny negative offsets from float32 rounding
-    # that would otherwise wrap to N instead of 0 (e.g. -4e-8 % 64 = 64.0)
     refined_row = ((peak_row.to(dtype) + _parabolic_sub_pixel(val_row_m1, val_center, val_row_p1)) % num_rows) % num_rows
     refined_col = ((peak_col.to(dtype) + _parabolic_sub_pixel(val_col_m1, val_center, val_col_p1)) % num_cols) % num_cols
     return refined_row, refined_col
@@ -1095,15 +1131,7 @@ def _parabolic_sub_pixel(
     val_p1: torch.Tensor,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sub-pixel offset from a 3-point stencil via parabolic interpolation.
-
-    Cross-correlation peaks fall on integer pixel positions, but the true
-    shift is usually between pixels. Fitting a parabola through the peak
-    and its two neighbors gives ~0.1 px precision cheaply:
-    ``offset = (val_p1 - val_m1) / (4·val_0 - 2·val_p1 - 2·val_m1)``.
-    Without this, the DFT upsample window may be centered on the wrong
-    pixel and miss the true peak.
-    """
+    """Sub-pixel offset from a 3-point stencil via parabolic interpolation."""
     denom = 4 * val_0 - 2 * val_p1 - 2 * val_m1
     valid = denom != 0
     if mask is not None:

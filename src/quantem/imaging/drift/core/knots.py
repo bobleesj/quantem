@@ -246,6 +246,62 @@ def _transform_coordinates_single_knot(
     return row_coords, col_coords
 
 
+def transform_row_numpy(
+    knots_row: NDArray,
+    scan_fast: NDArray,
+    input_shape: tuple[int, int],
+) -> tuple[NDArray, NDArray]:
+    """Map one scanline's knots to canvas coordinates, in numpy.
+
+    The numpy single-row counterpart of :meth:`DriftKnot.to_canvas`, which is
+    torch and batched over every scanline at once. A per-row scipy solve needs
+    the cost of *one* row without building the full ``(H, W)`` coordinate grid,
+    so this reproduces the same arithmetic for a single row.
+
+    The conventions must match :func:`_transform_coordinates_single_knot` and
+    :func:`_transform_coordinates_multi_knot` exactly. In particular the fast
+    axis spans ``num_rows - 1`` / ``num_cols - 1``, not ``num_rows`` /
+    ``num_cols``, and ``num_rows`` is the full image height rather than 1. A
+    half-pixel disagreement here would not raise: the row cost and the warp
+    would simply optimize different objectives, and the result would look
+    plausible. :func:`tests.imaging.test_drift_row_transform` asserts parity
+    against the torch path in float64.
+
+    Parameters
+    ----------
+    knots_row : NDArray
+        One scanline's knot positions, shape ``(2, K)``. First axis is
+        ``(row, col)``.
+    scan_fast : NDArray
+        Fast scan direction vector, shape ``(2,)``. Consulted only when
+        ``K == 1``.
+    input_shape : tuple[int, int]
+        Full source image shape ``(num_rows, num_cols)``.
+
+    Returns
+    -------
+    row_coords : NDArray
+        Row coordinates on canvas, shape ``(num_cols,)``.
+    col_coords : NDArray
+        Column coordinates on canvas, shape ``(num_cols,)``.
+    """
+    knots_row = np.asarray(knots_row, dtype=float)
+    num_rows, num_cols = input_shape
+    K = knots_row.shape[1]
+    if K == 1:
+        fast_fraction = np.linspace(0.0, 1.0, num_cols)
+        scan_fast = np.asarray(scan_fast, dtype=float)
+        row_coords = knots_row[0, 0] + fast_fraction * scan_fast[0] * (num_rows - 1)
+        col_coords = knots_row[1, 0] + fast_fraction * scan_fast[1] * (num_cols - 1)
+        return row_coords, col_coords
+    t = np.linspace(0.0, 1.0, num_cols) * (K - 1)
+    seg = np.minimum(t.astype(np.int64), K - 2)
+    frac = t - seg
+    row_lo, row_hi = knots_row[0, seg], knots_row[0, seg + 1]
+    col_lo, col_hi = knots_row[1, seg], knots_row[1, seg + 1]
+    return row_lo + (row_hi - row_lo) * frac, col_lo + (col_hi - col_lo) * frac
+
+
 def _transform_coordinates_multi_knot(
     knots: torch.Tensor,
     input_shape: tuple[int, int],
