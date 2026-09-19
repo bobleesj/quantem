@@ -152,7 +152,7 @@ def correct_nonrigid_center_out(
     update_fraction: float | None = None,
     max_image_shift: float | None = 32.0,
     lowpass: float = 0.0,
-    lowpass_ramp: int = 0,
+    cost_taper: int = 0,
     subpixel: str = "dft",
     verbose: bool = True,
     show_combined: bool = True,
@@ -175,7 +175,7 @@ def correct_nonrigid_center_out(
         upsample_factor=8,
         solve_translation=False,
         lowpass=lowpass,
-        ramp=lowpass_ramp,
+        ramp=cost_taper,
         subpixel=subpixel,
     )
     error_buffer = []
@@ -215,7 +215,7 @@ def correct_nonrigid_center_out(
             upsample_factor=8,
             solve_translation=True,
             lowpass=lowpass,
-            ramp=lowpass_ramp,
+            ramp=cost_taper,
             subpixel=subpixel,
         )
         images_mean = warped_t.mean(dim=0)

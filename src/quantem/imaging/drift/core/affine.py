@@ -129,7 +129,6 @@ def _delivered_candidate(
     upsample_factor,
     bridge=None,
     lowpass=0.0,
-    lowpass_ramp=0,
     subpixel="dft",
     cost_taper=0,
 ):
@@ -143,7 +142,7 @@ def _delivered_candidate(
             upsample_factor,
             fixed_indices=fixed_set,
             lowpass=lowpass,
-            ramp=lowpass_ramp,
+            ramp=cost_taper,
             subpixel=subpixel,
         )
         rate = rate - bridge
@@ -154,7 +153,7 @@ def _delivered_candidate(
         upsample_factor,
         fixed_indices=fixed_set,
         lowpass=lowpass,
-        ramp=lowpass_ramp,
+        ramp=cost_taper,
         subpixel=subpixel,
         return_weights=bool(cost_taper),
     )
@@ -177,7 +176,6 @@ def _delivered_candidates(
     max_image_shift,
     upsample_factor,
     lowpass=0.0,
-    lowpass_ramp=0,
     subpixel="dft",
     cost_taper=0,
 ):
@@ -192,7 +190,6 @@ def _delivered_candidates(
                 max_image_shift,
                 upsample_factor,
                 lowpass=lowpass,
-                lowpass_ramp=lowpass_ramp,
                 subpixel=subpixel,
                 cost_taper=cost_taper,
             )
@@ -250,7 +247,7 @@ def _delivered_candidates(
         upsample_factor,
         max_image_shift,
         lowpass=lowpass,
-        ramp=lowpass_ramp,
+        ramp=cost_taper,
     )
     final_warps = []
     for image_index, (row_candidates, col_candidates) in enumerate(
@@ -305,7 +302,6 @@ def correct_affine(
     downsample: int | str = "auto",
     chunk_size: int | None = None,
     lowpass=0.0,
-    lowpass_ramp=0,
     subpixel="dft",
     cost_taper=0,
     refine_divisor=None,
@@ -539,7 +535,6 @@ def correct_affine(
             fixed_set=fixed_set,
             max_image_shift=max_image_shift,
             lowpass=lowpass,
-            lowpass_ramp=lowpass_ramp,
             show_combined=show_combined,
             show_scans=show_scans,
             show_knots=show_knots,
@@ -601,7 +596,6 @@ def correct_affine(
             chunk_size,
             fixed_indices=fixed_set,
             lowpass=lowpass,
-            lowpass_ramp=lowpass_ramp,
             subpixel=subpixel,
             cost_taper=cost_taper,
             progress_desc=f"Affine {label.lower()}" if verbose else None,
@@ -611,7 +605,8 @@ def correct_affine(
             _print_top_candidates(label, candidates, costs)
         warped_t = warp_and_translate(
             self,
-            max_image_shift, upsample_factor, fixed_indices=fixed_set
+            max_image_shift, upsample_factor, fixed_indices=fixed_set,
+            lowpass=lowpass, ramp=cost_taper, subpixel=subpixel,
         )
         report.record_error(self, 1, warped_t)
 
@@ -838,7 +833,6 @@ def automatic_affine_search(
     chunk_size: int | None,
     pyramid_downsample: int | str,
     lowpass=0.0,
-    lowpass_ramp=0,
 ):
     """Find the affine drift basin cheaply, then verify the delivered result.
 
@@ -1119,7 +1113,6 @@ def automatic_affine_search(
             native_shift,
             upsample_factor,
             lowpass=lowpass,
-            lowpass_ramp=lowpass_ramp,
         )
         validation_status.update(status)
         row_trials = []
@@ -1148,7 +1141,6 @@ def automatic_affine_search(
                 native_shift,
                 upsample_factor,
             lowpass=lowpass,
-            lowpass_ramp=lowpass_ramp,
             )
             validation_status.update(status)
             for rate, result in zip(
@@ -1180,7 +1172,6 @@ def automatic_affine_search(
             upsample_factor,
             zero_bridge,
             lowpass=lowpass,
-            lowpass_ramp=lowpass_ramp,
         )
         cache[("zero_bridge",)] = zero_result
         best_key, best_result = min(cache.items(), key=lambda item: item[1][0])
@@ -1317,7 +1308,6 @@ def automatic_affine_search(
                 native_shift,
                 upsample_factor,
                 lowpass=lowpass,
-                lowpass_ramp=lowpass_ramp,
             )
             seed_results.append(
                 (
@@ -1377,7 +1367,6 @@ def automatic_affine_search(
                         native_shift,
                         upsample_factor,
                         lowpass=lowpass,
-                        lowpass_ramp=lowpass_ramp,
                     )
                     local_results.append(
                         (result[0], rate.copy(), result[1], result[2])
@@ -1543,7 +1532,6 @@ def grid_search_batch(
     progress_desc=None,
     fixed_overlap_check=False,
     lowpass=0.0,
-    lowpass_ramp=0,
     subpixel="dft",
     cost_taper=0,
 ):
@@ -1682,9 +1670,9 @@ def grid_search_batch(
                     self.kde_sigma,
                     self.pad_value[img_idx],
                 )
-                if lowpass or lowpass_ramp:
+                if lowpass or cost_taper:
                     shift_batch.append(
-                        soften_and_lowpass(warped, warped_weights, lowpass, lowpass_ramp))
+                        soften_and_lowpass(warped, warped_weights, lowpass, cost_taper))
                 if cost_taper:
                     warped = soften_and_lowpass(warped, warped_weights, 0.0, cost_taper)
                 warped_images.append(warped)
