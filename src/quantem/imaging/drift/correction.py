@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 
 import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.core.affine as affine
+import quantem.imaging.drift.core.centerout as centerout
 import quantem.imaging.drift.core.nonrigid as nonrigid
 import quantem.imaging.drift.core.strip as strip
 import quantem.imaging.drift.core.warping as warping
@@ -396,6 +397,7 @@ class DriftCorrection(AutoSerialize):
     report = drift_report.report
 
     correct_nonrigid = nonrigid.correct_nonrigid
+    correct_nonrigid_center_out = centerout.correct_nonrigid_center_out
 
     diagnose_affine = diagnostics.diagnose_affine
     diagnose_nonrigid = diagnostics.diagnose_nonrigid

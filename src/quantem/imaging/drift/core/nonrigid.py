@@ -368,6 +368,8 @@ def correct_nonrigid(
     fixed_scans: list[int] | None = None,
     loss: str = "auto",
     edge_smoothing_sigma: float = 1.0,
+    lowpass: float = 0.0,
+    cost_taper: int = 0,
     early_stop_patience: int = 3,
     early_stop_rtol: float = 1e-4,
     min_iterations: int = 4,
@@ -616,6 +618,8 @@ def correct_nonrigid(
         fixed_indices=fixed_set,
         imgs_t_override=imgs_t_override,
         return_weights=loss == "ncc",
+        lowpass=lowpass,
+        ramp=cost_taper,
     )
     if loss == "ncc":
         warped_t, coverage_weights_t = warp_result
@@ -718,6 +722,8 @@ def correct_nonrigid(
             fixed_indices=fixed_set,
             imgs_t_override=imgs_t_override,
             return_weights=loss == "ncc",
+            lowpass=lowpass,
+            ramp=cost_taper,
         )
         if loss == "ncc":
             warped_t, coverage_weights_t = warp_result
