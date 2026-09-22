@@ -32,13 +32,12 @@ def test_ans_alignment_and_correction_match_dense(tmp_path):
         calls = []
 
         def bounded_read(self, *, scan_region=None, detector_region=None,
-                         detector_pixels=None, detector_bin=1):
+                         detector_bin=1):
             assert (scan_region is not None or detector_region is not None
-                    or detector_pixels is not None or detector_bin > 1)
+                    or detector_bin > 1)
             calls.append((scan_region, detector_region))
             return original_read(self, scan_region=scan_region,
                                  detector_region=detector_region,
-                                 detector_pixels=detector_pixels,
                                  detector_bin=detector_bin)
 
         with pytest.MonkeyPatch.context() as patch:

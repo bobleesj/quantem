@@ -558,7 +558,7 @@ def regional_diffraction_patterns(
                     ]
                 if isinstance(block, torch.Tensor):
                     # CUDA cannot boolean-index uint16 tensors. Convert only
-                    # this small region, never the full diffraction cube.
+                    # this small region, never the full diffraction dataset.
                     local_mask_t = torch.as_tensor(local_mask, device=block.device)
                     pattern = block.to(torch.float32)[local_mask_t].mean(dim=0)
                     pattern = to_numpy(pattern, dtype=np.float32)
@@ -593,14 +593,14 @@ def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
     avoiding work on detector detail that the interactive viewer will discard.
     The returned stages share image 0's scan frame and the solved crop.
     """
-    def detector_bin(cube):
-        if is_loaded_4dstem(cube):
-            return cube.read(detector_bin=det_bin)
+    def detector_bin(data):
+        if is_loaded_4dstem(data):
+            return data.read(detector_bin=det_bin)
         if det_bin == 1:
-            return cube
-        detector_rows, detector_columns = cube.shape[-2:]
-        shape = cube.shape
-        reshaped = cube.reshape(
+            return data
+        detector_rows, detector_columns = data.shape[-2:]
+        shape = data.shape
+        reshaped = data.reshape(
             shape[0],
             shape[1],
             detector_rows // det_bin,
@@ -654,7 +654,7 @@ def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
             (corrected_0.astype(np.int64) + corrected_1.astype(np.int64)) >> 1
         ).astype(corrected_0.dtype)
     rows, columns = crop_slices(correction)
-    return [to_numpy(cube[rows, columns]) for cube in (raw_0, corrected_0, merged)]
+    return [to_numpy(data[rows, columns]) for data in (raw_0, corrected_0, merged)]
 
 
 def corrected_4dstem(

@@ -436,6 +436,15 @@ def apply_correction_to_dataset(
     col_coords = torch.arange(scan_w, device=device, dtype=torch.float32)
     sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift_row
     sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift_col
+    if is_loaded:
+        from quantem.gpu.geometry import resample_scan
+
+        return resample_scan(
+            ds_4d, torch.stack((sample_row, sample_col), dim=-1),
+            mode=mode, output_dtype=output_dtype, output_device=output_device,
+            output=output, verbose=verbose,
+        )
+
     # ── Pre-compute warp grid ONCE (tiny: 1×H×W×2 f32) ──
     warp_grid = torch.stack([
         2.0 * sample_col / (scan_w - 1) - 1.0,
@@ -443,7 +452,7 @@ def apply_correction_to_dataset(
     ], dim=-1)[None]                                       # (1, H, W, 2)
 
     # ── Flatten input to (H, W, C) view ──
-    flat = None if is_loaded else (
+    flat = (
         torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
         if is_numpy
         else ds_4d.reshape(scan_h, scan_w, n_channels)
@@ -456,8 +465,6 @@ def apply_correction_to_dataset(
             out_dt = torch.from_numpy(
                 np.empty(0, dtype=input_np_dtype)
             ).dtype
-        elif is_loaded:
-            out_dt = torch.from_numpy(np.empty(0, dtype=ds_4d.dtype)).dtype
         elif not is_numpy:
             out_dt = ds_4d.dtype
     elif isinstance(output_dtype, torch.dtype):
@@ -472,8 +479,6 @@ def apply_correction_to_dataset(
         target = torch.device(output_device)
         if target.type == "cuda":
             target = device
-    elif is_loaded:
-        target = device
     elif (
         isinstance(ds_4d, torch.Tensor)
         and (ds_4d.is_cuda or ds_4d.device.type == "mps")
@@ -535,12 +540,8 @@ def apply_correction_to_dataset(
     )
     for start in chunks:
         end = min(start + chunk_size, n_channels)
-        channels = (
-            ds_4d.read(detector_pixels=slice(start, end))
-            if is_loaded else flat[:, :, start:end]
-        )
         warped = F.grid_sample(
-            channels.permute(2, 0, 1).contiguous()
+            flat[:, :, start:end].permute(2, 0, 1).contiguous()
             .to(device=device, dtype=torch.float32)[None],
             warp_grid,
             mode=mode, align_corners=True, padding_mode="border",
@@ -760,7 +761,7 @@ def crop(self, image: NDArray, *, shape: str = "square") -> NDArray:
         cols = slice(col_start, col_start + side)
     elif shape != "rectangle":
         raise ValueError(f'shape must be "rectangle" or "square", got {shape!r}')
-    # Scan axes are the LEADING two: an EDS cube is (row, col, channel), so
+    # Scan axes are the LEADING two: an EDS dataset is (row, col, channel), so
     # trailing-axis indexing would slice width and channels instead of the
     # scan field. 4D-STEM mode shares the same (row, col, ...) layout.
     return np.asarray(image)[rows, cols, ...]
