@@ -21,6 +21,24 @@ from quantem.imaging.drift.core.warping import (
 )
 
 
+def is_loaded_4dstem(value) -> bool:
+    """Recognize the public loader result without requiring quantem.gpu."""
+    try:
+        from quantem.gpu.io import FourDSTEMData
+    except ImportError:
+        return False
+    return isinstance(value, FourDSTEMData)
+
+
+def _read_detector_channels(data, start: int, end: int) -> torch.Tensor:
+    """Read bounded detector rows spanning a flattened channel interval."""
+    width = data.shape[-1]
+    row_start, column_start = divmod(start, width)
+    row_stop = (end + width - 1) // width
+    block = data.read(detector_region=(row_start, row_stop, 0, width))
+    return block.flatten(2)[..., column_start:column_start + end - start]
+
+
 def dataset_info(dataset) -> dict[str, object]:
     """Copy the calibration and metadata needed for corrected output."""
     if not hasattr(dataset, "array"):
@@ -368,6 +386,7 @@ def apply_correction_to_dataset(
             )
         ds_4d = datasets[image_index]
 
+    is_loaded = is_loaded_4dstem(ds_4d)
     is_numpy = isinstance(ds_4d, np.ndarray)
     original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
     input_np_dtype = ds_4d.dtype if is_numpy else None
@@ -433,7 +452,7 @@ def apply_correction_to_dataset(
     ], dim=-1)[None]                                       # (1, H, W, 2)
 
     # ── Flatten input to (H, W, C) view ──
-    flat = (
+    flat = None if is_loaded else (
         torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
         if is_numpy
         else ds_4d.reshape(scan_h, scan_w, n_channels)
@@ -446,6 +465,8 @@ def apply_correction_to_dataset(
             out_dt = torch.from_numpy(
                 np.empty(0, dtype=input_np_dtype)
             ).dtype
+        elif is_loaded:
+            out_dt = torch.from_numpy(np.empty(0, dtype=ds_4d.dtype)).dtype
         elif not is_numpy:
             out_dt = ds_4d.dtype
     elif isinstance(output_dtype, torch.dtype):
@@ -460,6 +481,8 @@ def apply_correction_to_dataset(
         target = torch.device(output_device)
         if target.type == "cuda":
             target = device
+    elif is_loaded:
+        target = device
     elif (
         isinstance(ds_4d, torch.Tensor)
         and (ds_4d.is_cuda or ds_4d.device.type == "mps")
@@ -498,6 +521,10 @@ def apply_correction_to_dataset(
         else:
             chunk_size = min(n_channels, 64)
 
+    if is_loaded:
+        # Bound decoded working data even when the dense output fits in memory.
+        chunk_size = min(chunk_size, ds_4d.shape[-1])
+
     # ── Allocate output ──
     if use_external_output:
         out_flat = output.reshape(scan_h, scan_w, n_channels)
@@ -521,8 +548,12 @@ def apply_correction_to_dataset(
     )
     for start in chunks:
         end = min(start + chunk_size, n_channels)
+        channels = (
+            _read_detector_channels(ds_4d, start, end)
+            if is_loaded else flat[:, :, start:end]
+        )
         warped = F.grid_sample(
-            flat[:, :, start:end].permute(2, 0, 1).contiguous()
+            channels.permute(2, 0, 1).contiguous()
             .to(device=device, dtype=torch.float32)[None],
             warp_grid,
             mode=mode, align_corners=True, padding_mode="border",
@@ -668,8 +699,8 @@ def apply_correction(
         if self._reference_mode:
             data = self._datasets[1]
     if data is not None:
-        ndim = data.ndim
         shape = tuple(data.shape)
+        ndim = len(shape)
         dataset_layout = ndim >= 4
         if ndim == 3:
             cube_layout = shape[0] == scan_h and shape[1] == scan_w

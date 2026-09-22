@@ -22,12 +22,16 @@ def input_array(value):
     """Return the array carried by a drift-correction input."""
     if isinstance(value, (np.ndarray, torch.Tensor)):
         return value
+    from quantem.imaging.drift.apply import is_loaded_4dstem
+
+    if is_loaded_4dstem(value):
+        return value
     array = getattr(value, "array", None)
     if isinstance(array, np.ndarray):
         return array
     raise TypeError(
         f"DriftCorrection accepts ndarray, torch.Tensor, or Dataset "
-        f"objects; got {type(value).__name__}. To load from disk, call "
+        f"objects or quantem.gpu FourDSTEMData; got {type(value).__name__}. To load from disk, call "
         f"Dataset2d.from_file(path) (or Dataset4d.from_file) first."
     )
 
@@ -51,6 +55,17 @@ def prepare_image_collection(
                 image.signal_units = signal_units
             metadata = getattr(source, "metadata", None)
             if isinstance(metadata, dict):
+                from quantem.imaging.drift.apply import is_loaded_4dstem
+
+                if is_loaded_4dstem(source):
+                    # Raw HDF5 paths contain slashes and are not Zarr metadata
+                    # keys. Keep normalized acquisition and correction fields.
+                    names = (
+                        "scan_shape", "detector_shape", "dwell_time_us",
+                        "detector_name", "scan_rotation_deg", "source_dtype",
+                        "working_dtype", "representation", "hot_pixel_correction",
+                    )
+                    metadata = {key: metadata[key] for key in names if key in metadata}
                 image.metadata.update(metadata)
     correction.scan_direction_degrees = ensure_valid_array(
         scan_direction_degrees, ndim=1
@@ -96,7 +111,7 @@ def prepare_inputs(
             )
 
     arrays = [input_array(dataset) for dataset in datasets]
-    dimensions = [array.ndim for array in arrays]
+    dimensions = [len(array.shape) for array in arrays]
     for index, ndim in enumerate(dimensions):
         if ndim < 2:
             raise TypeError(f"dataset {index} must be ≥2-D, got ndim={ndim}")

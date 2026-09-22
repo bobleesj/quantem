@@ -218,7 +218,10 @@ class DriftCorrection(AutoSerialize):
         ----------
         *datasets
             Two 4D-STEM datasets with leading scan axes
-            ``(scan_row, scan_col, det_row, det_col)``.
+            ``(scan_row, scan_col, det_row, det_col)``. Pass results from
+            ``quantem.gpu.io.load`` directly. Their ANS representation remains
+            resident; detector reductions and bounded reads decode as needed.
+            NumPy arrays and Torch tensors are also accepted.
         scan_direction_degrees : sequence of float, default (0.0, 90.0)
             Scan direction per dataset in degrees.
         scan_sampling : float or 2-tuple of float, optional
@@ -236,14 +239,14 @@ class DriftCorrection(AutoSerialize):
 
         Examples
         --------
-        >>> from quantem.gpu.device import profile
-        >>> device = profile()["device"]  # or "cpu"
+        >>> from quantem.gpu.io import load
+        >>> data_0 = load("scan_0.h5")
+        >>> data_1 = load("scan_90.h5")
         >>> dc = DriftCorrection.from_4dstem(
         ...     data_0, data_1,
         ...     scan_direction_degrees=(0.0, 90.0),
         ...     scan_sampling=0.05,
         ...     scan_units="nm",
-        ...     device=device,
         ... )
         >>> dc.correct_affine(show_combined=False, verbose=False)
         >>> result = dc.corrected_4dstem(merge=True, verbose=True)

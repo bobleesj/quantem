@@ -10,6 +10,7 @@ from quantem.imaging.drift.apply import (
     apply_correction_to_dataset,
     crop_slices,
     padding_offset,
+    is_loaded_4dstem,
 )
 from quantem.imaging.drift.core import knots as drift_knots
 
@@ -545,10 +546,16 @@ def regional_diffraction_patterns(
                     row_start:row_stop,
                     column_start:column_stop,
                 ]
-                block = dataset[
-                    int(row_start):int(row_stop),
-                    int(column_start):int(column_stop),
-                ]
+                if is_loaded_4dstem(dataset):
+                    block = dataset.read(scan_region=(
+                        int(row_start), int(row_stop),
+                        int(column_start), int(column_stop),
+                    ))
+                else:
+                    block = dataset[
+                        int(row_start):int(row_stop),
+                        int(column_start):int(column_stop),
+                    ]
                 if isinstance(block, torch.Tensor):
                     # CUDA cannot boolean-index uint16 tensors. Convert only
                     # this small region, never the full diffraction cube.
@@ -587,6 +594,20 @@ def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
     The returned stages share image 0's scan frame and the solved crop.
     """
     def detector_bin(cube):
+        if is_loaded_4dstem(cube):
+            # Decode scan rows into the requested display resolution.
+            rows, columns, detector_rows, detector_columns = cube.shape
+            result = None
+            for row in range(rows):
+                block = cube.read(scan_region=(row, row + 1, 0, columns))
+                binned = detector_bin(block)
+                if result is None:
+                    result = torch.empty(
+                        rows, columns, *binned.shape[2:],
+                        dtype=binned.dtype, device=binned.device,
+                    )
+                result[row:row + 1] = binned
+            return result
         if det_bin == 1:
             return cube
         detector_rows, detector_columns = cube.shape[-2:]
