@@ -30,15 +30,6 @@ def is_loaded_4dstem(value) -> bool:
     return isinstance(value, FourDSTEMData)
 
 
-def _read_detector_channels(data, start: int, end: int) -> torch.Tensor:
-    """Read bounded detector rows spanning a flattened channel interval."""
-    width = data.shape[-1]
-    row_start, column_start = divmod(start, width)
-    row_stop = (end + width - 1) // width
-    block = data.read(detector_region=(row_start, row_stop, 0, width))
-    return block.flatten(2)[..., column_start:column_start + end - start]
-
-
 def dataset_info(dataset) -> dict[str, object]:
     """Copy the calibration and metadata needed for corrected output."""
     if not hasattr(dataset, "array"):
@@ -521,10 +512,6 @@ def apply_correction_to_dataset(
         else:
             chunk_size = min(n_channels, 64)
 
-    if is_loaded:
-        # Bound decoded working data even when the dense output fits in memory.
-        chunk_size = min(chunk_size, ds_4d.shape[-1])
-
     # ── Allocate output ──
     if use_external_output:
         out_flat = output.reshape(scan_h, scan_w, n_channels)
@@ -549,7 +536,7 @@ def apply_correction_to_dataset(
     for start in chunks:
         end = min(start + chunk_size, n_channels)
         channels = (
-            _read_detector_channels(ds_4d, start, end)
+            ds_4d.read(detector_pixels=slice(start, end))
             if is_loaded else flat[:, :, start:end]
         )
         warped = F.grid_sample(

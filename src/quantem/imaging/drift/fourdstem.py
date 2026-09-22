@@ -595,19 +595,7 @@ def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
     """
     def detector_bin(cube):
         if is_loaded_4dstem(cube):
-            # Decode scan rows into the requested display resolution.
-            rows, columns, detector_rows, detector_columns = cube.shape
-            result = None
-            for row in range(rows):
-                block = cube.read(scan_region=(row, row + 1, 0, columns))
-                binned = detector_bin(block)
-                if result is None:
-                    result = torch.empty(
-                        rows, columns, *binned.shape[2:],
-                        dtype=binned.dtype, device=binned.device,
-                    )
-                result[row:row + 1] = binned
-            return result
+            return cube.read(detector_bin=det_bin)
         if det_bin == 1:
             return cube
         detector_rows, detector_columns = cube.shape[-2:]
