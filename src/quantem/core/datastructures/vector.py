@@ -39,17 +39,27 @@ _SAFE_ELEMENTWISE_TORCH_FUNCTIONS = frozenset(
     if hasattr(torch, name)
 )
 
+# Tensor methods dispatched by operators such as ``tensor + vector``. Treating
+# them as elementwise makes ``tensor + vector`` return a Vector, matching
+# ``vector + tensor``.
+_SAFE_ELEMENTWISE_TORCH_FUNCTIONS |= frozenset(
+    getattr(torch.Tensor, name)
+    for name in """
+        add sub mul div remainder __pow__ __floordiv__
+        __radd__ __rsub__ __rmul__ __rtruediv__ __rfloordiv__ __rmod__ __rpow__
+    """.split()
+    if hasattr(torch.Tensor, name)
+)
+
 
 class Vector(AutoSerialize):
     """Ragged cell data on a fixed grid, backed by torch.
 
-    A ``Vector`` has two independent axes of structure:
-    - fixed-grid dimensions given by ``shape``
-    - ragged rows stored inside each fixed-grid cell
-
-    Each ragged row has one value per named field, so each cell behaves like a
-    small 2D tensor with shape ``(n_rows, num_fields)``, where ``n_rows`` may
-    vary from cell to cell.
+    A ``Vector`` stores a variable number of rows in each cell of a fixed grid
+    with dimensions ``shape``, such as the Bragg peaks measured at each probe
+    position of a 4D-STEM scan. Each row has one value per named field, so each
+    cell is a 2D tensor with shape ``(n_rows, num_fields)``, where ``n_rows``
+    can vary from cell to cell.
 
     Parameters
     ----------
@@ -71,32 +81,25 @@ class Vector(AutoSerialize):
 
     Notes
     -----
-    This class is torch-native: ``tensor``, ``flatten()`` and every arithmetic
-    result are ``torch.Tensor`` values living on ``device``. NumPy arrays,
-    Python sequences and scalars are accepted as *input* anywhere a payload is
-    taken and converted at the boundary; call ``numpy()`` to get NumPy back.
+    ``tensor``, ``flatten()`` and all arithmetic results are ``torch.Tensor``
+    values on ``device``. NumPy arrays, Python sequences and scalars are
+    accepted as inputs and converted to tensors, and ``numpy()`` returns a
+    NumPy copy of the flattened rows.
 
-    The public API keeps fixed-grid indexing and field selection separate:
-    - use ``[]`` for fixed-grid indexing
-    - use ``select_fields(...)`` for field selection
+    Fixed-grid indexing uses ``[]`` and always returns a ``Vector``, while
+    field selection uses ``select_fields(...)``. A 0D selection exposes its
+    cell through ``.tensor``, and ``flatten()`` concatenates the rows of a
+    multi-cell selection.
 
-    Fixed-grid indexing always returns a ``Vector``. A 0D selection exposes its
-    underlying cell tensor through ``.tensor``. Multi-cell selections can be
-    concatenated with ``flatten()``.
+    All rows are stored in a single 2D tensor ``_state["data"]``, with the
+    start offset and row count of each cell in ``_state["cell_starts"]`` and
+    ``_state["cell_lengths"]``. These offsets stay on the CPU when the row
+    buffer is on a GPU, because they are read one scalar at a time and a GPU
+    copy would synchronize on every cell access.
 
-    The internal representation is compact:
-    - ``_state["data"]`` stores all ragged rows in one numeric 2D tensor
-    - ``_state["cell_starts"]`` stores the start offset for each cell
-    - ``_state["cell_lengths"]`` stores the row count for each cell
-
-    The offset bookkeeping is deliberately kept on the CPU even when the row
-    buffer lives on a GPU: it is read one scalar at a time, so keeping it on
-    the device would force a synchronization on every cell access.
-
-    A ``Vector`` selection is a write-through view over shared storage. Views
-    track only the selected fixed-grid shape, selected cell indices, and selected
-    field names. Because ``_state`` is shared, ``to(device)`` moves every view
-    of the same Vector.
+    Selections are write-through views of the shared storage, and store only
+    their fixed-grid shape, cell indices and field names. Because the storage
+    is shared, ``to(device)`` moves every view of the same Vector.
 
     Examples
     --------
@@ -206,7 +209,33 @@ class Vector(AutoSerialize):
         dtype: torch.dtype | None = None,
         device: str | int | torch.device | None = None,
     ) -> "Vector":
-        """Create an empty Vector with the given fixed-grid shape and fields."""
+        """Create a Vector with zero rows in every cell.
+
+        Parameters
+        ----------
+        shape : tuple of int
+            Fixed-grid shape. Zero-length axes are allowed.
+        num_fields : int, optional
+            Number of fields, named ``field_0``, ``field_1``, ... when ``fields``
+            is not given.
+        fields : sequence of str, optional
+            Field names in column order. One of ``fields`` or ``num_fields`` is
+            required.
+        units : sequence of str, optional
+            Units of each field. Defaults to ``"none"``.
+        name : str, optional
+            Descriptive name.
+        metadata : dict, optional
+            Additional user metadata.
+        dtype : torch.dtype, optional
+            Row-buffer dtype. Defaults to ``torch.float32``.
+        device : str, int or torch.device, optional
+            Row-buffer device. Defaults to ``"cpu"``.
+
+        Returns
+        -------
+        Vector
+        """
         fields = _resolve_fields(fields, num_fields, None)
         return cls(
             shape=shape,
@@ -233,19 +262,49 @@ class Vector(AutoSerialize):
     ) -> "Vector":
         """Create a Vector from nested fixed-grid data.
 
-        The outer nesting defines the fixed-grid shape. Each leaf must coerce to a
-        2D cell tensor with consistent field count across all cells. Leaves may be
-        tensors, NumPy arrays or nested sequences; they are cast to ``dtype``
-        (``torch.float32`` by default), so pass ``dtype=torch.float64`` to keep
-        double precision.
+        The nesting depth of ``data`` sets the fixed-grid shape, and each leaf is
+        one cell. Leaves can be tensors, NumPy arrays or nested sequences with
+        shape ``(n_rows, num_fields)``, and an empty list ``[]`` gives a cell
+        with zero rows. All leaves are cast to ``dtype``.
+
+        Parameters
+        ----------
+        data : list or tuple
+            Nested fixed-grid data, e.g. ``data[i][j]`` is the cell at ``(i, j)``.
+        num_fields : int, optional
+            Number of fields, checked against the data when given.
+        fields : sequence of str, optional
+            Field names in column order. Required when every cell is empty.
+        units : sequence of str, optional
+            Units of each field. Defaults to ``"none"``.
+        name : str, optional
+            Descriptive name.
+        metadata : dict, optional
+            Additional user metadata.
+        dtype : torch.dtype, optional
+            Row-buffer dtype. Defaults to ``torch.float32``, so pass
+            ``torch.float64`` to keep double-precision input.
+        device : str, int or torch.device, optional
+            Row-buffer device. Defaults to ``"cpu"``.
+
+        Returns
+        -------
+        Vector
         """
         if not isinstance(data, (list, tuple)):
             raise TypeError(f"Data must be a list or tuple, got {type(data)}")
         root_shape, cell_arrays = _flatten_fixed_grid(data) if len(data) > 0 else ((0,), [])
-        inferred_counts = {array.shape[1] for array in cell_arrays}
+        # An empty list ([]) carries no field count, so it is skipped here and
+        # padded to (0, num_fields) on assignment.
+        inferred_counts = {array.shape[1] for array in cell_arrays if array.shape != (0, 0)}
         if len(inferred_counts) > 1:
             raise ValueError("All cell arrays must have the same number of fields.")
-        inferred_fields = cell_arrays[0].shape[1] if cell_arrays else 0
+        if inferred_counts:
+            inferred_fields: int | None = inferred_counts.pop()
+        elif fields is None and num_fields is None:
+            inferred_fields = 0
+        else:
+            inferred_fields = None
 
         vector = cls(
             shape=root_shape,
@@ -333,25 +392,30 @@ class Vector(AutoSerialize):
 
     @property
     def tensor(self) -> torch.Tensor:
-        """Return the selected cell as a torch tensor.
+        """Rows of a single selected cell, with shape ``(n_rows, num_fields)``.
 
-        Unlike ``Dataset.tensor``, which is the whole payload, this is *one
-        cell*: it is only valid for 0D selections and raises otherwise. Use
-        :meth:`flatten` to get every row of a multi-cell selection.
+        This property is only defined for 0D selections such as ``v[i, j]``,
+        which differs from ``Dataset.tensor`` (the full array). Use
+        :meth:`flatten` for the rows of a multi-cell selection.
 
-        Contiguous field selections return writable views into the backing
-        storage. Reordered or non-contiguous selections return a copy, because
-        torch cannot expose a writable column-subset view for that layout.
+        When the selected fields are contiguous and in storage order, the
+        result is a writable view of the backing storage. Reordered or
+        non-contiguous field selections return a copy, so writes to it do not
+        reach the Vector; use ``v[i, j] = ...`` or :meth:`set_flattened` instead.
         """
         if self.shape != ():
             raise ValueError(".tensor is only valid when the selection contains exactly one cell.")
         return self._selected_cell_matrix(int(self._selected_cell_indices()[0]))
 
     def flatten(self) -> torch.Tensor:
-        """Concatenate selected cells in row-major order.
+        """Concatenate the rows of all selected cells in row-major cell order.
 
-        Returns a 2D tensor with shape ``(total_rows, num_fields)`` even for
-        single-field selections.
+        Returns
+        -------
+        torch.Tensor
+            Copy of the selected rows with shape ``(total_rows, num_fields)``,
+            which stays 2D for single-field selections. Use :meth:`set_flattened`
+            to write modified rows back.
         """
         data = self._state["data"]
         gather = self._row_gather_index(self._selected_cell_indices())
@@ -360,13 +424,12 @@ class Vector(AutoSerialize):
         return _select_columns(data.index_select(0, gather.to(data.device)), self._field_indices())
 
     def numpy(self) -> NDArray[Any]:
-        """Return the flattened selection as a NumPy array.
+        """Return :meth:`flatten` as a read-only NumPy array on the CPU.
 
-        This is the NumPy counterpart of :meth:`flatten`, **not** of
-        :attr:`tensor` -- it covers the whole selection, not one cell. The
-        result is a detached CPU copy, and like ``Dataset.numpy()`` it is marked
-        read-only so accidental in-place writes raise instead of silently going
-        nowhere; use :meth:`set_flattened` to write values back.
+        The result covers every selected cell, unlike :attr:`tensor`. As for
+        ``Dataset.numpy()``, the array is read-only so that in-place edits raise
+        an error rather than modifying a copy. Use ``numpy().copy()`` for a
+        writable array, and :meth:`set_flattened` to write values back.
         """
         array = self.flatten().detach().cpu().numpy()
         array.flags.writeable = False
@@ -377,15 +440,12 @@ class Vector(AutoSerialize):
         return self._selected_cell_lengths().tolist()
 
     def to(self, device: str | int | torch.device) -> "Vector":
-        """Move the backing row buffer to ``device`` and return ``self``.
+        """Move the row buffer to ``device`` in place and return ``self``.
 
-        ``device`` is normalized via :func:`quantem.core.config.validate_device`
-        so ``"cuda"``, ``0``, ``"cuda:0"`` and ``torch.device("cuda:0")`` all
-        resolve to the same canonical device.
-
-        Because all views share one ``_state``, this moves every view of the same
-        Vector, not just this one. The offset bookkeeping stays on the CPU by
-        design.
+        ``device`` is normalized with :func:`quantem.core.config.validate_device`,
+        so ``"cuda"``, ``0``, ``"cuda:0"`` and ``torch.device("cuda:0")`` give the
+        same device. All views share the same storage, so this moves every view
+        of the Vector. The cell offsets stay on the CPU.
         """
         self._state["data"] = self._state["data"].to(_resolve_device(device))
         return self
@@ -395,12 +455,10 @@ class Vector(AutoSerialize):
     # ------------------------------------------------------------------ #
 
     def select_fields(self, *field_names: str | Sequence[str]) -> "Vector":
-        """Return a view containing only the requested fields.
+        """Return a write-through view of the requested fields, in the requested order.
 
-        Accepted forms:
-        - ``select_fields("kx")``
-        - ``select_fields("kx", "ky")``
-        - ``select_fields(["kx", "ky"])``
+        Fields can be given as separate arguments, ``select_fields("kx", "ky")``,
+        or as one sequence, ``select_fields(["kx", "ky"])``.
         """
         if not field_names:
             raise ValueError("At least one field name is required.")
@@ -431,7 +489,22 @@ class Vector(AutoSerialize):
         values: Any | None = None,
         units: str | Sequence[str] | None = None,
     ) -> None:
-        """Add one or more new fields to the full Vector schema."""
+        """Add fields to the Vector in place.
+
+        New columns are filled with NaN, so an integer row buffer is promoted to
+        ``torch.float32``. This method requires a view with all fields selected.
+
+        Parameters
+        ----------
+        names : str or sequence of str
+            Names of the new fields.
+        values : Vector, tensor, array, scalar or sequence, optional
+            Initial values, broadcast to ``(total_rows, len(names))``. When
+            several fields are added, a sequence with one entry per field sets
+            each field separately.
+        units : str or sequence of str, optional
+            Units of the new fields. Defaults to ``"none"``.
+        """
         self._require_full_field_view("add_fields")
         new_fields = _normalize_field_names(names)
         if any(field in self._state["fields"] for field in new_fields):
@@ -485,7 +558,11 @@ class Vector(AutoSerialize):
             self._selected_fields = tuple(rename.get(f, f) for f in self._selected_fields)
 
     def remove_fields(self, names: str | Sequence[str]) -> None:
-        """Remove one or more fields from the full Vector schema."""
+        """Remove fields from the Vector in place.
+
+        This method requires a view with all fields selected, and at least one
+        field must remain.
+        """
         self._require_full_field_view("remove_fields")
         to_remove = set(_normalize_field_names(names))
         old_fields = self._state["fields"]
@@ -514,11 +591,16 @@ class Vector(AutoSerialize):
     # ------------------------------------------------------------------ #
 
     def append_rows(self, idx: Any, rows: Any) -> None:
-        """Append one or more rows to a single selected cell.
+        """Append rows to one cell.
 
-        ``idx`` is interpreted with the same fixed-grid indexing rules as
-        ``__getitem__`` and must resolve to exactly one cell. Appending rows is a
-        full-cell operation, so all fields must be selected.
+        Parameters
+        ----------
+        idx : int, tuple or index
+            Fixed-grid index, using the same rules as ``v[idx]``, which must
+            select exactly one cell.
+        rows : tensor, array or sequence
+            New rows with shape ``(n_rows, num_fields)``, or ``(num_fields,)``
+            for a single row. All fields must be selected.
         """
         target = self[idx]
         if target.shape != ():
@@ -534,17 +616,18 @@ class Vector(AutoSerialize):
         target._replace_cells(torch.tensor([cell_index], dtype=torch.int64), [combined])
 
     def set_flattened(self, values: Any) -> None:
-        """Write values back in flattened row-major order.
+        """Overwrite the selected rows and fields, in the order given by :meth:`flatten`.
 
-        This updates existing rows without changing per-cell row counts. It is
-        the rowwise companion to ``flatten()`` and is especially useful for
-        tensor-based transforms that operate on all selected rows at once.
+        The per-cell row counts do not change. The typical use is a transform
+        applied to all rows at once, ``v.set_flattened(f(v.flatten()))``.
+
+        Parameters
+        ----------
+        values : Vector, tensor, array or scalar
+            New values, broadcast to shape ``(total_rows, num_fields)``.
         """
         self._require_unique_cell_targets("set_flattened")
-        field_indices = self._field_indices()
-        targets = self._selected_cell_indices().tolist()
-        row_counts = self.row_counts()
-        total_rows = sum(row_counts)
+        total_rows = self.total_rows
 
         if isinstance(values, Vector):
             if values.num_fields != self.num_fields:
@@ -556,12 +639,7 @@ class Vector(AutoSerialize):
         else:
             flat_values = self._broadcast_values(values, total_rows, self.num_fields)
 
-        cursor = 0
-        for target, rows in zip(targets, row_counts):
-            cell = self._cell_matrix(int(target))
-            if rows > 0:
-                cell[:, field_indices] = flat_values[cursor : cursor + rows]
-            cursor += rows
+        self._write_selected_rows(flat_values)
 
     def compact(self) -> None:
         """Repack the backing row buffer to remove dead rows.
@@ -651,25 +729,18 @@ class Vector(AutoSerialize):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Apply torch functions over the ragged rows.
+        """Apply torch functions to the flattened rows of Vector arguments.
 
-        Every ``Vector`` argument is replaced by its flattened rows and ``func``
-        is applied to those tensors. The result is rebuilt into a ``Vector``
-        -- preserving the selection shape and fields -- only when both hold:
+        Each ``Vector`` argument is replaced by ``flatten()`` before calling
+        ``func``. The result is returned as a ``Vector`` with the same shape and
+        fields when ``func`` is in :data:`_SAFE_ELEMENTWISE_TORCH_FUNCTIONS` and
+        the result has shape ``(total_rows, num_fields)``. All other results,
+        including reductions (``torch.sum``), predicates (``torch.allclose``) and
+        shape-changing functions (``torch.t``), are returned as plain tensors.
 
-        - ``func`` is in :data:`_SAFE_ELEMENTWISE_TORCH_FUNCTIONS`, i.e. it maps
-          each row to a row and so keeps the ragged structure meaningful
-        - the result is a tensor shaped ``(total_rows, num_fields)``
-
-        Anything else is returned exactly as torch produced it. That covers
-        reductions (``torch.sum``), predicates (``torch.allclose``), and
-        shape-changing ops (``torch.t``) -- all of which still *work*, they just
-        hand back plain tensors rather than Vectors.
-
-        The allowlist is what makes this safe: shape alone is not a reliable
-        test, since ``torch.t`` on a Vector whose row and field counts happen to
-        be equal returns a same-shaped tensor that would otherwise be rewrapped
-        with its rows silently permuted.
+        The allowlist is required because the shape test alone is ambiguous:
+        ``torch.t`` applied to a Vector with equal row and field counts returns a
+        tensor of the same shape, with the rows permuted.
         """
         kwargs = {} if kwargs is None else kwargs
         if kwargs.get("out") is not None:
@@ -803,17 +874,14 @@ class Vector(AutoSerialize):
     def to_polars(self, dim_names: Sequence[str] | None = None) -> "pl.DataFrame":
         """Export the current selection to a polars DataFrame.
 
-        Every ragged row becomes one DataFrame row. The fixed-grid location of
-        that row is carried in leading integer columns -- one per fixed-grid
-        dimension -- followed by one column per selected field.
+        Each row of the Vector becomes one DataFrame row. The leading integer
+        columns give the fixed-grid index of the row's cell, one column per grid
+        dimension, followed by one column per selected field. Grid indices refer
+        to the full Vector rather than the selection, so a row from ``v[1, :]``
+        has ``dim_0 == 1``, and ``v[1].select_fields("kx").to_polars()`` returns
+        only the ``kx`` values of the cells in ``v[1]``.
 
-        Grid coordinates are always reported in the *root* grid, not the
-        selection's local coordinates, so a view such as ``v[1, :]`` still
-        reports ``dim_0 == 1``. Both fixed-grid indexing and ``select_fields``
-        are honored, so ``v[1].select_fields("kx").to_polars()`` returns only
-        the ``kx`` rows belonging to cell 1.
-
-        Requires polars, which is an optional dependency:
+        Requires the optional dependency polars, installed with
         ``pip install "quantem[dataframe]"``.
 
         Parameters
@@ -899,19 +967,16 @@ class Vector(AutoSerialize):
         Skipped attribute names and types are also stored in the file metadata for correct
         round-trip skipping during load().
 
-        The row buffer and offset arrays are written as NumPy arrays rather than as
-        torch tensors, so they land in chunked, compressed Zarr arrays instead of
-        uncompressed ``torch.save`` blobs. :meth:`_post_load` converts them back to
-        CPU tensors on load, which also makes a GPU-saved Vector loadable without CUDA.
-
-        Note this only applies when the Vector is the *root* of the save.
-        ``AutoSerialize`` walks nested objects with ``_recursive_save`` rather than
-        calling their ``save()``, so a Vector held as an attribute of another
-        serializable object still round-trips correctly but writes its buffers as
-        uncompressed blobs. Fixing that properly means teaching
-        ``AutoSerialize._serialize_value`` to store plain non-grad tensors as Zarr
-        arrays, at which point this whole override collapses to ``compact()``.
+        The row buffer and cell offsets are written as compressed Zarr arrays,
+        and are loaded as CPU tensors, so a Vector saved from a GPU can be loaded
+        without CUDA. A Vector saved as an attribute of another object is
+        written by that object's ``save()``, and its buffers are stored
+        uncompressed.
         """
+        # Nested Vectors go through AutoSerialize._recursive_save, not this
+        # method. Storing plain non-grad tensors as Zarr arrays in
+        # AutoSerialize._serialize_value would fix that, and reduce this
+        # override to compact().
         self.compact()
         buffer_keys = ("data", "cell_starts", "cell_lengths")
         saved_state = {key: self._state[key] for key in buffer_keys}
@@ -1039,6 +1104,24 @@ class Vector(AutoSerialize):
         data = self._state["data"]
         return tensor.to(dtype=data.dtype, device=data.device)
 
+    def _write_selected_rows(self, values: torch.Tensor) -> None:
+        """Write a ``(total_rows, num_fields)`` block into the selected rows and fields.
+
+        This is the scatter counterpart of :meth:`flatten`: every selected row is
+        written with one ``index_put_``, so the cost does not scale with the cell
+        count. Values that cannot be cast to the buffer dtype without changing
+        kind (e.g. float into an integer buffer) raise, matching torch in-place
+        semantics.
+        """
+        data = self._state["data"]
+        rows = self._row_gather_index(self._selected_cell_indices()).to(data.device)
+        if rows.numel() == 0:
+            return
+        if not torch.can_cast(values.dtype, data.dtype):
+            raise TypeError(f"Cannot write {values.dtype} values into a {data.dtype} Vector.")
+        cols = torch.tensor(self._field_indices(), dtype=torch.int64, device=data.device)
+        data[rows[:, None], cols[None, :]] = values.to(dtype=data.dtype, device=data.device)
+
     def _coerce_cell(self, value: Any, num_fields: int) -> torch.Tensor:
         """Normalize a single-cell payload onto this Vector's dtype/device."""
         data = self._state["data"]
@@ -1081,7 +1164,7 @@ class Vector(AutoSerialize):
         data = self._state["data"]
         # Promote to a float dtype first: torch.full(..., nan) rejects integer dtypes.
         # This is a "smallest float that holds NaN" rule, independent of the
-        # new-Vector default in DEFAULT_DTYPE -- keep them separate.
+        # new-Vector default in DEFAULT_DTYPE.
         dtype = torch.promote_types(data.dtype, torch.float32)
         filler = torch.full(
             (data.shape[0], num_new_fields), float("nan"), dtype=dtype, device=data.device
@@ -1138,46 +1221,23 @@ class Vector(AutoSerialize):
         preserved, so each target cell keeps its existing row count and only the
         selected columns are overwritten.
         """
-        targets = self._selected_cell_indices().tolist()
-        field_indices = self._field_indices()
         row_counts = self.row_counts()
-        total_rows = sum(row_counts)
 
         if isinstance(value, Vector):
-            source_cells = value._selected_cell_indices().tolist()
-            if len(targets) != len(source_cells):
-                raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
+            if value.num_cells != self.num_cells:
+                raise ValueError(f"Expected {self.num_cells} cells, got {value.num_cells}")
             if value.num_fields != self.num_fields:
                 raise ValueError(f"Expected {self.num_fields} fields, got {value.num_fields}")
-            source_counts = value.row_counts()
-            if row_counts != source_counts:
+            if value.row_counts() != row_counts:
                 raise ValueError("Per-cell row counts must match for field-selected assignment.")
-            snapshots = [
-                self._to_buffer(value._selected_cell_matrix(index)).clone()
-                for index in source_cells
-            ]
-            for target, array in zip(targets, snapshots):
-                cell = self._cell_matrix(int(target))
-                if array.shape[0] > 0:
-                    cell[:, field_indices] = array
+            # flatten() gathers into a new tensor, so overlapping source and
+            # target selections are read before anything is written.
+            self._write_selected_rows(self._to_buffer(value.flatten()))
             return
 
-        if _is_scalar(value):
-            scalar = _scalar_value(value)
-            for target in targets:
-                cell = self._cell_matrix(int(target))
-                if cell.shape[0] > 0:
-                    cell[:, field_indices] = scalar
-            return
-
-        broadcast = self._broadcast_values(value, total_rows, self.num_fields)
-        cursor = 0
-        for target, rows in zip(targets, row_counts):
-            chunk = broadcast[cursor : cursor + rows]
-            cell = self._cell_matrix(int(target))
-            if rows > 0:
-                cell[:, field_indices] = chunk
-            cursor += rows
+        self._write_selected_rows(
+            self._broadcast_values(_scalar_value(value), sum(row_counts), self.num_fields)
+        )
 
     # ------------------------------------------------------------------ #
     # Private helpers — arithmetic
@@ -1213,59 +1273,28 @@ class Vector(AutoSerialize):
     def _inplace_unary(self, op: Any) -> None:
         """Apply a unary elementwise operation in-place to the selected fields."""
         self._require_unique_cell_targets("In-place arithmetic")
-        targets = self._selected_cell_indices().tolist()
-        field_indices = self._field_indices()
-        for target in targets:
-            cell = self._cell_matrix(int(target))
-            lhs = cell[:, field_indices]
-            if lhs.shape[0] > 0:
-                cell[:, field_indices] = op(lhs)
+        self._write_selected_rows(op(self.flatten()))
 
     def _inplace_op(self, other: Any, op: Any, reverse: bool = False) -> None:
         """Apply elementwise arithmetic in-place to the selected fields."""
         self._require_unique_cell_targets("In-place arithmetic")
-        targets = self._selected_cell_indices().tolist()
-        field_indices = self._field_indices()
         row_counts = self.row_counts()
-        total_rows = sum(row_counts)
+        lhs = self.flatten()
 
         if isinstance(other, Vector):
-            source_cells = other._selected_cell_indices().tolist()
-            if len(targets) != len(source_cells):
-                raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
+            if other.num_cells != self.num_cells:
+                raise ValueError(f"Expected {self.num_cells} cells, got {other.num_cells}")
             if other.num_fields != self.num_fields:
                 raise ValueError(f"Expected {self.num_fields} fields, got {other.num_fields}")
-            source_counts = other.row_counts()
-            if row_counts != source_counts:
+            if other.row_counts() != row_counts:
                 raise ValueError("Per-cell row counts must match for Vector arithmetic.")
-            snapshots = [
-                self._to_buffer(other._selected_cell_matrix(index)).clone()
-                for index in source_cells
-            ]
-            for target, rhs in zip(targets, snapshots):
-                cell = self._cell_matrix(int(target))
-                lhs = cell[:, field_indices]
-                cell[:, field_indices] = op(rhs, lhs) if reverse else op(lhs, rhs)
-            return
+            rhs: Any = self._to_buffer(other.flatten())
+        elif _is_scalar(other):
+            rhs = _scalar_value(other)
+        else:
+            rhs = self._broadcast_values(other, sum(row_counts), self.num_fields)
 
-        if _is_scalar(other):
-            scalar = _scalar_value(other)
-            for target in targets:
-                cell = self._cell_matrix(int(target))
-                lhs = cell[:, field_indices]
-                if lhs.shape[0] > 0:
-                    cell[:, field_indices] = op(scalar, lhs) if reverse else op(lhs, scalar)
-            return
-
-        broadcast = self._broadcast_values(other, total_rows, self.num_fields)
-        cursor = 0
-        for target, rows in zip(targets, row_counts):
-            chunk = broadcast[cursor : cursor + rows]
-            cell = self._cell_matrix(int(target))
-            lhs = cell[:, field_indices]
-            if rows > 0:
-                cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
-            cursor += rows
+        self._write_selected_rows(op(rhs, lhs) if reverse else op(lhs, rhs))
 
     def _require_unique_cell_targets(self, operation: str) -> None:
         """Reject ambiguous write-through operations on repeated cell indices."""
@@ -1446,7 +1475,7 @@ def _coerce_cell_array(
 
     if array.ndim == 0:
         raise ValueError("Cell assignment requires a 2D array.")
-    if array.ndim == 1:
+    if array.ndim == 1 or array.shape == (0, 0):
         if array.numel() == 0:
             array = torch.empty((0, num_fields), dtype=dtype, device=device)
         elif num_fields == 1:
@@ -1493,12 +1522,16 @@ def _looks_like_cell_rows(node: Sequence[Any]) -> bool:
 
 
 def _is_row_like(item: Any) -> bool:
-    """Return True for a single row of scalar values."""
+    """Return True for a single row of scalar values.
+
+    An empty list is not a row, so ``[[], []]`` is read as two empty cells
+    rather than one cell with two zero-length rows.
+    """
     if isinstance(item, (np.ndarray, torch.Tensor)):
-        return item.ndim == 1
+        return item.ndim == 1 and item.shape[0] > 0
     if not isinstance(item, (list, tuple)):
         return False
-    return all(_is_scalar(value) for value in item)
+    return len(item) > 0 and all(_is_scalar(value) for value in item)
 
 
 def _coerce_inferred_cell_array(value: Any) -> torch.Tensor:
@@ -1671,9 +1704,9 @@ def _vector_from_rows(
 ) -> Vector:
     """Build a Vector from an already row-major block of rows.
 
-    ``rows`` is exactly the buffer the result needs, so it is adopted directly
-    and the offsets are derived from ``row_counts`` -- no per-cell split and
-    re-concatenation.
+    ``rows`` is used directly as the new row buffer and the offsets are
+    computed from ``row_counts``, which avoids splitting and re-concatenating
+    the cells.
     """
     source = _as_tensor(rows)
     result = Vector.from_shape(

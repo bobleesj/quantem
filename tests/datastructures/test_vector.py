@@ -162,6 +162,29 @@ class TestVector:
 
         assert_rows(kx.flatten(), [[10.0], [20.0], [-1.0], [-1.0], [-1.0], [-1.0]])
 
+    def test_set_flattened_follows_selection_order(self):
+        v = make_grid_vector()
+        view = v[[2, 0], 1].select_fields("ky", "intensity")
+        view.set_flattened(torch.tensor([[-1.0, -2.0], [-3.0, -4.0]]))
+        assert_rows(v[2, 1].tensor, [[-2.0, 121.0, -1.0]])
+        assert_rows(v[0, 1].tensor, [[-4.0, 101.0, -3.0]])
+
+    def test_inplace_ops_respect_buffer_dtype(self):
+        v = Vector.from_data([[[1, 2]], [[3, 4]]], fields=["a", "b"], dtype=torch.int64)
+        v += 1
+        assert_rows(v.flatten(), [[2, 3], [4, 5]])
+        with pytest.raises(TypeError, match="Cannot write"):
+            v /= 2
+
+    def test_tensor_operand_on_left_returns_vector(self):
+        v = make_line_vector().select_fields("kx")
+        offsets = torch.arange(6.0).reshape(6, 1)
+        left = offsets + v
+        assert isinstance(left, Vector)
+        torch.testing.assert_close(left.flatten(), (v + offsets).flatten())
+        assert isinstance(torch.tensor(100.0) - v, Vector)
+        assert_rows((torch.tensor(100.0) - v)[0].tensor, [[90.0], [80.0]])
+
     def test_field_arithmetic_with_scalar_and_array(self):
         v = make_line_vector()
 
@@ -588,6 +611,18 @@ class TestVector:
 
         with pytest.raises(ValueError, match="same number of fields"):
             Vector.from_data(data=[np.array([[1.0, 2.0]]), np.array([[1.0, 2.0, 3.0]])])
+
+    def test_from_data_accepts_empty_list_cells(self):
+        v = Vector.from_data([[[1.0, 2.0]], [], [[3.0, 4.0], [5.0, 6.0]]])
+        assert v.shape == (3,)
+        assert v.num_fields == 2
+        assert v.row_counts() == [1, 0, 2]
+        assert v[1].tensor.shape == (0, 2)
+
+        empty = Vector.from_data([[], []], fields=["a", "b"])
+        assert empty.shape == (2,)
+        assert empty.row_counts() == [0, 0]
+        assert empty.fields == ["a", "b"]
 
     def test_to_polars_line_vector(self):
         pytest.importorskip("polars")
