@@ -51,6 +51,11 @@ dependencies = [
   "em-database>=0.5",
 ]
 
+[project.optional-dependencies]
+dataframe = [
+    "polars>=1.0",
+]
+
 [tool.hatch.build.targets.sdist]
 # hatchling always includes:
 # pyproject.toml, .gitignore, any README, any LICENSE, AUTHORS
