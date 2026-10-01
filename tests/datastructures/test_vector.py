@@ -191,12 +191,24 @@ class TestVector:
         assert (v + [1.0, 2.0, 3.0]).dtype == torch.float32
         assert (v * torch.ones(3, dtype=torch.float64)).dtype == torch.float64
 
+        # Integer Vectors times float NumPy or list values must not truncate.
+        vi = Vector.from_data([[[1, 2]], [[3, 4]]], fields=["a", "b"], dtype=torch.int64)
+        assert_rows((vi * np.array([0.5, 0.5])).flatten(), [[0.5, 1.0], [1.5, 2.0]])
+        assert_rows((vi * [0.5, 0.5]).flatten(), [[0.5, 1.0], [1.5, 2.0]])
+
     def test_single_field_1d_operand_is_per_row_on_both_sides(self):
         kx = make_line_vector().select_fields("kx")
         x = torch.arange(6.0)
         assert isinstance(x + kx, Vector)
         torch.testing.assert_close((x + kx).flatten(), (kx + x).flatten())
         torch.testing.assert_close((x - kx).flatten(), -(kx - x).flatten())
+
+        # Non-elementwise functions keep their own meaning for 1D arguments.
+        idx = torch.tensor([5, 4, 3, 2, 1, 0])
+        assert_rows(
+            torch.index_select(kx, 0, idx), [[60.0], [50.0], [40.0], [30.0], [20.0], [10.0]]
+        )
+        assert torch.matmul(torch.ones(6), kx).tolist() == [210.0]
 
         # Multi-field Vectors keep torch broadcasting, one value per field.
         v = make_grid_vector()

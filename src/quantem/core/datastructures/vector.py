@@ -323,8 +323,9 @@ class Vector(AutoSerialize):
         if rows and all(isinstance(array, np.ndarray) for array in rows):
             vector._state["data"] = vector._to_buffer(_as_tensor(np.concatenate(rows)))
         elif rows:
-            vector._state["data"] = vector._to_buffer(
-                torch.cat([_as_tensor(array) for array in rows], dim=0)
+            # Cast each cell first, so tensors on different devices can be joined.
+            vector._state["data"] = torch.cat(
+                [vector._to_buffer(_as_tensor(array)) for array in rows], dim=0
             )
         vector._state["cell_lengths"] = lengths
         vector._state["cell_starts"] = torch.cumsum(lengths, 0) - lengths
@@ -792,8 +793,14 @@ class Vector(AutoSerialize):
             if other.row_counts() != row_counts:
                 raise ValueError("Vector inputs must have matching per-cell row counts.")
 
-        # Single-field Vectors read a 1D tensor as one value per row, as in v + x.
-        per_row = sum(row_counts) if template.num_fields == 1 else None
+        # For elementwise functions on single-field Vectors, a 1D tensor is one
+        # value per row, as in v + x. Other functions (e.g. index_select) keep
+        # their own meaning for 1D arguments.
+        per_row = (
+            sum(row_counts)
+            if template.num_fields == 1 and func in _SAFE_ELEMENTWISE_TORCH_FUNCTIONS
+            else None
+        )
         flat_args = tuple(_flatten_torch_input(value, per_row) for value in args)
         flat_kwargs = {key: _flatten_torch_input(value, per_row) for key, value in kwargs.items()}
         result = func(*flat_args, **flat_kwargs)
@@ -1277,11 +1284,17 @@ class Vector(AutoSerialize):
         elif _is_scalar(other):
             rhs = _scalar_value(other)
         else:
+            if not isinstance(other, torch.Tensor):
+                # NumPy and list operands promote like Python scalars: float64
+                # input keeps a float32 Vector float32, while an integer Vector
+                # times float values still gives a float result.
+                other = _as_tensor(other)
+                other = other.to(torch.result_type(lhs, torch.zeros((), dtype=other.dtype)))
             rhs = _broadcast_field_values(
                 other,
                 sum(row_counts),
                 self.num_fields,
-                dtype=None if isinstance(other, torch.Tensor) else lhs.dtype,
+                dtype=None,
                 device=lhs.device,
             )
 
