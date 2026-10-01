@@ -185,6 +185,39 @@ class TestVector:
         assert isinstance(torch.tensor(100.0) - v, Vector)
         assert_rows((torch.tensor(100.0) - v)[0].tensor, [[90.0], [80.0]])
 
+    def test_numpy_operands_keep_vector_dtype(self):
+        v = make_line_vector()
+        assert (v * np.ones(3)).dtype == torch.float32
+        assert (v + [1.0, 2.0, 3.0]).dtype == torch.float32
+        assert (v * torch.ones(3, dtype=torch.float64)).dtype == torch.float64
+
+    def test_single_field_1d_operand_is_per_row_on_both_sides(self):
+        kx = make_line_vector().select_fields("kx")
+        x = torch.arange(6.0)
+        assert isinstance(x + kx, Vector)
+        torch.testing.assert_close((x + kx).flatten(), (kx + x).flatten())
+        torch.testing.assert_close((x - kx).flatten(), -(kx - x).flatten())
+
+        # Multi-field Vectors keep torch broadcasting, one value per field.
+        v = make_grid_vector()
+        y = torch.arange(3.0)
+        torch.testing.assert_close((y + v).flatten(), (v + y).flatten())
+
+    def test_integer_indexing_fast_path(self):
+        v = make_grid_vector()
+        torch.testing.assert_close(v[-1, -1].tensor, v[2, 1].tensor)
+        torch.testing.assert_close(v[np.int64(1), 0].tensor, v[1][0].tensor)
+        assert v[2, 1].shape == ()
+        with pytest.raises(IndexError, match="out of range"):
+            v[3, 0]
+        with pytest.raises(IndexError, match="out of range"):
+            v[0, -3]
+
+        # Fast-path views must not share memory with the cached cell index range.
+        cell = v[1, 1]
+        cell._selection_indices[0] = 0
+        assert v[1, 1].tensor[0, 0] == 11.0
+
     def test_field_arithmetic_with_scalar_and_array(self):
         v = make_line_vector()
 
@@ -533,6 +566,14 @@ class TestVector:
         with pytest.raises(ValueError, match="already exist"):
             v.rename_fields({"px": "intensity"})
 
+    def test_rename_fields_leaves_older_views_stale(self):
+        # Documented limitation: update this test if views start tracking renames.
+        v = make_line_vector()
+        kx = v.select_fields("kx")
+        v.rename_fields({"kx": "qx"})
+        with pytest.raises(KeyError, match="Unknown field"):
+            kx.flatten()
+
     def test_remove_fields_preserves_remaining_data(self):
         v = make_line_vector()
         v.add_fields("extra", 1.0)
@@ -623,6 +664,19 @@ class TestVector:
         assert empty.shape == (2,)
         assert empty.row_counts() == [0, 0]
         assert empty.fields == ["a", "b"]
+
+    def test_from_data_mixed_leaf_types(self):
+        data = [
+            [np.array([[1.0, 2.0], [3.0, 4.0]]), []],
+            [torch.tensor([[5.0, 6.0]]), [[7.0, 8.0]]],
+        ]
+        v = Vector.from_data(data, fields=["a", "b"])
+        assert v.row_counts() == [2, 0, 1, 1]
+        assert v.dtype == torch.float32
+        assert_rows(v.flatten(), [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+
+        v64 = Vector.from_data([np.array([[1.0, 2.0]])], dtype=torch.float64)
+        assert v64.dtype == torch.float64
 
     def test_to_polars_line_vector(self):
         pytest.importorskip("polars")

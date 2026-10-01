@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import math
 import numbers
 from pathlib import Path
@@ -316,7 +317,17 @@ class Vector(AutoSerialize):
             device=device,
             _token=cls._token,
         )
-        vector._replace_cells(torch.arange(len(cell_arrays), dtype=torch.int64), cell_arrays)
+        num_fields = vector._full_num_fields
+        lengths = torch.tensor([array.shape[0] for array in cell_arrays], dtype=torch.int64)
+        rows = [array.reshape(-1, num_fields) for array in cell_arrays if array.shape[0] > 0]
+        if rows and all(isinstance(array, np.ndarray) for array in rows):
+            vector._state["data"] = vector._to_buffer(_as_tensor(np.concatenate(rows)))
+        elif rows:
+            vector._state["data"] = vector._to_buffer(
+                torch.cat([_as_tensor(array) for array in rows], dim=0)
+            )
+        vector._state["cell_lengths"] = lengths
+        vector._state["cell_starts"] = torch.cumsum(lengths, 0) - lengths
         return vector
 
     # ------------------------------------------------------------------ #
@@ -541,6 +552,11 @@ class Vector(AutoSerialize):
         mapping : dict
             Maps each old field name to its new name, e.g.
             ``{"kx": "qx", "ky": "qy"}``.
+
+        Notes
+        -----
+        Views created before the rename keep the old field names and raise
+        ``KeyError``; create new views with ``select_fields`` after renaming.
         """
         old_field_set = set(self._state["fields"])
         missing = [old for old in mapping if old not in old_field_set]
@@ -776,8 +792,10 @@ class Vector(AutoSerialize):
             if other.row_counts() != row_counts:
                 raise ValueError("Vector inputs must have matching per-cell row counts.")
 
-        flat_args = tuple(_flatten_torch_input(value) for value in args)
-        flat_kwargs = {key: _flatten_torch_input(value) for key, value in kwargs.items()}
+        # Single-field Vectors read a 1D tensor as one value per row, as in v + x.
+        per_row = sum(row_counts) if template.num_fields == 1 else None
+        flat_args = tuple(_flatten_torch_input(value, per_row) for value in args)
+        flat_kwargs = {key: _flatten_torch_input(value, per_row) for key, value in kwargs.items()}
         result = func(*flat_args, **flat_kwargs)
 
         if func not in _SAFE_ELEMENTWISE_TORCH_FUNCTIONS:
@@ -1059,7 +1077,7 @@ class Vector(AutoSerialize):
     def _selected_cell_indices(self) -> torch.Tensor:
         """Return linear cell indices for the current fixed-grid selection."""
         if self._selection_indices is None:
-            return torch.arange(_cell_count(self._state["shape"]), dtype=torch.int64)
+            return _cell_arange(_cell_count(self._state["shape"]))
         return self._selection_indices
 
     def _selected_cell_lengths(self) -> torch.Tensor:
@@ -1263,7 +1281,7 @@ class Vector(AutoSerialize):
                 other,
                 sum(row_counts),
                 self.num_fields,
-                dtype=None,
+                dtype=None if isinstance(other, torch.Tensor) else lhs.dtype,
                 device=lhs.device,
             )
 
@@ -1358,9 +1376,18 @@ def _scalar_value(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
-def _flatten_torch_input(value: Any) -> Any:
-    """Replace a Vector argument with its flattened rows for torch dispatch."""
-    return value.flatten() if isinstance(value, Vector) else value
+def _flatten_torch_input(value: Any, per_row: int | None = None) -> Any:
+    """Prepare one argument for torch dispatch.
+
+    A Vector is replaced by its flattened rows. When ``per_row`` is given, a 1D
+    tensor of that length becomes a column, so for single-field Vectors ``x + v``
+    and ``v + x`` both apply one value per row.
+    """
+    if isinstance(value, Vector):
+        return value.flatten()
+    if isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == per_row:
+        return value.reshape(-1, 1)
+    return value
 
 
 def _maybe_wrap_result(template: "Vector", value: Any, row_counts: list[int]) -> Any:
@@ -1403,6 +1430,12 @@ def _resolve_fields(
     if inferred is not None:
         return [f"field_{i}" for i in range(inferred)]
     raise ValueError("Must specify either 'fields' or 'num_fields'.")
+
+
+@functools.lru_cache(maxsize=8)
+def _cell_arange(num_cells: int) -> torch.Tensor:
+    """Cached ``arange(num_cells)``, shared read-only by every root Vector of that size."""
+    return torch.arange(num_cells, dtype=torch.int64)
 
 
 def _cell_count(shape: tuple[int, ...]) -> int:
@@ -1534,8 +1567,18 @@ def _is_row_like(item: Any) -> bool:
     return len(item) > 0 and all(_is_scalar(value) for value in item)
 
 
-def _coerce_inferred_cell_array(value: Any) -> torch.Tensor:
-    """Infer a 2D cell tensor from row-like input during ``from_data``."""
+def _coerce_inferred_cell_array(value: Any) -> torch.Tensor | NDArray[Any]:
+    """Infer a 2D cell from row-like input during ``from_data``.
+
+    NumPy input stays NumPy, so that ``from_data`` can join all cells with one
+    ``np.concatenate`` and convert to torch once.
+    """
+    if isinstance(value, np.ndarray):
+        if value.ndim == 1:
+            return value.reshape(0, 0) if value.size == 0 else value.reshape(1, -1)
+        if value.ndim != 2:
+            raise ValueError("Cell data must be 1D or 2D.")
+        return value
     array = _as_tensor(value)
     if array.ndim == 0:
         raise ValueError("Cell data must be 1D or 2D.")
@@ -1561,6 +1604,15 @@ def _select_linear_indices(
     - the output fixed-grid shape
     - the flattened linear indices of the selected cells, in row-major order
     """
+    key = idx if isinstance(idx, tuple) else (idx,)
+    if len(key) == len(shape) and all(type(i) is int for i in key):
+        linear = 0
+        for i, size in zip(key, shape):
+            if not -size <= i < size:
+                raise IndexError("Vector index out of range")
+            linear = linear * size + (i % size)
+        return (), current_indices[linear : linear + 1].clone()
+
     if shape == ():
         if idx in ((), Ellipsis):
             return (), torch.tensor([int(current_indices[0])], dtype=torch.int64)
