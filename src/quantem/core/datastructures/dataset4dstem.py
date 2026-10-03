@@ -49,8 +49,10 @@ class Dataset4dstem(Dataset4d):
         sampling: NDArray | tuple | list | float | int | None = None,
         units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
-        metadata: dict = {},
+        metadata: dict | None = None,
         _token: object | None = None,
+        *,
+        storage: object | None = None,
     ):
         """Initialize a 4D-STEM dataset.
 
@@ -77,6 +79,7 @@ class Dataset4dstem(Dataset4d):
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
+        metadata = {} if metadata is None else dict(metadata)
         mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
@@ -92,6 +95,7 @@ class Dataset4dstem(Dataset4d):
             signal_units=signal_units,
             metadata=metadata,
             _token=_token,
+            storage=storage,
         )
         self._virtual_images = {}
         self._virtual_detectors = {}  # Store detector information for regeneration
@@ -260,13 +264,14 @@ class Dataset4dstem(Dataset4d):
         """
         dp_mean = self.mean((0, 1))
 
-        dp_mean_dataset = Dataset2d.from_array(
+        dp_mean_dataset = Dataset2d(
             array=dp_mean,
             name=self.name + "_dp_mean",
             origin=self.origin[-2:],
             sampling=self.sampling[-2:],
             units=self.units[-2:],
             signal_units=self.signal_units,
+            _token=Dataset2d._token,
         )
 
         if attach is True:
@@ -305,13 +310,14 @@ class Dataset4dstem(Dataset4d):
         """
         dp_max = self.max((0, 1))
 
-        dp_max_dataset = Dataset2d.from_array(
+        dp_max_dataset = Dataset2d(
             array=dp_max,
             name=self.name + "_dp_max",
             origin=self.origin[-2:],
             sampling=self.sampling[-2:],
             units=self.units[-2:],
             signal_units=self.signal_units,
+            _token=Dataset2d._token,
         )
 
         if attach is True:
@@ -347,16 +353,48 @@ class Dataset4dstem(Dataset4d):
         -------
         Dataset
             A new Dataset with the median diffraction pattern
-        """
-        dp_median = np.median(self.array, axis=(0, 1))
 
-        dp_median_dataset = Dataset2d.from_array(
+        Notes
+        -----
+        Dense tensor data stays on its device. Encoded acquisitions require
+        selecting a bounded region before computing a median.
+
+        Examples
+        --------
+        >>> median = data[:8, :8].get_dp_median(attach=False)
+        """
+        if getattr(self, "_storage", None) is not None:
+            raise NotImplementedError(
+                "An encoded acquisition has no bounded full-scan median. "
+                "Select a region first, for example data[:8, :8].dp_median."
+            )
+        if self._tensor is None:
+            dp_median = np.median(self._array, axis=(0, 1))
+        else:
+            values_t = self._tensor.flatten(0, 1)
+            if values_t.is_complex():
+                raise NotImplementedError(
+                    "Tensor diffraction medians require real measurements; "
+                    "select the real component or magnitude explicitly."
+                )
+            if values_t.dtype not in (torch.float32, torch.float64):
+                dtype = (
+                    torch.float32
+                    if values_t.is_floating_point() or values_t.device.type == "mps"
+                    else torch.float64
+                )
+                values_t = values_t.to(dtype)
+            # Quantile averages the middle pair, matching NumPy's even median.
+            dp_median = torch.quantile(values_t, 0.5, dim=0)
+
+        dp_median_dataset = Dataset2d(
             array=dp_median,
             name=self.name + "_dp_median",
             origin=self.origin[-2:],
             sampling=self.sampling[-2:],
             units=self.units[-2:],
             signal_units=self.signal_units,
+            _token=Dataset2d._token,
         )
 
         if attach is True:
@@ -402,12 +440,25 @@ class Dataset4dstem(Dataset4d):
         -------
         Dataset2d
             A new Dataset2d with the virtual image
+
+        Notes
+        -----
+        Dense tensor calculations stay on their device. Encoded data uses the
+        public detector reducer and transfers only the reduced scan image to
+        the host. Encoded virtual detectors require a binary mask.
+
+        Examples
+        --------
+        >>> bright_field = data.get_virtual_image(
+        ...     mode="circle", geometry=((32, 32), 12)
+        ... )
         """
         if mask is not None:
             # Use provided mask
-            if mask.shape != self.array.shape[-2:]:
+            if mask.shape != self.shape[-2:]:
                 raise ValueError(
-                    f"Mask shape {mask.shape} does not match diffraction pattern shape {self.array.shape[-2:]}"
+                    f"Mask shape {mask.shape} does not match diffraction pattern "
+                    f"shape {self.shape[-2:]}; provide one weight per detector pixel."
                 )
             final_mask = mask
         elif mode is not None and geometry is not None:
@@ -435,15 +486,37 @@ class Dataset4dstem(Dataset4d):
         else:
             raise ValueError("Either mask or both mode and geometry must be provided")
 
-        virtual_image = np.sum(self.array * final_mask, axis=(-1, -2))
+        if getattr(self, "_storage", None) is not None:
+            if not np.all((final_mask == 0) | (final_mask == 1)):
+                raise NotImplementedError(
+                    "Encoded virtual detectors require a binary mask. Select "
+                    "a bounded region before applying fractional detector weights."
+                )
+            from quantem.gpu import detector
 
-        virtual_image_dataset = Dataset2d.from_array(
+            virtual_image = detector.masked_sum(self, final_mask)
+        elif self._tensor is not None:
+            values_t = self._tensor
+            if values_t.dtype in (torch.uint16, torch.uint32):
+                values_t = values_t.to(torch.int64)
+            mask_dtype = (
+                torch.float32
+                if values_t.device.type == "mps" and final_mask.dtype == np.float64
+                else None
+            )
+            mask_t = torch.as_tensor(final_mask, dtype=mask_dtype, device=values_t.device)
+            virtual_image = (values_t * mask_t).sum(dim=(-1, -2))
+        else:
+            virtual_image = np.sum(self._array * final_mask, axis=(-1, -2))
+
+        virtual_image_dataset = Dataset2d(
             array=virtual_image,
             name=name,
             origin=self.origin[0:2],
             sampling=self.sampling[0:2],
             units=self.units[0:2],
             signal_units=self.signal_units,
+            _token=Dataset2d._token,
         )
 
         if attach is True:
@@ -457,7 +530,7 @@ class Dataset4dstem(Dataset4d):
 
         if show:
             dp_mean_dataset = self.get_dp_mean(attach=False)
-            _fig, ax = show_2d(dp_mean_dataset.array, title=f"Mean DP with {name} detector")
+            _fig, ax = show_2d(dp_mean_dataset.numpy(), title=f"Mean DP with {name} detector")
 
             if mask is not None:
                 # For custom masks, show the mask contour
@@ -520,7 +593,7 @@ class Dataset4dstem(Dataset4d):
         Parameters
         ----------
         center : tuple[float, float]
-            Center coordinates (cy, cx) of the circle
+            Center coordinates (row, column) of the circle
         radius : float
             Radius of the circle
 
@@ -529,13 +602,9 @@ class Dataset4dstem(Dataset4d):
         np.ndarray
             Boolean mask with True inside the circle
         """
-        cy, cx = center
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
-
-        # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-
+        center_row, center_column = center
+        rows, columns = np.ogrid[: self.shape[-2], : self.shape[-1]]
+        distance = np.sqrt((rows - center_row) ** 2 + (columns - center_column) ** 2)
         return distance <= radius
 
     def _create_annular_mask(
@@ -547,7 +616,7 @@ class Dataset4dstem(Dataset4d):
         Parameters
         ----------
         center : tuple[float, float]
-            Center coordinates (cy, cx) of the annulus
+            Center coordinates (row, column) of the annulus
         radii : tuple[float, float]
             Inner and outer radii (r_inner, r_outer) of the annulus
 
@@ -556,14 +625,10 @@ class Dataset4dstem(Dataset4d):
         np.ndarray
             Boolean mask with True inside the annular region
         """
-        cy, cx = center
+        center_row, center_column = center
         r_inner, r_outer = radii
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
-
-        # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-
+        rows, columns = np.ogrid[: self.shape[-2], : self.shape[-1]]
+        distance = np.sqrt((rows - center_row) ** 2 + (columns - center_column) ** 2)
         return (distance >= r_inner) & (distance <= r_outer)
 
     def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
@@ -586,7 +651,7 @@ class Dataset4dstem(Dataset4d):
             print("No virtual images to display. Create virtual images with get_virtual_image().")
             return None, None
 
-        arrays = [vi.array for vi in self.virtual_images.values()]
+        arrays = [vi.numpy() for vi in self.virtual_images.values()]
         titles = list(self.virtual_images.keys())
 
         n_images = len(arrays)
@@ -766,6 +831,7 @@ class Dataset4dstem(Dataset4d):
             specifies the width of the median kernel
 
         """
+        self._require_numpy("median_filter_masked_pixels()")
         if kernel_width % 2 == 0:
             width_max = kernel_width // 2
             width_min = kernel_width // 2

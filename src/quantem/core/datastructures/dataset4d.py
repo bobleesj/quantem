@@ -31,6 +31,8 @@ class Dataset4d(Dataset):
         signal_units: str = "arb. units",
         metadata: dict = {},
         _token: object | None = None,
+        *,
+        storage: object | None = None,
     ):
         """Initialize a 4D dataset.
 
@@ -63,6 +65,7 @@ class Dataset4d(Dataset):
             signal_units=signal_units,
             metadata=metadata,
             _token=_token,
+            storage=storage,
         )
 
     @classmethod
