@@ -428,6 +428,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 f"amplitude-space loss; got loss_type with target_space="
                 f"{self._criterion.target_space!r}."
             )
+        if not autograd and not self.dset.center_diffraction:
+            raise ValueError(
+                "autograd=False uses the amplitude-projection update, which does not undo the "
+                "descan phase ramp; use autograd=True with center_diffraction=False."
+            )
         self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 

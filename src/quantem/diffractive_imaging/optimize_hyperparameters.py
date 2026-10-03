@@ -199,6 +199,7 @@ def _clone_ptychography_dataset(dset: PtychographyDatasetBase) -> PtychographyDa
     cloned.diffraction_padding = dset.diffraction_padding.copy()
     cloned.com_measured = dset.com_measured.copy()
     cloned.com_fit = dset.com_fit.copy()
+    cloned.center_diffraction = dset.center_diffraction
     cloned.centered_amplitudes = dset.centered_amplitudes.detach().cpu().clone()
     # amplitudes / intensities / centered_intensities are derived on demand from
     # intensities_4d; only carry them over if the source has them materialized

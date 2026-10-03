@@ -146,6 +146,7 @@ class PtychographyDatasetBase(
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
         self._transpose = False  # default
+        self.center_diffraction = True  # default
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
@@ -378,7 +379,7 @@ class PtychographyDatasetBase(
         # When residency is "cpu", build targets on CPU so they can be streamed per-batch
         # (and read by DataLoader workers); otherwise keep them resident on the compute device.
         target_device = "cpu" if self.target_residency == "cpu" else self.device
-        learn_descan = self.learn_descan and self.has_optimizer()
+        learn_descan = (self.learn_descan and self.has_optimizer()) or not self.center_diffraction
         if target_space == "amplitude":
             source = self.amplitudes if learn_descan else self.centered_amplitudes
         elif target_space == "intensity":
@@ -1220,6 +1221,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         force_com_rotation: float | None = None,
         force_com_transpose: bool | None = None,
         bilinear: bool = False,
+        center_diffraction: bool = True,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
         obj_padding_px: tuple[int, int] | np.ndarray = (0, 0),
         plot_rotation: bool = True,
@@ -1237,6 +1239,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "force_com_rotation": force_com_rotation,
             "force_com_transpose": force_com_transpose,
             "bilinear": bilinear,
+            "center_diffraction": center_diffraction,
             "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
             "obj_padding_px": obj_padding_px,
             "plot_rotation": False,
@@ -1247,6 +1250,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         if probe_energy is not None:
             self.probe_energy = probe_energy
+        self.center_diffraction = center_diffraction
 
         if padded_diffraction_intensities_shape is not None:
             self.diffraction_padding = (
@@ -1777,6 +1781,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         positions_px = self.scan_positions_px[batch_indices]
         if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
+        elif not self.center_diffraction:
+            descan_shifts = self.descan_shifts.detach()[batch_indices]
         else:
             descan_shifts = None
 
