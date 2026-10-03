@@ -13,27 +13,6 @@ from quantem.core.visualization.visualization import (
 from quantem.core.visualization.visualization_utils import ScalebarConfig
 
 
-def test_show_2d_selected_native_tensor_datasets():
-    import matplotlib.pyplot as plt
-    import torch
-
-    from quantem.core.datastructures import Dataset4dstem
-
-    values = torch.arange(2 * 2 * 8 * 8, dtype=torch.float32).reshape(2, 2, 8, 8)
-    data = Dataset4dstem.from_tensor(values)
-    selected = [data[0, 1], data[1, 0]]
-    fig, axes = show_2d(selected)
-    expected_fig, expected_axes = show_2d([values[0, 1].numpy(), values[1, 0].numpy()])
-    try:
-        for axis, expected in zip(np.asarray(axes).flat, np.asarray(expected_axes).flat):
-            np.testing.assert_array_equal(
-                axis.images[0].get_array(), expected.images[0].get_array()
-            )
-    finally:
-        plt.close(fig)
-        plt.close(expected_fig)
-
-
 @pytest.fixture
 def sample_array():
     return np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])

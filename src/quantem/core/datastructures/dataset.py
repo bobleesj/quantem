@@ -1,6 +1,5 @@
 import numbers
 import os
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
@@ -32,8 +31,7 @@ class Dataset(AutoSerialize):
 
     Notes
     -----
-    Dense data may use NumPy or Torch. Acquisition storage can provide bounded
-    reads without materializing the complete detector array.
+    This branch is NumPy-only. CuPy arrays are explicitly rejected.
     """
 
     _token = object()
@@ -50,22 +48,19 @@ class Dataset(AutoSerialize):
         signal_units: str = "arb. units",
         metadata: Optional[dict] = None,
         _token: object | None = None,
-        *,
-        storage: object | None = None,
     ):
-        if _token is not self._token and storage is None:
+        if _token is not self._token:
             raise RuntimeError(
                 "Use Dataset.from_array() or Dataset.from_tensor() to instantiate this class."
             )
         super().__init__()
-        if sum(value is not None for value in (array, tensor, storage)) != 1:
-            raise ValueError("Provide exactly one of array, tensor, or storage.")
-        self._storage = storage
-        if isinstance(array, torch.Tensor):
-            tensor, array = array, None
-        if storage is not None:
-            self._array = self._tensor = None
-        elif array is not None:
+        # Dual-slot storage: exactly one of (_array, _tensor) is set.
+        # TODO: remove dual-init guards once torch transition is complete.
+        if array is None and tensor is None:
+            raise ValueError("Provide either `array` (numpy) or `tensor` (torch).")
+        if array is not None and tensor is not None:
+            raise ValueError("Provide only one of `array` or `tensor`, not both.")
+        if array is not None:
             arr = ensure_valid_array(array)
             if not isinstance(arr, np.ndarray):
                 raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
@@ -73,15 +68,13 @@ class Dataset(AutoSerialize):
             self._tensor = None
         else:
             if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}."
-                )
+                raise TypeError(f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}.")
             self._array = None
             self._tensor = tensor
         self.name = name
-        self.origin = np.zeros(self.ndim) if origin is None else origin
-        self.sampling = np.ones(self.ndim) if sampling is None else sampling
-        self.units = ["pixels"] * self.ndim if units is None else units
+        self.origin = origin
+        self.sampling = sampling
+        self.units = units
         self.signal_units = signal_units
         self._file_path = None
         self._metadata = {} if metadata is None else dict(metadata)
@@ -150,23 +143,14 @@ class Dataset(AutoSerialize):
         Returns ``None`` for tensor-backed datasets. Use ``.tensor`` for the
         torch tensor, or ``.numpy()`` to materialize a numpy copy explicitly.
         """
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError(
-                "This dataset keeps its acquisition in compressed storage. "
-                "Select a bounded region with data[row, column], then use "
-                "its .tensor or .numpy(); use detector.mean(data) for a full-scan reduction."
-            )
         return getattr(self, "_array", None)
 
     @array.setter
     def array(self, value: NDArray) -> None:
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError("Select a decoded region before replacing its array.")
         arr = ensure_valid_array(value, ndim=self.ndim)
         if not isinstance(arr, np.ndarray):
             raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
         self._array = arr
-        self._tensor = None
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -175,133 +159,9 @@ class Dataset(AutoSerialize):
         tensor = getattr(self, "_tensor", None)
         if tensor is None:
             raise AttributeError(
-                f"Dataset '{self.name}' has no dense Torch tensor. "
-                "For compressed data, select a bounded region first: data[row, column].tensor."
+                f"Dataset '{self.name}' is numpy-backed; use Dataset.from_tensor() at construction."
             )
         return tensor
-
-    @property
-    def data(self):
-        """Return the underlying storage without decoding or transferring it."""
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.data
-        return self._array if self._array is not None else self._tensor
-
-    @property
-    def size(self) -> int:
-        """Return the logical number of elements without decoding storage."""
-        return int(np.prod(self.shape))
-
-    @property
-    def representation(self):
-        """Return the storage representation, such as dense or encoded."""
-        storage = getattr(self, "_storage", None)
-        return storage.representation if storage is not None else "dense"
-
-    @property
-    def residency(self) -> str:
-        """Return where the acquisition storage is available."""
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.residency
-        return "host" if self.device == "cpu" else "device"
-
-    @property
-    def logical_bytes(self) -> int:
-        """Return the size of an equivalent dense array in bytes."""
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.logical_bytes
-        return self.size * (
-            self._array.itemsize if self._array is not None else self._tensor.element_size()
-        )
-
-    @property
-    def resident_bytes(self) -> int | None:
-        """Return measured storage bytes when available."""
-        storage = getattr(self, "_storage", None)
-        return storage.resident_bytes if storage is not None else self.logical_bytes
-
-    @property
-    def lossless(self) -> bool:
-        """Return whether exact source-to-working values have been verified."""
-        storage = getattr(self, "_storage", None)
-        return (
-            storage.lossless
-            if storage is not None
-            else bool(self.metadata.get("lossless_exact", False))
-        )
-
-    def read(self, *, scan_region=None, detector_region=None):
-        """Read a bounded 4D-STEM region into a native array or tensor.
-
-        Regions are ``(row_start, row_stop, column_start, column_stop)``.
-        For example, ``data.read(scan_region=(0, 8, 0, 8))`` reads eight
-        scan rows and columns. Prefer indexing for calibrated dataset views.
-        """
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.read(scan_region=scan_region, detector_region=detector_region)
-        if self.ndim != 4:
-            raise ValueError("read() requires a single 4D-STEM acquisition.")
-        scan = scan_region or (0, self.shape[0], 0, self.shape[1])
-        detector = detector_region or (0, self.shape[2], 0, self.shape[3])
-        return self.data[
-            scan[0] : scan[1],
-            scan[2] : scan[3],
-            detector[0] : detector[1],
-            detector[2] : detector[3],
-        ]
-
-    def to_representation(self, representation) -> Self:
-        """Convert acquisition storage while preserving the source.
-
-        For example, ``packed = data.to_representation("packed")`` requests
-        a backend-supported exact conversion without expanding on the host.
-        """
-        if representation == self.representation:
-            return self
-        from quantem.gpu.io.representation import convert
-
-        return convert(self, representation)
-
-    def close(self) -> None:
-        """Release owned acquisition storage, for example ``data.close()``."""
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            storage.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.__exit__(exc_type, exc_value, traceback)
-
-    def __len__(self) -> int:
-        return self.shape[0]
-
-    def __iter__(self):
-        for index in range(len(self)):
-            yield self[index]
-
-    def __array__(self, dtype=None, copy=None):
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError("Select a bounded region first, then call its .numpy() explicitly.")
-        values = self.numpy()
-        return np.array(values, dtype=dtype, copy=copy)
-
-    def save(self, *args, **kwargs) -> None:
-        """Save a dense dataset using the native serializer.
-
-        Compressed acquisitions use ``quantem.gpu.io.save(path, data)`` so
-        device handles are never serialized as scientific detector values.
-        """
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError("Save compressed acquisitions with quantem.gpu.io.save(path, data).")
-        return super().save(*args, **kwargs)
 
     @property
     def metadata(self) -> dict:
@@ -361,21 +221,16 @@ class Dataset(AutoSerialize):
         # Direct slot access (never triggers .array derive, which would force
         # a full GPU->CPU copy on tensor-backed datasets). getattr handles
         # AutoSerialize-restored instances (no __init__ run).
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.shape
         array = getattr(self, "_array", None)
         return tuple((array if array is not None else self._tensor).shape)
 
     @property
     def ndim(self) -> int:
-        return len(self.shape)
+        array = getattr(self, "_array", None)
+        return (array if array is not None else self._tensor).ndim
 
     @property
     def dtype(self) -> DTypeLike | torch.dtype:
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.dtype
         array = getattr(self, "_array", None)
         return (array if array is not None else self._tensor).dtype
 
@@ -384,8 +239,8 @@ class Dataset(AutoSerialize):
         """Device string for the underlying storage. numpy 2.x ndarray and torch.Tensor
         both expose ``.device`` (array-API convention), so this is uniform.
         """
-        storage = getattr(self, "_storage", None)
-        return str(storage.device if storage is not None else self.data.device)
+        array = getattr(self, "_array", None)
+        return str((array if array is not None else self._tensor).device)
 
     def numpy(self) -> NDArray:
         """Return the data as a numpy array (mirrors ``torch.Tensor.numpy()``).
@@ -396,8 +251,6 @@ class Dataset(AutoSerialize):
         in-place writes raise instead of silently being lost (the copy is not
         the tensor).
         """
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError("Select a bounded region first, then call its .numpy().")
         array = getattr(self, "_array", None)
         if array is not None:
             return array
@@ -413,10 +266,11 @@ class Dataset(AutoSerialize):
         all resolve to the same canonical device.
         """
         from quantem.core import config
-
         tensor = getattr(self, "_tensor", None)
         if tensor is None:
-            raise AttributeError(f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'.")
+            raise AttributeError(
+                f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
+            )
         dev, _ = config.validate_device(device)
         self._tensor = tensor.to(dev)
         return self
@@ -424,7 +278,7 @@ class Dataset(AutoSerialize):
     # --- Summaries ---
     def __repr__(self) -> str:
         description = [
-            f"{type(self).__name__}(shape={self.shape}, dtype={self.dtype}, name='{self.name}')",
+            f"Dataset(shape={self.shape}, dtype={self.dtype}, name='{self.name}')",
             f"  sampling: {self.sampling}",
             f"  units: {self.units}",
             f"  signal units: '{self.signal_units}'",
@@ -457,19 +311,14 @@ class Dataset(AutoSerialize):
         """
         # Metadata arrays (origin, sampling) are numpy, use copy()
         # Units list is copied by slicing
-        if getattr(self, "_storage", None) is not None:
-            raise TypeError("Select a bounded region before copying: data[rows, columns].copy().")
-        values = self._array.copy() if self._array is not None else self._tensor.clone()
-        new_dataset = type(self)(
-            array=values,
+        new_dataset = type(self).from_array(
+            array=self.array.copy(),
             name=self.name,
             origin=self.origin.copy(),
             sampling=self.sampling.copy(),
             units=self.units[:],
             signal_units=self.signal_units,
-            _token=self._token,
         )
-        new_dataset._metadata = deepcopy(self.metadata)
 
         # Copy custom attributes if requested
         if copy_custom_attributes:
@@ -490,9 +339,6 @@ class Dataset(AutoSerialize):
         # Standard attributes that should not be copied
         standard_attrs = {
             "_array",
-            "_tensor",
-            "_storage",
-            "_metadata",
             "_name",
             "_origin",
             "_sampling",
@@ -536,15 +382,7 @@ class Dataset(AutoSerialize):
         mean: scalar or array (np.ndarray)
             Mean of the data.
         """
-        storage = getattr(self, "_storage", None)
-        if storage is not None:
-            return storage.mean(axes)
-        if self._tensor is not None:
-            values = self._tensor
-            if not (values.is_floating_point() or values.is_complex()):
-                values = values.to(torch.float32 if values.device.type == "mps" else torch.float64)
-            return values.mean(dim=axes)
-        return self._array.mean(axis=axes)
+        return self.array.mean(axis=axes)
 
     def max(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
@@ -560,11 +398,6 @@ class Dataset(AutoSerialize):
         maximum: scalar or array (np.ndarray)
             Maximum of the data.
         """
-        if self._tensor is not None:
-            values = self._tensor
-            if values.dtype in (torch.uint16, torch.uint32):
-                return values.to(torch.int64).amax(dim=axes).to(values.dtype)
-            return values.amax(dim=axes)
         return self.array.max(axis=axes)
 
     def min(self, axes: int | tuple[int, ...] | None = None) -> Any:
@@ -581,21 +414,7 @@ class Dataset(AutoSerialize):
         minimum: scalar or array (np.ndarray)
             Minimum of the data.
         """
-        if self._tensor is not None:
-            values = self._tensor
-            if values.dtype in (torch.uint16, torch.uint32):
-                return values.to(torch.int64).amin(dim=axes).to(values.dtype)
-            return values.amin(dim=axes)
         return self.array.min(axis=axes)
-
-    def _require_numpy(self, operation: str) -> None:
-        """Reject NumPy-only transforms before changing data or calibration."""
-        if self._array is None:
-            raise NotImplementedError(
-                f"{operation} requires a NumPy-backed dataset. Select a bounded "
-                "region with data[rows, columns], then use its .numpy() to "
-                "construct a NumPy-backed dataset with the same calibration."
-            )
 
     @overload
     def pad(
@@ -643,7 +462,6 @@ class Dataset(AutoSerialize):
         Dataset or None
             Padded Dataset if modify_in_place is False, otherwise None.
         """
-        self._require_numpy("pad()")
         if pad_width is not None:
             if output_shape is not None:
                 raise ValueError("pad_width and output_shape cannot both be specified.")
@@ -742,7 +560,6 @@ class Dataset(AutoSerialize):
         ...     modify_in_place=True,
         ... )
         """
-        self._require_numpy("crop()")
         if axes is None:
             if len(crop_widths) != self.ndim:
                 raise ValueError("crop_widths must match number of dimensions when axes is None.")
@@ -853,7 +670,6 @@ class Dataset(AutoSerialize):
 
         >>> dset_binned = dset.bin(bin_factors=2)
         """
-        self._require_numpy("bin()")
         reducer_norm = str(reducer).lower()
         if reducer_norm not in ("sum", "mean"):
             raise ValueError("reducer must be 'sum' or 'mean'")
@@ -973,7 +789,6 @@ class Dataset(AutoSerialize):
         Dataset or None
             A new resampled dataset if `modify_in_place` is False, otherwise None.
         """
-        self._require_numpy("fourier_resample()")
         if axes is None:
             axes = tuple(range(self.ndim))
         elif isinstance(axes, int | float):
@@ -1105,18 +920,15 @@ class Dataset(AutoSerialize):
         Dataset
             A new Dataset instance with appropriately adjusted metadata.
         """
-        storage = getattr(self, "_storage", None)
-        array_view = storage[index] if storage is not None else self.data[index]
-        if array_view.ndim == 0:
-            return array_view
+        array_view = self.array[index]
 
         # Normalize index into tuple form
         if not isinstance(index, tuple):
             index = (index,)
 
         # Expand Ellipsis
-        if any(item is Ellipsis for item in index):
-            ellipsis_pos = next(i for i, item in enumerate(index) if item is Ellipsis)
+        if Ellipsis in index:
+            ellipsis_pos = index.index(Ellipsis)
             num_missing = self.ndim - (len(index) - 1)
             index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
 
@@ -1157,31 +969,14 @@ class Dataset(AutoSerialize):
                 cls = Dataset
 
         # Construct new dataset
-        result = cls(
+        return cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
             array=array_view,
             name=f"{self.name}{index}",
             origin=new_origin,
             sampling=new_sampling,
             units=new_units,
             signal_units=self.signal_units,
-            _token=cls._token,
         )
-        result._metadata = dict(self.metadata)
-        result._metadata["working_shape"] = result.shape
-        result._metadata["origin"] = result.origin.tolist()
-        result._metadata["sampling"] = result.sampling.tolist()
-        result._metadata["units"] = list(result.units)
-        result._metadata["representation"] = "dense"
-        result._metadata["residency"] = result.residency
-        if result.ndim == 4:
-            result._metadata["scan_shape"] = result.shape[:2]
-            result._metadata["detector_shape"] = result.shape[-2:]
-            result._metadata["n_frames"] = result.shape[0] * result.shape[1]
-            for key in ("valid_pixels", "pixel_mask"):
-                mask = result._metadata.get(key)
-                if mask is not None and np.shape(mask) == self.shape[-2:]:
-                    result._metadata[key] = np.asarray(mask)[index[-2:]].tolist()
-        return result
 
     @classmethod
     def register_dimension(cls, ndim: int):

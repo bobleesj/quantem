@@ -85,7 +85,7 @@ def to_cpu(arrs: Any) -> np.ndarray | Sequence:
     elif isinstance(arrs, tuple):
         return tuple([to_cpu(i) for i in arrs])
     elif isinstance(arrs, Dataset2d):
-        return arrs.numpy()
+        return to_cpu(arrs.array)
     else:
         raise NotImplementedError(f"Unkown type: {type(arrs)}")
 
