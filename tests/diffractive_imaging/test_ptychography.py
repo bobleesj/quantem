@@ -5,6 +5,7 @@ plus property-style tests for state management and serialization.
 
 import numpy as np
 import pytest
+import torch
 from skimage.metrics import structural_similarity as ssim
 
 from quantem.core import config
@@ -390,6 +391,101 @@ class TestTargetResidency:
         ptycho_dataset.save(str(path))
         reloaded = autoserialize_load(str(path))
         assert reloaded.target_residency == "cpu"
+
+
+def _build_off_center_dataset(complex_obj, probe_array, shift, center_diffraction):
+    """The ``ptycho_dataset`` simulation with every pattern rolled by the integer ``shift``, so
+    the beam sits off the detector center as it does on a real detector."""
+    x = y = np.arange(0.0, N, SCAN_STEP_SIZE)
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    positions = np.stack((xx.ravel(), yy.ravel()), axis=-1)
+    reciprocal_sampling = 2 * Q_MAX / N  # inverse Angstroms
+    sim_row, sim_col = return_patch_indices(positions, (N, N), (N, N))
+    *_, intensities = simulate_intensities(complex_obj, probe_array, sim_row, sim_col)
+    patterns = np.roll(np.fft.fftshift(intensities * 100, axes=(-2, -1)), shift, axis=(-2, -1))
+    dset = Dataset4dstem.from_array(
+        array=patterns.reshape((sx, sy, N, N)),
+        sampling=(SCAN_STEP_SIZE, SCAN_STEP_SIZE, reciprocal_sampling, reciprocal_sampling),
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+    pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
+    pdset.preprocess(
+        com_fit_function="constant",
+        center_diffraction=center_diffraction,
+        plot_rotation=False,
+        plot_com=False,
+        probe_energy=PROBE_ENERGY,
+        force_com_rotation=0,
+        force_com_transpose=False,
+    )
+    return pdset
+
+
+def _build_off_center_ptycho(complex_obj, probe_array, shift, center_diffraction):
+    """A uniform-object reconstruction of ``_build_off_center_dataset`` with the true probe."""
+    pdset = _build_off_center_dataset(complex_obj, probe_array, shift, center_diffraction)
+    probe_params = {
+        "energy": PROBE_ENERGY,
+        "C10": C10,
+        "semiangle_cutoff": electron_wavelength_angstrom(PROBE_ENERGY) * 1e3,
+    }
+    ptycho = Ptychography.from_models(
+        dset=pdset,
+        obj_model=ObjectPixelated.from_uniform(num_slices=1, obj_type="complex"),
+        probe_model=ProbePixelated.from_array(
+            num_probes=1, probe_params=probe_params, probe_array=probe_array
+        ),
+        detector_model=DetectorPixelated(),
+        rng=42,
+    )
+    ptycho.preprocess(obj_padding_px=(0, 0))
+    return ptycho
+
+
+class TestCenterDiffraction:
+    """``preprocess(center_diffraction=False)`` fits the patterns as recorded and moves the
+    model's beam to the fitted center with the descan ramp instead of shifting the data."""
+
+    SHIFT = (3, -2)
+
+    def test_patterns_stay_as_recorded(self, complex_obj, probe_array):
+        pdset = _build_off_center_dataset(complex_obj, probe_array, self.SHIFT, False)
+        raw = pdset.intensities_4d.reshape(-1, N, N).astype(np.float32)
+        assert pdset.center_diffraction is False
+        np.testing.assert_array_equal(pdset.targets.cpu().numpy(), np.sqrt(raw))
+        pdset._set_targets("intensity")
+        np.testing.assert_array_equal(pdset.targets.cpu().numpy(), raw)
+        assert pdset._preprocessing_params["center_diffraction"] is False
+
+
+    def test_fixed_descan_puts_the_beam_at_the_measured_center(self, complex_obj, probe_array):
+        """With a uniform object the prediction is the symmetric aperture disk, so its center
+        of mass is where the ramp put it; it must land on the fitted center of the data."""
+        ptycho = _build_off_center_ptycho(complex_obj, probe_array, self.SHIFT, False)
+        pdset = ptycho.dset
+        batch = torch.arange(4)
+        patch_data, _, fractional, descan = ptycho.dset.forward(batch, ptycho.obj_padding_px)
+        probes = ptycho.probe_model.forward(fractional)
+        patches = ptycho.obj_model.forward(patch_data)
+        _, overlap = ptycho.forward_operator(patches, probes, descan)
+        predicted = ptycho.detector_model.forward(overlap).detach().cpu().double()
+        pixel = torch.arange(N, dtype=torch.float64)
+        total = predicted.sum((-2, -1))
+        com_row = (predicted.sum(-1) * pixel).sum(-1) / total
+        com_col = (predicted.sum(-2) * pixel).sum(-1) / total
+        com_fit = np.stack(pdset.com_fit, axis=-1).reshape(-1, 2)[:4]
+        # the discrete CoM of the sampled disk after a sub-pixel ramp is off by up to 5e-4 px here
+        np.testing.assert_allclose(com_row.numpy(), com_fit[:, 0], rtol=0, atol=1e-3)
+        np.testing.assert_allclose(com_col.numpy(), com_fit[:, 1], rtol=0, atol=1e-3)
+        assert abs(com_fit[0, 0] - N / 2 - self.SHIFT[0]) < 0.5
+        assert abs(com_fit[0, 1] - N / 2 - self.SHIFT[1]) < 0.5
+
+    def test_projection_update_refuses_the_ramp(self, complex_obj, probe_array):
+        """autograd=False projects the measured amplitudes onto the ramped exit wave and never
+        undoes the ramp, so it would update the object with the wrong phase."""
+        ptycho = _build_off_center_ptycho(complex_obj, probe_array, self.SHIFT, False)
+        with pytest.raises(ValueError, match="descan phase ramp"):
+            ptycho.reconstruct(num_iters=1, autograd=False)
 
 
 def _build_aspect_ratio_ptycho(complex_obj, probe_array, gpts, com_rotation, transpose):
