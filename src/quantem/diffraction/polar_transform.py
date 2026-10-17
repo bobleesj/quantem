@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,12 +10,18 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.utils.utils import to_numpy
 
+# Percentile of the per-origin in-frame radius budget used to pick radial_max
+# when the caller does not supply one. A plain minimum lets a single failed
+# origin fit truncate the q-axis of an entire dataset, so a small fraction of
+# the worst origins is allowed to fall outside (and zero-pad) instead
+RADIAL_MAX_PERCENTILE = 0.1
+
 # Standard DPs use (row, col) convention. Polar coordinates use (phi, r_pix),
 # grid_sample's grid tensor requires them to be ordered (col, row)
 # but is noted where the call occures
 
 
-def auto_origin_id(
+def find_origin_angular_grid(
     data: Dataset4dstem,
     *,
     ellipse_params: tuple[float, float, float] | None = None,
@@ -24,7 +32,8 @@ def auto_origin_id(
     two_fold_rotation_symmetry: bool = False,
     device: str = "cpu",
     batch_size: int = 16,
-    local_margin: int = 25,
+    local_margin: int = 40,
+    kpow: float = 0.0,
 ) -> NDArray:
     """
     Automatic diffraction center finding by minimizing angular intensity
@@ -64,6 +73,8 @@ def auto_origin_id(
         ``(2*local_margin+1)`` square window centered on the global
         origin. Set this large enough to cover the worst-case descan
         drift across the scan.
+    kpow : float
+        Up-weight each ring's contribution to the score by ``k**kpow``
 
     Returns
     -------
@@ -71,31 +82,41 @@ def auto_origin_id(
         Array of shape (scan_row, scan_col, 2) containing (row, col) origin
         estimates in pixels.
     """
-    if len(data.array.shape) == 2:
-        n_row, n_col = data.array.shape
+    if data.ndim == 2:
+        n_row, n_col = data.shape
         scan_row, scan_col = 1, 1
-    elif len(data.array.shape) == 4:
-        scan_row, scan_col, n_row, n_col = data.array.shape
+    elif data.ndim == 4:
+        scan_row, scan_col, n_row, n_col = data.shape
     else:
         raise ValueError(
-            f" Got array with shape {data.array.shape}."
-            "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
+            f" Got array with shape {data.shape}."
+            "To use find_origin_angular_grid, pass a 2D or 4DSTEM dataset."
         )
 
-    origin_array = np.zeros((scan_row, scan_col, 2), dtype=float)
+    # Move the full dataset to the chosen device once
+    dps = (
+        torch.from_numpy(np.ascontiguousarray(data.array))
+        if data.array is not None
+        else data.tensor
+    )
+    array_t = dps.to(device=device, dtype=torch.float32)
+    if array_t.ndim == 2:
+        array_t = array_t[None, None]
     # first get COM of mean DP because it gives a robust rough center
-    array_4d = data.array if data.array.ndim == 4 else data.array[None, None, :, :]
-    mean_dp_np = array_4d.mean(axis=(0, 1)).astype(np.float32)
-    total_intensity = mean_dp_np.sum()
-    row_grid, col_grid = np.mgrid[0:n_row, 0:n_col]
-    com_row = int(round(float((row_grid * mean_dp_np).sum() / total_intensity)))
-    com_col = int(round(float((col_grid * mean_dp_np).sum() / total_intensity)))
+    mean_dp_t = array_t.mean(dim=(0, 1))
+    total_intensity = mean_dp_t.sum()
+    row_grid_t = torch.arange(n_row, dtype=torch.float32, device=device)[:, None]
+    col_grid_t = torch.arange(n_col, dtype=torch.float32, device=device)[None, :]
+    com_row = int(round(float(((row_grid_t * mean_dp_t).sum() / total_intensity).item())))
+    com_col = int(round(float(((col_grid_t * mean_dp_t).sum() / total_intensity).item())))
     # Radial max of the search polar grid, so dp_mean search candidates
     # (at ±global_margin from COM) stay within image bounds
     # in-image. Single pos candidates further from COM might be out of bounds
     # and are masked with [safe_low, safe_high_*] if so
     # (zero-padded samples would otherwise produce a falsely low score)
-    global_margin = 20
+    # global_margin is the half-width of the candidate-center search around the COM.
+    com_edge_budget = min(com_row, com_col, (n_row - 1) - com_row, (n_col - 1) - com_col)
+    global_margin = int(min(40, max(2, com_edge_budget // 2)))
     safe_radial_max = float(
         min(
             com_row - global_margin,
@@ -124,8 +145,14 @@ def auto_origin_id(
         device,
     )
     n_r = radial_bins.numel()
-    min_r_idx = int(np.floor(0.1 * n_r))
+    min_r_idx = 0
     max_r_idx = int(np.ceil(0.9 * n_r))
+    # k-weighting, none when kpow == 0 
+    ring_weights = (
+        None
+        if kpow == 0.0
+        else (radial_bins[min_r_idx:max_r_idx].to(device) ** kpow).to(torch.float32)
+    )
     # Normalize offsets to [-1, 1] because grid_sample expects normalized coordinates
     col_norm_scale = 2.0 / (n_col - 1)
     row_norm_scale = 2.0 / (n_row - 1)
@@ -134,7 +161,7 @@ def auto_origin_id(
 
     # Mean-DP global center search: coarse → fine, masking candidates
     # whose polar grid would extend OOB at each step.
-    mean_dp_batch = torch.from_numpy(mean_dp_np).to(device)[None, None]
+    mean_dp_batch = mean_dp_t[None, None]
     # Coarse: step=4 over ±global_margin around the COM
     rows, cols, grids = _build_candidate_grids(
         base_col_norm,
@@ -147,13 +174,13 @@ def auto_origin_id(
         col_norm_scale,
         row_norm_scale,
         device,
-        step=4,
+        step=2,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx, ring_weights)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
-    best = scores.masked_fill(~valid, float("inf")).argmin().item()
+    best = int(scores.masked_fill(~valid, float("inf")).argmin().item())
     coarse_row, coarse_col = int(rows[best].item()), int(cols[best].item())
     # Fine: step=1 over ±6 around the coarse winner
     rows, cols, grids = _build_candidate_grids(
@@ -161,7 +188,7 @@ def auto_origin_id(
         base_row_norm,
         coarse_row,
         coarse_col,
-        6,
+        10,
         n_row,
         n_col,
         col_norm_scale,
@@ -169,11 +196,11 @@ def auto_origin_id(
         device,
         step=1,
     )
-    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
+    scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx, ring_weights)
     valid = (
         (rows >= safe_low) & (rows <= safe_high_row) & (cols >= safe_low) & (cols <= safe_high_col)
     )
-    best = scores.masked_fill(~valid, float("inf")).argmin().item()
+    best = int(scores.masked_fill(~valid, float("inf")).argmin().item())
     global_row, global_col = int(rows[best].item()), int(cols[best].item())
 
     # Per-scan-position refinement (coarse → medium → fine) for descan
@@ -199,20 +226,24 @@ def auto_origin_id(
     )
     n_coarse = coarse_grids.shape[0]
     # Per-DP relative offsets used by the medium and fine stages
-    med_rel = torch.arange(
-        -local_coarse_step, local_coarse_step + 1, 2, dtype=torch.long, device=device
+    med_search_range = torch.arange(
+        -local_coarse_step, local_coarse_step + 1, 1, dtype=torch.long, device=device
     )
-    med_drow, med_dcol = (m.reshape(-1) for m in torch.meshgrid(med_rel, med_rel, indexing="ij"))
-    fine_rel = torch.arange(-1, 2, dtype=torch.long, device=device)
+    med_drow, med_dcol = (
+        m.reshape(-1) for m in torch.meshgrid(med_search_range, med_search_range, indexing="ij")
+    )
+    fine_search_range = torch.arange(-2, 3, dtype=torch.long, device=device)  # [-2,-1,0,1,2] px
     fine_drow, fine_dcol = (
-        m.reshape(-1) for m in torch.meshgrid(fine_rel, fine_rel, indexing="ij")
+        m.reshape(-1) for m in torch.meshgrid(fine_search_range, fine_search_range, indexing="ij")
     )
-    flat_dps = array_4d.reshape(-1, n_row, n_col)
-    origin_flat = origin_array.reshape(-1, 2)
-    n_pos = flat_dps.shape[0]
+    flat_dps_t = array_t.reshape(-1, n_row, n_col)
+    n_pos = flat_dps_t.shape[0]
+    origin_flat_t = torch.zeros(n_pos, 2, dtype=torch.float32, device=device)
 
     def refine(dp_batch, current_row, current_col, drow, dcol):
-        """scores candidates per DP and return the best(row, col) per DP. Invalid (out of bounds) candidates are masked."""
+        """Score candidates per DP and return the best (row, col) per DP, plus
+        the raw score grid and validity mask (used for sub-pixel refinement).
+        Invalid (out of bounds) candidates are masked for the argmin only."""
         n_cands = drow.numel()
         cand_rows = (current_row[:, None] + drow[None, :]).clamp(0, n_row - 1)
         cand_cols = (current_col[:, None] + dcol[None, :]).clamp(0, n_col - 1)
@@ -223,15 +254,24 @@ def auto_origin_id(
             base_row_norm + (cand_rows.reshape(-1).float() * row_norm_scale - 1.0)[:, None, None]
         )
         grids = torch.stack([g_col, g_row], dim=-1)
-        dps = dp_batch.repeat_interleave(n_cands, dim=0)
+        # Stack each DP's candidate grids along the grid's row dim, so each DP
+        # is sampled from its own image instead of from n_cands copies of it
         polars = F.grid_sample(
-            dps, grids, mode="bilinear", padding_mode="zeros", align_corners=True
+            dp_batch,
+            grids.view(dp_batch.shape[0], n_cands * search_n_phi, n_r, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
         )
-        scores = (
-            polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[..., min_r_idx:max_r_idx]
-            .std(dim=2)
-            .sum(dim=2)
-        )
+        region = polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[
+            ..., min_r_idx:max_r_idx
+        ]
+        std_r = _angular_std(region, dim=2)
+        mean_r = region.mean(dim=2)
+        if ring_weights is not None:
+            std_r = std_r * ring_weights
+            mean_r = mean_r * ring_weights
+        scores = std_r.sum(dim=2) / (mean_r.sum(dim=2) + 1e-6)
         valid = (
             (cand_rows >= safe_low)
             & (cand_rows <= safe_high_row)
@@ -239,43 +279,106 @@ def auto_origin_id(
             & (cand_cols <= safe_high_col)
         )
         best = scores.masked_fill(~valid, float("inf")).argmin(dim=1)
-        return (
-            cand_rows.gather(1, best[:, None]).squeeze(1),
-            cand_cols.gather(1, best[:, None]).squeeze(1),
-        )
+        best_row = cand_rows.gather(1, best[:, None]).squeeze(1)
+        best_col = cand_cols.gather(1, best[:, None]).squeeze(1)
+        return best_row, best_col, scores, valid
 
+    n_not_converged = 0  # positions whose fine search did not bracket the minimum
     pbar = tqdm(total=n_pos, desc="Finding origin for each scan position")
     for start in range(0, n_pos, batch_size):
         end = min(start + batch_size, n_pos)
-        bsz = end - start
-        dp_b = (
-            torch.from_numpy(np.ascontiguousarray(flat_dps[start:end], dtype=np.float32))
-            .to(device)
-            .unsqueeze(1)
-        )  # (B, 1, H, W)
+        n_dp = end - start  # number of diffraction patterns in this batch chunk
+        dp_b = flat_dps_t[start:end].unsqueeze(1)  # (B, 1, H, W)
         # Coarse (shared grids): broadcast B DPs across n_coarse candidate
         # grids in one grid_sample call by stacking DPs in the channel dim
         # and stride-0 expanding along the candidate dim
         polars_coarse = F.grid_sample(
-            dp_b.transpose(0, 1).expand(n_coarse, bsz, n_row, n_col),
+            dp_b.transpose(0, 1).expand(n_coarse, n_dp, n_row, n_col),
             coarse_grids,
             mode="bilinear",
             padding_mode="zeros",
             align_corners=True,
         )
-        scores_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx].std(dim=2).sum(dim=2)
+        region_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx]
+        std_r_coarse = _angular_std(region_coarse, dim=2)
+        mean_r_coarse = region_coarse.mean(dim=2)
+        if ring_weights is not None:
+            std_r_coarse = std_r_coarse * ring_weights
+            mean_r_coarse = mean_r_coarse * ring_weights
+        scores_coarse = std_r_coarse.sum(dim=2) / (mean_r_coarse.sum(dim=2) + 1e-6)
         scores_coarse = scores_coarse.masked_fill(~coarse_valid[:, None], float("inf"))
         best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
         current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
         # Medium: per-DP search around the coarse winner
-        current_row, current_col = refine(dp_b, current_row, current_col, med_drow, med_dcol)
-        # Fine: per-DP ±1 around the medium winner
-        current_row, current_col = refine(dp_b, current_row, current_col, fine_drow, fine_dcol)
-        origin_flat[start:end, 0] = current_row.cpu().numpy()
-        origin_flat[start:end, 1] = current_col.cpu().numpy()
-        pbar.update(bsz)
+        current_row, current_col, _, _ = refine(
+            dp_b, current_row, current_col, med_drow, med_dcol
+        )
+        # Fine: per-DP search around the medium winner
+        best_row, best_col, fine_scores, fine_valid = refine(
+            dp_b, current_row, current_col, fine_drow, fine_dcol
+        )
+        # Sub-pixel refine: fit a 2D quadratic to the 3x3 of fine scores around
+        # the integer winner and add the vertex offset. The flat (B, n) grid
+        # reshapes to (B, side, side) with [:, i, j] = (fine_search_range[i], fine_search_range[j]).
+        side = fine_search_range.numel()
+        scores_grid = fine_scores.view(n_dp, side, side)
+        valid_grid = fine_valid.view(n_dp, side, side)
+        flat_best = (
+            scores_grid.masked_fill(~valid_grid, float("inf")).view(n_dp, -1).argmin(dim=1)
+        )
+        # unravel the flat argmin (best candidate pixel) into 2D (row, col) indices in the side x side grid
+        i_star, j_star = flat_best // side, flat_best % side
+        # Gather the 3x3 patch around (i_star, j_star)
+        batch_idx = torch.arange(n_dp, device=device)
+        ii = torch.stack([i_star - 1, i_star, i_star + 1], dim=1).clamp(0, side - 1)
+        jj = torch.stack([j_star - 1, j_star, j_star + 1], dim=1).clamp(0, side - 1)
+        patch = scores_grid[batch_idx[:, None, None], ii[:, :, None], jj[:, None, :]]
+        # A winner "on the border" of the fine grid (its 3x3 would fall off the
+        # edge) means coarse+medium did not bracket the minimum -- genuine
+        # non-convergence, counted and warned about below. Keep the integer
+        # winner there; apply the sub-pixel offset only to interior winners.
+        on_border = (i_star < 1) | (i_star > side - 2) | (j_star < 1) | (j_star > side - 2)
+        n_not_converged += int(on_border.sum())
+        offset = _quadratic_subpixel_offset(patch).to(torch.float32)  # (B, 2)
+        offset = torch.where(on_border[:, None], torch.zeros_like(offset), offset)
+        origin_flat_t[start:end, 0] = best_row.to(torch.float32) + offset[:, 0]
+        origin_flat_t[start:end, 1] = best_col.to(torch.float32) + offset[:, 1]
+        pbar.update(n_dp)
     pbar.close()
-    return origin_array
+    if n_not_converged:
+        warnings.warn(
+            f"find_origin_angular_grid: {n_not_converged} of {n_pos} scan positions did not "
+            "converge to a sub-pixel origin (descan may exceed local_margin). The integer-pixel origin was "
+            "used at those positions.",
+            stacklevel=2,
+        )
+    return origin_flat_t.cpu().numpy().reshape(scan_row, scan_col, 2)
+
+
+def _ellipse_stretch_factors(
+    ellipse_params: tuple[float, float, float] | None,
+) -> tuple[float, float]:
+    """Largest factor by which polar sampling at radius ``r_pix`` can exceed
+    ``r_pix`` along each image axis.
+
+    :func:`_polar_to_cartesian_offsets` stretches the ellipse-frame major axis
+    by ``a / b``, so a sample nominally at ``r_pix`` actually lands as far as
+    ``r_pix * stretch`` from the origin. Dividing an origin's distance-to-edge
+    budget by these gives the largest radius that still samples inside the
+    frame. Both factors are 1 when no ellipse correction is applied.
+    """
+    if ellipse_params is None:
+        return 1.0, 1.0
+    if len(ellipse_params) != 3:
+        raise ValueError("ellipse_params must be (a, b, theta_deg).")
+    a, b, theta_deg = ellipse_params
+    ab = float(a) / float(b)
+    theta = np.deg2rad(float(theta_deg))
+    # offset_col = (a/b) r cos(alpha) cos(theta) - r sin(alpha) sin(theta), so
+    # max over alpha is r * hypot((a/b) cos(theta), sin(theta)); likewise for row.
+    stretch_row = float(np.hypot(ab * np.sin(theta), np.cos(theta)))
+    stretch_col = float(np.hypot(ab * np.cos(theta), np.sin(theta)))
+    return stretch_row, stretch_col
 
 
 def polar_transform(
@@ -293,12 +396,12 @@ def polar_transform(
     device: str = "cpu",
     batch_size: int = 128,
 ) -> Polar4dstem | torch.Tensor:
-    if data.array.ndim != 4:
+    if data.ndim != 4:
         raise ValueError(
-            f"Found array with shape: {data.array.shape}. "
+            f"Found array with shape: {data.shape}. "
             "polar_transform requires a 4D-STEM dataset (ndim=4)."
         )
-    scan_row, scan_col, n_row, n_col = data.array.shape
+    scan_row, scan_col, n_row, n_col = data.shape
 
     # Standardize origin_array input
     if isinstance(origin_array, torch.Tensor):
@@ -321,12 +424,26 @@ def polar_transform(
     # If scan_pos is provided, compute polar transform only for that position
     if scan_pos is not None:
         i_row, i_col = scan_pos
-        dp = torch.from_numpy(data.array[i_row, i_col].astype(np.float32)).to(device)
+        dps = (
+            torch.from_numpy(np.ascontiguousarray(data.array))
+            if data.array is not None
+            else data.tensor
+        )
+        dp = dps[i_row, i_col].to(device=device, dtype=torch.float32)
         r0 = float(origins[i_row, i_col, 0])
         c0 = float(origins[i_row, i_col, 1])
-        # Clamp radial range to image bounds for this origin
+        # Clamp radial range to image bounds for this origin, accounting for the
+        # ellipse correction stretching the sampling beyond r_pix
         if radial_max is None:
-            radial_max_eff = float(min(r0, (n_row - 1) - r0, c0, (n_col - 1) - c0))
+            stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
+            radial_max_eff = float(
+                min(
+                    r0 / stretch_row,
+                    ((n_row - 1) - r0) / stretch_row,
+                    c0 / stretch_col,
+                    ((n_col - 1) - c0) / stretch_col,
+                )
+            )
         else:
             radial_max_eff = float(radial_max)
         if radial_max_eff <= radial_min:
@@ -354,15 +471,40 @@ def polar_transform(
         )
         return polar2d.squeeze(0).squeeze(0)  # (n_phi, n_r)
 
-    # Use the global minimum safe radius across all origins so every scan
-    # position maps to the same-size polar grid (required for a uniform 4D output)
+    # Every scan position must map to the same-size polar grid (required for a
+    # uniform 4D output), so one radius has to serve all origins. Using from a
+    # low percentile rather than the minimum prevents a of failed origin fit
+    # from truncating the whole dataset's q-axis.
     if radial_max is None:
-        r_row_pos = origins[:, :, 0]
-        r_row_neg = (n_row - 1) - origins[:, :, 0]
-        r_col_pos = origins[:, :, 1]
-        r_col_neg = (n_col - 1) - origins[:, :, 1]
+        stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
+        r_row_pos = origins[:, :, 0] / stretch_row
+        r_row_neg = ((n_row - 1) - origins[:, :, 0]) / stretch_row
+        r_col_pos = origins[:, :, 1] / stretch_col
+        r_col_neg = ((n_col - 1) - origins[:, :, 1]) / stretch_col
         radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
-        radial_max = float(max(radial_max_eff_array.min(), radial_min + radial_step))
+        radial_max = float(
+            max(
+                np.percentile(radial_max_eff_array, RADIAL_MAX_PERCENTILE),
+                radial_min + radial_step,
+            )
+        )
+        # Positions in the percentile tail sample past the detector edge and are
+        # zero-filled there. The tail is non-empty by construction, and most of
+        # it only grazes the edge by a fraction of a pixel, which costs nothing.
+        # Warn only where a position loses a whole radial bin or more: that is a
+        # bad origin fit, not an artifact of choosing a percentile.
+        shortfall = radial_max - radial_max_eff_array
+        n_bad = int((shortfall > radial_step).sum())
+        if n_bad:
+            worst = float(radial_max_eff_array.min())
+            warnings.warn(
+                f"polar_transform: {n_bad} of {radial_max_eff_array.size} scan "
+                "positions have origins too close to the detector edge for "
+                f"radial_max={radial_max:.2f} px and lose more than one radial "
+                f"bin to zero-padding (the worst supports only {worst:.2f} px). "
+                "This is likely due to a failed origin fit.",
+                stacklevel=2,
+            )
 
     # Build origin-independent polar offsets ONCE. Only the per-origin shift
     # changes from one scan position to the next, so we can reuse these.
@@ -387,12 +529,17 @@ def polar_transform(
 
     # Flatten scan dims so we can iterate in flat batches
     n_pos = scan_row * scan_col
-    dp_view = data.array.reshape(n_pos, n_row, n_col)
+    dps = (
+        torch.from_numpy(np.ascontiguousarray(data.array))
+        if data.array is not None
+        else data.tensor
+    )
+    dp_view = dps.reshape(n_pos, n_row, n_col)
     origins_t = torch.from_numpy(
         np.ascontiguousarray(origins.reshape(n_pos, 2), dtype=np.float32)
     ).to(device)
 
-    out = np.empty((n_pos, n_phi, n_r), dtype=np.float32)
+    out = torch.empty((n_pos, n_phi, n_r), dtype=torch.float32, device=device)
     for start in tqdm(range(0, n_pos, batch_size), desc="Polar transform"):
         end = min(start + batch_size, n_pos)
         # Translate the precomputed offsets to each origin in this batch
@@ -403,9 +550,7 @@ def polar_transform(
         # grid_sample requires (col, row) ordering in the last dim
         grids = torch.stack([grid_col, grid_row], dim=-1)
 
-        dp_batch = torch.from_numpy(np.ascontiguousarray(dp_view[start:end], dtype=np.float32)).to(
-            device
-        )
+        dp_batch = dp_view[start:end].to(device=device, dtype=torch.float32)
         polars = F.grid_sample(
             dp_batch.unsqueeze(1),
             grids,
@@ -413,7 +558,7 @@ def polar_transform(
             padding_mode="zeros",
             align_corners=True,
         )
-        out[start:end] = to_numpy(polars.squeeze(1))
+        out[start:end] = polars.squeeze(1)
     out = out.reshape(scan_row, scan_col, n_phi, n_r)
 
     # Get polar axes in physical units matching the input dataset's calibration
@@ -445,7 +590,7 @@ def polar_transform(
         }
     )
     return Polar4dstem(
-        array=out,
+        tensor=out,
         name=name if name is not None else f"{data.name}_polar",
         origin=origin,
         sampling=sampling,
@@ -604,9 +749,11 @@ def _angular_std_scores(
     grids: torch.Tensor,
     min_r_idx: int,
     max_r_idx: int,
+    ring_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score candidate origins by angular std over a mid-radius band.
-    Lower scores indicate better centering."""
+    Lower scores indicate better centering. Optional ``ring_weights``
+    applies a per-ring weighting before summation."""
     n = grids.shape[0]
     # Sample the diffraction pattern at each candidate's polar grid positions
     polars = F.grid_sample(
@@ -617,6 +764,288 @@ def _angular_std_scores(
         align_corners=True,
     )
     # A correctly centered pattern has uniform intensity along each ring,
-    # so the angular std is minimized at the true center
+    # so the angular std is minimized at the true center. Normalize by
+    # mean intensity so candidates whose polar grid samples only background
+    # do not win on absolute std alone (relevant when search windows are
+    # wide enough to include centers far from the direct beam).
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    return region.std(dim=1).sum(dim=1)
+    std_r = _angular_std(region, dim=1)
+    mean_r = region.mean(dim=1)
+    if ring_weights is not None:
+        std_r = std_r * ring_weights
+        mean_r = mean_r * ring_weights
+    return std_r.sum(dim=1) / (mean_r.sum(dim=1) + 1e-6)
+
+
+def _angular_std(region: torch.Tensor, dim: int) -> torch.Tensor:
+    """``region.std(dim=dim)``, with a faster route on CPU."""
+    if region.device.type != "cpu":
+        return region.std(dim=dim)
+    region = region.double()
+    centred = region - region.mean(dim=dim, keepdim=True)
+    return (centred.square().sum(dim=dim) / (region.shape[dim] - 1)).sqrt().float()
+
+
+def _quadratic_subpixel_offset(patch: torch.Tensor) -> torch.Tensor:
+    """Sub-pixel location of the minimum of a 3x3 score patch.
+
+    Fits a 2D quadratic surface
+        s(u, v) = a + b u + c v + d u^2 + e v^2 + f u v
+    (u = row offset, v = col offset, both over {-1, 0, 1}) to each patch by
+    least squares, then returns the vertex (the point where both partial
+    derivatives vanish):
+        [2d  f ] [dr]   [-b]
+        [f   2e] [dc] = [-c]
+    The fit depends only on the fixed 3x3 offset positions, so the
+    least-squares matrix (``fit_matrix``) is identical for every patch.
+
+    Parameters
+    ----------
+    patch
+        (N, 3, 3) score patches. ``patch[:, i, j]`` is the score at row
+        offset ``i - 1`` and col offset ``j - 1``.
+
+    Returns
+    -------
+    offset
+        (N, 2) sub-pixel ``(drow, dcol)`` offsets in pixels, each clamped to
+        [-1, 1]. Rows whose fit is not a clean minimum (Hessian not positive
+        definite, or any non-finite score) get ``(0, 0)``.
+    """
+    device = patch.device
+    scores_flat = patch.reshape(patch.shape[0], 9).to(torch.float64)  # (N, 9)
+    # The 9 fixed offset positions of the 3x3 patch, flattened row-major to
+    # match scores_flat.
+    grid = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64, device=device)
+    uu, vv = torch.meshgrid(grid, grid, indexing="ij")
+    u, v = uu.reshape(9), vv.reshape(9)
+    # Design matrix: each row evaluates the quadratic basis
+    # [1, u, v, u^2, v^2, u v] at one offset position.
+    basis_matrix = torch.stack([torch.ones_like(u), u, v, u * u, v * v, u * v], dim=1)  # (9, 6)
+    # Least-squares pseudo-inverse, same for every patch: coeffs = fit_matrix @ scores.
+    fit_matrix = torch.linalg.pinv(basis_matrix)  # (6, 9)
+    # fit coeffs
+    a, b, c, d, e, f = (scores_flat @ fit_matrix.T).unbind(dim=1)  # each (N,)
+    # find minimum
+    det = 4.0 * d * e - f * f  # determinant of the 2x2 curvature (Hessian) matrix
+    # Accept only clean minima (Hessian positive definite) with finite scores.
+    valid = (2.0 * d > 0) & (det > 1e-12) & torch.isfinite(scores_flat).all(dim=1)
+    det_safe = torch.where(valid, det, torch.ones_like(det))
+    drow = torch.where(valid, (f * c - 2.0 * e * b) / det_safe, torch.zeros_like(det))
+    dcol = torch.where(valid, (f * b - 2.0 * d * c) / det_safe, torch.zeros_like(det))
+    return torch.stack([drow.clamp(-1.0, 1.0), dcol.clamp(-1.0, 1.0)], dim=1)
+
+
+
+def find_origin_angular_descent(
+    data: Dataset4dstem,
+    *,
+    ellipse_params: tuple[float, float, float] | None = None,
+    radial_min: float = 0.0,
+    radial_max: float | None = None,
+    n_phi: int = 120,
+    radial_step: float = 1.0,
+    kpow: float = 0.0,
+    device: str = "cpu",
+) -> NDArray:
+    """Margin-free diffraction-center finding by COM-anchored local descent.
+
+    Anchors every pattern at the intensity centroid and walks downhill, then 
+    fits a 2D quadratic for the sub-pixel center. Robust on small detectors.
+
+    Parameters
+    ----------
+    data : Dataset4dstem
+        A 4D-STEM dataset (or a 2D dataset, treated as a 1x1 scan).
+    ellipse_params : tuple or None
+        ``(a, b, theta_deg)`` to sample along elliptical rings. Origin finding stays
+        accurate without it (the center is located by the pattern's inversion
+        symmetry, independent of ring shape); supplying it deepens the score minimum
+        and is a mild refinement on strongly elliptical data. ``None`` = circular.
+    radial_min, radial_max : float
+        Inner / outer radius (px) of the scoring annulus. Set ``radial_min`` above
+        the central beam (or any saturated core). ``radial_max=None`` defaults to
+        ``min(n_row, n_col) // 2 - 2``.
+    n_phi : int
+        Number of angular samples per ring.
+    radial_step : float
+        Radial sampling step (px).
+    kpow : float
+        Up-weight each ring's contribution by ``k**kpow`` (k == radius). ``0`` is the
+        plain ratio-of-sums objective; ``1``/``2`` emphasize high-k.
+    device : str
+        Torch device.
+
+    Returns
+    -------
+    origin_array : np.ndarray
+        Shape ``(scan_row, scan_col, 2)`` of ``(row, col)`` origins in pixels.
+
+    See Also
+    --------
+    find_origin_angular_grid : global angular-variance grid search; more robust to a
+        poor initial guess.
+    """
+    if data.ndim == 2:
+        scan_row, scan_col, n_row, n_col = 1, 1, *data.shape
+    elif data.ndim == 4:
+        scan_row, scan_col, n_row, n_col = data.shape
+    else:
+        raise ValueError(
+            f"Got array with shape {data.shape}. "
+            "To use find_origin_angular_descent, pass a 2D or 4D-STEM dataset."
+        )
+    if radial_max is None:
+        radial_max = float(min(n_row, n_col) // 2 - 2)
+    n_radial = max(4, int(round((radial_max - radial_min) / radial_step)) + 1)
+    data_tensor = (
+        torch.from_numpy(np.ascontiguousarray(data.array))
+        if data.array is not None
+        else data.tensor
+    )
+    array_tensor = data_tensor.to(device=device, dtype=torch.float32)
+    if array_tensor.ndim == 2:
+        array_tensor = array_tensor[None, None]
+    patterns = array_tensor.reshape(-1, n_row, n_col)
+    n_patterns = patterns.shape[0]
+    offset_row, offset_col, ring_weights = _local_sampling(
+        radial_min, radial_max, n_phi, n_radial, kpow, ellipse_params, device
+    )
+    # Global anchor: descend on the high-SNR mean DP (a batch of one), seeded at its COM.
+    mean_pattern = array_tensor.mean(dim=(0, 1))
+    global_origin = _descend_batched(
+        mean_pattern[None], torch.round(_com_anchor(mean_pattern))[None],
+        offset_row, offset_col, ring_weights, n_phi, n_radial, device,
+    )[0]
+    # Per-position: start every DP at the integer global anchor and descend (tracks descan).
+    start_centers = torch.round(global_origin)[None].expand(n_patterns, 2).clone()
+    origins = _descend_batched(
+        patterns, start_centers, offset_row, offset_col, ring_weights, n_phi, n_radial, device,
+    )
+    return origins.reshape(scan_row, scan_col, 2).cpu().numpy()
+
+
+# --- helpers for find_origin_angular_descent -------------------------------------
+# The 8 neighbor directions (axial + diagonal) for the pattern search.
+_NEIGHBOR_STEPS_8 = [[1.0, 0], [-1, 0], [0, 1.0], [0, -1], [1, 1.0], [1, -1], [-1, 1], [-1, -1]]
+# The 9 offsets of a 3x3 patch, row-major: index k = i*3 + j -> (row i-1, col j-1);
+# the patch center is k = 4.
+_PATCH_OFFSETS_3X3 = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]]
+
+
+def _com_anchor(pattern: torch.Tensor) -> torch.Tensor:
+    """Rough center guess from the intensity-weighted centroid of the DP."""
+    n_row, n_col = pattern.shape
+    clipped = pattern.clamp(min=0)
+    total = clipped.sum() + 1e-9
+    rows = torch.arange(n_row, device=pattern.device, dtype=torch.float32)
+    cols = torch.arange(n_col, device=pattern.device, dtype=torch.float32)
+    center_row = (rows[:, None] * clipped).sum() / total
+    center_col = (cols[None, :] * clipped).sum() / total
+    return torch.tensor([center_row.item(), center_col.item()], device=pattern.device)
+
+
+def _local_sampling(radial_min, radial_max, n_phi, n_radial, kpow, ellipse_params, device):
+    """Polar-sampling template (row/col offset per (phi, radius)) + per-ring k-weights.
+
+    With ``ellipse_params=(a, b, theta_deg)`` the template follows the elliptical rings. ``None`` samples on
+    circles. Uses the same ``_polar_to_cartesian_offsets`` transform as the grid finder."""
+    phi = torch.linspace(0, 2 * np.pi, n_phi + 1, device=device)[:-1]
+    radii = torch.linspace(radial_min, radial_max, n_radial, device=device)
+    phi_grid, radius_grid = torch.meshgrid(phi, radii, indexing="ij")   # (n_phi, n_radial)
+    offset_row, offset_col = _polar_to_cartesian_offsets(
+        phi_grid, radius_grid, ellipse_params, device
+    )
+    ring_weights = radii**kpow                                          # (n_radial,)
+    return offset_row, offset_col, ring_weights
+
+
+def _local_polar_score(polar_values, valid_mask, n_phi, ring_weights, min_valid_frac):
+    """Angular-uniformity score from sampled polar values."""
+    n_valid = valid_mask.sum(dim=-2).clamp(min=1)              # (..., n_radial)
+    ring_mean = (polar_values * valid_mask).sum(dim=-2) / n_valid
+    ring_var = (((polar_values - ring_mean.unsqueeze(-2)) ** 2) * valid_mask).sum(dim=-2) / n_valid
+    ring_std = ring_var.sqrt()
+    ring_usable = valid_mask.sum(dim=-2) >= (min_valid_frac * n_phi)
+    weights = ring_weights * ring_usable
+    score = (weights * ring_std).sum(dim=-1) / ((weights * ring_mean.abs()).sum(dim=-1) + 1e-6)
+    return score, ring_usable
+
+
+def _local_score_pairs(patterns, pattern_index, centers, offset_row, offset_col,
+                       ring_weights, n_phi, device, min_valid_frac=0.5, chunk=4096):
+    """Score K (pattern, center) pairs: patterns[pattern_index[k]] scored at centers[k].
+
+    patterns:(M,H,W), pattern_index:(K,), centers:(K,2) -> (K,) angular-uniformity scores."""
+    _, n_row, n_col = patterns.shape
+    ones_image = torch.ones(1, 1, n_row, n_col, device=device)
+    scores = torch.empty(centers.shape[0], device=device)
+    for start in range(0, centers.shape[0], chunk):
+        index = pattern_index[start:start + chunk]
+        n_chunk = index.shape[0]
+        center_row = centers[start:start + chunk, 0][:, None, None]
+        center_col = centers[start:start + chunk, 1][:, None, None]
+        sample_grid = torch.stack(
+            [2.0 * (center_col + offset_col[None]) / (n_col - 1) - 1.0,
+             2.0 * (center_row + offset_row[None]) / (n_row - 1) - 1.0], dim=-1
+        )
+        polar_values = F.grid_sample(
+            patterns[index][:, None], sample_grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        )[:, 0]
+        valid_mask = F.grid_sample(
+            ones_image.expand(n_chunk, 1, n_row, n_col), sample_grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        )[:, 0] > 0.999
+        scores[start:start + n_chunk], _ = _local_polar_score(
+            polar_values, valid_mask, n_phi, ring_weights, min_valid_frac
+        )
+    return scores
+
+
+def _descend_batched(patterns, anchors, offset_row, offset_col, ring_weights, n_phi,
+                     n_radial, device, schedule=(4.0, 2.0, 1.0), sweeps=2):
+    """Batched coarse descent (shared step schedule, to 1 px) + quadratic sub-pixel.
+
+    Walks each pattern downhill on the angular-uniformity score from its integer
+    ``anchors`` center (Hooke-Jeeves 8-neighbor search, step halving over ``schedule``),
+    then fits a 2D quadratic to the local 3x3 for the sub-pixel vertex. Used for both
+    the global mean-DP anchor (a batch of one) and the per-position pass.
+
+    patterns : (M, H, W);  anchors : (M, 2) integer-valued start centers.
+    Returns (M, 2) sub-pixel (row, col) origins.
+    """
+    n_patterns = patterns.shape[0]
+    pattern_ids = torch.arange(n_patterns, device=device)
+    neighbor_steps = torch.tensor(_NEIGHBOR_STEPS_8, device=device)
+    patch_offsets = torch.tensor(_PATCH_OFFSETS_3X3, dtype=torch.float32, device=device)
+    pattern_ids_per_neighbor = pattern_ids.repeat_interleave(8)
+    pattern_ids_per_patch = pattern_ids.repeat_interleave(9)
+    center = anchors.clone()
+
+    def score_at(pattern_index, centers):
+        return _local_score_pairs(patterns, pattern_index, centers, offset_row, offset_col,
+                                  ring_weights, n_phi, device)
+
+    best_score = score_at(pattern_ids, center)
+    # Coarse descent: at each step size, move to the best-improving 8-neighbor; when no
+    # neighbor improves, halve the step. Brackets the minimum to ~1 px.
+    for step in schedule:
+        for _ in range(sweeps):
+            neighbors = (center[:, None, :] + step * neighbor_steps[None]).reshape(n_patterns * 8, 2)
+            neighbor_scores = score_at(pattern_ids_per_neighbor, neighbors).reshape(n_patterns, 8)
+            best_neighbor = neighbor_scores.argmin(dim=1)
+            best_neighbor_score = neighbor_scores.gather(1, best_neighbor[:, None]).squeeze(1)
+            improved = best_neighbor_score < best_score - 1e-12
+            best_neighbor_center = neighbors.reshape(n_patterns, 8, 2)[pattern_ids, best_neighbor]
+            center = torch.where(improved[:, None], best_neighbor_center, center)
+            best_score = torch.where(improved, best_neighbor_score, best_score)
+    # Re-center each 3x3 patch on its integer minimum so the quadratic brackets it.
+    patch_centers = (center[:, None, :] + patch_offsets[None]).reshape(n_patterns * 9, 2)
+    patch_scores = score_at(pattern_ids_per_patch, patch_centers).reshape(n_patterns, 9)
+    center = patch_centers.reshape(n_patterns, 9, 2)[pattern_ids, patch_scores.argmin(dim=1)]
+    # Sub-pixel vertex from a 2D-quadratic fit to the final 3x3 of scores.
+    patch_centers = (center[:, None, :] + patch_offsets[None]).reshape(n_patterns * 9, 2)
+    score_patch = score_at(pattern_ids_per_patch, patch_centers).reshape(n_patterns, 3, 3)
+    subpixel_offset = _quadratic_subpixel_offset(score_patch).to(torch.float32)
+    return center + subpixel_offset
