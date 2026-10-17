@@ -28,21 +28,18 @@ def _summary_record(shape: tuple[int, int, int, int], sources: Sequence) -> dict
     corrections = [
         source.metadata.get(
             "hot_pixel_correction",
-            {"method": "zero", "applied": False, "pixel_count": 0},
+            {"method": "none", "applied": False, "pixel_count": 0},
         )
         for source in sources
     ]
-    methods = sorted({str(record.get("method", "zero")) for record in corrections})
+    methods = sorted({str(record.get("method", "none")) for record in corrections})
     corrected = all(record.get("applied") is True for record in corrections)
     if corrected and methods == ["median"]:
         invalid_policy = "stored detector-mask pixels use their local 3x3 median"
     elif corrected and methods == ["zero"]:
         invalid_policy = "stored detector-mask pixels are replaced with zero"
     else:
-        invalid_policy = (
-            "stored detector-mask exclusions contribute zero; the divisor "
-            "remains the complete detector pixel count"
-        )
+        invalid_policy = "input detector values are used without further pixel correction"
     return {
         "version": 1,
         "source_count": len(sources),
@@ -458,7 +455,9 @@ class ResidentMergeSource:
 
     def _update_merge_metadata(self) -> None:
         representations = {
-            str(source.metadata.get("representation", "unknown"))
+            str(source.metadata.get(
+                "representation", "dense" if isinstance(source, Dataset4dstem) else "unknown"
+            ))
             for source in self.sources
         }
         record = {

@@ -97,7 +97,6 @@ def read_4dstem(
     scan_length: int | None = None,
     scan_axis: int = 0,
     transpose_scan_axes: bool = False,
-    apply_mask: bool = False,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -136,10 +135,6 @@ def read_4dstem(
         If True, transpose the scan axes after reshaping so that
         (scan_y, scan_x) -> (scan_x, scan_y). This effectively swaps the
         interpretation of scan rows and columns in the final 4D array.
-    apply_mask : bool, optional
-        Zero pixels flagged by the stored Arina detector mask. Requires native
-        detector sampling (``rebin_diffraction=1``); no interpolation is applied.
-        The original file is unchanged and the correction is recorded in metadata.
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
 
@@ -264,11 +259,6 @@ def read_4dstem(
     name_override = kwargs.pop("name", None)
 
     plugin, file_reader = _rsciio_reader(file_path, file_type)
-    if apply_mask and (plugin != "rsciio.arina" or kwargs.get("rebin_diffraction", 1) != 1):
-        raise ValueError(
-            "apply_mask requires file_type='arina' and rebin_diffraction=1; "
-            "apply the stored detector mask before binning."
-        )
     data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
@@ -379,22 +369,6 @@ def read_4dstem(
     )
 
     array = imported_data["data"]
-    correction = None
-    if apply_mask:
-        with h5py.File(file_path, "r") as source:
-            mask = source["entry/instrument/detector/detectorSpecific/pixel_mask"][()] != 0
-        if mask.shape != array.shape[-2:]:
-            raise ValueError(
-                f"Detector mask shape {mask.shape} differs from {array.shape[-2:]}; "
-                "load the native detector dimensions before applying the mask."
-            )
-        array[..., mask] = 0
-        correction = {
-            "method": "zero",
-            "applied": True,
-            "pixel_count": int(mask.sum()),
-            "coordinates_row_column": np.argwhere(mask).tolist(),
-        }
     if hot_pixel_filter:
         from quantem.core.utils.filter import filter_hot_pixels
 
@@ -407,10 +381,6 @@ def read_4dstem(
         units=units,
         name=name_override,
     )
-    dataset.file_path = file_path
-    dataset.metadata.update(source_path=str(file_path), representation="dense")
-    if correction is not None:
-        dataset.metadata["hot_pixel_correction"] = correction
 
     return dataset
 

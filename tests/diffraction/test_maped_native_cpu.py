@@ -6,10 +6,11 @@ import h5py
 import numpy as np
 import torch
 
-import quantem.diffraction.maped as maped_module
+import quantem.diffraction.maped._maped as maped_module
 from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io import load
 from quantem.diffraction import MAPED
+from quantem.diffraction.maped import io
 
 
 def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
@@ -42,11 +43,19 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
         with h5py.File(path, "w") as file:
             file["entry/data/data_000001"] = counts.reshape(-1, 16, 16)
             file["entry/instrument/detector/detectorSpecific/pixel_mask"] = mask
-        tilt = Dataset4dstem.from_file(path, "arina", apply_mask=True)
+        original = Dataset4dstem.from_file(path, "arina")
+        np.testing.assert_array_equal(original.array, counts)
+        unmasked = io.load(path, "arina")
+        np.testing.assert_array_equal(unmasked.array, original.array)
+        tilt = io.load(path, "arina", apply_mask=True)
         expected = counts.copy()
         expected[..., 0, 0] = 0
         np.testing.assert_array_equal(tilt.array, expected)
         assert tilt.metadata["hot_pixel_correction"]["pixel_count"] == 1
+        with h5py.File(path) as file:
+            np.testing.assert_array_equal(
+                file["entry/data/data_000001"][()], counts.reshape(-1, 16, 16)
+            )
         tilts.append(tilt)
 
     maped = MAPED.from_datasets(tilts)
@@ -111,7 +120,7 @@ def test_native_arina_counts_and_optional_calibration(tmp_path):
         file.attrs["scan_shape"] = (4, 6)
         file["entry/data/data_000001"] = counts[:12]
         file["entry/data/data_000002"] = counts[12:]
-    pixels = Dataset4dstem.from_file(
+    pixels = io.load(
         path, "arina", navigation_shape=(4, 6), dtype=np.uint32
     )
     np.testing.assert_array_equal(pixels.array, counts.reshape(4, 6, 8, 8))
@@ -120,7 +129,7 @@ def test_native_arina_counts_and_optional_calibration(tmp_path):
 
     with h5py.File(tmp_path / "scan.h5", "w") as file:
         file.create_group("STEM Metadata").attrs["Pixel Size"] = [0.25]
-    calibrated = Dataset4dstem.from_file(
+    calibrated = io.load(
         path, "arina", navigation_shape=(4, 6), dtype=np.uint32
     )
     np.testing.assert_array_equal(calibrated.array, pixels.array)
@@ -134,7 +143,7 @@ def test_native_arina_binning_and_flatfield(tmp_path):
     counts = np.broadcast_to(np.arange(16, dtype=np.uint16).reshape(4, 4), (4, 4, 4))
     with h5py.File(path, "w") as file:
         file["entry/data/data_000001"] = counts
-    binned = Dataset4dstem.from_file(path, "arina", rebin_diffraction=2, dtype=np.float32)
+    binned = io.load(path, "arina", rebin_diffraction=2, dtype=np.float32)
     np.testing.assert_array_equal(binned.array[0, 0], [[2.5, 4.5], [10.5, 12.5]])
 
     with h5py.File(path, "r+") as file:
@@ -142,7 +151,7 @@ def test_native_arina_binning_and_flatfield(tmp_path):
     flatfield = np.full((4, 4), 2.0)
     flatfield[:, 0] = 4.0
     flatfield[0, 0] = 0
-    corrected = Dataset4dstem.from_file(
+    corrected = io.load(
         path, "arina", rebin_diffraction=2, flatfield=flatfield, dtype=np.uint16
     )
     assert corrected.array.dtype == np.float32

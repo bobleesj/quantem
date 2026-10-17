@@ -94,7 +94,7 @@ def _tilt_name(index: int, file: str | Path | None) -> str:
 
     Acquisition software writes the beam tilt into the file name as
     ``<x>x_<y>y`` (``sample_-17.0x_0.0y_master.h5``); the HDF5 metadata does
-    not carry it. ``quantem.gpu.io.load`` records the file in
+    not carry it. ``maped.io.load`` and ``quantem.gpu.io.load`` record the file in
     ``metadata["source_path"]``. Plots labelled by position in the list make
     the reader count files to know which tilt they are looking at.
     """
@@ -155,9 +155,9 @@ class MAPED(AutoSerialize):
             (scan_row, scan_col, k_row, k_col) and on the same device.
             CPU inputs are native ``Dataset4dstem`` objects; they do not require
             ``quantem.gpu``. Encoded inputs use ``quantem.gpu.io.load``. Plots
-            name each tilt from the file it was loaded from: a file named
+            name each tilt from ``metadata["source_path"]`` when available: a file named
             ``..._-17.0x_0.0y_master.h5`` is labelled ``-17.0x 0.0y``; a name
-            without a tilt is labelled ``Tilt 0``, ``Tilt 1``, ...
+            without a tilt or source path is labelled ``Tilt 0``, ``Tilt 1``, ...
 
         Examples
         --------

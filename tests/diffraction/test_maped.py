@@ -8,7 +8,7 @@ from torch import arange, backends, cuda, equal, exp, float32, meshgrid, tensor,
 from torch.testing import assert_close
 
 from quantem.diffraction import MAPED
-from quantem.diffraction._maped_resident import _sample_scan_rows
+from quantem.diffraction.maped._maped_resident import _sample_scan_rows
 
 io = pytest.importorskip("quantem.gpu.io", reason="Encoded-input tests require quantem.gpu")
 
