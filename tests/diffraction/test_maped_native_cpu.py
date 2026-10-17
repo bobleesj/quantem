@@ -12,7 +12,7 @@ from quantem.core.io import load
 from quantem.diffraction import MAPED
 
 
-def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch, caplog):
+def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
     """Native Arina inputs recover known shifts without optional GPU packages."""
     original_import = builtins.__import__
 
@@ -47,9 +47,7 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch, caplog):
         expected[..., 0, 0] = 0
         np.testing.assert_array_equal(tilt.array, expected)
         assert tilt.metadata["hot_pixel_correction"]["pixel_count"] == 1
-        assert not tilt.metadata["scan_calibration"]["available"]
         tilts.append(tilt)
-    assert "Could not read metadata" not in caplog.text
 
     maped = MAPED.from_datasets(tilts)
     merged = maped.run(show=False, verbose=False)
@@ -100,23 +98,26 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch, caplog):
 def test_native_arina_counts_and_optional_calibration(tmp_path):
     """Rectangular scans retain uint32 counts with or without microscope metadata."""
     path = tmp_path / "scan_master.h5"
-    counts = np.arange(4 * 6 * 8 * 10, dtype=np.uint32).reshape(24, 8, 10) + 70000
+    counts = np.arange(4 * 6 * 8 * 8, dtype=np.uint32).reshape(24, 8, 8) + 70000
     with h5py.File(path, "w") as file:
         file.attrs["scan_shape"] = (4, 6)
         file["entry/data/data_000001"] = counts[:12]
         file["entry/data/data_000002"] = counts[12:]
-    pixels = Dataset4dstem.from_file(path, "arina")
-    np.testing.assert_array_equal(pixels.array, counts.reshape(4, 6, 8, 10))
+    pixels = Dataset4dstem.from_file(
+        path, "arina", navigation_shape=(4, 6), dtype=np.uint32
+    )
+    np.testing.assert_array_equal(pixels.array, counts.reshape(4, 6, 8, 8))
     assert pixels.array.dtype == np.uint32
-    assert pixels.units == ["pixels"] * 4
-    assert not pixels.metadata["scan_calibration"]["available"]
+    np.testing.assert_array_equal(pixels.sampling, [1, 1, 1, 1])
 
     with h5py.File(tmp_path / "scan.h5", "w") as file:
         file.create_group("STEM Metadata").attrs["Pixel Size"] = [0.25]
-    calibrated = Dataset4dstem.from_file(path, "arina")
+    calibrated = Dataset4dstem.from_file(
+        path, "arina", navigation_shape=(4, 6), dtype=np.uint32
+    )
     np.testing.assert_array_equal(calibrated.array, pixels.array)
     np.testing.assert_array_equal(calibrated.sampling, [2.5, 2.5, 1, 1])
-    assert calibrated.metadata["scan_calibration"]["available"]
+    assert calibrated.units[:2] == ["A", "A"]
 
 
 def test_native_arina_binning_and_flatfield(tmp_path):

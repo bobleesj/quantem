@@ -31,8 +31,7 @@ def read_4dstem(
     file_path : str | PathLike
         Path to data.
     file_type : str, optional
-        Arina files use native HDF5 loading; their microscope calibration
-        companion is optional. Other formats use RosettaSciIO:
+        The type of file reader needed. See RosettaSciIO for supported formats:
         https://hyperspy.org/rosettasciio/supported_formats/index.html
     dataset_index : int, optional
         Index of the dataset to load if file contains multiple datasets.
@@ -204,10 +203,7 @@ def read_4dstem(
     units_override = kwargs.pop("units", None)
     name_override = kwargs.pop("name", None)
 
-    if file_type == "arina":
-        from ._arina import read_arina as file_reader
-    else:
-        file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
@@ -353,8 +349,6 @@ def read_4dstem(
     )
     dataset.file_path = file_path
     dataset.metadata.update(source_path=str(file_path), representation="dense")
-    if file_type == "arina":
-        dataset.metadata.update(imported_data["metadata"])
     if correction is not None:
         dataset.metadata["hot_pixel_correction"] = correction
 

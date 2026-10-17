@@ -163,7 +163,7 @@ class MAPED(AutoSerialize):
         --------
         >>> from quantem.gpu import io
         >>> tilts = io.load(files)
-        >>> maped = MAPED(tilts)
+        >>> maped = MAPED.from_datasets(tilts)
         >>> merged = maped.run()
         """
         super().__init__()
