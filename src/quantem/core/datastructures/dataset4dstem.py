@@ -97,7 +97,7 @@ class Dataset4dstem(Dataset4d):
         self._virtual_detectors = {}  # Store detector information for regeneration
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str, file_type: str, **kwargs) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
@@ -108,16 +108,23 @@ class Dataset4dstem(Dataset4d):
         file_type : str
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
+        **kwargs
+            Options forwarded to ``quantem.core.io.read_4dstem``, including
+            ``apply_mask=True`` to zero flagged Arina detector pixels.
 
         Returns
         -------
         Dataset4dstem
             A new Dataset4dstem instance loaded from the file
+
+        Examples
+        --------
+        >>> tilt = Dataset4dstem.from_file("tilt_master.h5", "arina", apply_mask=True)
         """
         # Import here to avoid circular imports
         from quantem.core.io.file_readers import read_4dstem
 
-        return read_4dstem(file_path, file_type)
+        return read_4dstem(file_path, file_type, **kwargs)
 
     @classmethod
     def from_array(

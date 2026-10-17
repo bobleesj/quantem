@@ -39,6 +39,7 @@ dependencies = [
   "colorspacious",
   "dill",
   "numpy>2",
+  "pandas",
   "matplotlib",
   "scipy",
   "tqdm",

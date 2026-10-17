@@ -20,6 +20,7 @@ def read_4dstem(
     scan_axis: int = 0,
     transpose_scan_axes: bool = False,
     hot_pixel_filter: bool = False,
+    apply_mask: bool = False,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -30,7 +31,8 @@ def read_4dstem(
     file_path : str | PathLike
         Path to data.
     file_type : str, optional
-        The type of file reader needed. See RosettaSciIO for supported formats:
+        Arina files use native HDF5 loading; their microscope calibration
+        companion is optional. Other formats use RosettaSciIO:
         https://hyperspy.org/rosettasciio/supported_formats/index.html
     dataset_index : int, optional
         Index of the dataset to load if file contains multiple datasets.
@@ -56,6 +58,10 @@ def read_4dstem(
         loading using `quantem.core.utils.filter.filter_hot_pixels` with its
         default parameters. For custom thresholds, call `filter_hot_pixels`
         directly on the array.
+    apply_mask : bool, optional
+        Zero pixels flagged by the stored Arina detector mask. Requires native
+        detector sampling (``rebin_diffraction=1``); no interpolation is applied.
+        The original file is unchanged and the correction is recorded in metadata.
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
 
@@ -187,12 +193,21 @@ def read_4dstem(
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
 
+    if apply_mask and (file_type != "arina" or kwargs.get("rebin_diffraction", 1) != 1):
+        raise ValueError(
+            "apply_mask requires file_type='arina' and rebin_diffraction=1; "
+            "apply the stored detector mask before binning."
+        )
+
     sampling_override = kwargs.pop("sampling", None)
     origin_override = kwargs.pop("origin", None)
     units_override = kwargs.pop("units", None)
     name_override = kwargs.pop("name", None)
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    if file_type == "arina":
+        from ._arina import read_arina as file_reader
+    else:
+        file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
@@ -308,6 +323,22 @@ def read_4dstem(
     )
 
     array = imported_data["data"]
+    correction = None
+    if apply_mask:
+        with h5py.File(file_path, "r") as source:
+            mask = source["entry/instrument/detector/detectorSpecific/pixel_mask"][()] != 0
+        if mask.shape != array.shape[-2:]:
+            raise ValueError(
+                f"Detector mask shape {mask.shape} differs from {array.shape[-2:]}; "
+                "load the native detector dimensions before applying the mask."
+            )
+        array[..., mask] = 0
+        correction = {
+            "method": "zero",
+            "applied": True,
+            "pixel_count": int(mask.sum()),
+            "coordinates_row_column": np.argwhere(mask).tolist(),
+        }
     if hot_pixel_filter:
         from quantem.core.utils.filter import filter_hot_pixels
 
@@ -320,6 +351,12 @@ def read_4dstem(
         units=units,
         name=name_override,
     )
+    dataset.file_path = file_path
+    dataset.metadata.update(source_path=str(file_path), representation="dense")
+    if file_type == "arina":
+        dataset.metadata.update(imported_data["metadata"])
+    if correction is not None:
+        dataset.metadata["hot_pixel_correction"] = correction
 
     return dataset
 
