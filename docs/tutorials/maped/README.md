@@ -66,12 +66,12 @@ MPS or CUDA:
 ```python
 tilts = io.load(files, device="cuda:0")
 maped = MAPED.from_datasets(tilts)
-merged = maped.run(iterations=80, dtype="float32", show=False)
+merged = maped.run(iterations=80, show=False)
 Show4DSTEM(merged)
 ```
 
 The notebooks expand `run` into its alignment stages so each correction can be
-inspected. The small result stays float32. CPU saves through QuantEM as a Zarr
+inspected. Merging retains float32 by default. CPU saves through QuantEM as a Zarr
 ZIP; GPU notebooks use lossless HDF5 through quantem.gpu.
 The CPU comparison marks selected scan positions and shows their individual
 diffraction patterns from the first tilt and the merge. Input patterns use
@@ -80,14 +80,31 @@ For a full series, write exact float32 blocks before reopening the result:
 
 ```python
 merged = maped.merge(
-    dtype="float32", save_to="merged_master.h5", release_tilts=True,
+    save_to="merged_master.h5", release_tilts=True,
 )
 io.save("merged.qem", merged)
 ```
 
 This avoids the 4 GiB in-memory merge limit; the reopened result must still
 fit on the device. Saving and reopening include disk IO and are not real-time.
-Scaled uint16 storage is quantized and is not used in these tutorials.
+
+## Save GPU results
+
+Omit `dtype` to preserve the result's precision. The full-merge example already
+writes exact HDF5; its reopened ANS resident can also be saved as `.qem`:
+
+| Save | Storage |
+| --- | --- |
+| `io.save("merged.qem", merged)` | Exact ANS copy of the encoded resident |
+| `io.save("copy_master.h5", merged)` | Exact HDF5 master and data files |
+| `io.save("compact_master.h5", merged, dtype="scaled_uint16")` | Calibrated uint16 codes with measured rounding error |
+
+Scaled uint16 is optional, not the save default; `.qem` does not yet support it.
+Small in-memory merges are dense: save them as HDF5 and reopen with `io.load`
+before making an encoded QEM copy. Native CPU saving stays independent of
+quantem.gpu.
+
+## Loading behavior
 
 Multiple input files load as a list, so `stack=False` is unnecessary. Stacking
 would combine acquisitions along an additional tilt axis. MAPED keeps each

@@ -60,7 +60,7 @@ def test_run_matches_the_step_by_step_stages(tmp_path):
     """run() reproduces the five stage calls: identical shifts and identical float32 merge."""
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
     one, steps = MAPED(tilts), MAPED(tilts)
-    run_merged_t = one.run(show=False, verbose=False, dtype="float32").read()
+    run_merged_t = one.run(show=False, verbose=False).read()
     steps.find_beam_center(blur=1, show=False)
     steps.align_diffraction(border_taper=2, show=False)
     steps.align_real_space(
@@ -145,8 +145,8 @@ def test_saving_while_merging_can_release_the_tilts(tmp_path):
         verbose=False,
     )
     assert all(tilt.data.is_released for tilt in tilts)
-    # streaming to disk uses smaller regions, each with its own calibration
-    assert_close(saved.read(), kept, rtol=0, atol=2 * saved.metadata["precision"]["max_abs_error"])
+    assert equal(saved.read(), kept)
+    assert "precision" not in saved.metadata
 
 
 def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
@@ -156,13 +156,28 @@ def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
     reference = maped.run(dtype="float32", show=False, verbose=False)
     reference_t = reference.read()
     saved = maped.merge(
-        dtype="float32", save_to=tmp_path / "merged_master.h5", crop=True,
+        save_to=tmp_path / "merged_master.h5", crop=True,
         release_tilts=True, show=False, verbose=False,
     )
     assert equal(saved.read(), reference_t)
     assert saved.lossless
     assert saved.metadata["maped_merge"]["scan_region"] == reference.metadata["maped_merge"]["scan_region"]
     assert all(tilt.data.is_released for tilt in tilts)
+
+    # The saved merge reopens encoded, so it can also be archived directly as QEM.
+    io.save(tmp_path / "merged.qem", saved)
+    with io.load(tmp_path / "merged.qem", device=maped.device, verbose=False) as reopened:
+        assert reopened.lossless
+        assert equal(reopened.read(), reference_t)
+
+    compact_path = tmp_path / "compact_master.h5"
+    io.save(compact_path, saved, dtype="scaled_uint16")
+    with io.load(compact_path, device=maped.device, verbose=False) as compact:
+        assert compact.metadata["precision"]["storage"] == "scaled_uint16"
+        assert_close(
+            compact.read(), reference_t, rtol=0,
+            atol=compact.metadata["precision"]["max_abs_error"],
+        )
 
 
 # --- summaries ---

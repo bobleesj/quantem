@@ -216,7 +216,7 @@ class MAPED(AutoSerialize):
         >>> tilt = Dataset4dstem.from_file("tilt_master.h5", "arina")
         >>> tilts = [tilt]
         >>> maped = MAPED.from_datasets(tilts)
-        >>> merged = maped.run(dtype="float32", show=False)
+        >>> merged = maped.run(show=False)
         """
         return cls(datasets)
 
@@ -274,7 +274,7 @@ class MAPED(AutoSerialize):
 
         Examples
         --------
-        >>> merged = maped.merge(dtype="float32", crop=True, show=False)
+        >>> merged = maped.merge(crop=True, show=False)
         >>> maped.show(positions=[(20, 30), (40, 50)], tilt_indices=[0])
         """
         from matplotlib import pyplot as plt
@@ -849,7 +849,7 @@ class MAPED(AutoSerialize):
         each shifted bilinearly by its scan and detector alignment. The merge
         always computes in float32; ``dtype`` only chooses how the result is
         stored. Large acquisitions can exceed device memory. Use ``save_to``
-        with ``dtype="float32"`` to write an exact result in bounded regions,
+        to write an exact float32 result in bounded regions,
         then reopen it as lossless ANS. The reopened result must fit in memory;
         ``release_tilts=True`` frees input residents first.
 
@@ -865,18 +865,16 @@ class MAPED(AutoSerialize):
         Parameters
         ----------
         dtype : str or torch.dtype, optional
-            Output storage dtype. ``"scaled_uint16"`` computes the merge in
-            float32 once, then retains calibrated, ANS-encoded uint16 regions on
-            the GPU. Calibration and region sizes are automatic. Saving uses
-            this storage by default. This does not reduce the precision of
-            alignment, interpolation, or float32 accumulation. Reads reconstruct
-            float32 intensities from the stored codes and calibration; rounding
-            error is recorded in the result's ``metadata["precision"]``.
-            ``None`` without ``save_to`` and explicit ``"float32"`` retain exact
-            float32 results up to 4 GiB, including small complete scans.
-            With ``save_to``, explicit ``"float32"`` removes the 4 GiB merge
-            allocation limit by writing bounded blocks without rounding.
-            ``None`` with ``save_to`` selects scaled uint16.
+            Output storage dtype; omitted or ``"float32"`` retains exact
+            float32 values on every backend. In-memory results are limited to
+            4 GiB; ``save_to`` writes bounded blocks without that allocation.
+            Explicit ``"scaled_uint16"`` retains calibrated, ANS-encoded uint16
+            regions on the GPU. It leaves alignment and float32 accumulation
+            unchanged but rounds the stored result. Reads reconstruct float32
+            intensities from the codes and calibration; rounding error is
+            recorded in ``metadata["precision"]``. Alternatively, keep the
+            exact merge and choose scaled storage when saving it with
+            ``quantem.gpu.io.save(..., dtype="scaled_uint16")`` as HDF5.
         save_to : str, optional
             Output HDF5 path. The merge is written in bounded regions with the
             requested storage precision, then reopened encoded for viewing. This holds
@@ -922,7 +920,7 @@ class MAPED(AutoSerialize):
         Examples
         --------
         >>> patch = maped.merge(scan_region=(252, 260, 252, 260), show=False)
-        >>> merged = maped.merge(dtype="float32", save_to="merged_master.h5", release_tilts=True)
+        >>> merged = maped.merge(save_to="merged_master.h5", release_tilts=True)
         >>> merged = maped.merge(dtype="scaled_uint16")
         """
         from ._maped_resident import ResidentMergeSource
@@ -943,7 +941,7 @@ class MAPED(AutoSerialize):
         backend = torch.device(self.device).type
         if backend == "cpu" and (dtype == "scaled_uint16" or save_to is not None):
             raise ValueError(
-                "CPU MAPED retains float32 values. Use merge(dtype='float32') "
+                "CPU MAPED retains float32 values. Use merge() "
                 "on a small scan, then save the returned dataset."
             )
 
@@ -1021,7 +1019,7 @@ class MAPED(AutoSerialize):
                 self.im_bf_merged = self.dp_mean_merged = None
             titles = ["Merged Region Bright Field", "Merged Region Mean Diffraction Pattern"]
         else:
-            storage_dtype = "float32" if dtype in ("float32", torch.float32) else "scaled_uint16"
+            storage_dtype = "scaled_uint16" if dtype == "scaled_uint16" else "float32"
             if scan_region is not None:
                 raise ValueError(
                     "scan_region selects float32 inspection; omit it for the "
@@ -1124,8 +1122,8 @@ class MAPED(AutoSerialize):
             Storage settings of ``merge``. ``crop`` keeps only the scan positions
             every tilt covers, and says so. ``scaled_uint16`` stores the complete
             merge compactly; the progress line reports its rounding error.
-            If omitted, native CPU datasets retain float32 and encoded GPU
-            datasets use scaled uint16 storage.
+            Omitted ``dtype`` retains exact float32 on every backend, including
+            when saving. Choose ``save_to`` for results larger than 4 GiB.
         show : bool
             If True, draw the four pictures: the tilts, the aligned mean
             diffraction pattern, the aligned bright field, the merged result.
@@ -1144,8 +1142,6 @@ class MAPED(AutoSerialize):
         >>> merged = maped.run()
         >>> merged = maped.run(iterations=80, show=False)
         """
-        if dtype is None:
-            dtype = "float32" if self.device == "cpu" else "scaled_uint16"
         scan_rows, scan_cols = self.im_bf[0].shape
         k_rows, k_cols = self.dp_mean[0].shape
         started = stage_started = time.perf_counter()
