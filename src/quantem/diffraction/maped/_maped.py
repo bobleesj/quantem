@@ -2,8 +2,9 @@ import json
 import math
 import re
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Self, Sequence
+from typing import Self
 
 import numpy as np
 import torch
@@ -37,6 +38,7 @@ def _resident_summaries(sources, device: str):
             images.append(image_t)
         return patterns, images
     from quantem.gpu.detector import prepare
+    from quantem.gpu.io.read import torch_value
 
     native_sources = [getattr(source, "data", source) for source in sources]
     if all(
@@ -44,48 +46,23 @@ def _resident_summaries(sources, device: str):
         and callable(getattr(source, "detector_mean_device", None))
         for source in native_sources
     ):
-        mean_dp_torch = []
-        detector_mean_torch = []
-        for source in native_sources:
-            mean_dp = source.mean_dp_device()
-            detector_mean = source.detector_mean_device()
-            try:
-                mean_dp_torch.append(mean_dp.to_torch())
-                detector_mean_torch.append(detector_mean.to_torch())
-            finally:
-                mean_dp.release()
-                detector_mean.release()
-        return mean_dp_torch, detector_mean_torch
+        # Encoded count means round once after exact reduction, including on MPS.
+        return (
+            [torch_value(source.mean_dp_device()) for source in native_sources],
+            [torch_value(source.detector_mean_device()) for source in native_sources],
+        )
     session = prepare(sources[0] if len(sources) == 1 else sources)
-    mean_dp = session.mean_dp(output="native")
+    mean_dp_t = torch_value(session.mean_dp(output="native"))
     detector_mask = np.ones(session.detector_shape, dtype=bool)
-    detector_sum = session.masked_sum(detector_mask, output="native")
-    if (
-        callable(getattr(mean_dp, "to_torch", None))
-        and callable(getattr(detector_sum, "to_torch", None))
-    ):
-        try:
-            mean_dp_torch = mean_dp.to_torch()
-            detector_sum_torch = detector_sum.to_torch()
-            detector_mean_torch = detector_sum_torch / float(
-                math.prod(session.detector_shape)
-            )
-        finally:
-            mean_dp.release()
-            detector_sum.release()
-        if mean_dp_torch.ndim == 2:
-            mean_dp_torch = mean_dp_torch[None]
-            detector_mean_torch = detector_mean_torch[None]
-        return list(mean_dp_torch.unbind(0)), list(detector_mean_torch.unbind(0))
-    detector_mean = (
-        detector_sum / float(math.prod(session.detector_shape))
-    ).astype(mean_dp.dtype)
-    mean_dp_torch = torch.from_dlpack(mean_dp).to(device=device)
-    detector_mean_torch = torch.from_dlpack(detector_mean).to(device=device)
-    if mean_dp_torch.ndim == 2:
-        mean_dp_torch = mean_dp_torch[None]
-        detector_mean_torch = detector_mean_torch[None]
-    return list(mean_dp_torch.unbind(0)), list(detector_mean_torch.unbind(0))
+    detector_sum_t = torch_value(session.masked_sum(detector_mask, output="native"))
+    if not detector_sum_t.is_floating_point():
+        # Divide exact integer totals before rounding to the float32 summary.
+        detector_sum_t = detector_sum_t.to(torch.float64)
+    detector_mean_t = (detector_sum_t / math.prod(session.detector_shape)).to(mean_dp_t.dtype)
+    return (
+        list(mean_dp_t.reshape(-1, *session.detector_shape).unbind(0)),
+        list(detector_mean_t.reshape(-1, *session.scan_shape).unbind(0)),
+    )
 
 
 def _tilt_name(index: int, file: str | Path | None) -> str:
@@ -103,30 +80,6 @@ def _tilt_name(index: int, file: str | Path | None) -> str:
         if match:
             return f"{match.group(1)}x {match.group(2)}y"
     return f"Tilt {index}"
-
-
-class TiltShifts(torch.Tensor):
-    """(n, 2) tensor of one (row, col) value per tilt that prints as a table.
-
-    Behaves as a plain tensor in arithmetic (results are ordinary tensors); only
-    the printout differs, so a notebook cell ending in ``maped.real_space_shifts``
-    shows labelled, rounded numbers instead of a raw tensor dump.
-    """
-
-    __torch_function__ = torch._C._disabled_torch_function_impl
-
-    @staticmethod
-    def wrap(values: torch.Tensor, label: str, unit: str) -> "TiltShifts":
-        shifts = torch.Tensor._make_subclass(TiltShifts, values.detach())
-        shifts.label, shifts.unit = label, unit
-        return shifts
-
-    def __repr__(self) -> str:
-        rows = self.detach().cpu().tolist()
-        digits = 0 if self.dtype in (torch.int32, torch.int64) else 2
-        lines = [f"{self.label} ({self.unit}), one (row, col) per tilt", "tilt      row      col"]
-        lines += [f"{i:4d} {row:8.{digits}f} {col:8.{digits}f}" for i, (row, col) in enumerate(rows)]
-        return "\n".join(lines)
 
 
 class MAPED(AutoSerialize):
@@ -187,7 +140,7 @@ class MAPED(AutoSerialize):
             raise ValueError("Tilts must share one shape and one device.")
         self.datasets = tilts
         self.tilt_names = [_tilt_name(i, tilt.metadata.get("source_path")) for i, tilt in enumerate(tilts)]
-        self.metadata: dict[str, Any] = {}
+        self.metadata: dict[str, object] = {}
         self.device = devices[0]
         config.set_device(self.device)
         # every stage works on these two small images per tilt: the mean diffraction
@@ -391,10 +344,10 @@ class MAPED(AutoSerialize):
         plot_scale: float | Sequence[float] | None = None,
         show_detector_center: bool = True,
         bright_field_cmap: str = "gray",
-        bright_field_contrast: Any = "linear_auto",
+        bright_field_contrast= "linear_auto",
         pattern_cmap: str = "inferno",
-        pattern_contrast: Any = "power_sqrt",
-        **plot_kwargs: Any,
+        pattern_contrast= "power_sqrt",
+        **plot_kwargs,
     ) -> Self:
         """
         Show each tilt: its bright-field image and its mean diffraction pattern.
@@ -461,7 +414,7 @@ class MAPED(AutoSerialize):
         blur: float | None = 1,
         show: bool = True,
         plot_indices: list | None = None,
-        **plot_kwargs: Any,
+        **plot_kwargs,
     ) -> Self:
         """
         Find the direct beam in each mean diffraction pattern, or take it as given.
@@ -536,7 +489,7 @@ class MAPED(AutoSerialize):
                 if centers_t.shape != (n, 2):
                     raise ValueError("centers must have shape (n, 2) after conversion.")
 
-        self.beam_centers = TiltShifts.wrap(centers_t, "beam centers", "detector px")
+        self.beam_centers = centers_t
 
         if show:
             arrays = [np.asarray(self.dp_mean[i].cpu()) for i in plot_indices_list]
@@ -562,7 +515,7 @@ class MAPED(AutoSerialize):
         border_taper: float = 2,
         precision: float = 0.01,
         show: bool = True,
-        **plot_kwargs: Any,
+        **plot_kwargs,
     ) -> Self:
         """
         Align mean diffraction patterns using weighted cross-correlation in Fourier space.
@@ -636,9 +589,6 @@ class MAPED(AutoSerialize):
             G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
 
         self.diffraction_shifts -= torch.mean(self.diffraction_shifts, dim=0)[None, :]
-        self.diffraction_shifts = TiltShifts.wrap(
-            self.diffraction_shifts, "detector shifts", "detector px"
-        )
         if show:
             im_aligned = shift_images_torch(
                 images=torch.stack(self.dp_mean),
@@ -664,7 +614,7 @@ class MAPED(AutoSerialize):
         precision: float = 0.01,
         num_tilts: int | None = None,
         show: bool = True,
-        **plot_kwargs: Any,
+        **plot_kwargs,
     ) -> Self:
         """
         Align real-space mean BF images using iterative average-reference correlation.
@@ -809,7 +759,6 @@ class MAPED(AutoSerialize):
 
         self.real_space_shifts = torch.zeros((n_total, 2), dtype=torch.float32, device=self.device)
         self.real_space_shifts[:n, :] = shifts
-        self.real_space_shifts = TiltShifts.wrap(self.real_space_shifts, "scan shifts", "scan px")
 
         if show:
             im_aligned = shift_images_torch(
@@ -838,9 +787,9 @@ class MAPED(AutoSerialize):
         verbose: bool = True,
         compile_merge: bool | None = None,
         compute_summaries: bool = True,
-        profile_timings: dict[str, Any] | None = None,
-        **plot_kwargs: Any,
-    ) -> Any:
+        profile_timings: dict[str, object] | None = None,
+        **plot_kwargs,
+    ):
         """
         Merge the aligned tilts into one 4D-STEM dataset.
 
@@ -944,38 +893,46 @@ class MAPED(AutoSerialize):
                 "on a small scan, then save the returned dataset."
             )
 
-        if save_to is None and dtype != "scaled_uint16":
-            generated = ResidentMergeSource(
-                self.datasets,
-                self.real_space_shifts,
-                self.diffraction_shifts,
-                close_sources_before_reopen=False,
-                compile_merge=compile_merge,
-                crop=crop,
+        in_memory = save_to is None and dtype != "scaled_uint16"
+        storage_dtype = "scaled_uint16" if dtype == "scaled_uint16" else "float32"
+        if scan_region is not None and not in_memory:
+            raise ValueError(
+                "scan_region selects float32 inspection; omit it for the "
+                "complete saved result."
             )
-            region = generated.scan_box if scan_region is None else scan_region
-            if (
-                len(region) != 4
-                or any(not isinstance(value, (int, np.integer)) for value in region)
-                or not (0 <= region[0] < region[1] <= scan_rows)
-                or not (0 <= region[2] < region[3] <= scan_cols)
-            ):
-                raise ValueError(
-                    f"scan_region={region} must be (row_start, row_stop, "
-                    f"column_start, column_stop) inside {(scan_rows, scan_cols)}."
-                )
-            row0, row1, column0, column1 = map(int, region)
-            shape = (row1 - row0, column1 - column0, k_rows, k_cols)
-            output_bytes = math.prod(shape) * 4
-            if output_bytes > 4 * 1024**3:
-                raise ValueError(
-                    f"This float32 merge needs {output_bytes / 1024**3:.2f} GiB; "
-                    "the in-memory limit is 4 GiB. Select a smaller scan_region "
-                    "for exact float32, use save_to for a bounded float32 archive, "
-                    "or explicitly choose dtype='scaled_uint16' "
-                    "to accept calibrated rounding for the complete merge."
-                )
-            try:
+        generated = ResidentMergeSource(
+            self.datasets,
+            self.real_space_shifts,
+            self.diffraction_shifts,
+            close_sources_before_reopen=save_to is not None and release_tilts,
+            compile_merge=compile_merge,
+            compute_region_frames=2048 if save_to is not None else None,
+            crop=crop,
+        )
+        try:
+            if in_memory:
+                region = generated.scan_box if scan_region is None else scan_region
+                if (
+                    len(region) != 4
+                    or any(not isinstance(value, (int, np.integer)) for value in region)
+                    or not (0 <= region[0] < region[1] <= scan_rows)
+                    or not (0 <= region[2] < region[3] <= scan_cols)
+                ):
+                    raise ValueError(
+                        f"scan_region={region} must be (row_start, row_stop, "
+                        f"column_start, column_stop) inside {(scan_rows, scan_cols)}."
+                    )
+                row0, row1, column0, column1 = map(int, region)
+                shape = (row1 - row0, column1 - column0, k_rows, k_cols)
+                output_bytes = math.prod(shape) * 4
+                if output_bytes > 4 * 1024**3:
+                    raise ValueError(
+                        f"This float32 merge needs {output_bytes / 1024**3:.2f} GiB; "
+                        "the in-memory limit is 4 GiB. Select a smaller scan_region "
+                        "for exact float32, use save_to for a bounded float32 archive, "
+                        "or explicitly choose dtype='scaled_uint16' "
+                        "to accept calibrated rounding for the complete merge."
+                    )
                 values = torch.empty(shape, dtype=torch.float32, device=self.device)
                 destination = values.flatten(0, 1)
                 cursor = 0
@@ -1008,51 +965,27 @@ class MAPED(AutoSerialize):
                     result.metadata.update(metadata)
                 else:
                     result = gpu_io.Dataset4dstemGPU(values, metadata)
-            finally:
-                generated.close()
-            self.merged = result
-            if compute_summaries or show:
-                self.im_bf_merged = values.mean(dim=(-2, -1))
-                self.dp_mean_merged = values.flatten(0, 1).mean(dim=0)
             else:
-                self.im_bf_merged = self.dp_mean_merged = None
-            titles = ["Merged Region Bright Field", "Merged Region Mean Diffraction Pattern"]
-        else:
-            storage_dtype = "scaled_uint16" if dtype == "scaled_uint16" else "float32"
-            if scan_region is not None:
-                raise ValueError(
-                    "scan_region selects float32 inspection; omit it for the "
-                    "complete saved result."
-                )
-            generated = ResidentMergeSource(
-                self.datasets,
-                self.real_space_shifts,
-                self.diffraction_shifts,
-                close_sources_before_reopen=save_to is not None and release_tilts,
-                compile_merge=compile_merge,
-                compute_region_frames=2048 if save_to is not None else None,
-                crop=crop,
-            )
-            if crop and verbose:
-                row0, row1, column0, column1 = generated.scan_box
-                print(
-                    f"Cropped to rows {row0}:{row1}, columns {column0}:{column1} "
-                    f"({row1 - row0} x {column1 - column0} of {scan_rows} x {scan_cols}), "
-                    f"where all {len(self.datasets)} tilts overlap. crop=False keeps the full scan."
-                )
-            try:
+                if crop and verbose:
+                    row0, row1, column0, column1 = generated.scan_box
+                    print(
+                        f"Cropped to rows {row0}:{row1}, columns {column0}:{column1} "
+                        f"({row1 - row0} x {column1 - column0} of {scan_rows} x {scan_cols}), "
+                        f"where all {len(self.datasets)} tilts overlap. crop=False keeps the full scan."
+                    )
                 if save_to is None:
                     result = gpu_io.load(
-                        generated, dtype="scaled_uint16", backend=backend, verbose=verbose
+                        generated, dtype=storage_dtype, backend=backend, verbose=verbose
                     )
                 else:
-                    # stream completed regions to disk so the complete result never
-                    # shares the device with the float32 regions being merged
+                    # Write completed regions without allocating the full float32 result.
                     gpu_io.save(
                         save_to, generated, dtype=storage_dtype, backend=backend, verbose=verbose
                     )
-            finally:
-                generated.close()
+        finally:
+            generated.close()
+
+        if not in_memory:
             if release_tilts:
                 for tilt in self.datasets:
                     tilt.close()
@@ -1067,22 +1000,25 @@ class MAPED(AutoSerialize):
                     backend=backend, verbose=verbose, hot_pixel_correction="none",
                 )
             result.metadata.setdefault("maped_merge", {})["scan_box"] = list(generated.scan_box)
-            self.merged = result
-            if compute_summaries or show:
-                # accumulated from the float32 regions during the merge pass, so the
-                # stored result is not decoded a second time just for two pictures
-                self.dp_mean_merged = generated.detector_sum / math.prod(generated.shape[:2])
-                self.im_bf_merged = generated.scan_sum / (k_rows * k_cols)
-            else:
-                self.dp_mean_merged = self.im_bf_merged = None
             if profile_timings is not None:
                 profile_timings.update(result.metadata.get("maped_merge", {}))
-            titles = ["Merged Bright Field", "Merged Mean Diffraction Pattern"]
+        self.merged = result
+        self.im_bf_merged = self.dp_mean_merged = None
+        if compute_summaries or show:
+            if in_memory:
+                self.im_bf_merged = values.mean(dim=(-2, -1))
+                self.dp_mean_merged = values.flatten(0, 1).mean(dim=0)
+            else:
+                # Reuse the sums from the merge pass instead of decoding stored values.
+                self.im_bf_merged = generated.scan_sum / (k_rows * k_cols)
+                self.dp_mean_merged = generated.detector_sum / math.prod(generated.shape[:2])
         if profile_timings is not None:
             profile_timings["total_profiled_seconds"] = time.perf_counter() - profile_start
         if show:
+            label = "Merged Region" if in_memory else "Merged"
             show_2d(
-                [[self.im_bf_merged, self.dp_mean_merged]], title=[titles],
+                [[self.im_bf_merged, self.dp_mean_merged]],
+                title=[[f"{label} Bright Field", f"{label} Mean Diffraction Pattern"]],
                 cmap=[["gray", "inferno"]], norm=[[None, "power_sqrt"]], **plot_kwargs,
             )
         return result
@@ -1103,7 +1039,7 @@ class MAPED(AutoSerialize):
         release_tilts: bool = False,
         show: bool = True,
         verbose: bool = True,
-    ) -> Any:
+    ):
         """
         Run every MAPED stage in order and return the merged dataset.
 

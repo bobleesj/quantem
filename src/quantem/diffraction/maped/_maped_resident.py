@@ -312,19 +312,6 @@ def _accumulate_tilt(
     return numerator
 
 
-@torch.compile(fullgraph=True, dynamic=False)
-def _sample_scan_interior(
-    values: torch.Tensor, columns: torch.Tensor, weights: torch.Tensor
-) -> torch.Tensor:
-    """Fuse four ordered scan taps without specializing on shift values."""
-    output = torch.zeros_like(values[:-1])
-    output.addcmul_(values[:-1, columns[0]], weights[0, None, :, None, None])
-    output.addcmul_(values[:-1, columns[1]], weights[1, None, :, None, None])
-    output.addcmul_(values[1:, columns[0]], weights[2, None, :, None, None])
-    output.addcmul_(values[1:, columns[1]], weights[3, None, :, None, None])
-    return output
-
-
 class ResidentMergeSource:
     """Re-readable Torch MAPED blocks consumed by ``quantem.gpu.io.save``."""
 
@@ -379,7 +366,6 @@ class ResidentMergeSource:
         # Scalar displacements only: reading each scalar in the region loop
         # would wait for previously queued accelerator work on every tilt.
         self._scan_shifts = real_space_shifts.detach().cpu().tolist()
-        self._compile_scan = device.type in ("mps", "cuda") and compile_merge is not False
         self._fuse_tilt = device.type in ("cuda", "mps") and compile_merge is not False
         self._scan_columns = []
         self._scan_weights = []
@@ -408,7 +394,7 @@ class ResidentMergeSource:
                         for a in range(2) for b in range(2)
                     ]),
                 ))
-        if self._compile_scan:
+        if self._fuse_tilt:
             column = torch.arange(self.source_shape[1], device=device)
             for row_shift, column_shift in self._scan_shifts:
                 row_fraction = -row_shift - math.floor(-row_shift)
@@ -513,9 +499,7 @@ class ResidentMergeSource:
     def _compute_blocks(self, scan_region, region_frames) -> Iterator[torch.Tensor]:
         """Evaluate unchanged float32 merge arithmetic on row-aligned blocks."""
         rows, columns, detector_rows, detector_columns = self.source_shape
-        row_start, row_stop, column_start, column_stop = (
-            (0, rows, 0, columns) if scan_region is None else scan_region
-        )
+        row_start, row_stop, column_start, column_stop = scan_region
         rows_per_region = max(1, region_frames // columns)
         generation_seconds = 0.0
         sampled_workspace = torch.empty(
@@ -545,14 +529,6 @@ class ResidentMergeSource:
                 if decoded_row0 < decoded_row1 and decoded_column0 < decoded_column1:
                     decoded = _read_scan_region(
                         source, (decoded_row0, decoded_row1, decoded_column0, decoded_column1)
-                    )
-                    interior = (
-                        self._compile_scan
-                        and scan_region is None
-                        and (output_row1 - output_row0) * columns >= 2048
-                        and decoded_row0 == output_row0 + row_offset
-                        and decoded_row1 == output_row1 + row_offset + 1
-                        and (shift[0] != int(shift[0]) or shift[1] != int(shift[1]))
                     )
                     if self._fuse_tilt:
                         row_indices, column_indices, detector_weights = self._detector_taps[index]
@@ -586,25 +562,17 @@ class ResidentMergeSource:
                         )
                         del decoded
                         continue
-                    if interior:
-                        # The compiler does not accept native uint16. This single
-                        # exact cast lets it fuse all four float32 tap updates.
-                        sampled = _sample_scan_interior(
-                            decoded.to(torch.float32),
-                            self._scan_columns[index], self._scan_weights[index],
-                        )
-                    else:
-                        sampled = _sample_scan_rows(
-                            decoded,
-                            decoded_first_row=decoded_row0,
-                            output_first_row=output_row0,
-                            output_stop_row=output_row1,
-                            shift=shift,
-                            out=sampled_workspace[: output_row1 - output_row0],
-                            decoded_first_column=decoded_column0,
-                            output_first_column=column_start,
-                            output_stop_column=column_stop,
-                        )
+                    sampled = _sample_scan_rows(
+                        decoded,
+                        decoded_first_row=decoded_row0,
+                        output_first_row=output_row0,
+                        output_stop_row=output_row1,
+                        shift=shift,
+                        out=sampled_workspace[: output_row1 - output_row0],
+                        decoded_first_column=decoded_column0,
+                        output_first_column=column_start,
+                        output_stop_column=column_stop,
+                    )
                     del decoded
                 else:
                     sampled = sampled_workspace[: output_row1 - output_row0]
