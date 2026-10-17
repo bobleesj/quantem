@@ -37,11 +37,11 @@ from quantem.diffractive_imaging.ptycho_utils import add_input_noise, sum_patche
 object_type = Literal["potential", "pure_phase", "complex"]
 
 
-class PtychoObjConstraintParams:
+class PtychoObjConstraints:
     """
     Namespace class for ptychography object constraint dataclasses.
 
-    Tab-complete on ``PtychoObjConstraintParams`` in a notebook to discover the
+    Tab-complete on ``PtychoObjConstraints`` in a notebook to discover the
     available variants. Tab-complete inside a variant's constructor to see every
     constraint field with its default value.
 
@@ -56,8 +56,8 @@ class PtychoObjConstraintParams:
 
     Examples
     --------
-    >>> PtychoObjConstraintParams.Raster(tv_weight_z=5.0, identical_slices=True)
-    >>> PtychoObjConstraintParams.parse_dict({"name": "raster", "positivity": False})
+    >>> PtychoObjConstraints.Raster(tv_weight_z=5.0, identical_slices=True)
+    >>> PtychoObjConstraints.parse_dict({"name": "raster", "positivity": False})
     """
 
     @dataclass
@@ -209,7 +209,11 @@ class PtychoObjConstraintParams:
         return cast(PtychoObjConstraintsType, parse_constraint_dict(cls, d, kind="object"))
 
 
-PtychoObjConstraintsType = PtychoObjConstraintParams.Raster | PtychoObjConstraintParams.INR
+# Compatibility alias for existing notebooks and saved Python objects.
+PtychoObjConstraintParams = PtychoObjConstraints
+
+
+PtychoObjConstraintsType = PtychoObjConstraints.Raster | PtychoObjConstraints.INR
 
 """
 Object representation by obj_type:
@@ -468,13 +472,11 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             obj_array2 = obj_array
         obj_flat = obj_array2.reshape(obj_array.shape[0], -1)
 
-        # patches = obj_flat[:, patch_indices]
-        # MPS does not support complex scatter kernel..
-        real = obj_flat.real
-        imag = obj_flat.imag
-        patches = torch.complex(real[:, patch_indices], imag[:, patch_indices])
-
-        return patches
+        if obj_flat.device.type == "mps":
+            # MPS requires separate real/imaginary scatter in backward.
+            return torch.complex(obj_flat.real[:, patch_indices], obj_flat.imag[:, patch_indices])
+        # A single complex gather also accumulates patch gradients in one pass.
+        return obj_flat[:, patch_indices]
 
     def backward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -483,8 +485,8 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         )
 
 
-class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], ObjectBase):
-    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.Raster = PtychoObjConstraintParams.Raster()
+class ObjectConstraints(BaseConstraints[PtychoObjConstraints.Raster], ObjectBase):
+    DEFAULT_CONSTRAINTS: PtychoObjConstraints.Raster = PtychoObjConstraints.Raster()
 
     def apply_hard_constraints(
         self, raw: torch.Tensor, mask: torch.Tensor | None = None
@@ -505,14 +507,14 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         return raw + (constrained - raw).detach()
 
     def _apply_hard_complex(
-        self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
+        self, obj: torch.Tensor, c: PtychoObjConstraints.Raster
     ) -> torch.Tensor:
         amp = torch.clamp(torch.abs(obj), 0.0, 1.0)
         phase = obj.angle() - obj.angle().mean()
         return amp * torch.exp(1.0j * phase)
 
     def _apply_hard_pure_phase(
-        self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
+        self, obj: torch.Tensor, c: PtychoObjConstraints.Raster
     ) -> torch.Tensor:
         # phase stored directly as a real tensor; recenter to zero mean
         return obj - obj.mean()
@@ -520,7 +522,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     def _apply_hard_potential(
         self,
         obj: torch.Tensor,
-        c: PtychoObjConstraintParams.Raster,
+        c: PtychoObjConstraints.Raster,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
         # "shrink" manages the _obj parameter directly in project_parameters() (post-step), so the
@@ -538,7 +540,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     def _potential_baseline_offset(
         self,
         obj: torch.Tensor,
-        c: PtychoObjConstraintParams.Raster,
+        c: PtychoObjConstraints.Raster,
         mask: torch.Tensor | None,
     ) -> torch.Tensor | float:
         """Background offset subtracted by ``fix_potential_baseline`` (``0`` when disabled).
@@ -559,7 +561,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     def _apply_shared_hard(
         self,
         obj: torch.Tensor,
-        c: PtychoObjConstraintParams.Raster,
+        c: PtychoObjConstraints.Raster,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if c.apply_fov_mask and mask is not None:
@@ -649,7 +651,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             "phase wrapping may distort the gradient. Consider obj_type='pure_phase'."
         )
         # TODO: amp and phase share `w` here. Consider splitting `tv_weight_xy`
-        # into separate amp/phase weights on PtychoObjConstraintParams.Raster
+        # into separate amp/phase weights on PtychoObjConstraints.Raster
         # so users can tune them independently for obj_type="complex".
         loss = loss + self._calc_tv_loss(ph, w)
         amp = array.abs()
@@ -983,10 +985,10 @@ class ObjectPixelated(ObjectConstraints):
         if self._initialize_mode == "uniform":
             if self.obj_type == "complex":
                 # amp=1, phase=0 -> complex ones
-                arr = torch.ones(init_shape) * torch.exp(1.0j * torch.zeros(init_shape))
+                arr = torch.ones(init_shape, dtype=self.dtype, device=self.device)
             else:
                 # pure_phase (phase=0) and potential start as real zeros
-                arr = torch.zeros(init_shape)
+                arr = torch.zeros(init_shape, dtype=self.dtype, device=self.device)
         elif self._initialize_mode == "random":
             ph = (
                 torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch) - 0.5
@@ -1093,6 +1095,7 @@ class ObjectDIP(ObjectConstraints):
 
         self._pretrain_losses = []
         self._pretrain_lrs = []
+        self.pretrain_history = None
         self._model_input_noise_std = input_noise_std
 
     @classmethod
@@ -1351,7 +1354,25 @@ class ObjectDIP(ObjectConstraints):
         show: bool = True,
         device: str | int | None = None,
         normalize_object_plotting: bool = True,
+        *,
+        snapshot_every: int | None = None,
     ):
+        """Fit the DIP to its target, optionally recording display snapshots.
+
+        Parameters
+        ----------
+        snapshot_every : int or None, optional
+            Save the first, final, and every Nth evaluated prediction in
+            ``pretrain_history``. Only the mean over slices or probe modes is
+            retained on the training device. None disables capture. Each call
+            replaces its display history; optimizer behavior is unchanged.
+        """
+        if snapshot_every is not None and (
+            isinstance(snapshot_every, bool)
+            or not isinstance(snapshot_every, int)
+            or snapshot_every < 1
+        ):
+            raise ValueError("snapshot_every must be a positive integer or None.")
         if device is not None:
             dev, _ = config.validate_device(device)
             self.to(dev)
@@ -1387,6 +1408,7 @@ class ObjectDIP(ObjectConstraints):
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
+            snapshot_every=snapshot_every,
             normalize_object_plotting=normalize_object_plotting,
         )
         self._set_pretrained_weights(self.model)
@@ -1397,12 +1419,24 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
+        snapshot_every: int | None = None,
         normalize_object_plotting: bool = True,
     ):
         """Pretrain the DIP model."""
         if self.pretrain_target is None:
             raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
 
+        from quantem.diffractive_imaging.pretrain_history import PretrainHistory
+
+        self.pretrain_history = (
+            PretrainHistory(
+                target=self.pretrain_target.detach().mean(0).clone(),
+                kind="object",
+                obj_type=self.obj_type,
+            )
+            if snapshot_every is not None
+            else None
+        )
         self.model.train()
         optimizer = self.optimizer
         if optimizer is None:
@@ -1433,6 +1467,15 @@ class ObjectDIP(ObjectConstraints):
 
             self._pretrain_losses.append(loss.item())
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+            if snapshot_every is not None and self.pretrain_history is not None:
+                self.pretrain_history.record(
+                    output,
+                    self._pretrain_losses[-1],
+                    self._pretrain_lrs[-1],
+                    a0 + 1,
+                    num_iters,
+                    snapshot_every,
+                )
             pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
@@ -1558,7 +1601,7 @@ class ObjectDIP(ObjectConstraints):
         plt.show()
 
 
-class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
+class ObjectINR(BaseConstraints[PtychoObjConstraints.INR], ObjectBase):
     """Implicit (coordinate-queried) object model.
 
     Wraps an implicit neural representation (INR; an ``HSiren`` by default) that maps
@@ -1584,7 +1627,7 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     -----
     - Autograd-only: analytical gradients are not implemented (see ``backward``).
     - Hard constraints have no grid to project; only the soft, coordinate-sampled TV
-      penalties of ``PtychoObjConstraintParams.INR`` apply.
+      penalties of ``PtychoObjConstraints.INR`` apply.
     """
 
     DEFAULT_LRS = {
@@ -1592,7 +1635,7 @@ class ObjectINR(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
         "tv_weight_z": 0,
         "tv_weight_xy": 0,
     }
-    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.INR = PtychoObjConstraintParams.INR()
+    DEFAULT_CONSTRAINTS: PtychoObjConstraints.INR = PtychoObjConstraints.INR()
 
     def __init__(
         self,
@@ -2221,7 +2264,7 @@ class ObjectTensorDecomp(ObjectINR):
       the grid to a pixelated reconstruction (cheap, useful for finding hyperparameters quickly).
     """
 
-    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.INR = PtychoObjConstraintParams.INR()
+    DEFAULT_CONSTRAINTS: PtychoObjConstraints.INR = PtychoObjConstraints.INR()
 
     @classmethod
     def from_model(

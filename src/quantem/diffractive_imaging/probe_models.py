@@ -47,11 +47,11 @@ from quantem.diffractive_imaging.ptycho_utils import (
 DeviceType = Union[str, torch.device, int]
 
 
-class PtychoProbeConstraintParams:
+class PtychoProbeConstraints:
     """
     Namespace class for ptychography probe constraint dataclasses.
 
-    Tab-complete on ``PtychoProbeConstraintParams`` in a notebook to discover the
+    Tab-complete on ``PtychoProbeConstraints`` in a notebook to discover the
     available variants. Tab-complete inside a variant's constructor to see every
     constraint field with its default value.
 
@@ -123,8 +123,12 @@ class PtychoProbeConstraintParams:
         return cast(PtychoProbeConstraintsType, parse_constraint_dict(cls, d, kind="probe"))
 
 
+# Compatibility alias for existing notebooks and saved Python objects.
+PtychoProbeConstraintParams = PtychoProbeConstraints
+
+
 PtychoProbeConstraintsType = (
-    PtychoProbeConstraintParams.Raster | PtychoProbeConstraintParams.Parametric
+    PtychoProbeConstraints.Raster | PtychoProbeConstraints.Parametric
 )
 
 
@@ -506,8 +510,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagators
 
 
-class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], ProbeBase):
-    DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Raster = PtychoProbeConstraintParams.Raster()
+class ProbeConstraints(BaseConstraints[PtychoProbeConstraints.Raster], ProbeBase):
+    DEFAULT_CONSTRAINTS: PtychoProbeConstraints.Raster = PtychoProbeConstraints.Raster()
 
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
@@ -787,6 +791,7 @@ class ProbePixelated(ProbeConstraints):
                 vacuum_probe_intensity=self.vacuum_probe_intensity,
                 aberration_coefs=self.probe_params["aberration_coefs"],
                 soft_edges=self.probe_params["soft_edges"],
+                device=self.device,
             )
             probes = prb.to(dtype=self.dtype, device=self.device)
         else:
@@ -888,15 +893,19 @@ class ProbePixelated(ProbeConstraints):
     def _apply_random_phase_shifts(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
         probes = self._to_torch(probe_array)
         for a0 in range(1, self.num_probes):
-            shift_y = torch.exp(
-                -2j * torch.pi * (self.rng.random() - 0.5) * torch.fft.fftfreq(self.roi_shape[0])
+            shift_row_t = torch.exp(
+                -2j
+                * torch.pi
+                * (self.rng.random() - 0.5)
+                * torch.fft.fftfreq(self.roi_shape[0], device=self.device)
             )
-            shift_x = torch.exp(
-                -2j * torch.pi * (self.rng.random() - 0.5) * torch.fft.fftfreq(self.roi_shape[1])
+            shift_col_t = torch.exp(
+                -2j
+                * torch.pi
+                * (self.rng.random() - 0.5)
+                * torch.fft.fftfreq(self.roi_shape[1], device=self.device)
             )
-            shift_y = shift_y.to(self.device)
-            shift_x = shift_x.to(self.device)
-            probes[a0] = probes[a0] * shift_y[:, None] * shift_x[None]
+            probes[a0] = probes[a0] * shift_row_t[:, None] * shift_col_t[None]
         return probes
 
     def _apply_weights(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
@@ -1145,6 +1154,7 @@ class ProbeDIP(ProbeConstraints):
         self._scheduler = None
         self._pretrain_losses: list[float] = []
         self._pretrain_lrs: list[float] = []
+        self.pretrain_history = None
 
     @classmethod
     def from_model(
@@ -1385,7 +1395,25 @@ class ProbeDIP(ProbeConstraints):
         apply_constraints: bool = False,
         show: bool = True,
         device: str | int | None = None,
+        *,
+        snapshot_every: int | None = None,
     ):
+        """Fit the DIP to its target, optionally recording display snapshots.
+
+        Parameters
+        ----------
+        snapshot_every : int or None, optional
+            Save the first, final, and every Nth evaluated prediction in
+            ``pretrain_history``. Only the mean over slices or probe modes is
+            retained on the training device. None disables capture. Each call
+            replaces its display history; optimizer behavior is unchanged.
+        """
+        if snapshot_every is not None and (
+            isinstance(snapshot_every, bool)
+            or not isinstance(snapshot_every, int)
+            or snapshot_every < 1
+        ):
+            raise ValueError("snapshot_every must be a positive integer or None.")
         if device is not None:
             dev, _ = config.validate_device(device)
             self.to(dev)
@@ -1418,6 +1446,7 @@ class ProbeDIP(ProbeConstraints):
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
+            snapshot_every=snapshot_every,
         )
         self.set_pretrained_weights(self.model)
 
@@ -1427,11 +1456,23 @@ class ProbeDIP(ProbeConstraints):
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
+        snapshot_every: int | None = None,
     ):
         """Pretrain the DIP model."""
         if self._pretrain_target.numel() == 0:
             raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
 
+        from quantem.diffractive_imaging.pretrain_history import PretrainHistory
+
+        self.pretrain_history = (
+            PretrainHistory(
+                target=self.pretrain_target.detach().mean(0).clone(),
+                kind="probe",
+                obj_type="complex",
+            )
+            if snapshot_every is not None
+            else None
+        )
         self.model.train()
         optimizer = self.optimizer
         if optimizer is None:
@@ -1461,6 +1502,15 @@ class ProbeDIP(ProbeConstraints):
 
             self._pretrain_losses.append(loss.item())
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+            if snapshot_every is not None and self.pretrain_history is not None:
+                self.pretrain_history.record(
+                    output,
+                    self._pretrain_losses[-1],
+                    self._pretrain_lrs[-1],
+                    a0 + 1,
+                    num_iters,
+                    snapshot_every,
+                )
             pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:

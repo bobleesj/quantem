@@ -1061,7 +1061,9 @@ class PtychographyVisualizations(PtychographyBase):
             print(f"Step size: {probe_step_size_A:.2f} Å")
             print(f"Probe overlap (rough estimate): {overlap * 100:.1f}%")
 
-        _fig, ax = show_2d(self._get_probe_overlap(), title="probe overlap", axsize=axsize)
+        _fig, ax = show_2d(
+            self._get_probe_overlap().detach().cpu().numpy(), title="probe overlap", axsize=axsize
+        )
         if probe_radius_px is not None and plot_radii:
             # plot a circle with the probe radius for each probe position
             if num_probes is None:

@@ -1,10 +1,10 @@
 from typing import Any, Self, Union
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
-from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -30,6 +30,7 @@ class Dataset2d(Dataset):
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
         _token: object | None = None,
+        tensor: torch.Tensor | None = None,
     ):
         """Initialize a 2D dataset.
 
@@ -52,12 +53,64 @@ class Dataset2d(Dataset):
         """
         super().__init__(
             array=array,
+            tensor=tensor,
             name=name,
             origin=origin,
             sampling=sampling,
             units=units,
             signal_units=signal_units,
             _token=_token,
+        )
+
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor: torch.Tensor,
+        name: str | None = None,
+        origin: NDArray | tuple | list | None = None,
+        sampling: NDArray | tuple | list | None = None,
+        units: list[str] | tuple | None = None,
+        signal_units: str = "arb. units",
+    ) -> Self:
+        """Wrap a two-dimensional Torch tensor without copying its storage.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Values in (row, col) order, retained on their current device.
+        name : str, optional
+            Dataset label.
+        origin, sampling : array-like, optional
+            Coordinate origin and sampling for each axis.
+        units : sequence of str, optional
+            Coordinate units for each axis.
+        signal_units : str, optional
+            Units of the stored values.
+
+        Returns
+        -------
+        Dataset2d
+            Tensor-backed dataset. Use ``tensor`` for device access or ``numpy()``
+            to explicitly copy values to the host.
+
+        Examples
+        --------
+        >>> values_t = torch.ones((16, 16))
+        >>> dataset = Dataset2d.from_tensor(values_t)
+        >>> dataset.tensor is values_t
+        True
+        """
+        if tensor.ndim != 2:
+            raise ValueError(f"Expected (row, col) tensor, got shape {tuple(tensor.shape)}.")
+        return cls(
+            array=None,
+            tensor=tensor,
+            name=name or "2D dataset (torch)",
+            origin=np.zeros(2) if origin is None else origin,
+            sampling=np.ones(2) if sampling is None else sampling,
+            units=["pixels"] * 2 if units is None else units,
+            signal_units=signal_units,
+            _token=cls._token,
         )
 
     @classmethod
@@ -176,4 +229,4 @@ class Dataset2d(Dataset):
         if title is None:
             title = self.name
 
-        return show_2d(to_numpy(self.array), scalebar=scalebar, title=title, **kwargs)
+        return show_2d(self.numpy(), scalebar=scalebar, title=title, **kwargs)

@@ -288,7 +288,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         ``constraints`` is a dict keyed by ``"object"``, ``"probe"``, ``"dataset"``
         (any subset). Each leaf may be:
 
-        - a ``Constraints`` dataclass instance (e.g. ``PtychoObjConstraintParams.Raster(...)``),
+        - a ``Constraints`` dataclass instance (e.g. ``PtychoObjConstraints.Raster(...)``),
           which replaces that model's constraint state wholesale, or
         - a plain ``dict`` of field-name -> value, which does a per-key partial update
           on the existing constraint state.
@@ -453,8 +453,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         for a0 in pbar:
             if _dist_world_size > 1 and train_sampler is not None:
                 train_sampler.set_epoch(a0)
-            consistency_loss = 0.0
-            total_loss = 0.0
+            # Match Python's double-precision sequential loss accumulation without
+            # synchronizing CUDA to read two scalars after every batch.
+            # MPS lacks float64; preserve its existing host-side reporting sums.
+            loss_device = "cpu" if self._single_device.startswith("mps") else self._single_device
+            losses_t = torch.zeros(2, device=loss_device, dtype=torch.float64)
             self._reset_iter_constraints()
 
             for batch in train_loader:
@@ -467,7 +470,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
                 obj_patches = self.obj_model.forward(patch_data)
                 propagated_probes, overlap = self.forward_operator(
-                    obj_patches, shifted_probes, descan_shifts
+                    obj_patches, shifted_probes, descan_shifts, retain_probe_history=not autograd
                 )
                 pred_intensities = self.detector_model.forward(overlap)
 
@@ -494,20 +497,15 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.step_optimizers()
                 # Post-step parameter projection (only for positivity_mode="shrink")
                 self.obj_model.project_parameters()
-                consistency_loss += batch_consistency_loss.item()
-                total_loss += batch_loss.item()
+                losses_t[0].add_(batch_loss.detach().to(losses_t.device))
+                losses_t[1].add_(batch_consistency_loss.detach().to(losses_t.device))
 
             num_batches = len(train_loader)
-            total_loss = total_loss / num_batches
-            consistency_loss = consistency_loss / num_batches
-
-            # Average loss across ranks so rank-0 reports the global mean
+            losses_t.div_(num_batches)
+            # Average on device before the one per-iteration reporting transfer.
             if _dist_world_size > 1:
-                loss_t = torch.tensor(
-                    [total_loss, consistency_loss], device=self._single_device, dtype=torch.float64
-                )
-                dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
-                total_loss, consistency_loss = loss_t[0].item(), loss_t[1].item()
+                dist.all_reduce(losses_t, op=dist.ReduceOp.AVG)
+            total_loss, consistency_loss = losses_t.tolist()
 
             # Validation pass (no gradient, no optimizer steps)
             val_loss = None
@@ -524,7 +522,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         shifted_probes = self.probe_model.forward(positions_px_fractional)
                         obj_patches = self.obj_model.forward(patch_data)
                         _propagated_probes, overlap = self.forward_operator(
-                            obj_patches, shifted_probes, descan_shifts
+                            obj_patches, shifted_probes, descan_shifts, retain_probe_history=False
                         )
                         pred_intensities = self.detector_model.forward(overlap)
                         batch_val_loss = self.error_estimate(
@@ -717,7 +715,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss: torch.Tensor,
         autograd: bool,
         obj_patches: torch.Tensor,
-        propagated_probes: torch.Tensor,
+        propagated_probes: torch.Tensor | None,
         overlap: torch.Tensor,
         patch_indices: torch.Tensor,
         amplitudes: torch.Tensor,

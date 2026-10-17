@@ -11,11 +11,11 @@ from quantem.diffractive_imaging import (
     DetectorPixelated,
     ObjectPixelated,
     ProbePixelated,
-    PtychoDatasetConstraintParams,
+    PtychoDatasetConstraints,
     Ptychography,
     PtychographyDatasetRaster,
-    PtychoObjConstraintParams,
-    PtychoProbeConstraintParams,
+    PtychoObjConstraints,
+    PtychoProbeConstraints,
 )
 
 N_SCAN = 8
@@ -62,34 +62,34 @@ def ptycho():
 
 class TestParseDict:
     def test_object_raster_by_name(self):
-        c = PtychoObjConstraintParams.parse_dict({"name": "raster", "tv_weight_z": 5.0})
-        assert isinstance(c, PtychoObjConstraintParams.Raster)
+        c = PtychoObjConstraints.parse_dict({"name": "raster", "tv_weight_z": 5.0})
+        assert isinstance(c, PtychoObjConstraints.Raster)
         assert c.tv_weight_z == 5.0
         assert c.positivity is True  # default preserved
 
     def test_object_inr_by_type(self):
-        c = PtychoObjConstraintParams.parse_dict({"type": "inr"})
-        assert isinstance(c, PtychoObjConstraintParams.INR)
+        c = PtychoObjConstraints.parse_dict({"type": "inr"})
+        assert isinstance(c, PtychoObjConstraints.INR)
 
     def test_object_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown object constraint type"):
-            PtychoObjConstraintParams.parse_dict({"name": "nope"})
+            PtychoObjConstraints.parse_dict({"name": "nope"})
 
     def test_object_missing_name_raises(self):
         with pytest.raises(ValueError, match="Must provide either 'name' or 'type'"):
-            PtychoObjConstraintParams.parse_dict({"tv_weight_z": 5.0})
+            PtychoObjConstraints.parse_dict({"tv_weight_z": 5.0})
 
     def test_probe_raster_with_fields(self):
-        c = PtychoProbeConstraintParams.parse_dict(
+        c = PtychoProbeConstraints.parse_dict(
             {"name": "raster", "center_probe": True, "tv_weight": 0.1}
         )
-        assert isinstance(c, PtychoProbeConstraintParams.Raster)
+        assert isinstance(c, PtychoProbeConstraints.Raster)
         assert c.center_probe is True
         assert c.tv_weight == 0.1
 
     def test_dataset_raster_default(self):
-        c = PtychoDatasetConstraintParams.parse_dict({"name": "raster"})
-        assert isinstance(c, PtychoDatasetConstraintParams.Raster)
+        c = PtychoDatasetConstraints.parse_dict({"name": "raster"})
+        assert isinstance(c, PtychoDatasetConstraints.Raster)
         assert c.clip_scan_positions is True  # default preserved
 
 
@@ -111,19 +111,19 @@ class TestTypoCatching:
 
 class TestRoundtrip:
     def test_obj_constraints_dataclass(self, ptycho):
-        obj_c = PtychoObjConstraintParams.Raster(tv_weight_z=2.5, identical_slices=True)
+        obj_c = PtychoObjConstraints.Raster(tv_weight_z=2.5, identical_slices=True)
         ptycho.constraints = {"object": obj_c}
         assert ptycho.obj_model.constraints is obj_c
         assert ptycho.obj_model.constraints.tv_weight_z == 2.5
         assert ptycho.obj_model.constraints.identical_slices is True
 
     def test_probe_constraints_dataclass(self, ptycho):
-        probe_c = PtychoProbeConstraintParams.Raster(center_probe=True, tv_weight=0.05)
+        probe_c = PtychoProbeConstraints.Raster(center_probe=True, tv_weight=0.05)
         ptycho.constraints = {"probe": probe_c}
         assert ptycho.probe_model.constraints is probe_c
 
     def test_dataset_constraints_dataclass(self, ptycho):
-        dset_c = PtychoDatasetConstraintParams.Raster(descan_tv_weight=0.01)
+        dset_c = PtychoDatasetConstraints.Raster(descan_tv_weight=0.01)
         ptycho.constraints = {"dataset": dset_c}
         assert ptycho.dset.constraints is dset_c
 
@@ -145,7 +145,7 @@ class TestReconstructKwargs:
     def test_dataclass_leaf_applied(self, ptycho):
         from quantem.core.ml import OptimizerParams
 
-        obj_c = PtychoObjConstraintParams.Raster(tv_weight_z=1.5)
+        obj_c = PtychoObjConstraints.Raster(tv_weight_z=1.5)
         ptycho.reconstruct(
             num_iters=1,
             reset=True,
@@ -179,7 +179,7 @@ class TestReconstructKwargs:
             reset=True,
             optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
             constraints={
-                "object": PtychoObjConstraintParams.Raster(tv_weight_xy=0.4),
+                "object": PtychoObjConstraints.Raster(tv_weight_xy=0.4),
                 "probe": {"center_probe": True},
             },
             batch_size=4,

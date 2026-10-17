@@ -1,6 +1,7 @@
 from typing import Self
 
 import numpy as np
+import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from numpy.typing import NDArray
@@ -24,7 +25,7 @@ class Dataset3d(Dataset):
 
     def __init__(
         self,
-        array: NDArray,
+        array: NDArray | None,
         name: str,
         origin: NDArray | tuple | list | float | int,
         sampling: NDArray | tuple | list | float | int,
@@ -32,6 +33,7 @@ class Dataset3d(Dataset):
         signal_units: str = "arb. units",
         metadata: dict = {},
         _token: object | None = None,
+        tensor: torch.Tensor | None = None,
     ):
         """Initialize a 3D dataset.
 
@@ -54,6 +56,7 @@ class Dataset3d(Dataset):
         """
         super().__init__(
             array=array,
+            tensor=tensor,
             name=name,
             origin=origin,
             sampling=sampling,
@@ -61,6 +64,59 @@ class Dataset3d(Dataset):
             signal_units=signal_units,
             metadata=metadata,
             _token=_token,
+        )
+
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor: torch.Tensor,
+        name: str | None = None,
+        origin: NDArray | tuple | list | None = None,
+        sampling: NDArray | tuple | list | None = None,
+        units: list[str] | tuple | None = None,
+        signal_units: str = "arb. units",
+    ) -> Self:
+        """Wrap a three-dimensional Torch tensor without copying its storage.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Values in (frame, row, col) order, retained on their current device.
+        name : str, optional
+            Dataset label.
+        origin, sampling : array-like, optional
+            Coordinate origin and sampling for each axis.
+        units : sequence of str, optional
+            Coordinate units for each axis.
+        signal_units : str, optional
+            Units of the stored values.
+
+        Returns
+        -------
+        Dataset3d
+            Tensor-backed dataset. Use ``tensor`` for device access or ``numpy()``
+            to explicitly copy values to the host.
+
+        Examples
+        --------
+        >>> values_t = torch.ones((4, 16, 16))
+        >>> dataset = Dataset3d.from_tensor(values_t)
+        >>> dataset.tensor is values_t
+        True
+        """
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"Expected (frame, row, col) tensor, got shape {tuple(tensor.shape)}."
+            )
+        return cls(
+            array=None,
+            tensor=tensor,
+            name=name or "3D dataset (torch)",
+            origin=np.zeros(3) if origin is None else origin,
+            sampling=np.ones(3) if sampling is None else sampling,
+            units=["pixels"] * 3 if units is None else units,
+            signal_units=signal_units,
+            _token=cls._token,
         )
 
     @classmethod
@@ -75,47 +131,48 @@ class Dataset3d(Dataset):
     ) -> Self:
         """Create a Dataset3d from a 3D array.
 
-        Parameters
-        ----------
-        array : NDArray
-            3D array with shape (n_frames, height, width)
-        name : str | None
-            Dataset name. Default: "3D dataset"
-        origin : NDArray | tuple | list | float | int | None
-            Origin for each dimension in calibrated units. Default: [0, 0, 0]
-        sampling : NDArray | tuple | list | float | int | None
-            Sampling for each dimension. Default: [1, 1, 1]
-        units : list[str] | tuple | list | None
-            Units for each dimension. Default: ["index", "pixels", "pixels"]
-        signal_units : str
-            Units for array values. Default: "arb. units"
+                Parameters
+                ----------
+                array : NDArray
+                    3D array with shape (n_frames, height, width)
+                name : str | None
+                    Dataset name. Default: "3D dataset"
+                origin : NDArray | tuple | list | float | int | None
+                    Origin for each dimension in calibrated units. Default: [0, 0, 0]
+                sampling : NDArray | tuple | list | float | int | None
+                    Sampling for each dimension. Default: [1, 1, 1]
+                units : list[str] | tuple | list | None
+                    Units for each dimension. Default: ["index", "pixels", "pixels"]
+                signal_units : str
+                    Units for array values. Default: "arb. units"
 
-        Returns
-        -------
-        Dataset3d
+                Returns
+                -------
+                Dataset3d
 
-        Examples
-        --------
-        >>> import numpy as np
-        >>> from quantem.core.datastructures import Dataset3d
-        >>> arr = np.random.rand(10, 64, 64)
-        >>> data = Dataset3d.from_array(arr)
-        >>> data.shape
-        (10, 64, 64)
+                Examples
+                --------
+                >>> import numpy as np
+        import torch
+                >>> from quantem.core.datastructures import Dataset3d
+                >>> arr = np.random.rand(10, 64, 64)
+                >>> data = Dataset3d.from_array(arr)
+                >>> data.shape
+                (10, 64, 64)
 
-        With calibration:
+                With calibration:
 
-        >>> data = Dataset3d.from_array(
-        ...     arr,
-        ...     sampling=[1, 0.1, 0.1],
-        ...     units=["frame", "nm", "nm"],
-        ... )
+                >>> data = Dataset3d.from_array(
+                ...     arr,
+                ...     sampling=[1, 0.1, 0.1],
+                ...     units=["frame", "nm", "nm"],
+                ... )
 
-        Visualize:
+                Visualize:
 
-        >>> data.show()              # all frames in grid
-        >>> data.show(index=0)       # single frame
-        >>> data.show(ncols=2)       # 2 columns
+                >>> data.show()              # all frames in grid
+                >>> data.show(index=0)       # single frame
+                >>> data.show(ncols=2)       # 2 columns
         """
         array = ensure_valid_array(array, ndim=3)
         return cls(

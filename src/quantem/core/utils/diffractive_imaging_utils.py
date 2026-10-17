@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.ndimage as ndi
+import torch
 from matplotlib.patches import Circle, Ellipse
 from scipy.optimize import least_squares
 
@@ -10,8 +11,8 @@ from quantem.core.utils.filter import otsu_threshold
 
 
 def fit_probe_circle(
-    img: np.ndarray, threshold: Optional[float] = None, show: bool = True
-) -> Tuple[float, float, float]:
+    img: np.ndarray | torch.Tensor, threshold: float | None = None, show: bool = True
+) -> tuple[float, float, float]:
     """
     Fit a circle to the probe shape in an image.
 
@@ -21,8 +22,16 @@ def fit_probe_circle(
         show (bool): Whether to display the fitted circle. Default is True.
 
     Returns:
-        Tuple[float, float, float]: Center coordinates (xc, yc) and radius R of the fitted circle.
+        Tuple[float, float, float]: Center coordinates (center_row, center_col) and radius radius of the fitted circle.
     """
+    if isinstance(img, torch.Tensor):
+        center_row, center_col, radius = _fit_probe_circle_tensor(img, threshold)
+        if show:
+            _, ax = plt.subplots()
+            ax.imshow(img.detach().cpu().numpy(), cmap="gray")
+            ax.add_patch(Circle((center_col, center_row), radius, color="red", alpha=0.3))
+            plt.show()
+        return center_row, center_col, radius
     if threshold is None:
         threshold = otsu_threshold(img)
     binary = ndi.binary_closing(img > threshold, iterations=2)
@@ -32,27 +41,29 @@ def fit_probe_circle(
     grad_mag = np.hypot(ndi.sobel(smoothed, axis=1), ndi.sobel(smoothed, axis=0))
 
     edge_points = np.argwhere(grad_mag > grad_mag.mean())
-    y, x = edge_points[:, 0], edge_points[:, 1]
+    row, col = edge_points[:, 0], edge_points[:, 1]
 
-    def calc_R(xc: float, yc: float, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        return np.sqrt((x - xc) ** 2 + (y - yc) ** 2)
+    def radial_distance(
+        center_col: float, center_row: float, col: np.ndarray, row: np.ndarray
+    ) -> np.ndarray:
+        return np.sqrt((col - center_col) ** 2 + (row - center_row) ** 2)
 
-    def f_2(c: Tuple[float, float], x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        Ri = calc_R(*c, x, y)
-        return Ri - Ri.mean()
+    def f_2(c: Tuple[float, float], col: np.ndarray, row: np.ndarray) -> np.ndarray:
+        radii = radial_distance(*c, col, row)
+        return radii - radii.mean()
 
-    center_estimate = np.mean(x), np.mean(y)
-    result = least_squares(f_2, center_estimate, args=(x, y))
-    xc, yc = result.x
-    R = calc_R(xc, yc, x, y).mean()
+    center_estimate = np.mean(col), np.mean(row)
+    result = least_squares(f_2, center_estimate, args=(col, row))
+    center_col, center_row = result.x
+    radius = radial_distance(center_col, center_row, col, row).mean()
 
     if show:
         _fig, ax = plt.subplots()
         ax.imshow(img, cmap="gray")
-        ax.add_patch(Circle((xc, yc), R, color="red", alpha=0.3, linewidth=2))
+        ax.add_patch(Circle((center_col, center_row), radius, color="red", alpha=0.3, linewidth=2))
         plt.show()
 
-    return yc, xc, R
+    return center_row, center_col, radius
 
 
 def fit_probe_ellipse(
@@ -135,3 +146,115 @@ def fit_probe_ellipse(
         plt.show()
 
     return yc, xc, a_axis, b_axis, theta
+
+
+@torch.no_grad()
+def _fit_probe_circle_tensor(img_t: torch.Tensor, threshold: float | None):
+    """Match the NumPy circle fit while retaining calibration arrays on device."""
+    import torch.nn.functional as F
+
+    values_t = img_t.double()
+    if threshold is None:
+        lower, upper = float(img_t.min()), float(img_t.max())
+        if lower == upper:
+            lower, upper = lower - 0.5, upper + 0.5
+        counts_t = torch.histc(img_t, bins=256, min=lower, max=upper).double()
+        edges_t = torch.linspace(lower, upper, 257, device=img_t.device, dtype=img_t.dtype)[
+            :-1
+        ].double()
+        background_t = counts_t.cumsum(0)
+        foreground_t = img_t.numel() - background_t
+        moment_t = (counts_t * edges_t).cumsum(0)
+        difference_t = moment_t / background_t - (moment_t[-1] - moment_t) / foreground_t
+        variance_t = background_t * foreground_t * difference_t.square()
+        variance_t[(background_t == 0) | (foreground_t == 0)] = 0
+        threshold = float(edges_t[variance_t.argmax()])
+    cross_t = values_t.new_tensor([[0, 1, 0], [1, 1, 1], [0, 1, 0]])[None, None]
+    binary_t = values_t > threshold
+    for _ in range(2):
+        binary_t = F.conv2d(binary_t[None, None].double(), cross_t, padding=1)[0, 0] > 0
+    for _ in range(2):
+        binary_t = F.conv2d(binary_t[None, None].double(), cross_t, padding=1)[0, 0] == 5
+    exterior_t = torch.zeros_like(binary_t)
+    exterior_t[0] = ~binary_t[0]
+    exterior_t[-1] = ~binary_t[-1]
+    exterior_t[:, 0] = ~binary_t[:, 0]
+    exterior_t[:, -1] = ~binary_t[:, -1]
+    while True:
+        expanded_t = (
+            F.conv2d(exterior_t[None, None].double(), cross_t, padding=1)[0, 0] > 0
+        ) & ~binary_t
+        if torch.equal(expanded_t, exterior_t):
+            break
+        exterior_t = expanded_t
+    binary_t = ~exterior_t
+
+    def reflect_filter(array_t, kernel_t):
+        radius = kernel_t.shape[-1] // 2
+        row_t = torch.arange(-radius, array_t.shape[0] + radius, device=img_t.device) % (
+            2 * array_t.shape[0]
+        )
+        col_t = torch.arange(-radius, array_t.shape[1] + radius, device=img_t.device) % (
+            2 * array_t.shape[1]
+        )
+        row_t = torch.minimum(row_t, 2 * array_t.shape[0] - 1 - row_t)
+        col_t = torch.minimum(col_t, 2 * array_t.shape[1] - 1 - col_t)
+        padded_t = array_t[row_t[:, None], col_t[None, :]]
+        return F.conv2d(padded_t[None, None], kernel_t[None, None])[0, 0]
+
+    support_t = torch.arange(-4, 5, device=img_t.device, dtype=torch.float64)
+    gaussian_t = torch.exp(-support_t.square() / 2)
+    gaussian_t /= gaussian_t.sum()
+    smooth_t = reflect_filter(binary_t.double(), gaussian_t[:, None] * gaussian_t[None, :])
+    sobel_t = values_t.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+    gradient_t = torch.hypot(
+        reflect_filter(smooth_t, sobel_t), reflect_filter(smooth_t, sobel_t.T)
+    )
+    points_t = (gradient_t > gradient_t.mean()).nonzero().double()
+    # Keep the original (column, row) parameter order for the two-column SVD.
+    points_t = points_t.flip(1)
+    center_t = points_t.mean(0)
+
+    def residual(center_t):
+        offsets_t = points_t - center_t
+        radii_t = torch.sqrt(offsets_t[:, 0].square() + offsets_t[:, 1].square())
+        return radii_t - radii_t.mean()
+
+    # The reference uses a forward-difference Jacobian and stops on relative
+    # cost change. An analytic Jacobian converged further and changed calibration.
+    epsilon = torch.finfo(torch.float64).eps**0.5
+    residual_t = residual(center_t)
+    for _ in range(199):
+        columns_t = []
+        for axis in range(2):
+            shifted_t = center_t.clone()
+            step_t = epsilon * torch.maximum(center_t[axis].abs(), center_t.new_tensor(1))
+            step_t = torch.where(center_t[axis] < 0, -step_t, step_t)
+            shifted_t[axis] += step_t
+            step_t = shifted_t[axis] - center_t[axis]
+            columns_t.append((residual(shifted_t) - residual_t) / step_t)
+        jacobian_t = torch.stack(columns_t, dim=1)
+        gradient_t = jacobian_t.T @ residual_t
+        if float(gradient_t.abs().max()) < 1e-8:
+            break
+        left_t, singular_t, right_t = torch.linalg.svd(jacobian_t, full_matrices=False)
+        step_t = -(right_t.T @ ((left_t.T @ residual_t) / singular_t))
+        next_center_t = center_t + step_t
+        next_residual_t = residual(next_center_t)
+        cost_t = 0.5 * torch.dot(residual_t, residual_t)
+        next_cost_t = 0.5 * torch.dot(next_residual_t, next_residual_t)
+        reduction_t = cost_t - next_cost_t
+        projected_t = jacobian_t @ step_t
+        predicted_t = -(0.5 * torch.dot(projected_t, projected_t) + gradient_t @ step_t)
+        ratio_t = reduction_t / predicted_t
+        converged = bool((reduction_t < 1e-8 * cost_t) & (ratio_t > 0.25)) or bool(
+            torch.linalg.vector_norm(step_t)
+            < 1e-8 * (1e-8 + torch.linalg.vector_norm(center_t))
+        )
+        if bool(reduction_t > 0):
+            center_t, residual_t = next_center_t, next_residual_t
+        if converged:
+            break
+    offsets_t = points_t - center_t
+    radius = float(torch.sqrt(offsets_t[:, 0].square() + offsets_t[:, 1].square()).mean())
+    return float(center_t[1]), float(center_t[0]), radius

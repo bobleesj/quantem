@@ -24,6 +24,7 @@ from quantem.core.utils.validators import (
     validate_np_len,
     validate_tensor,
 )
+from quantem.diffractive_imaging._overlap_multiply import _multiply_overlap
 from quantem.diffractive_imaging.dataset_models import (
     DatasetModelType,
     PtychographyDatasetBase,
@@ -208,17 +209,26 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     def _set_obj_fov_mask(self, gaussian_sigma: float = 2.0, batch_size=None):
         overlap = self._get_probe_overlap(batch_size)
-        ov = overlap > overlap.max() * 0.3
-        ov = ndi.binary_closing(ov, iterations=5)
-        dilation_iters = min(32, np.min(self.obj_padding_px) // 4)
-        if dilation_iters > 0:
-            ov = ndi.binary_dilation(ov, iterations=dilation_iters)
-        ov = ndi.gaussian_filter(ov.astype(config.get("dtype_real")), sigma=gaussian_sigma)
+        from ._tensor_preprocessing import _object_fov_mask
+
+        dilation_iters = int(min(32, np.min(self.obj_padding_px) // 4))
+        if isinstance(self.dset.intensities_4d, np.ndarray):
+            # Preserve the original numerical path for NumPy-backed datasets.
+            overlap = self._to_numpy(overlap)
+            ov = overlap > overlap.max() * 0.3
+            ov = ndi.binary_closing(ov, iterations=5)
+            if dilation_iters > 0:
+                ov = ndi.binary_dilation(ov, iterations=dilation_iters)
+            ov = ndi.gaussian_filter(
+                ov.astype(config.get("dtype_real")), sigma=gaussian_sigma
+            )
+        else:
+            ov = _object_fov_mask(overlap, dilation_iters, gaussian_sigma)
         self.obj_fov_mask = ov
         self.obj_model.mask = ov
         return
 
-    def _get_probe_overlap(self, max_batch_size: int | None = None) -> np.ndarray:
+    def _get_probe_overlap(self, max_batch_size: int | None = None) -> torch.Tensor:
         prb = self.probe_model.probe[0]
         num_dps = self.dset.num_positions
         shifted_probes = prb.expand(num_dps, *self.roi_shape)
@@ -233,7 +243,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.dset.patch_indices[start:end],
                 tuple(self.obj_shape_full[-2:]),
             )
-        return self._to_numpy(probe_overlap)
+        return probe_overlap
 
     # endregion --- preprocessing ---
 
@@ -701,9 +711,23 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "complex":
-            ph = np.angle(cropped)
-            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
+            phase = np.angle(cropped)
+            cropped = np.abs(cropped) * np.exp(1j * (phase - phase.mean()))
         return cropped
+
+    @property
+    def obj_cropped_tensor(self) -> torch.Tensor:
+        """Return the cropped, FOV-rotated object on the reconstruction device.
+
+        Examples
+        --------
+        >>> object_t = ptycho.obj_cropped_tensor
+        """
+        cropped_t = self._crop_rotate_obj_fov(self.obj_model.obj.detach())
+        if self.obj_type == "complex":
+            phase_t = cropped_t.angle()
+            cropped_t = cropped_t.abs() * torch.exp(1j * (phase_t - phase_t.mean()))
+        return cropped_t
 
     @property  # FIXME depend on ptychodataset
     def roi_shape(self) -> np.ndarray:
@@ -856,6 +880,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
         """Un-rotates and un-transposes the object and crops it to the reconstruction FOV."""
+        if isinstance(array, torch.Tensor):
+            return self._crop_rotate_tensor(array, com_rotation_rad, transpose)
         array = self._to_numpy(array).copy()
         com_rotation_rad = (
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
@@ -872,6 +898,62 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
 
         return cropped
+
+    def _crop_rotate_tensor(self, array_t, rotation, transpose):
+        """Match scipy's order-one rotate and centered FOV crop on device."""
+        import math
+
+        from torch.nn.functional import grid_sample
+
+        rotation = self.dset.com_rotation_rad if rotation is None else rotation
+        transpose = self.dset.com_transpose if transpose is None else transpose
+        angle = -rotation if transpose else rotation
+        cosine, sine = math.cos(angle), math.sin(angle)
+        rows, cols = array_t.shape[-2:]
+        out_rows = int(abs(cosine) * rows + abs(sine) * cols + 0.5)
+        out_cols = int(abs(sine) * rows + abs(cosine) * cols + 0.5)
+        row_t, col_t = torch.meshgrid(
+            torch.arange(out_rows, device=array_t.device, dtype=array_t.real.dtype)
+            - (out_rows - 1) / 2,
+            torch.arange(out_cols, device=array_t.device, dtype=array_t.real.dtype)
+            - (out_cols - 1) / 2,
+            indexing="ij",
+        )
+        source_row_t = cosine * row_t + sine * col_t + (rows - 1) / 2
+        source_col_t = -sine * row_t + cosine * col_t + (cols - 1) / 2
+        grid_t = torch.stack(
+            (2 * source_col_t / max(1, cols - 1) - 1, 2 * source_row_t / max(1, rows - 1) - 1), -1
+        )
+        outside_t = (
+            (source_row_t < 0)
+            | (source_row_t > rows - 1)
+            | (source_col_t < 0)
+            | (source_col_t > cols - 1)
+        )
+
+        def sample(values_t):
+            flat_t = values_t.reshape(-1, 1, rows, cols)
+            rotated_t = grid_sample(
+                flat_t,
+                grid_t[None].expand(len(flat_t), -1, -1, -1),
+                align_corners=True,
+                padding_mode="zeros",
+            )[:, 0]
+            return rotated_t.masked_fill(outside_t, 0).reshape(
+                *values_t.shape[:-2], out_rows, out_cols
+            )
+
+        rotated_t = (
+            torch.complex(sample(array_t.real), sample(array_t.imag))
+            if array_t.is_complex()
+            else sample(array_t)
+        )
+        if transpose:
+            rotated_t = rotated_t.transpose(-2, -1)
+        crop_rows, crop_cols = map(int, self.obj_shape_crop[-2:])
+        first_row = (rotated_t.shape[-2] - crop_rows) // 2
+        first_col = (rotated_t.shape[-1] - crop_cols) // 2
+        return rotated_t[..., first_row : first_row + crop_rows, first_col : first_col + crop_cols]
 
     def reset_recon(self) -> None:
         self._reset_rng()
@@ -1067,10 +1149,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         obj_patches: torch.Tensor,
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        retain_probe_history: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         if self.probe_model.learn_probe_tilt:
             self.compute_propagator_arrays()
-        propagated_probes, overlap = self.overlap_projection(obj_patches, shifted_input_probes)
+        propagated_probes, overlap = self.overlap_projection(
+            obj_patches, shifted_input_probes, retain_probe_history=retain_probe_history
+        )
         ## prop_probes shape: (nslices, nprobes, batch_size, roi_shape[0], roi_shape[1])
         ## overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         if descan is not None:
@@ -1103,20 +1189,26 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         loss = error / self.dset.mean_diffraction_intensity
         return loss
 
-    def overlap_projection(self, obj_patches, input_probe):
-        """Multiplies `input_probes` with roi-shaped patches from `obj_array`.
-        This version is for GD only -- AD does not require all the propagated probe
-        slices and trying to store them causes in-place issues
+    def overlap_projection(self, obj_patches, input_probe, *, retain_probe_history=True):
+        """Propagate probes through object slices and retain intermediate waves.
+
+        Autograd differentiates the exit wave; analytical gradients also use
+        the returned probe wave at each slice. Disable ``retain_probe_history``
+        when only the exit wave is needed to avoid materializing that stack.
         """
-        propagated_probes = [input_probe]
-        overlap = obj_patches[0] * input_probe
+        # One unbind joins slice gradients once. Repeated indexing creates a
+        # full-stack zero/scatter/add backward operation for every slice.
+        object_slices = obj_patches.unbind(dim=0)
+        propagated_probes = [input_probe] if retain_probe_history else None
+        overlap = _multiply_overlap(object_slices[0], input_probe)
         for s in range(1, self.num_slices):
             propagated_probe = self._propagate_array(overlap, self._propagators[s - 1])
-            overlap = obj_patches[s] * propagated_probe
-            propagated_probes.append(propagated_probe)
+            overlap = _multiply_overlap(object_slices[s], propagated_probe)
+            if propagated_probes is not None:
+                propagated_probes.append(propagated_probe)
 
-        propagated_probes = torch.stack(propagated_probes, dim=0).to(overlap.device)
-        return propagated_probes, overlap  # type:ignore
+        probe_history = torch.stack(propagated_probes) if propagated_probes is not None else None
+        return probe_history, overlap
 
     def estimate_amplitudes(
         self, overlap_array: "torch.Tensor", corner_centered: bool = False

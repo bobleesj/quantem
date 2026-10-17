@@ -97,7 +97,7 @@ class Dataset4dstem(Dataset4d):
         self._virtual_detectors = {}  # Store detector information for regeneration
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str, file_type: str, **kwargs) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
@@ -108,16 +108,23 @@ class Dataset4dstem(Dataset4d):
         file_type : str
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
+        **kwargs
+            Options forwarded to ``quantem.core.io.read_4dstem``, including
+            ``apply_mask=True`` to zero flagged Arina detector pixels.
 
         Returns
         -------
         Dataset4dstem
             A new Dataset4dstem instance loaded from the file
+
+        Examples
+        --------
+        >>> tilt = Dataset4dstem.from_file("tilt_master.h5", "arina", apply_mask=True)
         """
         # Import here to avoid circular imports
         from quantem.core.io.file_readers import read_4dstem
 
-        return read_4dstem(file_path, file_type)
+        return read_4dstem(file_path, file_type, **kwargs)
 
     @classmethod
     def from_array(
@@ -161,6 +168,87 @@ class Dataset4dstem(Dataset4d):
             units=units if units is not None else ["pixels"] * 4,
             signal_units=signal_units,
             _token=cls._token,
+        )
+
+    @classmethod
+    def from_qem(
+        cls,
+        path: str,
+        *,
+        sampling: tuple[float, float, float, float],
+        units: tuple[str, str, str, str],
+        name: str | None = None,
+        transpose_detector: bool = False,
+    ) -> Self:
+        """Load cached measurements into a device-resident working dataset.
+
+        QuantEM.GPU owns compressed IO and decoding. This entry point prepares
+        a dense Torch tensor for iterative reconstruction, decoding bounded
+        scan-row blocks without materializing the full cube on the CPU.
+
+        Parameters
+        ----------
+        path : str
+            Path to a QEM cache; a leading tilde is expanded.
+        sampling : tuple of float
+            Calibrated steps in scan-row, scan-col, detector-row, detector-col order.
+        units : tuple of str
+            Units corresponding to sampling, after any detector transpose.
+        name : str, optional
+            Scientific dataset label.
+        transpose_detector : bool, optional
+            Swap detector row and col to match the experimental orientation.
+            Sampling and units must describe the resulting orientation.
+
+        Returns
+        -------
+        Dataset4dstem
+            Float32 Torch-backed dataset on the configured CUDA device.
+
+        Examples
+        --------
+        >>> dset = Dataset4dstem.from_qem(
+        ...     "~/data/ptycho-depth/tbl_wse2.qem",
+        ...     sampling=(0.429, 0.429, 1, 1),
+        ...     units=("A", "A", "pixels", "pixels"),
+        ...     transpose_detector=True,
+        ... )
+        """
+        from pathlib import Path
+
+        from quantem.core import config
+        from quantem.gpu import io
+
+        device = torch.device(config.get("device"))
+        if device.type != "cuda":
+            raise ValueError(
+                "QEM reconstruction loading requires CUDA; call config.set_device(0)."
+            )
+        with (
+            torch.cuda.device(device),
+            io.load(Path(path).expanduser(), backend="cuda", verbose=False) as source,
+        ):
+            detector_shape = source.shape[2:]
+            if transpose_detector:
+                detector_shape = detector_shape[::-1]
+            values_t = torch.empty(
+                (*source.shape[:2], *detector_shape), dtype=torch.float32, device=device
+            )
+            for scan_row in range(0, source.shape[0], 4):
+                stop = min(scan_row + 4, source.shape[0])
+                block_t = source.read(scan_region=(scan_row, stop, 0, source.shape[1]))
+                values_t[scan_row:stop] = (
+                    block_t.transpose(2, 3) if transpose_detector else block_t
+                )
+        return cls.from_tensor(
+            values_t,
+            name=name,
+            sampling=sampling,
+            units=units,
+            metadata={
+                "source_qem": str(Path(path).expanduser()),
+                "detector_transposed": transpose_detector,
+            },
         )
 
     @classmethod
@@ -260,8 +348,11 @@ class Dataset4dstem(Dataset4d):
         """
         dp_mean = self.mean((0, 1))
 
-        dp_mean_dataset = Dataset2d.from_array(
-            array=dp_mean,
+        constructor = (
+            Dataset2d.from_tensor if isinstance(dp_mean, torch.Tensor) else Dataset2d.from_array
+        )
+        dp_mean_dataset = constructor(
+            dp_mean,
             name=self.name + "_dp_mean",
             origin=self.origin[-2:],
             sampling=self.sampling[-2:],
@@ -380,14 +471,14 @@ class Dataset4dstem(Dataset4d):
         ----------
         mask : np.ndarray | None, optional
             Mask for forming virtual images from 4D-STEM data. The mask should be the same
-            shape as the datacube Kx and Ky. If provided, mode and geometry are ignored.
+            shape as the datacube detector row and col. If provided, mode and geometry are ignored.
         mode : str | None, optional
             Mode for automatic mask creation. Options are "circle" or "annular".
             Required if mask is not provided.
         geometry : tuple | None, optional
             Geometry parameters for automatic mask creation:
-            - For "circle" mode: ((cy, cx), r) where (cy, cx) is center and r is radius
-            - For "annular" mode: ((cy, cx), (r_inner, r_outer)) where (cy, cx) is center
+            - For "circle" mode: ((center_row, center_col), r) where (center_row, center_col) is center and r is radius
+            - For "annular" mode: ((center_row, center_col), (r_inner, r_outer)) where (center_row, center_col) is center
               and (r_inner, r_outer) are inner and outer radii
             Required if mask is not provided.
         name : str, optional
@@ -405,9 +496,9 @@ class Dataset4dstem(Dataset4d):
         """
         if mask is not None:
             # Use provided mask
-            if mask.shape != self.array.shape[-2:]:
+            if mask.shape != self.shape[-2:]:
                 raise ValueError(
-                    f"Mask shape {mask.shape} does not match diffraction pattern shape {self.array.shape[-2:]}"
+                    f"Mask shape {mask.shape} does not match diffraction pattern shape {self.shape[-2:]}"
                 )
             final_mask = mask
         elif mode is not None and geometry is not None:
@@ -418,13 +509,15 @@ class Dataset4dstem(Dataset4d):
                     or len(geometry[0]) != 2
                     or not isinstance(geometry[1], (int, float))
                 ):
-                    raise ValueError("For circle mode, geometry must be ((cy, cx), r)")
+                    raise ValueError(
+                        "For circle mode, geometry must be ((center_row, center_col), r)"
+                    )
                 center, radius = geometry
                 final_mask = self._create_circle_mask(center, radius)
             elif mode == "annular":
                 if len(geometry) != 2 or len(geometry[0]) != 2 or len(geometry[1]) != 2:
                     raise ValueError(
-                        "For annular mode, geometry must be ((cy, cx), (r_inner, r_outer))"
+                        "For annular mode, geometry must be ((center_row, center_col), (r_inner, r_outer))"
                     )
                 center, radii = geometry
                 final_mask = self._create_annular_mask(center, radii)
@@ -435,10 +528,22 @@ class Dataset4dstem(Dataset4d):
         else:
             raise ValueError("Either mask or both mode and geometry must be provided")
 
-        virtual_image = np.sum(self.array * final_mask, axis=(-1, -2))
+        if self._tensor is not None:
+            mask_t = torch.as_tensor(final_mask, device=self.tensor.device)
+            from quantem.gpu import detector
 
-        virtual_image_dataset = Dataset2d.from_array(
-            array=virtual_image,
+            session = detector.prepare(self.tensor)
+            try:
+                virtual_image = session.masked_sum(mask_t, output="native")
+            finally:
+                session.close()
+            constructor = Dataset2d.from_tensor
+        else:
+            virtual_image = np.sum(self.array * final_mask, axis=(-1, -2))
+            constructor = Dataset2d.from_array
+
+        virtual_image_dataset = constructor(
+            virtual_image,
             name=name,
             origin=self.origin[0:2],
             sampling=self.sampling[0:2],
@@ -450,18 +555,31 @@ class Dataset4dstem(Dataset4d):
             self._virtual_images[name] = virtual_image_dataset
             # Store detector information for regeneration after operations
             self._virtual_detectors[name] = {
-                "mask": final_mask.copy() if mask is not None else None,
+                "mask": (
+                    final_mask.clone()
+                    if isinstance(final_mask, torch.Tensor)
+                    else final_mask.copy()
+                )
+                if mask is not None
+                else None,
                 "mode": mode,
                 "geometry": geometry,
             }
 
         if show:
             dp_mean_dataset = self.get_dp_mean(attach=False)
-            _fig, ax = show_2d(dp_mean_dataset.array, title=f"Mean DP with {name} detector")
+            _fig, ax = show_2d(dp_mean_dataset.numpy(), title=f"Mean DP with {name} detector")
 
             if mask is not None:
                 # For custom masks, show the mask contour
-                ax.contour(final_mask, colors="red", linewidths=2, alpha=0.8)
+                ax.contour(
+                    final_mask.cpu().numpy()
+                    if isinstance(final_mask, torch.Tensor)
+                    else final_mask,
+                    colors="red",
+                    linewidths=2,
+                    alpha=0.8,
+                )
                 ax.text(
                     0.02,
                     0.98,
@@ -474,11 +592,13 @@ class Dataset4dstem(Dataset4d):
                 )
             elif mode == "circle" and geometry is not None:
                 center, radius = geometry
-                cy, cx = center
-                circle = Circle((cx, cy), radius, color="red", fill=True, alpha=0.2)
+                center_row, center_col = center
+                circle = Circle(
+                    (center_col, center_row), radius, color="red", fill=True, alpha=0.2
+                )
                 ax.add_patch(circle)
                 circle = Circle(
-                    (cx, cy),
+                    (center_col, center_row),
                     radius,
                     color="red",
                     fill=False,
@@ -488,10 +608,10 @@ class Dataset4dstem(Dataset4d):
                 ax.add_patch(circle)
             elif mode == "annular" and geometry is not None:
                 center, radii = geometry
-                cy, cx = center
+                center_row, center_col = center
                 r_inner, r_outer = radii
                 annulus_filled = Wedge(
-                    (cx, cy),
+                    (center_col, center_row),
                     r_outer,
                     0,
                     360,
@@ -502,10 +622,20 @@ class Dataset4dstem(Dataset4d):
                 )
                 ax.add_patch(annulus_filled)
                 circle_inner = Circle(
-                    (cx, cy), r_inner, color="red", fill=False, linewidth=2, alpha=0.8
+                    (center_col, center_row),
+                    r_inner,
+                    color="red",
+                    fill=False,
+                    linewidth=2,
+                    alpha=0.8,
                 )
                 circle_outer = Circle(
-                    (cx, cy), r_outer, color="red", fill=False, linewidth=2, alpha=0.8
+                    (center_col, center_row),
+                    r_outer,
+                    color="red",
+                    fill=False,
+                    linewidth=2,
+                    alpha=0.8,
                 )
                 ax.add_patch(circle_inner)
                 ax.add_patch(circle_outer)
@@ -520,7 +650,7 @@ class Dataset4dstem(Dataset4d):
         Parameters
         ----------
         center : tuple[float, float]
-            Center coordinates (cy, cx) of the circle
+            Center coordinates (center_row, center_col) of the circle
         radius : float
             Radius of the circle
 
@@ -529,13 +659,26 @@ class Dataset4dstem(Dataset4d):
         np.ndarray
             Boolean mask with True inside the circle
         """
-        cy, cx = center
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
+        center_row, center_col = center
+        dp_shape = self.shape[-2:]  # Get diffraction pattern dimensions
+        if self._tensor is not None:
+            row = torch.arange(dp_shape[0], device=self.tensor.device, dtype=torch.float64)[
+                :, None
+            ]
+            col = torch.arange(dp_shape[1], device=self.tensor.device, dtype=torch.float64)[
+                None, :
+            ]
+        else:
+            row, col = np.ogrid[: dp_shape[0], : dp_shape[1]]
 
         # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        distance_squared = (row - center_row) ** 2 + (col - center_col) ** 2
 
+        distance = (
+            distance_squared.sqrt()
+            if isinstance(distance_squared, torch.Tensor)
+            else np.sqrt(distance_squared)
+        )
         return distance <= radius
 
     def _create_annular_mask(
@@ -547,7 +690,7 @@ class Dataset4dstem(Dataset4d):
         Parameters
         ----------
         center : tuple[float, float]
-            Center coordinates (cy, cx) of the annulus
+            Center coordinates (center_row, center_col) of the annulus
         radii : tuple[float, float]
             Inner and outer radii (r_inner, r_outer) of the annulus
 
@@ -556,14 +699,27 @@ class Dataset4dstem(Dataset4d):
         np.ndarray
             Boolean mask with True inside the annular region
         """
-        cy, cx = center
+        center_row, center_col = center
         r_inner, r_outer = radii
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
+        dp_shape = self.shape[-2:]  # Get diffraction pattern dimensions
+        if self._tensor is not None:
+            row = torch.arange(dp_shape[0], device=self.tensor.device, dtype=torch.float64)[
+                :, None
+            ]
+            col = torch.arange(dp_shape[1], device=self.tensor.device, dtype=torch.float64)[
+                None, :
+            ]
+        else:
+            row, col = np.ogrid[: dp_shape[0], : dp_shape[1]]
 
         # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        distance_squared = (row - center_row) ** 2 + (col - center_col) ** 2
 
+        distance = (
+            distance_squared.sqrt()
+            if isinstance(distance_squared, torch.Tensor)
+            else np.sqrt(distance_squared)
+        )
         return (distance >= r_inner) & (distance <= r_outer)
 
     def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
@@ -586,7 +742,7 @@ class Dataset4dstem(Dataset4d):
             print("No virtual images to display. Create virtual images with get_virtual_image().")
             return None, None
 
-        arrays = [vi.array for vi in self.virtual_images.values()]
+        arrays = [vi.numpy() for vi in self.virtual_images.values()]
         titles = list(self.virtual_images.keys())
 
         n_images = len(arrays)
