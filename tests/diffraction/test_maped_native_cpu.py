@@ -13,11 +13,11 @@ from quantem.diffraction import MAPED
 
 
 def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
-    """Native Arina inputs recover known shifts without optional GPU packages."""
+    """Native Arina inputs recover and report shifts with QuantEM's dependencies."""
     original_import = builtins.__import__
 
     def core_only(name, *args, **kwargs):
-        if name.startswith(("quantem.gpu", "quantem.widget")):
+        if name.startswith(("quantem.gpu", "quantem.widget", "pandas")):
             raise AssertionError(f"CPU MAPED imported an optional package: {name}")
         return original_import(name, *args, **kwargs)
 
@@ -51,6 +51,14 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
 
     maped = MAPED.from_datasets(tilts)
     merged = maped.run(show=False, verbose=False)
+    report = maped.report()
+    assert report["Tilt"] == maped.tilt_names
+    for label, shifts in (
+        ("Detector", maped.diffraction_shifts),
+        ("Scan", maped.real_space_shifts),
+    ):
+        assert report[f"{label} row (px)"] == shifts[:, 0].tolist()
+        assert report[f"{label} col (px)"] == shifts[:, 1].tolist()
     torch.testing.assert_close(
         maped.diffraction_shifts - maped.diffraction_shifts[0],
         -torch.tensor([beam for beam, _ in displacements], dtype=torch.float32),

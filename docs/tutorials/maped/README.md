@@ -28,7 +28,9 @@ For the GPU notebooks, also include the validated quantem.gpu and quantem.widget
 source directories. `quantem.widget[cuda]` and `quantem.widget[mps]` include
 the matching `quantem.gpu` extra. Plain `quantem.widget` and its `cpu` extra do
 not include it. The CPU notebook uses `Dataset4dstem.from_file` and the native
-QuantEM `save`/`load` methods. Package releases must contain the APIs used here
+QuantEM `save`/`load` methods. MAPED adds no required dependencies to QuantEM;
+`maped.report()` returns tilt labels and measured shifts as a Python dictionary.
+Package releases must contain the APIs used here
 before these become released-package installation instructions.
 
 ## Data

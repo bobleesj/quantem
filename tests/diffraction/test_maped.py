@@ -33,7 +33,10 @@ def test_cpu_classmethod_aligns_merges_and_reopens_float32(tmp_path):
         maped.diffraction_shifts - maped.diffraction_shifts[0], -beam_t, rtol=0, atol=0.07
     )
     assert_close(maped.real_space_shifts - maped.real_space_shifts[0], -scan_t, rtol=0, atol=0.07)
-    assert maped.report().shape == (3, 4)
+    report = maped.report()
+    assert report["Tilt"] == maped.tilt_names
+    assert report["Detector row (px)"] == maped.diffraction_shifts[:, 0].tolist()
+    assert report["Scan col (px)"] == maped.real_space_shifts[:, 1].tolist()
     assert merged.read().device.type == "cpu"
     path = tmp_path / "merged_master.h5"
     io.save(path, merged, backend="cpu", verbose=False)

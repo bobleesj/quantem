@@ -220,13 +220,14 @@ class MAPED(AutoSerialize):
         """
         return cls(datasets)
 
-    def report(self):
-        """Return measured detector and scan shifts in pixels as a table.
+    def report(self) -> dict[str, list[str] | list[float]]:
+        """Return measured detector and scan shifts in pixels, grouped by column.
 
         Returns
         -------
-        pandas.DataFrame
-            One row per tilt, with available row/column shifts.
+        dict
+            Tilt labels and available row/column shifts as lists in acquisition
+            order. All values are plain Python objects.
 
         Examples
         --------
@@ -234,9 +235,7 @@ class MAPED(AutoSerialize):
         >>> maped.align_real_space(show=False)
         >>> maped.report()
         """
-        import pandas as pd
-
-        columns = {}
+        columns: dict[str, list[str] | list[float]] = {"Tilt": self.tilt_names.copy()}
         for attribute, label in (
             ("diffraction_shifts", "Detector"),
             ("real_space_shifts", "Scan"),
@@ -245,7 +244,7 @@ class MAPED(AutoSerialize):
             if shifts_t is not None:
                 columns[f"{label} row (px)"] = shifts_t[:, 0].detach().cpu().tolist()
                 columns[f"{label} col (px)"] = shifts_t[:, 1].detach().cpu().tolist()
-        return pd.DataFrame(columns, index=self.tilt_names).rename_axis("Tilt")
+        return columns
 
     def show(
         self,
