@@ -848,9 +848,10 @@ class MAPED(AutoSerialize):
         Every merged diffraction pattern is the weighted mean of the tilts,
         each shifted bilinearly by its scan and detector alignment. The merge
         always computes in float32; ``dtype`` only chooses how the result is
-        stored. Large acquisitions can exceed device memory, so scaled uint16
-        is available for the complete merge and float32 is offered for a
-        scan region.
+        stored. Large acquisitions can exceed device memory. Use ``save_to``
+        with ``dtype="float32"`` to write an exact result in bounded regions,
+        then reopen it as lossless ANS. The reopened result must fit in memory;
+        ``release_tilts=True`` frees input residents first.
 
         Notes
         -----
@@ -873,10 +874,12 @@ class MAPED(AutoSerialize):
             error is recorded in the result's ``metadata["precision"]``.
             ``None`` without ``save_to`` and explicit ``"float32"`` retain exact
             float32 results up to 4 GiB, including small complete scans.
+            With ``save_to``, explicit ``"float32"`` removes the 4 GiB merge
+            allocation limit by writing bounded blocks without rounding.
             ``None`` with ``save_to`` selects scaled uint16.
         save_to : str, optional
-            Output HDF5 path. The merge is written in bounded regions with their
-            intensity calibration, then reopened encoded for viewing. This holds
+            Output HDF5 path. The merge is written in bounded regions with the
+            requested storage precision, then reopened encoded for viewing. This holds
             less in memory than merging first and saving afterwards, at the cost
             of disk IO during the merge.
         scan_region : tuple of int, optional
@@ -919,6 +922,7 @@ class MAPED(AutoSerialize):
         Examples
         --------
         >>> patch = maped.merge(scan_region=(252, 260, 252, 260), show=False)
+        >>> merged = maped.merge(dtype="float32", save_to="merged_master.h5", release_tilts=True)
         >>> merged = maped.merge(dtype="scaled_uint16")
         """
         from ._maped_resident import ResidentMergeSource
@@ -931,10 +935,8 @@ class MAPED(AutoSerialize):
             raise RuntimeError("Run align_real_space() first so self.real_space_shifts exists.")
         if not hasattr(self, "diffraction_shifts"):
             raise RuntimeError("Run align_diffraction() first so self.diffraction_shifts exists.")
-        if dtype not in (None, "scaled_uint16") and (
-            save_to is not None or dtype not in ("float32", torch.float32)
-        ):
-            raise ValueError("dtype must be 'scaled_uint16', or 'float32' without save_to.")
+        if dtype not in (None, "scaled_uint16", "float32", torch.float32):
+            raise ValueError("dtype must be 'scaled_uint16' or 'float32'.")
         profile_start = time.perf_counter()
         scan_rows, scan_cols = self.im_bf[0].shape
         k_rows, k_cols = self.dp_mean[0].shape
@@ -972,7 +974,8 @@ class MAPED(AutoSerialize):
                 raise ValueError(
                     f"This float32 merge needs {output_bytes / 1024**3:.2f} GiB; "
                     "the in-memory limit is 4 GiB. Select a smaller scan_region "
-                    "for exact float32, or explicitly choose dtype='scaled_uint16' "
+                    "for exact float32, use save_to for a bounded float32 archive, "
+                    "or explicitly choose dtype='scaled_uint16' "
                     "to accept calibrated rounding for the complete merge."
                 )
             try:
@@ -1018,10 +1021,11 @@ class MAPED(AutoSerialize):
                 self.im_bf_merged = self.dp_mean_merged = None
             titles = ["Merged Region Bright Field", "Merged Region Mean Diffraction Pattern"]
         else:
+            storage_dtype = "float32" if dtype in ("float32", torch.float32) else "scaled_uint16"
             if scan_region is not None:
                 raise ValueError(
                     "scan_region selects float32 inspection; omit it for the "
-                    "complete scaled_uint16 result."
+                    "complete saved result."
                 )
             generated = ResidentMergeSource(
                 self.datasets,
@@ -1048,7 +1052,7 @@ class MAPED(AutoSerialize):
                     # stream completed regions to disk so the complete result never
                     # shares the device with the float32 regions being merged
                     gpu_io.save(
-                        save_to, generated, dtype="scaled_uint16", backend=backend, verbose=verbose
+                        save_to, generated, dtype=storage_dtype, backend=backend, verbose=verbose
                     )
             finally:
                 generated.close()
@@ -1062,7 +1066,8 @@ class MAPED(AutoSerialize):
                     torch.mps.empty_cache()
             if save_to is not None:
                 result = gpu_io.load(
-                    save_to, dtype="scaled_uint16", backend=backend, verbose=verbose
+                    save_to, dtype="native" if storage_dtype == "float32" else storage_dtype,
+                    backend=backend, verbose=verbose, hot_pixel_correction="none",
                 )
             result.metadata.setdefault("maped_merge", {})["scan_box"] = list(generated.scan_box)
             self.merged = result

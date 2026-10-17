@@ -468,6 +468,8 @@ class ResidentMergeSource:
                 representations.pop() if len(representations) == 1 else "mixed"
             ),
             "region_frames": self.region_frames,
+            "scan_region": list(self.scan_box),
+            "scan_box": list(self.scan_box),
             "merge_generation_pass_seconds": self._pass_generation_seconds,
             "released_sources_before_reopen": self._close_sources_before_reopen,
             "real_space_shifts_row_column": self.real_space_shifts.detach().cpu().tolist(),

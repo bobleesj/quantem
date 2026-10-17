@@ -64,7 +64,7 @@ maped.show(positions=[(15, 15), (25, 25), (40, 40)], tilt_indices=[0])
 MPS or CUDA:
 
 ```python
-tilts = io.load(files, device="cuda:0", stack=False)
+tilts = io.load(files, device="cuda:0")
 maped = MAPED.from_datasets(tilts)
 merged = maped.run(iterations=80, dtype="float32", show=False)
 Show4DSTEM(merged)
@@ -76,9 +76,25 @@ ZIP; GPU notebooks use lossless HDF5 through quantem.gpu.
 The CPU comparison marks selected scan positions and shows their individual
 diffraction patterns from the first tilt and the merge. Input patterns use
 the same registration as the merge; coordinates refer to the cropped result.
-Full experimental series need a separate memory/precision choice: the current
-float32 merge is limited to a 4 GiB output, with bounded computation blocks.
-Scaled uint16 GPU storage is quantized and is not used in these tutorials.
+For a full series, write exact float32 blocks before reopening the result:
+
+```python
+merged = maped.merge(
+    dtype="float32", save_to="merged_master.h5", release_tilts=True,
+)
+io.save("merged.qem", merged)
+```
+
+This avoids the 4 GiB in-memory merge limit; the reopened result must still
+fit on the device. Saving and reopening include disk IO and are not real-time.
+Scaled uint16 storage is quantized and is not used in these tutorials.
+
+Multiple input files load as a list, so `stack=False` is unnecessary. Stacking
+would combine acquisitions along an additional tilt axis. MAPED keeps each
+acquisition separate until registration. `hot_pixel_correction="zero"` means
+replace detector-flagged pixels with zero, not disable correction or zero the
+alignment shifts. The GPU default uses median replacement; native CPU Arina
+`apply_mask=True` uses zero masking.
 
 To use your own recordings, replace the folder path and use the recorded
 calibration. Input corrections are disabled only for this known synthetic

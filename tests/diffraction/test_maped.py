@@ -149,6 +149,22 @@ def test_saving_while_merging_can_release_the_tilts(tmp_path):
     assert_close(saved.read(), kept, rtol=0, atol=2 * saved.metadata["precision"]["max_abs_error"])
 
 
+def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
+    """A complete float merge can be written in blocks and reopened losslessly."""
+    tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
+    maped = MAPED(tilts)
+    reference = maped.run(dtype="float32", show=False, verbose=False)
+    reference_t = reference.read()
+    saved = maped.merge(
+        dtype="float32", save_to=tmp_path / "merged_master.h5", crop=True,
+        release_tilts=True, show=False, verbose=False,
+    )
+    assert equal(saved.read(), reference_t)
+    assert saved.lossless
+    assert saved.metadata["maped_merge"]["scan_region"] == reference.metadata["maped_merge"]["scan_region"]
+    assert all(tilt.data.is_released for tilt in tilts)
+
+
 # --- summaries ---
 
 
