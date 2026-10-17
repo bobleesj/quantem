@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import torch
 
-import quantem.diffraction.maped._maped as maped_module
+import quantem.diffraction.maped.maped as maped_module
 from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io import load
 from quantem.diffraction import MAPED

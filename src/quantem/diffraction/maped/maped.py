@@ -18,11 +18,11 @@ from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization import show_2d
 
 
-def _resident_summaries(sources, device: str):
-    """Compute MAPED summaries from encoded residents without dense tilts."""
+def _summaries(sources, device: str):
+    """Compute mean diffraction patterns and scan images in bounded memory."""
     sources = list(sources)
     if torch.device(device).type == "cpu":
-        from ._maped_resident import _read_scan_region
+        from .merge import _read_scan_region
 
         patterns, images = [], []
         for source in sources:
@@ -146,7 +146,7 @@ class MAPED(AutoSerialize):
         # every stage works on these two small images per tilt: the mean diffraction
         # pattern (average over the scan) and the bright-field image (average over
         # the detector); one pass over the encoded counts, nothing is cleaned
-        self.dp_mean, self.im_bf = _resident_summaries(self.datasets, self.device)
+        self.dp_mean, self.im_bf = _summaries(self.datasets, self.device)
         self.scales = torch.ones(len(self.datasets), dtype=torch.float32, device=self.device)
 
     @classmethod
@@ -231,7 +231,7 @@ class MAPED(AutoSerialize):
         """
         from matplotlib import pyplot as plt
 
-        from ._maped_resident import ResidentMergeSource, _read_scan_region
+        from .merge import MergeSource, _read_scan_region
 
         if getattr(self, "merged", None) is None or self.im_bf_merged is None:
             raise RuntimeError("Run merge(compute_summaries=True) before inspecting positions.")
@@ -255,7 +255,7 @@ class MAPED(AutoSerialize):
         offset_row, _, offset_col, _ = region
         grid, markers, names = [], [], []
         for index in indices:
-            source = ResidentMergeSource(
+            source = MergeSource(
                 [self.datasets[index]],
                 self.real_space_shifts[index : index + 1],
                 self.diffraction_shifts[index : index + 1],
@@ -871,7 +871,7 @@ class MAPED(AutoSerialize):
         >>> merged = maped.merge(save_to="merged_master.h5", release_tilts=True)
         >>> merged = maped.merge(dtype="scaled_uint16")
         """
-        from ._maped_resident import ResidentMergeSource
+        from .merge import MergeSource
 
         native = isinstance(self.datasets[0], Dataset4dstem)
         if not native:
@@ -900,7 +900,7 @@ class MAPED(AutoSerialize):
                 "scan_region selects float32 inspection; omit it for the "
                 "complete saved result."
             )
-        generated = ResidentMergeSource(
+        generated = MergeSource(
             self.datasets,
             self.real_space_shifts,
             self.diffraction_shifts,

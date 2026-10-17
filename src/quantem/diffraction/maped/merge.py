@@ -1,4 +1,4 @@
-"""Torch implementation of bounded MAPED merging from resident acquisitions."""
+"""Merge aligned MAPED tilts in bounded Torch blocks."""
 
 import json
 import math
@@ -312,7 +312,7 @@ def _accumulate_tilt(
     return numerator
 
 
-class ResidentMergeSource:
+class MergeSource:
     """Re-readable Torch MAPED blocks consumed by ``quantem.gpu.io.save``."""
 
     dtype = np.dtype("float32")
@@ -335,12 +335,12 @@ class ResidentMergeSource:
     ) -> None:
         self.sources = list(sources)
         if not self.sources:
-            raise ValueError("Provide at least one resident MAPED acquisition.")
+            raise ValueError("Provide at least one MAPED acquisition.")
         self.source_shape = tuple(int(value) for value in self.sources[0].shape)
         if len(self.source_shape) != 4 or any(
             tuple(source.shape) != self.source_shape for source in self.sources
         ):
-            raise ValueError("Resident MAPED acquisitions must share one 4D shape.")
+            raise ValueError("MAPED acquisitions must share one 4D shape.")
         device = real_space_shifts.device
         for name, shifts in (
             ("real_space_shifts", real_space_shifts),
