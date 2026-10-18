@@ -128,8 +128,8 @@ def positions(
     """Compare aligned patterns at matching specimen positions."""
     from matplotlib import pyplot as plt
 
-    from .core.merge import MergedRegions
-    from .io import read_region
+    from quantem.diffraction.maped.core.merge import MergedRegions
+    from quantem.diffraction.maped.io import read_region
 
     if getattr(maped, "merged", None) is None or maped.im_bf_merged is None:
         raise RuntimeError("Run merge() before inspecting positions.")
