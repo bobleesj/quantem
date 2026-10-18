@@ -1,4 +1,4 @@
 """MAPED alignment, merging, and optional input preparation."""
 
 from . import io as io
-from .maped import MAPED as MAPED
+from .workflow import MAPED as MAPED

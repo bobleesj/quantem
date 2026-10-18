@@ -1,36 +1,138 @@
-"""Rendering for the public MAPED inspection methods."""
+"""Every MAPED picture.
 
-from __future__ import annotations
+Each function takes the MAPED object and draws one figure with ``show_2d``;
+none computes anything MAPED keeps. Diffraction patterns use a square-root
+scale (``power_sqrt``) so the weak spots show next to the direct beam.
+"""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
+from torch import stack
 
 from quantem.core.visualization import show_2d
+from quantem.diffraction.maped.core.align import blend_shifted_images, shift_images
 
-from .alignment import shift_images_torch
 
-if TYPE_CHECKING:
-    from matplotlib.figure import Figure
+def tilts(
+    maped,
+    plot_scale: float | Sequence[float] | None = None,
+    show_detector_center: bool = True,
+    bright_field_cmap: str = "gray",
+    bright_field_contrast="linear_auto",
+    pattern_cmap: str = "inferno",
+    pattern_contrast="power_sqrt",
+    **plot_kwargs,
+):
+    """
+    Show each tilt: its bright-field image and its mean diffraction pattern.
 
-    from .maped import MAPED
+    Parameters
+    ----------
+    plot_scale : float or sequence of float, optional
+        Divides the bright-field images in this picture only, one value for all
+        tilts or one per tilt, so tilts of different dose compare by eye.
+    show_detector_center : bool
+        Mark the detector center with a red cross, so each beam's offset from
+        it shows at a glance.
+    bright_field_cmap, pattern_cmap : str
+        Matplotlib colormaps of the two columns.
+    bright_field_contrast, pattern_contrast : str or dict
+        Contrast as ``show_2d`` takes it: ``"linear_auto"``, ``"log_auto"``,
+        ``"power_sqrt"`` (2nd to 98th percentile), or a dict such as
+        ``{"lower_quantile": 0.01, "upper_quantile": 0.999, "power": 0.5}``.
+    **plot_kwargs
+        Passed to ``show_2d``.
+
+    Returns
+    -------
+    MAPED
+        The same object, so the call chains like the stages.
+    """
+    names = maped.tilt_names
+    num_tilts = len(names)
+    scales = plot_scale if isinstance(plot_scale, Sequence) else [plot_scale or 1] * num_tilts
+    bright_fields = [image / scale for image, scale in zip(maped.im_bf, scales)]
+    _, axes = show_2d(
+        [[image, pattern] for image, pattern in zip(bright_fields, maped.dp_mean)],
+        title=[[f"{name}: bright field", f"{name}: mean diffraction pattern"] for name in names],
+        cmap=[[bright_field_cmap, pattern_cmap]] * num_tilts,
+        norm=[[bright_field_contrast, pattern_contrast]] * num_tilts,
+        returnfig=True,
+        **plot_kwargs,
+    )
+    if show_detector_center:
+        detector_rows, detector_cols = maped.dp_mean[0].shape
+        for axis in np.asarray(axes, dtype=object).reshape(num_tilts, 2)[:, 1]:
+            _cross(axis, detector_rows / 2, detector_cols / 2, size=14)
+    return maped
+
+
+def beam_centers(maped, **plot_kwargs) -> None:
+    """Each mean diffraction pattern with its beam center as a red cross, four per row.
+
+    Four per row keeps each pattern large enough to read; the title only names
+    the tilt, since the cross is the result.
+    """
+    per_row = 4
+    patterns, names = maped.dp_mean, maped.tilt_names
+    _, axes = show_2d(
+        [patterns[start : start + per_row] for start in range(0, len(patterns), per_row)],
+        title=[names[start : start + per_row] for start in range(0, len(names), per_row)],
+        cmap="inferno",
+        norm="power_sqrt",
+        returnfig=True,
+        **plot_kwargs,
+    )
+    axes = np.ravel(np.asarray(axes, dtype=object))
+    for axis, (row, col) in zip(axes, maped.beam_centers.tolist()):
+        _cross(axis, row, col, size=16)
+
+
+def aligned_patterns(maped, **plot_kwargs) -> None:
+    """Mean of the patterns, each moved by its detector shift: sharp spots mean a good alignment."""
+    aligned = shift_images(stack(maped.dp_mean), maped.diffraction_shifts).mean(0)
+    title = f"Mean diffraction pattern, {len(maped.dp_mean)} tilts aligned on the detector"
+    show_2d(aligned, title=title, cmap="inferno", norm="power_sqrt", **plot_kwargs)
+
+
+def aligned_bright_field(maped, edge_width: float, **plot_kwargs) -> None:
+    """Bright-field images blended after each is moved by its scan shift: sharp features mean a good alignment."""
+    blended = blend_shifted_images(stack(maped.im_bf), maped.real_space_shifts, edge_width)
+    title = f"Bright field, {len(maped.im_bf)} tilts aligned in the scan"
+    show_2d(blended, title=title, **plot_kwargs)
+
+
+def merged(maped, **plot_kwargs) -> None:
+    """The merged bright field and merged mean diffraction pattern, side by side."""
+    show_2d(
+        [[maped.im_bf_merged, maped.dp_mean_merged]],
+        title=[["Merged bright field", "Merged mean diffraction pattern"]],
+        cmap=[["gray", "inferno"]],
+        norm=[[None, "power_sqrt"]],
+        **plot_kwargs,
+    )
+
+
+def _cross(axis, row: float, col: float, size: int) -> None:
+    """Why: a red cross reads at a glance on the inferno colormap, where a dot would vanish in the beam."""
+    axis.plot([col], [row], marker="+", color="red", markersize=size, markeredgewidth=2)
 
 
 def positions(
-    maped: MAPED,
+    maped,
     positions: Sequence[tuple[int, int]],
     *,
     tilt_indices: Sequence[int] | None = None,
-) -> Figure:
+):
     """Compare aligned patterns at matching specimen positions."""
     from matplotlib import pyplot as plt
 
-    from .merge import MergeSource, _read_scan_region
+    from .core.merge import MergedRegions
+    from .io import read_region
 
     if getattr(maped, "merged", None) is None or maped.im_bf_merged is None:
-        raise RuntimeError("Run merge(compute_summaries=True) before inspecting positions.")
+        raise RuntimeError("Run merge() before inspecting positions.")
     positions = list(positions)
     rows, columns = maped.merged.shape[:2]
     if not positions or any(
@@ -40,32 +142,28 @@ def positions(
         for row, col in positions
     ):
         raise ValueError(f"Choose integer (row, col) positions inside {(rows, columns)}.")
-    indices = list(range(len(maped.datasets))) if tilt_indices is None else list(tilt_indices)
+    indices = list(range(len(maped.tilts))) if tilt_indices is None else list(tilt_indices)
     if any(
-        not isinstance(index, (int, np.integer)) or not 0 <= index < len(maped.datasets)
+        not isinstance(index, (int, np.integer)) or not 0 <= index < len(maped.tilts)
         for index in indices
     ):
-        raise ValueError(f"Choose tilt_indices between 0 and {len(maped.datasets) - 1}.")
+        raise ValueError(f"Choose tilt_indices between 0 and {len(maped.tilts) - 1}.")
     record = maped.merged.metadata["maped_merge"]
     region = record.get("scan_region", record["scan_box"])
     offset_row, _, offset_col, _ = region
     grid, markers, names = [], [], []
     for index in indices:
-        source = MergeSource(
-            [maped.datasets[index]],
+        source = MergedRegions(
+            [maped.tilts[index]],
             maped.real_space_shifts[index : index + 1],
             maped.diffraction_shifts[index : index + 1],
-            close_sources_before_reopen=False,
             compile_merge=False,
         )
         panels = [maped.im_bf[index].detach().cpu().numpy()]
-        try:
-            for row, col in positions:
-                scan_row, scan_col = row + offset_row, col + offset_col
-                block = next(source.blocks((scan_row, scan_row + 1, scan_col, scan_col + 1)))
-                panels.append(block[0].detach().cpu().numpy().copy())
-        finally:
-            source.close()
+        for row, col in positions:
+            scan_row, scan_col = row + offset_row, col + offset_col
+            block = next(source.blocks((scan_row, scan_row + 1, scan_col, scan_col + 1)))
+            panels.append(block[0].detach().cpu().numpy().copy())
         shift_row, shift_col = maped.real_space_shifts[index].detach().cpu().tolist()
         markers.append(
             [
@@ -77,7 +175,7 @@ def positions(
         names.append(maped.tilt_names[index])
     panels = [maped.im_bf_merged.detach().cpu().numpy()]
     for row, col in positions:
-        block = _read_scan_region(maped.merged, (row, row + 1, col, col + 1))
+        block = read_region(maped.merged, (row, row + 1, col, col + 1))
         panels.append(block[0, 0].detach().cpu().numpy().copy())
     grid.append(panels)
     markers.append(positions)
@@ -115,143 +213,3 @@ def positions(
             )
     plt.close(figure)
     return figure
-
-
-def tilts(
-    maped: MAPED,
-    show_detector_center: bool,
-    bright_field_cmap: str,
-    bright_field_contrast,
-    pattern_cmap: str,
-    pattern_contrast,
-    **plot_kwargs,
-) -> None:
-    """Draw the scan image and mean diffraction pattern for every tilt."""
-    n = len(maped.datasets)
-    tiles = [[(maped.im_bf[i] / maped.scales[i]), maped.dp_mean[i]] for i in range(n)]
-    titles = [
-        [f"{name}: bright field", f"{name}: mean diffraction pattern"] for name in maped.tilt_names
-    ]
-    fig, ax = show_2d(
-        tiles,
-        title=titles,
-        cmap=[[bright_field_cmap, pattern_cmap]] * n,
-        norm=[[bright_field_contrast, pattern_contrast]] * n,
-        returnfig=True,
-        **plot_kwargs,
-    )
-    if show_detector_center:
-        k_rows, k_cols = maped.dp_mean[0].shape
-        axs = np.asarray(ax, dtype=object).reshape(n, 2)
-        for i in range(n):
-            axs[i, 1].plot(
-                [k_cols / 2],
-                [k_rows / 2],
-                marker="+",
-                color="red",
-                markersize=14,
-                markeredgewidth=2,
-            )
-
-
-def beam_centers(maped: MAPED, indices: Sequence[int], **plot_kwargs) -> None:
-    """Mark the direct-beam center in each selected diffraction pattern."""
-    arrays = [np.asarray(maped.dp_mean[i].cpu()) for i in indices]
-    titles = [maped.tilt_names[i] for i in indices]
-    columns = 4
-    fig, ax = show_2d(
-        [arrays[i : i + columns] for i in range(0, len(arrays), columns)],
-        title=[titles[i : i + columns] for i in range(0, len(titles), columns)],
-        cmap="inferno",
-        norm="power_sqrt",
-        returnfig=True,
-        **plot_kwargs,
-    )
-    axs = np.ravel(np.asarray(ax, dtype=object))
-    for j, i in enumerate(indices):
-        r, c = maped.beam_centers[i].cpu().numpy()
-        axs[j].plot([c], [r], marker="+", color="red", markersize=16, markeredgewidth=2)
-
-
-def diffraction_alignment(maped: MAPED, border_taper: float, **plot_kwargs) -> None:
-    """Draw the mean of the aligned diffraction patterns."""
-    n = len(maped.dp_mean)
-    im_aligned = shift_images_torch(
-        images=torch.stack(maped.dp_mean),
-        shifts_rc=maped.diffraction_shifts,
-        edge_blend=float(border_taper),
-        pad_val="min",
-    )
-    show_2d(
-        im_aligned.mean(0),
-        title=f"Mean diffraction pattern, {n} tilts aligned on the detector",
-        cmap="inferno",
-        norm="power_sqrt",
-        **plot_kwargs,
-    )
-
-
-def scan_alignment(maped: MAPED, num_tilts: int, max_shift: float, **plot_kwargs) -> None:
-    """Draw the aligned scan images."""
-    im_aligned = shift_images_torch(
-        images=torch.stack(maped.im_bf[:num_tilts]),
-        shifts_rc=maped.real_space_shifts[:num_tilts, :],
-        edge_blend=float(max_shift),
-        pad_val="median",
-        blend=True,
-    )
-    show_2d(
-        im_aligned,
-        title=f"Bright field, {num_tilts} tilts aligned in the scan",
-        **plot_kwargs,
-    )
-
-
-def merged(maped: MAPED, in_memory: bool, **plot_kwargs) -> None:
-    """Draw the merged scan image and mean diffraction pattern."""
-    label = "Merged Region" if in_memory else "Merged"
-    show_2d(
-        [[maped.im_bf_merged, maped.dp_mean_merged]],
-        title=[[f"{label} Bright Field", f"{label} Mean Diffraction Pattern"]],
-        cmap=[["gray", "inferno"]],
-        norm=[[None, "power_sqrt"]],
-        **plot_kwargs,
-    )
-
-
-def scan_correction(
-    dataset: torch.Tensor,
-    shifted_dps: torch.Tensor,
-    diffraction_shifts: torch.Tensor,
-    diffraction_shifts_old: torch.Tensor | None,
-) -> None:
-    """Compare measured and fitted shifts and the corrected diffraction patterns."""
-    if diffraction_shifts_old is not None:
-        show_2d(
-            [
-                [
-                    diffraction_shifts_old[:, :, 0],
-                    diffraction_shifts[:, :, 0],
-                    diffraction_shifts[:, :, 0] - diffraction_shifts_old[:, :, 0],
-                ],
-                [
-                    diffraction_shifts_old[:, :, 1],
-                    diffraction_shifts[:, :, 1],
-                    diffraction_shifts[:, :, 1] - diffraction_shifts_old[:, :, 1],
-                ],
-            ],
-            title=[
-                ["Shifts x", "Fit x", "Residual x"],
-                ["Shifts y", "Fit y", "Residual y"],
-            ],
-            cmap="RdBu_r",
-        )
-    dp_mean_before = dataset.mean(dim=(0, 1))
-    dp_mean = shifted_dps.mean(dim=(0, 1))
-    dp_max = torch.max(
-        torch.max(shifted_dps, dim=0, keepdim=False).values, dim=0, keepdim=False
-    ).values
-    show_2d(
-        [dp_mean_before, dp_mean, dp_max],
-        vmax=0.75,
-    )

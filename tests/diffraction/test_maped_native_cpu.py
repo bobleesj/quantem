@@ -106,3 +106,14 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
         [figure.axes[0].lines[0].get_ydata()[0], figure.axes[0].lines[0].get_xdata()[0]],
         np.array([8 + row0, 9 + col0]) - maped.real_space_shifts[0].numpy(),
     )
+
+
+def test_native_counts_keep_their_range_and_fractional_values():
+    """An unshifted native acquisition merges without clipping or integer rounding."""
+    counts = np.linspace(0, 65535, 8 * 8 * 4 * 4).reshape(8, 8, 4, 4).astype(np.uint16)
+    for values in (counts, counts.astype(np.float32) * 1.25 - 0.125):
+        tilt = Dataset4dstem.from_array(values)
+        maped = MAPED().add(tilt)
+        maped.real_space_shifts = maped.diffraction_shifts = torch.zeros((1, 2))
+        merged = maped.merge(show=False, verbose=False)
+        np.testing.assert_array_equal(merged.array[1:-1, 1:-1], values[1:-1, 1:-1])
