@@ -6,11 +6,10 @@ import h5py
 import numpy as np
 import torch
 
-import quantem.diffraction.maped.maped as maped_module
 from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io import load
 from quantem.diffraction import MAPED
-from quantem.diffraction.maped import io
+from quantem.diffraction.maped import io, plot
 
 
 def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
@@ -93,13 +92,13 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
 
     # Inspect actual diffraction patterns at two matching specimen positions.
     plotted = []
-    show_2d = maped_module.show_2d
+    show_2d = plot.show_2d
 
     def capture_panels(arrays, **kwargs):
         plotted.extend(arrays)
         return show_2d(arrays, **kwargs)
 
-    monkeypatch.setattr(maped_module, "show_2d", capture_panels)
+    monkeypatch.setattr(plot, "show_2d", capture_panels)
     figure = maped.show(positions=[(8, 9), (16, 17)], tilt_indices=[0])
     np.testing.assert_array_equal(plotted[-1][1], merged.array[8, 9])
     np.testing.assert_array_equal(plotted[-1][2], merged.array[16, 17])

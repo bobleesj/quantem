@@ -8,7 +8,7 @@ import pytest
 import quantem.diffraction.maped as maped
 
 
-@pytest.mark.parametrize("filename", ["maped.py", "merge.py", "io.py"])
+@pytest.mark.parametrize("filename", ["maped.py", "alignment.py", "merge.py", "io.py", "plot.py"])
 def test_maped_has_no_native_accelerator_dependencies(filename: str) -> None:
     """Both public orchestration and bounded merging retain Torch ownership."""
     tree = ast.parse(Path(maped.__file__).with_name(filename).read_text())
