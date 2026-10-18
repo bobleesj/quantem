@@ -255,18 +255,23 @@ def _center_amplitudes(intensities_t, com_fit_t, mask_t, bilinear, dtype):
 def _scan_positions(model, padding):
     """Construct raster positions on the measurement device in (row, col) order."""
     dtype = model.scan_positions_px.dtype
-    row_t, col_t = torch.meshgrid(
-        torch.arange(int(model.gpts[0]), device=model.device, dtype=torch.float64)
-        * float(model.scan_sampling[0]),
-        torch.arange(int(model.gpts[1]), device=model.device, dtype=torch.float64)
-        * float(model.scan_sampling[1]),
-        indexing="ij",
-    )
-    # NumPy multiplies its integer raster by the calibration in float64 before
-    # converting positions to the reconstruction dtype.
-    positions_t = torch.stack((row_t.flatten(), col_t.flatten()), dim=-1)[
-        model.positions_mask
-    ].to(dtype)
+    supplied = model._probe_positions_px_flat()
+    if supplied is not None:
+        positions_t = torch.as_tensor(supplied, dtype=dtype, device=model.device)
+        positions_t = positions_t[model.positions_mask] * positions_t.new_tensor(model.scan_sampling)
+    else:
+        row_t, col_t = torch.meshgrid(
+            torch.arange(int(model.gpts[0]), device=model.device, dtype=torch.float64)
+            * float(model.scan_sampling[0]),
+            torch.arange(int(model.gpts[1]), device=model.device, dtype=torch.float64)
+            * float(model.scan_sampling[1]),
+            indexing="ij",
+        )
+        # NumPy multiplies its integer raster by the calibration in float64 before
+        # converting positions to the reconstruction dtype.
+        positions_t = torch.stack((row_t.flatten(), col_t.flatten()), dim=-1)[
+            model.positions_mask
+        ].to(dtype)
     angle = model.com_rotation_rad
     if angle:
         rotation_t = positions_t.new_tensor(

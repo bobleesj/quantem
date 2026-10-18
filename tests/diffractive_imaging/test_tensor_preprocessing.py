@@ -8,11 +8,12 @@ from quantem.core.datastructures import Dataset4dstem
 from quantem.diffractive_imaging import PtychographyDatasetRaster
 
 
+@pytest.mark.parametrize("supplied_positions", [False, True])
 @pytest.mark.parametrize(
     "fit_mode,bilinear",
     [("constant", False), ("plane", False), ("parabola", False), ("no_shift", True)],
 )
-def test_tensor_preprocessing_matches_array(fit_mode, bilinear):
+def test_tensor_preprocessing_matches_array(fit_mode, bilinear, supplied_positions):
     """A drifting diffraction disk keeps its calibration and amplitudes on CUDA."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for device-residency parity.")
@@ -27,12 +28,16 @@ def test_tensor_preprocessing_matches_array(fit_mode, bilinear):
     mask = np.ones((5, 6), dtype=bool)
     mask[0, 0] = False
     metadata = dict(sampling=(0.4, 0.5, 0.08, 0.09), units=("A", "A", "A^-1", "A^-1"))
+    positions = None
+    if supplied_positions:
+        rows, cols = np.indices((5, 6))
+        positions = np.stack((rows + 0.03 * cols**2, cols + 0.04 * rows), axis=-1).astype(np.float32)
     reference = PtychographyDatasetRaster.from_dataset4dstem(
-        Dataset4dstem.from_array(values, **metadata), verbose=False
+        Dataset4dstem.from_array(values, **metadata), verbose=False, probe_positions_px=positions
     )
     values_t = torch.as_tensor(values, device="cuda")
     candidate = PtychographyDatasetRaster.from_dataset4dstem(
-        Dataset4dstem.from_tensor(values_t, **metadata), verbose=False
+        Dataset4dstem.from_tensor(values_t, **metadata), verbose=False, probe_positions_px=positions
     )
     options = dict(
         com_fit_function=fit_mode,
@@ -91,6 +96,7 @@ def test_rotated_raster_keeps_reference_patch_rounding():
         device="cuda",
         scan_sampling=(scan_step, scan_step),
         positions_mask=torch.ones(128 * 128, dtype=torch.bool, device="cuda"),
+        _probe_positions_px_flat=lambda: None,
         com_rotation_rad=angle,
         com_transpose=False,
         obj_sampling=sampling,
