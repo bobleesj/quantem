@@ -374,35 +374,6 @@ class Dataset(AutoSerialize):
                             # Skip attributes that can't be copied
                             pass
 
-    def coords(self, axis: int) -> Any:
-        """
-        Coordinate array for a given axis in pixel units.
-
-        coords(d) = arange(shape[d]) - origin[d]
-        """
-        axis = int(axis)
-        if axis < 0 or axis >= self.ndim:
-            raise ValueError(f"axis {axis} out of bounds for ndim={self.ndim}")
-
-        xp = self._xp
-        n = int(self.shape[axis])
-        origin_d = float(np.asarray(self.origin)[axis])
-
-        return xp.arange(n, dtype=float) - origin_d
-
-    def coords_units(self, axis: int) -> Any:
-        """
-        Coordinate array for a given axis in physical units.
-
-        coords_units(d) = (arange(shape[d]) - origin[d]) * sampling[d]
-        """
-        axis = int(axis)
-        if axis < 0 or axis >= self.ndim:
-            raise ValueError(f"axis {axis} out of bounds for ndim={self.ndim}")
-
-        sampling_d = float(np.asarray(self.sampling)[axis])
-        return self.coords(axis) * sampling_d
-
     def mean(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
         Computes and returns mean of the data array.

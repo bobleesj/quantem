@@ -1,4 +1,6 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,21 +11,29 @@ from scipy.optimize import least_squares
 
 from quantem.core.utils.filter import otsu_threshold
 
+if TYPE_CHECKING:
+    from quantem.core.datastructures.dataset2d import Dataset2d
+
 
 def fit_probe_circle(
-    img: np.ndarray | torch.Tensor, threshold: float | None = None, show: bool = True
+    img: np.ndarray | torch.Tensor | Dataset2d, threshold: float | None = None, show: bool = True
 ) -> tuple[float, float, float]:
     """
     Fit a circle to the probe shape in an image.
 
     Args:
-        img (np.ndarray): Input image containing the probe.
+        img (np.ndarray | Dataset2d): Input diffraction pattern containing the probe.
         threshold (Optional[float]): Threshold for binarization. If None, Otsu's method is used.
         show (bool): Whether to display the fitted circle. Default is True.
 
     Returns:
         Tuple[float, float, float]: Center coordinates (center_row, center_col) and radius radius of the fitted circle.
     """
+    if not isinstance(img, np.ndarray) and hasattr(img, "array"):
+        img = img.array
+    if img.ndim != 2:
+        raise ValueError(f"Expected a 2D diffraction pattern, got shape {img.shape}.")
+
     if isinstance(img, torch.Tensor):
         center_row, center_col, radius = _fit_probe_circle_tensor(img, threshold)
         if show:

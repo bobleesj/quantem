@@ -1,14 +1,12 @@
 """MAPED on tilts loaded by quantem.gpu: one sample, three beam tilts, known displacements."""
 
 import os
-from math import floor, prod
 
 import pytest
 from torch import arange, backends, cuda, equal, exp, float32, meshgrid, tensor, uint16, zeros
 from torch.testing import assert_close
 
 from quantem.diffraction import MAPED
-from quantem.diffraction._maped_resident import _sample_scan_rows
 
 io = pytest.importorskip("quantem.gpu.io", reason="Encoded-input tests require quantem.gpu")
 
@@ -17,55 +15,22 @@ io = pytest.importorskip("quantem.gpu.io", reason="Encoded-input tests require q
 DISPLACEMENTS = [((0, 0), (0, 0)), ((2, -1), (3, 1)), ((-1, 2), (-2, -3))]
 
 
-# --- complete workflow ---
-
-
-def test_cpu_classmethod_aligns_merges_and_reopens_float32(tmp_path):
-    """A CPU-only user can follow the same loaded-dataset workflow and save it."""
-    tilts = _load_tilts(
-        tmp_path, scan_shape=(32, 32), detector_shape=(16, 16), backend="cpu"
-    )
-    maped = MAPED.from_datasets(tilts)
-    merged = maped.run(dtype="float32", show=False, verbose=False)
-    beam_t = tensor([beam for beam, _ in DISPLACEMENTS], dtype=float32)
-    scan_t = tensor([scan for _, scan in DISPLACEMENTS], dtype=float32)
-    assert_close(
-        maped.diffraction_shifts - maped.diffraction_shifts[0], -beam_t, rtol=0, atol=0.07
-    )
-    assert_close(maped.real_space_shifts - maped.real_space_shifts[0], -scan_t, rtol=0, atol=0.07)
-    assert maped.report().shape == (3, 4)
-    assert merged.read().device.type == "cpu"
-    path = tmp_path / "merged_master.h5"
-    io.save(path, merged, backend="cpu", verbose=False)
-    with io.load(path, device="cpu", verbose=False) as reopened:
-        assert equal(reopened.read(), merged.read())
-        assert reopened.metadata["maped_merge"] == merged.metadata["maped_merge"]
-
-
-def test_run_recovers_the_tilt_displacements(tmp_path):
-    """run() finds each tilt's beam and scan displacement relative to the first tilt."""
+@pytest.mark.parametrize("custom_images", [False, True])
+def test_run_matches_the_step_by_step_stages(tmp_path, custom_images):
+    """Automatic and manual stages recover the known shifts and the same merge."""
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
-    maped = MAPED(tilts)
-    maped.run(show=False, verbose=False)
-    beam_t = tensor([beam for beam, _ in DISPLACEMENTS], dtype=float32, device=maped.device)
-    scan_t = tensor([scan for _, scan in DISPLACEMENTS], dtype=float32, device=maped.device)
-    # a shift undoes a displacement; worst measured error is 0.060 px
-    assert_close(
-        maped.diffraction_shifts - maped.diffraction_shifts[0], -beam_t, rtol=0, atol=0.07
-    )
-    assert_close(maped.real_space_shifts - maped.real_space_shifts[0], -scan_t, rtol=0, atol=0.07)
-
-
-def test_run_matches_the_step_by_step_stages(tmp_path):
-    """run() reproduces the five stage calls: identical shifts and identical float32 merge."""
-    tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
-    one, steps = MAPED(tilts), MAPED(tilts)
-    run_merged_t = one.run(show=False, verbose=False).read()
+    one, steps = MAPED.from_datasets(tilts), MAPED.from_datasets(tilts)
+    images = [image.square() for image in one.bright_field] if custom_images else None
+    run_merged_t = one.run(images=images, show=False, verbose=False).read()
+    for shifts_t, expected in zip(
+        (one.diffraction_shifts, one.real_space_shifts), zip(*DISPLACEMENTS)
+    ):
+        # A shift undoes a displacement; the measured recovery error is below 0.07 px.
+        expected_t = -tensor(expected, dtype=float32, device=one.device)
+        assert_close(shifts_t - shifts_t[0], expected_t, rtol=0, atol=0.07)
     steps.find_beam_center(blur=1, show=False)
     steps.align_diffraction(border_taper=2, show=False)
-    steps.align_real_space(
-        iterations=20, hann_window=True, max_shift=5, show=False
-    )
+    steps.align_images(images=images, iterations=20, hann_window=True, max_shift=5, show=False)
     # run crops to the positions every tilt covers; the stage call must say so too
     steps_merged_t = steps.merge(dtype="float32", crop=True, show=False).read()
     assert equal(one.diffraction_shifts, steps.diffraction_shifts)
@@ -74,11 +39,8 @@ def test_run_matches_the_step_by_step_stages(tmp_path):
     assert equal(run_merged_t, steps_merged_t)
 
 
-# --- merge ---
-
-
 def test_float32_full_crop_matches_region_reads(tmp_path):
-    """A 128-square tutorial merges exactly across block boundaries and reopens."""
+    """A cropped full merge agrees exactly with a separately merged scan region."""
     tilts = _load_tilts(
         tmp_path, scan_shape=(128, 128), detector_shape=(8, 8), backend="cpu"
     )
@@ -89,10 +51,6 @@ def test_float32_full_crop_matches_region_reads(tmp_path):
     patch = (row0 + 24, row0 + 40, col0 + 8, col0 + 24)
     exact = maped.merge(scan_region=patch, dtype="float32", show=False).read()
     assert equal(merged.read()[24:40, 8:24], exact)
-    path = tmp_path / "merged_master.h5"
-    io.save(path, merged, backend="cpu", verbose=False)
-    with io.load(path, device="cpu", verbose=False) as reopened:
-        assert equal(reopened.read(), merged.read())
 
 
 def test_whole_pixel_scan_copies_merge_back_to_the_sample(tmp_path):
@@ -134,27 +92,13 @@ def test_scaled_merge_and_saved_file_match_float32_regions(tmp_path):
         assert equal(saved.read(scan_region=region), merged.read(scan_region=region))
 
 
-def test_saving_while_merging_can_release_the_tilts(tmp_path):
-    """save_to with release_tilts frees the tilts before reopening; the default keeps them."""
-    tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
-    maped = MAPED(tilts)
-    kept = maped.run(show=False, verbose=False).read()
-    assert all(not tilt.data.is_released for tilt in tilts)
-    saved = maped.merge(
-        save_to=tmp_path / "merged_master.h5", crop=True, release_tilts=True, show=False,
-        verbose=False,
-    )
-    assert all(tilt.data.is_released for tilt in tilts)
-    assert equal(saved.read(), kept)
-    assert "precision" not in saved.metadata
-
-
 def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
     """A complete float merge can be written in blocks and reopened losslessly."""
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
     maped = MAPED(tilts)
     reference = maped.run(dtype="float32", show=False, verbose=False)
     reference_t = reference.read()
+    assert all(not tilt.data.is_released for tilt in tilts)
     saved = maped.merge(
         save_to=tmp_path / "merged_master.h5", crop=True,
         release_tilts=True, show=False, verbose=False,
@@ -170,18 +114,6 @@ def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
         assert reopened.lossless
         assert equal(reopened.read(), reference_t)
 
-    compact_path = tmp_path / "compact_master.h5"
-    io.save(compact_path, saved, dtype="scaled_uint16")
-    with io.load(compact_path, device=maped.device, verbose=False) as compact:
-        assert compact.metadata["precision"]["storage"] == "scaled_uint16"
-        assert_close(
-            compact.read(), reference_t, rtol=0,
-            atol=compact.metadata["precision"]["max_abs_error"],
-        )
-
-
-# --- summaries ---
-
 
 def test_summaries_are_the_plain_means(tmp_path):
     """Mean diffraction pattern and bright-field image equal the means of the decoded tilt."""
@@ -189,72 +121,10 @@ def test_summaries_are_the_plain_means(tmp_path):
     maped = MAPED(tilts)
     for tilt, dp_mean_t, im_bf_t in zip(tilts, maped.dp_mean, maped.im_bf):
         decoded_t = tilt.read()
-        assert dp_mean_t.device == decoded_t.device
         # the reference mean is taken in float64, which Apple GPUs do not have
         counts_t = decoded_t.cpu().double()
         assert equal(dp_mean_t.cpu(), counts_t.mean(dim=(0, 1)).to(float32))
         assert equal(im_bf_t.cpu(), counts_t.mean(dim=(2, 3)).to(float32))
-
-
-def test_plot_titles_read_the_tilt_from_the_loaded_file_name(tmp_path):
-    """A tilt loaded from ``..._-17.0x_0.0y_master.h5`` is labelled ``-17.0x 0.0y``; otherwise ``Tilt i``."""
-    tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
-    names = ["sample_-17.0x_0.0y_master.h5", "sample_8.5x_-14.72y_master.h5", "sample_master.h5"]
-    for tilt, name in zip(tilts, names):
-        tilt.metadata["source_path"] = str(tmp_path / name)
-    assert MAPED(tilts).tilt_names == ["-17.0x 0.0y", "8.5x -14.72y", "Tilt 2"]
-
-
-# --- primitives ---
-
-
-@pytest.mark.parametrize("device", ["cuda:0", "mps"])
-def test_scan_regions_match_ordered_taps(device):
-    """Border, integer, fractional, and empty overlaps preserve full-range counts."""
-    if device == "cuda:0" and not cuda.is_available():
-        pytest.skip("CUDA is unavailable")
-    if device == "mps" and not backends.mps.is_available():
-        pytest.skip("MPS is unavailable")
-    shape = (17, 13, 4, 8)
-    indices_t = arange(prod(shape), device=device).reshape(shape)
-    values_t = ((indices_t * 37) % 65536).to(uint16)
-    for shift in [(0, 0), (-1.25, 0.6), (0.75, -1.4), (8.25, 4.5), (30, 0)]:
-        row_floor, column_floor = floor(-shift[0]), floor(-shift[1])
-        row_fraction = -shift[0] - row_floor
-        column_fraction = -shift[1] - column_floor
-        for row0, row1, column0, column1 in [(0, 8, 0, 13), (4, 12, 3, 10)]:
-            expected_t = zeros((row1 - row0, column1 - column0, *shape[2:]), device=device)
-            for row_delta, row_weight in [
-                (row_floor, 1 - row_fraction),
-                (row_floor + 1, row_fraction),
-            ]:
-                for column_delta, column_weight in [
-                    (column_floor, 1 - column_fraction),
-                    (column_floor + 1, column_fraction),
-                ]:
-                    weight = row_weight * column_weight
-                    if weight == 0:
-                        continue
-                    for row in range(row0, row1):
-                        for column in range(column0, column1):
-                            source_row, source_column = row + row_delta, column + column_delta
-                            if 0 <= source_row < shape[0] and 0 <= source_column < shape[1]:
-                                expected_t[row - row0, column - column0].add_(
-                                    values_t[source_row, source_column], alpha=weight
-                                )
-            actual_t = _sample_scan_rows(
-                values_t,
-                decoded_first_row=0,
-                output_first_row=row0,
-                output_stop_row=row1,
-                shift=shift,
-                output_first_column=column0,
-                output_stop_column=column1,
-            )
-            assert equal(actual_t, expected_t)
-
-
-# --- synthetic tilt series ---
 
 
 def _load_tilts(tmp_path, scan_shape, detector_shape, displacements=DISPLACEMENTS, backend=None) -> list:

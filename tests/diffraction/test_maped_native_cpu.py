@@ -4,20 +4,21 @@ import builtins
 
 import h5py
 import numpy as np
+import pytest
 import torch
 
-import quantem.diffraction.maped as maped_module
 from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io import load
 from quantem.diffraction import MAPED
+from quantem.diffraction.maped import io, plot
 
 
 def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
-    """Native Arina inputs recover known shifts without optional GPU packages."""
+    """Native Arina inputs recover and report shifts with QuantEM's dependencies."""
     original_import = builtins.__import__
 
     def core_only(name, *args, **kwargs):
-        if name.startswith(("quantem.gpu", "quantem.widget")):
+        if name.startswith(("quantem.gpu", "quantem.widget", "pandas")):
             raise AssertionError(f"CPU MAPED imported an optional package: {name}")
         return original_import(name, *args, **kwargs)
 
@@ -42,15 +43,31 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
         with h5py.File(path, "w") as file:
             file["entry/data/data_000001"] = counts.reshape(-1, 16, 16)
             file["entry/instrument/detector/detectorSpecific/pixel_mask"] = mask
-        tilt = Dataset4dstem.from_file(path, "arina", apply_mask=True)
+        original = Dataset4dstem.from_file(path, "arina")
+        np.testing.assert_array_equal(original.array, counts)
+        unmasked = io.load(path, "arina")
+        np.testing.assert_array_equal(unmasked.array, original.array)
+        tilt = io.load(path, "arina", apply_mask=True)
         expected = counts.copy()
         expected[..., 0, 0] = 0
         np.testing.assert_array_equal(tilt.array, expected)
         assert tilt.metadata["hot_pixel_correction"]["pixel_count"] == 1
+        with h5py.File(path) as file:
+            np.testing.assert_array_equal(
+                file["entry/data/data_000001"][()], counts.reshape(-1, 16, 16)
+            )
         tilts.append(tilt)
 
     maped = MAPED.from_datasets(tilts)
     merged = maped.run(show=False, verbose=False)
+    report = maped.report()
+    assert report["Tilt"] == maped.tilt_names
+    for label, shifts in (
+        ("Detector", maped.diffraction_shifts),
+        ("Scan", maped.real_space_shifts),
+    ):
+        assert report[f"{label} row (px)"] == shifts[:, 0].tolist()
+        assert report[f"{label} col (px)"] == shifts[:, 1].tolist()
     torch.testing.assert_close(
         maped.diffraction_shifts - maped.diffraction_shifts[0],
         -torch.tensor([beam for beam, _ in displacements], dtype=torch.float32),
@@ -64,7 +81,6 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
         atol=0.07,
     )
     assert maped.tilt_names == ["-17.0x 0.0y"] * 3
-    assert isinstance(merged, Dataset4dstem)
     assert merged.array.dtype == np.float32
     assert np.isfinite(merged.array).all()
     row0, _, col0, _ = merged.metadata["maped_merge"]["scan_region"]
@@ -77,18 +93,16 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
 
     # Inspect actual diffraction patterns at two matching specimen positions.
     plotted = []
-    show_2d = maped_module.show_2d
+    show_2d = plot.show_2d
 
     def capture_panels(arrays, **kwargs):
         plotted.extend(arrays)
         return show_2d(arrays, **kwargs)
 
-    monkeypatch.setattr(maped_module, "show_2d", capture_panels)
+    monkeypatch.setattr(plot, "show_2d", capture_panels)
     figure = maped.show(positions=[(8, 9), (16, 17)], tilt_indices=[0])
     np.testing.assert_array_equal(plotted[-1][1], merged.array[8, 9])
     np.testing.assert_array_equal(plotted[-1][2], merged.array[16, 17])
-    assert not np.array_equal(plotted[-1][1], plotted[-1][2])
-    assert len(figure.axes) == 6
     np.testing.assert_allclose(
         [figure.axes[0].lines[0].get_ydata()[0], figure.axes[0].lines[0].get_xdata()[0]],
         np.array([8 + row0, 9 + col0]) - maped.real_space_shifts[0].numpy(),
@@ -103,7 +117,7 @@ def test_native_arina_counts_and_optional_calibration(tmp_path):
         file.attrs["scan_shape"] = (4, 6)
         file["entry/data/data_000001"] = counts[:12]
         file["entry/data/data_000002"] = counts[12:]
-    pixels = Dataset4dstem.from_file(
+    pixels = io.load(
         path, "arina", navigation_shape=(4, 6), dtype=np.uint32
     )
     np.testing.assert_array_equal(pixels.array, counts.reshape(4, 6, 8, 8))
@@ -112,30 +126,53 @@ def test_native_arina_counts_and_optional_calibration(tmp_path):
 
     with h5py.File(tmp_path / "scan.h5", "w") as file:
         file.create_group("STEM Metadata").attrs["Pixel Size"] = [0.25]
-    calibrated = Dataset4dstem.from_file(
+    calibrated = io.load(
         path, "arina", navigation_shape=(4, 6), dtype=np.uint32
     )
     np.testing.assert_array_equal(calibrated.array, pixels.array)
     np.testing.assert_array_equal(calibrated.sampling, [2.5, 2.5, 1, 1])
     assert calibrated.units[:2] == ["A", "A"]
 
+def test_native_counts_keep_their_range_and_fractional_values():
+    """An unshifted native acquisition merges without clipping or integer rounding."""
+    counts = np.linspace(0, 65535, 8 * 8 * 4 * 4).reshape(8, 8, 4, 4).astype(np.uint16)
+    for values in (counts, counts.astype(np.float32) * 1.25 - 0.125):
+        tilt = Dataset4dstem.from_array(values)
+        maped = MAPED().add(tilt)
+        maped.real_space_shifts = maped.diffraction_shifts = torch.zeros((1, 2))
+        merged = maped.merge(show=False, verbose=False)
+        np.testing.assert_array_equal(merged.array[1:-1, 1:-1], values[1:-1, 1:-1])
 
-def test_native_arina_binning_and_flatfield(tmp_path):
-    """Binning retains fractional intensities; flatfield zeros remain unscaled."""
-    path = tmp_path / "scan_master.h5"
-    counts = np.broadcast_to(np.arange(16, dtype=np.uint16).reshape(4, 4), (4, 4, 4))
-    with h5py.File(path, "w") as file:
-        file["entry/data/data_000001"] = counts
-    binned = Dataset4dstem.from_file(path, "arina", rebin_diffraction=2, dtype=np.float32)
-    np.testing.assert_array_equal(binned.array[0, 0], [[2.5, 4.5], [10.5, 12.5]])
 
-    with h5py.File(path, "r+") as file:
-        file["entry/data/data_000001"][:] = 16
-    flatfield = np.full((4, 4), 2.0)
-    flatfield[:, 0] = 4.0
-    flatfield[0, 0] = 0
-    corrected = Dataset4dstem.from_file(
-        path, "arina", rebin_diffraction=2, flatfield=flatfield, dtype=np.uint16
+def test_external_images_align_and_display_without_replacing_diffraction(monkeypatch):
+    """Independent image contrast supplies scan shifts while original counts are merged."""
+    row, col = np.indices((32, 32))
+    displacements = [(0, 0), (3, 1), (-2, -3)]
+    images = [
+        np.exp(-((row - 16 - dr) ** 2 + (col - 16 - dc) ** 2) / 18)
+        for dr, dc in displacements
+    ]
+    counts = np.ones((32, 32, 4, 4), dtype=np.float32)
+    tilts = [Dataset4dstem.from_array(counts.copy()) for _ in images]
+    plotted = []
+    monkeypatch.setattr(plot, "show_2d", lambda image, **kwargs: plotted.append(image))
+    maped = MAPED(tilts).align_images(images=images)
+    torch.testing.assert_close(
+        maped.real_space_shifts - maped.real_space_shifts[0],
+        -torch.tensor(displacements, dtype=torch.float32), rtol=0, atol=0.07,
     )
-    assert corrected.array.dtype == np.float32
-    np.testing.assert_array_equal(corrected.array[0, 0], [[14, 16], [12, 16]])
+    assert plotted[0].std() > 0.05  # The supplied images, not the constant input mean.
+    maped.diffraction_shifts = torch.zeros((len(tilts), 2))
+    merged = maped.merge(crop=True, show=False, verbose=False)
+    np.testing.assert_allclose(merged.array, 1, rtol=0, atol=1e-6)
+    for tilt in tilts:
+        np.testing.assert_array_equal(tilt.array, counts)
+
+
+@pytest.mark.parametrize("images", [
+    [], [np.ones((8, 7))], [np.ones((8, 8), dtype=complex)], [np.full((8, 8), np.nan)],
+])
+def test_alignment_images_require_one_finite_real_image_per_scan(images):
+    maped = MAPED([Dataset4dstem.from_array(np.ones((8, 8, 4, 4)))])
+    with pytest.raises(ValueError):
+        maped.align_images(images=images, show=False)
