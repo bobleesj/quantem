@@ -193,14 +193,20 @@ class MergedRegions:
         box, which also adds up the sums behind the summary pictures.
         """
         row_start, row_stop, col_start, col_stop = scan_region or self.scan_box
-        return (
-            self._merge_region(
+        for row0 in range(row_start, row_stop, self.rows_per_region):
+            yield self._merge_region(
                 (row0, min(row_stop, row0 + self.rows_per_region)),
                 (col_start, col_stop),
                 scan_region is None,
             )
-            for row0 in range(row_start, row_stop, self.rows_per_region)
-        )
+        if self.release_tilts and scan_region is None:
+            # Release consumed inputs before a storage reader reopens the output.
+            for tilt in self.tilts:
+                tilt.close()
+            if self.device.type == "cuda":
+                cuda.empty_cache()
+            elif self.device.type == "mps":
+                mps.empty_cache()
 
     def _merge_region(
         self, rows: tuple[int, int], cols: tuple[int, int], whole_box: bool
