@@ -36,7 +36,7 @@ class MAPED(AutoSerialize):
 
     ``MAPED(tilts).run()`` does everything; step by step it is
     :meth:`show_tilts`, :meth:`find_beam_center`, :meth:`align_diffraction`,
-    :meth:`align_real_space`, :meth:`merge`. :meth:`report` tabulates the shifts.
+    :meth:`align_images`, :meth:`merge`. :meth:`report` tabulates the shifts.
     """
 
     show_tilts = plot.tilts
@@ -183,6 +183,7 @@ class MAPED(AutoSerialize):
     def run(
         self,
         *,
+        images: Sequence[np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor | None = None,
         blur: float = 1,
         border_taper: float = 2,
         iterations: int = 20,
@@ -205,6 +206,8 @@ class MAPED(AutoSerialize):
 
         Parameters
         ----------
+        images : sequence of 2D arrays or tensors, optional
+            Images for :meth:`align_images`. Omit to use the default images.
         blur, border_taper, iterations, hann_window, max_shift, edge_blur, precision
             Alignment settings, with the same meaning as on each stage.
         dtype, crop, save_to
@@ -213,7 +216,7 @@ class MAPED(AutoSerialize):
             Free each tilt's scan rows as the merge passes them, then close the
             tilts. Default False keeps them for another merge or a float32 patch.
         show : bool
-            Draw the tilts, the aligned pattern, the aligned bright field and
+            Draw the tilts, the aligned pattern, the aligned images and
             the merge. False in scripts.
         verbose : bool
             Print what each stage found and how long it took.
@@ -234,7 +237,8 @@ class MAPED(AutoSerialize):
         if show:
             self.show_tilts()
         self.align_diffraction(border_taper=border_taper, precision=precision, show=show)
-        self.align_real_space(
+        self.align_images(
+            images=images,
             iterations=iterations,
             max_shift=max_shift,
             edge_blur=edge_blur,
@@ -312,7 +316,7 @@ class MAPED(AutoSerialize):
             plot.aligned_patterns(self, **plot_kwargs)
         return self
 
-    def align_real_space(
+    def align_images(
         self,
         iterations: int = 20,
         max_shift: float = 5,
@@ -320,16 +324,26 @@ class MAPED(AutoSerialize):
         hann_window: bool = True,
         precision: float = 0.01,
         show: bool = True,
+        *,
+        images: Sequence[np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor | None = None,
         **plot_kwargs,
     ) -> Self:
         """
-        Measure each tilt's scan shift from its bright-field image.
+        Measure each tilt's scan shift from corresponding real-space images.
 
         Each iteration moves every image by its current shift, averages them,
-        and corrects each shift by the image's offset from that average.
+        and corrects each shift by the image's offset from that average. The
+        measured shifts are applied to the original diffraction data at merge.
 
         Parameters
         ----------
+        images : sequence of 2D arrays or tensors, optional
+            One real, finite image per tilt, in tilt order, with the same scan
+            shape, pixel sampling and orientation as the diffraction datasets.
+            Examples include virtual BF/ADF/DF or simultaneously acquired HAADF
+            images. Omit to use ``bright_field``, the existing whole-detector
+            mean images. Supplied images are converted to float32 on the
+            workflow device; input images and diffraction data are unchanged.
         iterations : int
             Raise until doubling it no longer changes ``real_space_shifts``.
         max_shift : float
@@ -344,20 +358,36 @@ class MAPED(AutoSerialize):
         precision : float
             Smallest shift step measured, in scan pixels.
         show : bool
-            Plot the aligned bright-field images blended; ``plot_kwargs`` go to
-            ``show_2d``.
+            Plot the supplied or default images aligned and blended;
+            ``plot_kwargs`` go to ``show_2d``.
 
         Returns
         -------
         MAPED
             self, with ``real_space_shifts``: (num_tilts, 2) (row, col) pixels
             that move each tilt onto the others, relative to their mean.
+
+        Examples
+        --------
+        >>> maped.align_images()
+        >>> maped.align_images(images=haadf_images)
         """
+        if images is None:
+            images = self.im_bf
+        else:
+            if len(images) != len(self.tilts):
+                raise ValueError("Supply one image per tilt, in the same order as the datasets.")
+            images = [torch.as_tensor(image) for image in images]
+            if any(image.shape != self.shape[:2] or image.is_complex() for image in images):
+                raise ValueError(f"Supply real 2D images with scan shape {self.shape[:2]}.")
+            images = [image.to(device=self.device, dtype=torch.float32) for image in images]
+            if not all(torch.isfinite(image).all() for image in images):
+                raise ValueError("Images contain NaN or infinity; supply finite image values.")
         self.real_space_shifts = align.scan_shifts(
-            self.im_bf, iterations, max_shift, edge_blur, hann_window, precision
+            images, iterations, max_shift, edge_blur, hann_window, precision
         )
         if show:
-            plot.aligned_bright_field(self, max_shift, **plot_kwargs)
+            plot.aligned_images(self, images, max_shift, **plot_kwargs)
         return self
 
     def merge(
@@ -425,7 +455,7 @@ class MAPED(AutoSerialize):
         >>> merged = maped.merge(dtype="scaled_uint16", crop=True)
         """
         if self.real_space_shifts is None or self.diffraction_shifts is None:
-            raise RuntimeError("Run align_diffraction() and align_real_space() before merge().")
+            raise RuntimeError("Run align_diffraction() and align_images() before merge().")
         if dtype not in (None, "float32", torch.float32, "scaled_uint16"):
             raise ValueError("dtype must be 'float32' or 'scaled_uint16'.")
         native = isinstance(self.tilts[0], Dataset4dstem)

@@ -1,7 +1,7 @@
 """Measuring how far each tilt is shifted, on the detector and in the scan.
 
 MAPED aligns each tilt on two small images: its mean diffraction pattern
-(detector shift) and its bright-field image (scan shift). Both use the same
+(detector shift) and a corresponding real-space image (scan shift). Both use the same
 registration: the peak of the Fourier cross-correlation, refined to a fraction
 of a pixel by evaluating the correlation on a finer grid around it
 (Guizar-Sicairos et al., Opt. Lett. 33, 156 (2008)).

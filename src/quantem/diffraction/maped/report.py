@@ -63,7 +63,7 @@ def shift_table(maped) -> dict[str, list[str] | list[float] | list[int]]:
     Examples
     --------
     >>> maped.align_diffraction(show=False)
-    >>> maped.align_real_space(show=False)
+    >>> maped.align_images(show=False)
     >>> maped.report()
     """
     columns = {"Tilt": maped.tilt_names.copy()}

@@ -96,10 +96,10 @@ def aligned_patterns(maped, **plot_kwargs) -> None:
     show_2d(aligned, title=title, cmap="inferno", norm="power_sqrt", **plot_kwargs)
 
 
-def aligned_bright_field(maped, edge_width: float, **plot_kwargs) -> None:
-    """Bright-field images blended after each is moved by its scan shift: sharp features mean a good alignment."""
-    blended = blend_shifted_images(stack(maped.im_bf), maped.real_space_shifts, edge_width)
-    title = f"Bright field, {len(maped.im_bf)} tilts aligned in the scan"
+def aligned_images(maped, images, edge_width: float, **plot_kwargs) -> None:
+    """Blend the alignment images after applying their measured scan shifts."""
+    blended = blend_shifted_images(stack(images), maped.real_space_shifts, edge_width)
+    title = f"Images, {len(images)} tilts aligned in the scan"
     show_2d(blended, title=title, **plot_kwargs)
 
 

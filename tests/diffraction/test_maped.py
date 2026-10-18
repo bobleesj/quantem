@@ -15,11 +15,13 @@ io = pytest.importorskip("quantem.gpu.io", reason="Encoded-input tests require q
 DISPLACEMENTS = [((0, 0), (0, 0)), ((2, -1), (3, 1)), ((-1, 2), (-2, -3))]
 
 
-def test_run_matches_the_step_by_step_stages(tmp_path):
+@pytest.mark.parametrize("custom_images", [False, True])
+def test_run_matches_the_step_by_step_stages(tmp_path, custom_images):
     """Automatic and manual stages recover the known shifts and the same merge."""
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
     one, steps = MAPED.from_datasets(tilts), MAPED.from_datasets(tilts)
-    run_merged_t = one.run(show=False, verbose=False).read()
+    images = [image.square() for image in one.bright_field] if custom_images else None
+    run_merged_t = one.run(images=images, show=False, verbose=False).read()
     for shifts_t, expected in zip(
         (one.diffraction_shifts, one.real_space_shifts), zip(*DISPLACEMENTS)
     ):
@@ -28,7 +30,7 @@ def test_run_matches_the_step_by_step_stages(tmp_path):
         assert_close(shifts_t - shifts_t[0], expected_t, rtol=0, atol=0.07)
     steps.find_beam_center(blur=1, show=False)
     steps.align_diffraction(border_taper=2, show=False)
-    steps.align_real_space(iterations=20, hann_window=True, max_shift=5, show=False)
+    steps.align_images(images=images, iterations=20, hann_window=True, max_shift=5, show=False)
     # run crops to the positions every tilt covers; the stage call must say so too
     steps_merged_t = steps.merge(dtype="float32", crop=True, show=False).read()
     assert equal(one.diffraction_shifts, steps.diffraction_shifts)

@@ -4,6 +4,7 @@ import builtins
 
 import h5py
 import numpy as np
+import pytest
 import torch
 
 from quantem.core.datastructures import Dataset4dstem
@@ -117,3 +118,37 @@ def test_native_counts_keep_their_range_and_fractional_values():
         maped.real_space_shifts = maped.diffraction_shifts = torch.zeros((1, 2))
         merged = maped.merge(show=False, verbose=False)
         np.testing.assert_array_equal(merged.array[1:-1, 1:-1], values[1:-1, 1:-1])
+
+
+def test_external_images_align_and_display_without_replacing_diffraction(monkeypatch):
+    """Independent image contrast supplies scan shifts while original counts are merged."""
+    row, col = np.indices((32, 32))
+    displacements = [(0, 0), (3, 1), (-2, -3)]
+    images = [
+        np.exp(-((row - 16 - dr) ** 2 + (col - 16 - dc) ** 2) / 18)
+        for dr, dc in displacements
+    ]
+    counts = np.ones((32, 32, 4, 4), dtype=np.float32)
+    tilts = [Dataset4dstem.from_array(counts.copy()) for _ in images]
+    plotted = []
+    monkeypatch.setattr(plot, "show_2d", lambda image, **kwargs: plotted.append(image))
+    maped = MAPED(tilts).align_images(images=images)
+    torch.testing.assert_close(
+        maped.real_space_shifts - maped.real_space_shifts[0],
+        -torch.tensor(displacements, dtype=torch.float32), rtol=0, atol=0.07,
+    )
+    assert plotted[0].std() > 0.05  # The supplied images, not the constant input mean.
+    maped.diffraction_shifts = torch.zeros((len(tilts), 2))
+    merged = maped.merge(crop=True, show=False, verbose=False)
+    np.testing.assert_allclose(merged.array, 1, rtol=0, atol=1e-6)
+    for tilt in tilts:
+        np.testing.assert_array_equal(tilt.array, counts)
+
+
+@pytest.mark.parametrize("images", [
+    [], [np.ones((8, 7))], [np.ones((8, 8), dtype=complex)], [np.full((8, 8), np.nan)],
+])
+def test_alignment_images_require_one_finite_real_image_per_scan(images):
+    maped = MAPED([Dataset4dstem.from_array(np.ones((8, 8, 4, 4)))])
+    with pytest.raises(ValueError):
+        maped.align_images(images=images, show=False)
