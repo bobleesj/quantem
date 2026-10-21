@@ -5,6 +5,10 @@ the same code, and so the wording lives in one place.
 """
 
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 def header(maped) -> str:
@@ -41,24 +45,38 @@ def crop(maped, scan_box: tuple[int, int, int, int]) -> str:
 
 
 def merged(merged, seconds: float) -> str:
-    """Time, stored size and rounding error of the complete merge, in counts."""
+    """Time and rounding error of the complete merge, in counts."""
     precision = merged.metadata.get("precision")
     if precision is None:
         return f"Merged in {seconds:.1f} s: exact float32"
+    clipping = "No clipping." if precision["clipped"] == 0 else f"Clipped values: {precision['clipped']}."
     return (
-        f"Merged in {seconds:.1f} s: {merged.resident_bytes / 2**30:.2f} GiB as scaled 16-bit, "
-        f"rounding RMSE {precision['rmse']:.4f} and at most {precision['max_abs_error']:.4f} counts"
+        f"Merged in {seconds:.1f} s: scaled uint16 (approximate). "
+        f"RMS rounding error {precision['rmse']:#.3g} counts; "
+        f"maximum absolute error {precision['max_abs_error']:#.3g} counts. {clipping}"
     )
 
 
-def shift_table(maped) -> dict[str, list[str] | list[float] | list[int]]:
+def shift_table(maped, *, as_dict: bool = False) -> "pd.DataFrame | dict[str, list]":
     """Return beam centers and measured shifts in pixels, grouped by column.
+
+    Diffraction shifts move patterns in detector pixels; scan-image shifts
+    move real-space images in scan pixels. Positive row/column shifts move
+    down/right. Beam centers are positions, not shifts.
+
+    Parameters
+    ----------
+    as_dict : bool
+        Return the original column dictionary instead of a pandas table.
+        This also supports computation-only installations without pandas.
 
     Returns
     -------
-    dict
+    pandas.DataFrame or dict
         Tilt labels and available row/column shifts as lists in acquisition
-        order. All values are plain Python objects.
+        order. The default DataFrame renders directly in a notebook, without
+        rounding the stored values. Use ``as_dict=True`` for the original
+        plain-Python representation.
 
     Examples
     --------
@@ -69,11 +87,22 @@ def shift_table(maped) -> dict[str, list[str] | list[float] | list[int]]:
     columns = {"Tilt": maped.tilt_names.copy()}
     for attribute, label in (
         ("beam_centers", "Beam center"),
-        ("diffraction_shifts", "Detector"),
-        ("real_space_shifts", "Scan"),
+        ("diffraction_shifts", "Diffraction shift"),
+        ("real_space_shifts", "Scan-image shift"),
     ):
         shifts_t = getattr(maped, attribute, None)
         if shifts_t is not None:
             columns[f"{label} row (px)"] = shifts_t[:, 0].detach().cpu().tolist()
             columns[f"{label} col (px)"] = shifts_t[:, 1].detach().cpu().tolist()
-    return columns
+    if as_dict:
+        return columns
+    try:
+        import pandas as pd
+    except ModuleNotFoundError as error:
+        if error.name != "pandas":
+            raise
+        raise ModuleNotFoundError(
+            "Install tables with pip install pandas, "
+            "or use maped.report(as_dict=True) without pandas."
+        ) from error
+    return pd.DataFrame(columns)

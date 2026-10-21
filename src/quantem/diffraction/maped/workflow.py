@@ -2,7 +2,7 @@
 
 Each stage is a short method: it calls the algorithm in ``core``, keeps the
 result on the object, and hands pictures to ``plot`` and printed lines to
-``report``. File loading and encoded storage belong to the supplied datasets.
+``report``. File loading and storage belong to the supplied datasets.
 """
 
 import json
@@ -40,21 +40,22 @@ class MAPED(AutoSerialize):
     """
 
     show_tilts = plot.tilts
+    show_alignment = plot.alignment
     report = report.shift_table
 
     def __init__(self, tilts: Sequence = ()):
         """
-        Start from loaded native CPU datasets or encoded GPU acquisitions.
+        Start from acquisitions already loaded on CPU or GPU.
 
-        Each GPU tilt stays ANS-encoded and is reduced to the two small images every stage
-        works on: its mean diffraction pattern ``dp_mean`` and its bright-field
-        image ``im_bf``.
+        Alignment uses two small images per tilt: its mean diffraction pattern
+        ``dp_mean`` and its bright-field image ``im_bf``. The supplied datasets
+        own storage and region access.
 
         Parameters
         ----------
         tilts : sequence of Dataset4dstem or loaded acquisitions
             One loaded acquisition per tilt, all of the same shape on the same
-            device. Native CPU inputs use QuantEM alone. Encoded inputs expose
+            device. Native CPU inputs use QuantEM alone. Other datasets expose
             ``shape``, ``device``, ``metadata``, ``read(scan_region=...)`` and
             ``mean(dim=...)`` returning Torch tensors. Their class owns output
             storage through ``from_blocks(...)``.
@@ -119,7 +120,7 @@ class MAPED(AutoSerialize):
         ----------
         datasets : Sequence
             Loaded 4D-STEM acquisitions with matching shapes and devices.
-            Compressed acquisitions remain encoded during processing.
+            Storage remains owned by the supplied datasets.
 
         Returns
         -------
@@ -407,7 +408,7 @@ class MAPED(AutoSerialize):
 
         Each pattern is the weighted mean of the tilts, each moved by its scan
         and detector shift. Computation is float32 on every backend. Whole
-        scan rows are read once per region; no full decoded tilt is needed.
+        scan rows are read once per region; no complete tilt copy is needed.
 
         Parameters
         ----------
@@ -418,24 +419,24 @@ class MAPED(AutoSerialize):
             Keep only the scan positions every tilt covers. The box is saved
             in ``metadata["maped_merge"]["scan_box"]``.
         save_to : str or Path, optional
-            Write the complete GPU merge to HDF5 in bounded regions, then reopen
-            it as ANS. The encoded result must fit in memory. For a small CPU
-            merge, call ``merged.save("merged.zip")`` afterwards instead.
+            Delegate the complete GPU merge to the dataset's bounded HDF5
+            writer and return its result.
+            For a small CPU merge, call ``merged.save("merged.zip")`` afterwards.
         release_tilts : bool
-            Free encoded input rows after their last use, then close the tilts.
+            Release input storage after its last use, then close the tilts.
             Default False keeps them for inspecting patterns or another merge.
-            Only applies to a complete encoded result or a saved merge.
+            Only applies to a complete GPU result or a saved merge.
         show : bool
             Plot the merged bright field and mean diffraction pattern.
         verbose : bool
-            Print the crop box, elapsed time and stored precision.
+            Show saving progress, the crop box, elapsed time and stored precision.
         compile_merge : bool, optional
             Compile the fused merge on CUDA and MPS by default. False uses the
             same Torch calculation without compilation; CPU defaults to False.
         dtype : str or torch.dtype, optional
             Omitted or ``"float32"`` preserves the computed values. Dense
             results are limited to 4 GiB; use ``save_to`` for larger results.
-            Explicit ``"scaled_uint16"`` stores calibrated ANS regions with
+            Explicit ``"scaled_uint16"`` stores calibrated integer values with
             measured rounding error in ``metadata["precision"]``. CPU results
             stay float32 and use QuantEM's ordinary dataset serialization.
         **plot_kwargs
@@ -444,7 +445,7 @@ class MAPED(AutoSerialize):
         Returns
         -------
         Dataset4dstem or loaded acquisition
-            Native CPU inputs return a native dataset; encoded inputs return
+            Native CPU inputs return a native dataset; GPU inputs return
             a GPU dataset. The result is also available as ``self.merged``.
 
         Examples
@@ -526,6 +527,7 @@ class MAPED(AutoSerialize):
         else:
             merged = type(self.tilts[0]).from_blocks(
                 regions, dtype=storage_dtype, device=self.device, save_to=save_to,
+                verbose=verbose,
             )
             if release_tilts:
                 self.tilts = []
