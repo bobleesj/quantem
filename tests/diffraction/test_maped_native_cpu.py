@@ -60,11 +60,11 @@ def test_native_cpu_load_align_merge_save(tmp_path, monkeypatch):
 
     maped = MAPED.from_datasets(tilts)
     merged = maped.run(show=False, verbose=False)
-    report = maped.report()
+    report = maped.report(as_dict=True)
     assert report["Tilt"] == maped.tilt_names
     for label, shifts in (
-        ("Detector", maped.diffraction_shifts),
-        ("Scan", maped.real_space_shifts),
+        ("Diffraction shift", maped.diffraction_shifts),
+        ("Scan-image shift", maped.real_space_shifts),
     ):
         assert report[f"{label} row (px)"] == shifts[:, 0].tolist()
         assert report[f"{label} col (px)"] == shifts[:, 1].tolist()

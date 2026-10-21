@@ -90,6 +90,22 @@ def test_scaled_merge_and_saved_file_match_float32_regions(tmp_path):
     saved = io.load(tmp_path / "merged_master.h5", verbose=False)
     for region in regions:
         assert equal(saved.read(scan_region=region), merged.read(scan_region=region))
+    saved_merge = maped.merge(
+        dtype="scaled_uint16", save_to=tmp_path / "scaled_master.h5",
+        show=False, verbose=False,
+    )
+    report = saved_merge.metadata["precision"]
+    assert report["clipped"] == report["overflow"] == 0
+    from quantem.diffraction.maped.report import merged as merge_summary
+
+    summary = merge_summary(saved_merge, 1.0)
+    assert "scaled uint16 (approximate)" in summary
+    assert f"RMS rounding error {report['rmse']:#.3g} counts" in summary
+    assert f"maximum absolute error {report['max_abs_error']:#.3g} counts" in summary
+    assert "No clipping." in summary
+    for region, exact_t in zip(regions, exact):
+        assert_close(saved_merge.read(scan_region=region), exact_t, rtol=0, atol=report["max_abs_error"])
+    saved_merge.close()
 
 
 def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
@@ -108,7 +124,6 @@ def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
     assert saved.metadata["maped_merge"]["scan_region"] == reference.metadata["maped_merge"]["scan_region"]
     assert all(tilt.data.is_released for tilt in tilts)
 
-    # The saved merge reopens encoded, so it can also be archived directly as QEM.
     io.save(tmp_path / "merged.qem", saved)
     with io.load(tmp_path / "merged.qem", device=maped.device, verbose=False) as reopened:
         assert reopened.lossless
