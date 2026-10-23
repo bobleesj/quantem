@@ -153,6 +153,7 @@ class PtychographyDatasetBase(
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
         self._transpose = False  # default
+        self.center_diffraction = True
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
@@ -403,11 +404,11 @@ class PtychographyDatasetBase(
         # When residency is "cpu", build targets on CPU so they can be streamed per-batch
         # (and read by DataLoader workers); otherwise keep them resident on the compute device.
         target_device = "cpu" if self.target_residency == "cpu" else self.device
-        learn_descan = self.learn_descan and self.has_optimizer()
+        recorded_targets = (self.learn_descan and self.has_optimizer()) or not self.center_diffraction
         if target_space == "amplitude":
-            source = self.amplitudes if learn_descan else self.centered_amplitudes
+            source = self.amplitudes if recorded_targets else self.centered_amplitudes
         elif target_space == "intensity":
-            source = self.intensities if learn_descan else self.centered_intensities
+            source = self.intensities if recorded_targets else self.centered_intensities
         else:
             raise ValueError(
                 f"target_space must be 'amplitude' or 'intensity', got {target_space!r}"
@@ -1324,7 +1325,19 @@ class PtychographyDatasetRaster(DatasetConstraints):
         probe_energy: float | None = None,
         positions_mask: np.ndarray | None = None,
         probe_positions_px: np.ndarray | None = None,
+        center_diffraction: bool = True,
     ):
+        """Prepare diffraction targets and scan geometry.
+
+        Parameters
+        ----------
+        center_diffraction : bool, default=True
+            Use centered diffraction patterns when descan is not being optimized.
+            Set False to keep the recorded patterns and apply the measured descan
+            as a fixed phase ramp in the forward model. Optimizing descan uses the
+            recorded patterns in either mode.
+        """
+        self.center_diffraction = bool(center_diffraction)
         if probe_positions_px is not None:
             self.probe_positions_px = probe_positions_px
         if positions_mask is not None:
@@ -1351,6 +1364,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "force_com_rotation": force_com_rotation,
             "force_com_transpose": force_com_transpose,
             "bilinear": bilinear,
+            "center_diffraction": self.center_diffraction,
             "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
             "obj_padding_px": obj_padding_px,
             "plot_rotation": False,
@@ -2017,6 +2031,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         positions_px = self.scan_positions_px[batch_indices]
         if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
+        elif not self.center_diffraction:
+            descan_shifts = self.descan_shifts.detach()[batch_indices]
         else:
             descan_shifts = None
 

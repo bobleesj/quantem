@@ -163,6 +163,7 @@ CONFIGURATIONS = {
     "mixed_state": {"num_probes": 2},
     "subpixel_positions": {"subpixel": True},
     "descan": {"descan": True},
+    "fixed_descan": {"fixed_descan": True},
 }
 
 
@@ -173,6 +174,7 @@ class TestAnalyticGradientMatchesAutograd:
         batch = config.pop("batch", None)
         subpixel = config.pop("subpixel", False)
         descan = config.pop("descan", False)
+        fixed_descan = config.pop("fixed_descan", False)
 
         ptycho = _build(**config)
         if subpixel:
@@ -180,8 +182,13 @@ class TestAnalyticGradientMatchesAutograd:
             positions = ptycho.dset._scan_positions_px
             with torch.no_grad():
                 positions.data += 0.4 * (torch.rand(positions.shape, generator=g) - 0.5)
+        if fixed_descan:
+            ptycho.dset.center_diffraction = False
+            ptycho.dset.learn_descan = False
+            with torch.no_grad():
+                ptycho.dset._descan_shifts.data += torch.tensor([0.37, -0.21])
         if descan:
-            # descan is only applied in the forward model while the dataset is optimized
+            # A dataset optimizer enables the learned descan ramp.
             ptycho.optimizer_params = {"dataset": {"type": "sgd", "lr": 0.0}}
             ptycho.set_optimizers()
             with torch.no_grad():
@@ -243,11 +250,18 @@ class TestAnalyticStepNormalization:
         assert _relative_difference(obj_step[0], expected_obj) < TOLERANCE
         assert _relative_difference(probe_step[0], expected_probe) < 10 * TOLERANCE
 
-    def test_sgd_runs_identically_on_both_paths(self):
+    @pytest.mark.parametrize("center_diffraction", [True, False])
+    def test_sgd_runs_identically_on_both_paths(self, center_diffraction):
         """Full batch, unit-step scan: the ePIE step equals the gradient, so SGD(lr) agrees."""
         losses, objects = {}, {}
         for autograd in (True, False):
             ptycho = _build()
+            ptycho.dset.center_diffraction = center_diffraction
+            ptycho.dset.learn_descan = False
+            if not center_diffraction:
+                ptycho.dset.initial_descan_shifts = (
+                    ptycho.dset.initial_descan_shifts + torch.tensor([0.37, -0.21])
+                )
             ptycho.reconstruct(
                 num_iters=10,
                 reset=True,

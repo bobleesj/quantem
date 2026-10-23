@@ -187,6 +187,7 @@ def _clone_ptychography_dataset(dset: PtychographyDatasetBase) -> PtychographyDa
     )
     cloned.constraints = copy.deepcopy(dset.constraints)
     cloned._preprocessing_params = copy.deepcopy(dset._preprocessing_params)
+    cloned.center_diffraction = dset.center_diffraction
     cloned.com_rotation_rad = dset.com_rotation_rad
     if hasattr(dset, "_transpose"):
         cloned.com_transpose = dset.com_transpose
