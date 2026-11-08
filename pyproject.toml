@@ -42,6 +42,7 @@ dependencies = [
   "h5py>=3.13.0",
   "torch>=2.7.0",
   "scikit-image>=0.25.2",
+  "pandas>=2.2",
   "torchvision>=0.22.1",
   "tensorboard>=2.19.0",
   "torchmetrics>=1.7.3",
