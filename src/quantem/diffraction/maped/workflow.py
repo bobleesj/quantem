@@ -526,7 +526,7 @@ class MAPED(AutoSerialize):
             self.dp_mean_merged = values_t.mean(dim=(0, 1))
         else:
             merged = type(self.tilts[0]).from_blocks(
-                regions, dtype=storage_dtype, device=self.device, save_to=save_to,
+                regions, dtype=storage_dtype, device=self.device, path=save_to,
                 verbose=verbose,
             )
             if release_tilts:
