@@ -2,3 +2,4 @@
 
 from quantem.diffraction.maped import io as io
 from quantem.diffraction.maped.workflow import MAPED as MAPED
+from quantem.diffraction.maped.workflow import RunningMAPED as RunningMAPED

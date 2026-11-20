@@ -21,7 +21,7 @@ from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.diffraction.maped import plot, report
 from quantem.diffraction.maped.core import align
-from quantem.diffraction.maped.core.merge import MergedRegions
+from quantem.diffraction.maped.core.merge import MergedRegions, RunningMerge
 from quantem.diffraction.maped.io import summaries
 
 
@@ -542,6 +542,114 @@ class MAPED(AutoSerialize):
 
     def close(self) -> None:
         """Release the merged result. The tilts stay with their caller."""
+        if self.merged is not None:
+            if not isinstance(self.merged, Dataset4dstem):
+                self.merged.close()
+            self.merged = None
+
+
+class RunningMAPED:
+    """MAPED one tilt at a time: each tilt is aligned to the first, added to the merge and then no longer needed.
+
+    :class:`MAPED` keeps every tilt until the merge, aligns them together and merges once. This class takes the
+    reference tilt first (the on-axis scan), measures each later tilt's detector and scan shift against it as the tilt
+    arrives, and adds the tilt to a running merge (:class:`~quantem.diffraction.maped.core.merge.RunningMerge`). Memory
+    is the running sum and one tilt whatever the number of tilts, so a series can have any length. A tilt's shift is
+    fixed when it is added: there is no joint refinement over the series afterwards.
+
+    Examples
+    --------
+    >>> running = RunningMAPED(on_axis)                     # doctest: +SKIP
+    >>> for tilt in tilts:                                  # doctest: +SKIP
+    ...     running.add(tilt)
+    >>> merged = running.merge(crop=True, dtype="scaled_uint16")   # doctest: +SKIP
+    """
+
+    def __init__(self, reference, *, compile_merge: bool | None = None):
+        """
+        Parameters
+        ----------
+        reference : loaded acquisition
+            The tilt every other is placed on, on an accelerator; its class stores the result (``from_blocks``).
+        compile_merge : bool, optional
+            As :meth:`MAPED.merge`.
+        """
+        native = isinstance(reference, Dataset4dstem)
+        self.device = torch.device("cpu") if native else torch.device(reference.device)
+        self.shape = tuple(int(size) for size in reference.shape)
+        self._store = None if native else type(reference)
+        patterns_t, images_t = summaries([reference], self.device)
+        self.dp_reference, self.im_reference = patterns_t[0], images_t[0]
+        self.running = RunningMerge(self.shape, self.device, compile_merge=compile_merge)
+        self.running.add(reference, (0.0, 0.0), (0.0, 0.0))
+        self.diffraction_shifts = [[0.0, 0.0]]
+        self.real_space_shifts = [[0.0, 0.0]]
+        self.merged = None
+
+    def __len__(self) -> int:
+        return len(self.real_space_shifts)
+
+    def add(
+        self,
+        tilt,
+        *,
+        iterations: int = 160,
+        max_shift: float = 5,
+        edge_blur: float | None = 2,
+        hann_window: bool = True,
+        border_taper: float = 2,
+        precision: float = 0.01,
+    ) -> Self:
+        """Measure one tilt's shifts against the reference and add it to the merge. The tilt is not kept.
+
+        The alignment settings are :meth:`MAPED.align_diffraction`'s and :meth:`MAPED.align_images`'s.
+        """
+        if self.merged is not None:
+            raise RuntimeError("This series is merged; start another RunningMAPED for more tilts.")
+        patterns_t, images_t = summaries([tilt], self.device)
+        detector = align.diffraction_shifts([self.dp_reference, patterns_t[0]], border_taper, precision)
+        scan = align.scan_shifts(
+            [self.im_reference, images_t[0]], iterations, max_shift, edge_blur, hann_window, precision
+        )
+        detector_shift = (detector[1] - detector[0]).tolist()
+        scan_shift = (scan[1] - scan[0]).tolist()
+        self.running.add(tilt, scan_shift, detector_shift)
+        self.diffraction_shifts.append(detector_shift)
+        self.real_space_shifts.append(scan_shift)
+        return self
+
+    def merge(
+        self,
+        crop: bool = False,
+        save_to: str | Path | None = None,
+        verbose: bool = False,
+        *,
+        dtype: str = "scaled_uint16",
+    ):
+        """Write the merge of the tilts added so far and release the running sum.
+
+        Parameters are :meth:`MAPED.merge`'s; the result is stored through the reference's class.
+        """
+        if dtype not in ("float32", "scaled_uint16"):
+            raise ValueError("dtype must be 'float32' or 'scaled_uint16'.")
+        regions = self.running.finish(crop)
+        if self._store is None:      # native CPU tilts: a small float32 dataset, as MAPED.merge returns for them
+            if dtype != "float32" or save_to is not None:
+                raise ValueError("Native CPU tilts merge to float32 in memory; save the result afterwards.")
+            values = torch.cat(list(regions.blocks())).reshape(regions.shape)
+            self.merged = Dataset4dstem.from_array(values.numpy(), name="MAPED merged")
+        else:
+            self.merged = self._store.from_blocks(
+                regions, dtype=dtype, device=self.device, path=save_to, verbose=verbose
+            )
+        self.dp_mean_merged = regions.detector_sum / prod(regions.shape[:2])
+        self.im_bf_merged = regions.scan_sum / prod(regions.shape[2:])
+        self.running.close()
+        return self.merged
+
+    def close(self) -> None:
+        """Release the running sum and the merged result."""
+        self.running.close()
         if self.merged is not None:
             if not isinstance(self.merged, Dataset4dstem):
                 self.merged.close()

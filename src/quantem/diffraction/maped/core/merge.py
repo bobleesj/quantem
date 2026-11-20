@@ -44,6 +44,7 @@ from torch import (
     zeros,
 )
 from torch import compile as compile_kernel
+from torch import device as torch_device
 
 from quantem.diffraction.maped.core.align import translation_grid
 from quantem.diffraction.maped.io import read_region
@@ -348,3 +349,165 @@ def _accumulate(
 
 
 _accumulate_compiled = compile_kernel(_accumulate, fullgraph=True)
+
+
+class RunningMerge:
+    """The same merge kept as a running sum: each tilt is added once and is then no longer needed.
+
+    :class:`MergedRegions` reads every tilt for each scan region, so every tilt stays loaded until the merge is
+    written. The merge's numerator is a sum over tilts, so it can also be built one tilt at a time: this class holds
+    that sum for the whole scan (float32, ``prod(shape) * 4`` bytes: 38 GB for 512 x 512 x 192 x 192) and each tilt's
+    small coverage maps. With the same shifts the result equals :class:`MergedRegions` to float32 rounding, for any
+    number of tilts. :meth:`finish` then hands the regions to a writer exactly as :class:`MergedRegions` does.
+    """
+
+    dtype = np.dtype("float32")
+    report_context = MergedRegions.report_context
+
+    def __init__(self, shape: Sequence[int], device, *, compile_merge: bool | None = None) -> None:
+        """
+        Parameters
+        ----------
+        shape : (scan_row, scan_col, k_row, k_col)
+            Shape of every tilt.
+        device : torch.device
+            Where the tilts are read and the sum is held.
+        compile_merge : bool or None
+            As :class:`MergedRegions`.
+        """
+        self.source_shape = tuple(int(size) for size in shape)
+        self.shape = self.source_shape
+        self.device = torch_device(device)
+        if compile_merge is None:
+            compile_merge = self.device.type in ("cuda", "mps")
+        self.accumulate = _accumulate_compiled if compile_merge else _accumulate
+        self.numerator = zeros(self.source_shape, dtype=float32, device=self.device)
+        self.scan_shifts: list[list[float]] = []
+        self.detector_shifts: list[list[float]] = []
+        self.real_weights: list[Tensor] = []
+        self.detector_weights: list[Tensor] = []
+        self.hot_pixel_corrections: list = []
+        self.scan_box = (0, self.source_shape[0], 0, self.source_shape[1])
+        self.rows_per_region = max(1, 2048 // self.source_shape[1])
+        self.merge_seconds = 0.0
+        self.save_metadata: dict[str, str] = {}
+
+    def add(self, tilt, scan_shift: Sequence[float], detector_shift: Sequence[float]) -> None:
+        """Add one tilt, moved by its (row, col) scan and detector shifts. The tilt is not kept."""
+        started = time.perf_counter()
+        num_rows, num_cols, detector_rows, detector_cols = self.source_shape
+        if tuple(int(size) for size in tilt.shape) != self.source_shape:
+            raise ValueError(f"This tilt is {tuple(tilt.shape)}; the merge is {self.source_shape}.")
+        scan_shift = [float(scan_shift[0]), float(scan_shift[1])]
+        detector_shift = [float(detector_shift[0]), float(detector_shift[1])]
+        with self.device:
+            window = zeros((1, 1, num_rows, num_cols))
+            window[..., 1:-1, 1:-1] = 1.0
+            real_weight = F.grid_sample(
+                window, translation_grid(tensor([scan_shift]), (num_rows, num_cols)), align_corners=True
+            )[0, 0]
+            detector_weight = F.grid_sample(
+                ones((1, 1, detector_rows, detector_cols)),
+                translation_grid(tensor([detector_shift]), (detector_rows, detector_cols)),
+                align_corners=True,
+            )[0, 0].clamp(0, 1)
+            row_taps, row_weights = _bilinear_taps(scan_shift[0], num_rows)
+            col_taps = _bilinear_taps(scan_shift[1], num_cols)
+            detector_row_taps = _bilinear_taps(detector_shift[0], detector_rows)
+            detector_col_taps = _bilinear_taps(detector_shift[1], detector_cols)
+        for row0 in range(0, num_rows, self.rows_per_region):
+            row1 = min(num_rows, row0 + self.rows_per_region)
+            decoded_row0 = max(0, row0 + floor(-scan_shift[0]))
+            decoded_row1 = min(num_rows, row1 + floor(-scan_shift[0]) + 1)
+            if decoded_row0 >= decoded_row1:
+                continue
+            counts = read_region(tilt, (decoded_row0, decoded_row1, 0, num_cols))
+            if counts.dtype == uint16:
+                counts = counts.view(int16)
+            elif counts.dtype not in (uint8, float32):
+                counts = counts.to(float32)
+            region_rows = row_taps[:, row0:row1] - decoded_row0
+            rows_inside = (region_rows >= 0) & (region_rows < counts.shape[0])
+            self.accumulate(
+                counts,
+                (region_rows.clamp(0, counts.shape[0] - 1), rows_inside * row_weights[:, row0:row1]),
+                col_taps,
+                detector_row_taps,
+                detector_col_taps,
+                real_weight[row0:row1],
+                self.numerator[row0:row1],
+            )
+        self.scan_shifts.append(scan_shift)
+        self.detector_shifts.append(detector_shift)
+        self.real_weights.append(real_weight)
+        self.detector_weights.append(detector_weight)
+        self.hot_pixel_corrections.append(tilt.metadata.get("hot_pixel_correction"))
+        self.merge_seconds += time.perf_counter() - started
+
+    def finish(self, crop: bool = False) -> "RunningMerge":
+        """Fix the scan box (with ``crop``, the positions every tilt covers) and the record; then read :meth:`blocks`."""
+        if not self.scan_shifts:
+            raise RuntimeError("Add at least one tilt before finishing the merge.")
+        num_rows, num_cols, detector_rows, detector_cols = self.source_shape
+        weights = stack(self.real_weights)
+        self.scan_box = (0, num_rows, 0, num_cols)
+        if crop:
+            covered = (weights >= 1 - 1e-5).all(dim=0)
+            rows = covered.any(dim=1).nonzero().flatten().tolist()
+            cols = covered.any(dim=0).nonzero().flatten().tolist()
+            if not rows or not cols:
+                raise ValueError("The aligned scans have no common interior; use crop=False.")
+            self.scan_box = (rows[0], rows[-1] + 1, cols[0], cols[-1] + 1)
+        row0, row1, col0, col1 = self.scan_box
+        self.shape = (row1 - row0, col1 - col0, detector_rows, detector_cols)
+        self.scan_sum = weights.new_zeros(self.shape[:2])
+        self.detector_sum = weights.new_zeros((detector_rows, detector_cols))
+        summary = {
+            "version": 1,
+            "source_count": len(self.scan_shifts),
+            "hot_pixel_correction": self.hot_pixel_corrections,
+            "mean_bright_field": "mean over the whole detector, every pixel in the divisor",
+            "mean_diffraction_pattern": "mean over the whole scan",
+        }
+        record = {
+            "version": 1,
+            "backend": self.device.type,
+            "running": True,
+            "region_frames": self.rows_per_region * num_cols,
+            "merge_seconds": self.merge_seconds,
+            "real_space_shifts_row_column": self.scan_shifts,
+            "diffraction_shifts_row_column": self.detector_shifts,
+            "scan_box": list(self.scan_box),
+            "scan_region": list(self.scan_box),
+        }
+        self.save_metadata = {
+            "quantem_maped_summary_v1": json.dumps(summary),
+            "quantem_maped_merge_v1": json.dumps(record),
+        }
+        return self
+
+    def blocks(self, scan_region: tuple[int, int, int, int] | None = None) -> Iterator[Tensor]:
+        """The merge, one row-aligned region at a time, as ``(frames, k_row, k_col)``: the sum over its coverage."""
+        detector_rows, detector_cols = self.source_shape[2:]
+        row_start, row_stop, col_start, col_stop = scan_region or self.scan_box
+        scan_weights = stack(self.real_weights)
+        detector_weights = stack(self.detector_weights)
+        detector_edge = 1 - detector_weights.sum(0).clamp(0, 1)
+        for row0 in range(row_start, row_stop, self.rows_per_region):
+            row1 = min(row_stop, row0 + self.rows_per_region)
+            denominator = einsum(
+                "nrc,nhw->rchw", scan_weights[:, row0:row1, col_start:col_stop], detector_weights
+            )
+            denominator += detector_edge
+            merged = (self.numerator[row0:row1, col_start:col_stop] / denominator).nan_to_num_(0)
+            if scan_region is None:
+                box_row0 = self.scan_box[0]
+                self.scan_sum[row0 - box_row0 : row1 - box_row0] = merged.sum(dim=(2, 3))
+                self.detector_sum += merged.sum(dim=(0, 1))
+            yield merged.reshape(-1, detector_rows, detector_cols)
+
+    def close(self) -> None:
+        """Release the running sum."""
+        self.numerator = None
+        if self.device.type == "cuda":
+            cuda.empty_cache()
