@@ -356,15 +356,21 @@ class RunningMerge:
 
     :class:`MergedRegions` reads every tilt for each scan region, so every tilt stays loaded until the merge is
     written. The merge's numerator is a sum over tilts, so it can also be built one tilt at a time: this class holds
-    that sum for the whole scan (float32, ``prod(shape) * 4`` bytes: 38 GB for 512 x 512 x 192 x 192) and each tilt's
-    small coverage maps. With the same shifts the result equals :class:`MergedRegions` to float32 rounding, for any
-    number of tilts. :meth:`finish` then hands the regions to a writer exactly as :class:`MergedRegions` does.
+    that sum for the whole scan and each tilt's small coverage maps, and :meth:`finish` hands the regions to a writer
+    exactly as :class:`MergedRegions` does.
+
+    With ``store`` (the tilts' dataset class, which stores results through ``from_blocks``) the sum stays encoded
+    between tilts: adding a tilt reads the sum a few scan rows at a time, adds the tilt's rows and stores them again
+    as calibrated scaled uint16, so memory is the encoded sum twice over for a moment and never a decoded copy of it.
+    Each tilt added rounds the sum once more to its 16-bit codes. Without ``store`` the sum is one float32 tensor
+    (``prod(shape) * 4`` bytes: 38 GB for 512 x 512 x 192 x 192) and equals :class:`MergedRegions` to float32
+    rounding for the same shifts.
     """
 
     dtype = np.dtype("float32")
     report_context = MergedRegions.report_context
 
-    def __init__(self, shape: Sequence[int], device, *, compile_merge: bool | None = None) -> None:
+    def __init__(self, shape: Sequence[int], device, *, compile_merge: bool | None = None, store=None) -> None:
         """
         Parameters
         ----------
@@ -374,6 +380,8 @@ class RunningMerge:
             Where the tilts are read and the sum is held.
         compile_merge : bool or None
             As :class:`MergedRegions`.
+        store : type, optional
+            The tilts' dataset class; its ``from_blocks`` keeps the sum encoded between tilts. Omit for a float32 sum.
         """
         self.source_shape = tuple(int(size) for size in shape)
         self.shape = self.source_shape
@@ -381,7 +389,9 @@ class RunningMerge:
         if compile_merge is None:
             compile_merge = self.device.type in ("cuda", "mps")
         self.accumulate = _accumulate_compiled if compile_merge else _accumulate
-        self.numerator = zeros(self.source_shape, dtype=float32, device=self.device)
+        self.store = store
+        self.encoded = None              # the sum so far as an encoded dataset (with ``store``)
+        self.numerator = None if store is not None else zeros(self.source_shape, dtype=float32, device=self.device)
         self.scan_shifts: list[list[float]] = []
         self.detector_shifts: list[list[float]] = []
         self.real_weights: list[Tensor] = []
@@ -411,32 +421,24 @@ class RunningMerge:
                 translation_grid(tensor([detector_shift]), (detector_rows, detector_cols)),
                 align_corners=True,
             )[0, 0].clamp(0, 1)
-            row_taps, row_weights = _bilinear_taps(scan_shift[0], num_rows)
-            col_taps = _bilinear_taps(scan_shift[1], num_cols)
-            detector_row_taps = _bilinear_taps(detector_shift[0], detector_rows)
-            detector_col_taps = _bilinear_taps(detector_shift[1], detector_cols)
-        for row0 in range(0, num_rows, self.rows_per_region):
-            row1 = min(num_rows, row0 + self.rows_per_region)
-            decoded_row0 = max(0, row0 + floor(-scan_shift[0]))
-            decoded_row1 = min(num_rows, row1 + floor(-scan_shift[0]) + 1)
-            if decoded_row0 >= decoded_row1:
-                continue
-            counts = read_region(tilt, (decoded_row0, decoded_row1, 0, num_cols))
-            if counts.dtype == uint16:
-                counts = counts.view(int16)
-            elif counts.dtype not in (uint8, float32):
-                counts = counts.to(float32)
-            region_rows = row_taps[:, row0:row1] - decoded_row0
-            rows_inside = (region_rows >= 0) & (region_rows < counts.shape[0])
-            self.accumulate(
-                counts,
-                (region_rows.clamp(0, counts.shape[0] - 1), rows_inside * row_weights[:, row0:row1]),
-                col_taps,
-                detector_row_taps,
-                detector_col_taps,
-                real_weight[row0:row1],
-                self.numerator[row0:row1],
+            taps = (
+                _bilinear_taps(scan_shift[0], num_rows),
+                _bilinear_taps(scan_shift[1], num_cols),
+                _bilinear_taps(detector_shift[0], detector_rows),
+                _bilinear_taps(detector_shift[1], detector_cols),
             )
+        if self.store is None:
+            for row0 in range(0, num_rows, self.rows_per_region):
+                row1 = min(num_rows, row0 + self.rows_per_region)
+                self._add_rows(tilt, scan_shift, taps, real_weight, row0, row1, self.numerator[row0:row1])
+        else:
+            previous = self.encoded
+            self.encoded = self.store.from_blocks(
+                _SumWithTilt(self, previous, tilt, scan_shift, taps, real_weight),
+                dtype="scaled_uint16", device=self.device,
+            )
+            if previous is not None:
+                previous.close()
         self.scan_shifts.append(scan_shift)
         self.detector_shifts.append(detector_shift)
         self.real_weights.append(real_weight)
@@ -444,8 +446,44 @@ class RunningMerge:
         self.hot_pixel_corrections.append(tilt.metadata.get("hot_pixel_correction"))
         self.merge_seconds += time.perf_counter() - started
 
-    def finish(self, crop: bool = False) -> "RunningMerge":
-        """Fix the scan box (with ``crop``, the positions every tilt covers) and the record; then read :meth:`blocks`."""
+    def _add_rows(self, tilt, scan_shift, taps, real_weight, row0: int, row1: int, numerator: Tensor) -> None:
+        """Why: both ways of holding the sum add a tilt's scan rows ``row0:row1`` with the same fused kernel."""
+        num_rows, num_cols = self.source_shape[:2]
+        (row_taps, row_weights), col_taps, detector_row_taps, detector_col_taps = taps
+        decoded_row0 = max(0, row0 + floor(-scan_shift[0]))
+        decoded_row1 = min(num_rows, row1 + floor(-scan_shift[0]) + 1)
+        if decoded_row0 >= decoded_row1:
+            return
+        counts = read_region(tilt, (decoded_row0, decoded_row1, 0, num_cols))
+        if counts.dtype == uint16:
+            counts = counts.view(int16)
+        elif counts.dtype not in (uint8, float32):
+            counts = counts.to(float32)
+        region_rows = row_taps[:, row0:row1] - decoded_row0
+        rows_inside = (region_rows >= 0) & (region_rows < counts.shape[0])
+        self.accumulate(
+            counts,
+            (region_rows.clamp(0, counts.shape[0] - 1), rows_inside * row_weights[:, row0:row1]),
+            col_taps,
+            detector_row_taps,
+            detector_col_taps,
+            real_weight[row0:row1],
+            numerator,
+        )
+
+    def _sum_rows(self, row0: int, row1: int) -> Tensor:
+        """The sum's scan rows ``row0:row1`` as float32, from either way of holding it."""
+        if self.store is None:
+            return self.numerator[row0:row1]
+        return self.encoded.read(scan_region=(row0, row1, 0, self.source_shape[1])).to(float32)
+
+    def finish(self, crop: bool = False, release: bool = False) -> "RunningMerge":
+        """Fix the scan box (with ``crop``, the positions every tilt covers) and the record; then read :meth:`blocks`.
+
+        ``release``: free the encoded sum's rows as the complete merge is read, so the sum and the result written
+        from it never sit side by side in full. The merge can then be read only once.
+        """
+        self.release_on_read = bool(release) and self.store is not None
         if not self.scan_shifts:
             raise RuntimeError("Add at least one tilt before finishing the merge.")
         num_rows, num_cols, detector_rows, detector_cols = self.source_shape
@@ -472,7 +510,7 @@ class RunningMerge:
         record = {
             "version": 1,
             "backend": self.device.type,
-            "running": True,
+            "running": "encoded" if self.store is not None else "float32",
             "region_frames": self.rows_per_region * num_cols,
             "merge_seconds": self.merge_seconds,
             "real_space_shifts_row_column": self.scan_shifts,
@@ -499,7 +537,9 @@ class RunningMerge:
                 "nrc,nhw->rchw", scan_weights[:, row0:row1, col_start:col_stop], detector_weights
             )
             denominator += detector_edge
-            merged = (self.numerator[row0:row1, col_start:col_stop] / denominator).nan_to_num_(0)
+            merged = (self._sum_rows(row0, row1)[:, col_start:col_stop] / denominator).nan_to_num_(0)
+            if scan_region is None and getattr(self, "release_on_read", False):
+                self.encoded.release_rows_before(row1)
             if scan_region is None:
                 box_row0 = self.scan_box[0]
                 self.scan_sum[row0 - box_row0 : row1 - box_row0] = merged.sum(dim=(2, 3))
@@ -509,5 +549,41 @@ class RunningMerge:
     def close(self) -> None:
         """Release the running sum."""
         self.numerator = None
+        if self.encoded is not None:
+            self.encoded.close()
+            self.encoded = None
         if self.device.type == "cuda":
             cuda.empty_cache()
+
+
+class _SumWithTilt:
+    """The running sum with one more tilt added, read once in scan order by the writer that stores it encoded."""
+
+    dtype = np.dtype("float32")
+    report_context = {
+        "scope": "the running sum of the tilts added so far",
+        "range_scope": "each stored region",
+        "measurement": "comparison against the float32 sum of each region",
+    }
+
+    def __init__(self, running: RunningMerge, previous, tilt, scan_shift, taps, real_weight) -> None:
+        self.running, self.previous, self.tilt = running, previous, tilt
+        self.scan_shift, self.taps, self.real_weight = scan_shift, taps, real_weight
+        self.shape, self.device = running.source_shape, running.device
+        self.save_metadata: dict[str, str] = {}
+
+    def blocks(self) -> Iterator[Tensor]:
+        """The sum so far plus this tilt, a few scan rows at a time, as ``(frames, k_row, k_col)``."""
+        num_rows, num_cols, detector_rows, detector_cols = self.shape
+        running = self.running
+        for row0 in range(0, num_rows, running.rows_per_region):
+            row1 = min(num_rows, row0 + running.rows_per_region)
+            if self.previous is None:
+                numerator = zeros((row1 - row0, num_cols, detector_rows, detector_cols), dtype=float32, device=self.device)
+            else:
+                numerator = self.previous.read(scan_region=(row0, row1, 0, num_cols)).to(float32)
+                # rows are read once, in order: the stored rows behind this point are no longer needed, so the old
+                # sum shrinks while the new one grows and the two never sit side by side in full
+                self.previous.release_rows_before(row1)
+            running._add_rows(self.tilt, self.scan_shift, self.taps, self.real_weight, row0, row1, numerator)
+            yield numerator.reshape(-1, detector_rows, detector_cols)

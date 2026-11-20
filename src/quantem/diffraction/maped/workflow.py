@@ -553,8 +553,9 @@ class RunningMAPED:
 
     :class:`MAPED` keeps every tilt until the merge, aligns them together and merges once. This class takes the
     reference tilt first (the on-axis scan), measures each later tilt's detector and scan shift against it as the tilt
-    arrives, and adds the tilt to a running merge (:class:`~quantem.diffraction.maped.core.merge.RunningMerge`). Memory
-    is the running sum and one tilt whatever the number of tilts, so a series can have any length. A tilt's shift is
+    arrives, and adds the tilt to a running merge (:class:`~quantem.diffraction.maped.core.merge.RunningMerge`), which
+    stays encoded on an accelerator. Memory is that encoded sum and one tilt whatever the number of tilts, so a series
+    can have any length. A tilt's shift is
     fixed when it is added: there is no joint refinement over the series afterwards.
 
     Examples
@@ -580,7 +581,8 @@ class RunningMAPED:
         self._store = None if native else type(reference)
         patterns_t, images_t = summaries([reference], self.device)
         self.dp_reference, self.im_reference = patterns_t[0], images_t[0]
-        self.running = RunningMerge(self.shape, self.device, compile_merge=compile_merge)
+        # accelerator tilts keep the running sum encoded between tilts; native CPU tilts are small and stay float32
+        self.running = RunningMerge(self.shape, self.device, compile_merge=compile_merge, store=self._store)
         self.running.add(reference, (0.0, 0.0), (0.0, 0.0))
         self.diffraction_shifts = [[0.0, 0.0]]
         self.real_space_shifts = [[0.0, 0.0]]
@@ -632,7 +634,7 @@ class RunningMAPED:
         """
         if dtype not in ("float32", "scaled_uint16"):
             raise ValueError("dtype must be 'float32' or 'scaled_uint16'.")
-        regions = self.running.finish(crop)
+        regions = self.running.finish(crop, release=True)
         if self._store is None:      # native CPU tilts: a small float32 dataset, as MAPED.merge returns for them
             if dtype != "float32" or save_to is not None:
                 raise ValueError("Native CPU tilts merge to float32 in memory; save the result afterwards.")

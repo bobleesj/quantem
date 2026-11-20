@@ -1,6 +1,7 @@
 """The running merge: tilts added one at a time give the joint merge."""
 
 import numpy as np
+import pytest
 import torch
 
 from quantem.core.datastructures import Dataset4dstem
@@ -57,3 +58,32 @@ def test_each_tilt_is_placed_on_the_first_and_not_kept():
     aligned = np.mean([np.roll(tilt.array, tuple(-np.array(shift)), axis=(0, 1)) for tilt, shift in zip(tilts, DISPLACEMENTS)], axis=0)
     row0, row1, col0, col1 = running.running.scan_box
     assert np.abs(merged.array - aligned[row0:row1, col0:col1]).mean() < 0.35  # the mean of the tilts moved back
+
+
+def test_the_sum_kept_encoded_gives_the_joint_merge_within_its_stored_rounding():
+    pytest.importorskip("quantem.gpu")
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from quantem.gpu import io
+
+    cp = pytest.importorskip("cupy")
+    tilts = [io.load(cp.asarray(tilt.array), dtype="scaled_uint16", device="cuda:0", verbose=False) for tilt in tilts_of_one_sample()]
+    fractions = torch.tensor([[0.0, 0.0], [0.3, 0.1], [0.0, -0.4], [0.25, 0.0], [0.0, 0.0]])
+    scan = (-torch.tensor(DISPLACEMENTS, dtype=torch.float32) + fractions).to("cuda:0")
+    detector = torch.tensor([[0.0, 0.0], [0.2, -0.1], [-0.3, 0.0], [0.0, 0.15], [0.1, 0.1]], device="cuda:0")
+    joint = MergedRegions(tilts, scan, detector, crop=True)
+    running = RunningMerge(tilts[0].shape, "cuda:0", store=type(tilts[0]))
+    for tilt, scan_shift, detector_shift in zip(tilts, scan.tolist(), detector.tolist()):
+        running.add(tilt, scan_shift, detector_shift)
+        assert running.numerator is None and running.encoded is not None        # never a decoded copy of the sum
+    running.finish(crop=True, release=True)
+    assert running.scan_box == joint.scan_box
+    joint.rows_per_region = running.rows_per_region
+    held = running.encoded.data.nbytes
+    merged = torch.cat(list(running.blocks()))
+    expected = torch.cat(list(joint.blocks()))
+    assert float((merged - expected).abs().max()) < 0.01 * float(expected.max())     # a few 16-bit steps
+    assert running.encoded.data.nbytes < held / 2          # read once: the rows passed were freed (not the cropped end)
+    running.close()
+    for tilt in tilts:
+        tilt.close()
