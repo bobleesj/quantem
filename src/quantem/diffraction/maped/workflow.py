@@ -7,8 +7,12 @@ result on the object, and hands pictures to ``plot`` and printed lines to
 
 import json
 import re
+import subprocess
+import sys
 import time
 from collections.abc import Sequence
+from datetime import datetime, timezone
+from importlib import metadata as package_metadata
 from math import prod
 from pathlib import Path
 from typing import Self
@@ -72,6 +76,7 @@ class MAPED(AutoSerialize):
         self.tilts, self.tilt_names, self.dp_mean, self.im_bf = [], [], [], []
         self.device = self.shape = None
         self.beam_centers = self.diffraction_shifts = self.real_space_shifts = self.merged = None
+        self.steps = {}  # each alignment step's settings, as it last ran; saved with the merge
         for tilt in tilts:
             self.add(tilt)
 
@@ -110,6 +115,7 @@ class MAPED(AutoSerialize):
         label = f"{found[1]}x {found[2]}y" if found else f"Tilt {len(self.tilt_names)}"
         self.tilt_names.append(label)
         self.beam_centers = self.diffraction_shifts = self.real_space_shifts = self.merged = None
+        self.steps = {}
         return self
 
     @classmethod
@@ -283,6 +289,9 @@ class MAPED(AutoSerialize):
         else:
             given = tensor(centers, dtype=int32, device=self.device).reshape(-1, 2)
             self.beam_centers = given.repeat(len(self.tilt_names), 1) if len(given) == 1 else given
+        self.steps["find_beam_center"] = {
+            "centers": None if centers is None else self.beam_centers.tolist(), "blur": blur,
+        }
         if show:
             plot.beam_centers(self, **plot_kwargs)
         return self
@@ -313,6 +322,7 @@ class MAPED(AutoSerialize):
             that move each tilt onto the others, relative to their mean.
         """
         self.diffraction_shifts = align.diffraction_shifts(self.dp_mean, border_taper, precision)
+        self.steps["align_diffraction"] = {"border_taper": border_taper, "precision": precision}
         if show:
             plot.aligned_patterns(self, **plot_kwargs)
         return self
@@ -373,6 +383,11 @@ class MAPED(AutoSerialize):
         >>> maped.align_images()
         >>> maped.align_images(images=haadf_images)
         """
+        self.steps["align_images"] = {
+            "images": "bright field" if images is None else "supplied",
+            "iterations": iterations, "max_shift": max_shift, "edge_blur": edge_blur,
+            "hann_window": hann_window, "precision": precision,
+        }
         if images is None:
             images = self.im_bf
         else:
@@ -402,6 +417,7 @@ class MAPED(AutoSerialize):
         compile_merge: bool | None = None,
         *,
         dtype: str | torch.dtype | None = None,
+        metadata: dict | None = None,
         **plot_kwargs,
     ):
         """Merge the aligned tilts into one 4D-STEM dataset.
@@ -433,6 +449,12 @@ class MAPED(AutoSerialize):
         compile_merge : bool, optional
             Compile the fused merge on CUDA and MPS by default. False uses the
             same Torch calculation without compilation; CPU defaults to False.
+        metadata : dict, optional
+            The caller's own records (a session, a series name), saved with the merge as they are.
+            The merge always records the calibration every tilt shares (``scan_sampling_A``,
+            ``detector_sampling_mrad``, ...), and in ``metadata["maped_run"]`` each step's
+            settings, the merge settings, the tilt files and their calibration, and the
+            software versions and commits.
         dtype : str or torch.dtype, optional
             Omitted or ``"float32"`` preserves the computed values. Dense
             results are limited to 4 GiB; use ``save_to`` for larger results.
@@ -476,6 +498,12 @@ class MAPED(AutoSerialize):
             max_region_frames=2048 if save_to else None,
             crop=crop,
         )
+        shared = _record_run(
+            self, regions, crop=crop, dtype=storage_dtype, compile_merge=compile_merge,
+            release_tilts=release_tilts, scan_region=scan_region,
+        )
+        regions.save_metadata.update(shared)
+        regions.save_metadata.update(metadata or {})
         if crop and scan_region is None and verbose:
             print(report.crop(self, regions.scan_box))
         if in_memory:
@@ -503,6 +531,7 @@ class MAPED(AutoSerialize):
                 cursor += len(block_t)
             metadata = {
                 key.removeprefix("quantem_").removesuffix("_v1"): json.loads(value)
+                if _versioned_record(key) else value
                 for key, value in regions.save_metadata.items()
             }
             metadata.update(
@@ -656,3 +685,102 @@ class RunningMAPED:
             if not isinstance(self.merged, Dataset4dstem):
                 self.merged.close()
             self.merged = None
+
+
+# The calibration a merge keeps when every tilt records the same value (the names of Calibration in quantem.gpu)
+CALIBRATION = (
+    "voltage_kV", "semiangle_mrad", "scan_sampling_A", "detector_sampling_mrad",
+    "detector_sampling_inv_A", "scan_rotation_deg",
+)
+
+
+def _versioned_record(key: str) -> bool:
+    """True for a record saved as versioned JSON text (``quantem_maped_merge_v1``)."""
+    return re.fullmatch(r"quantem_\w+_v\d+", key) is not None
+
+
+def _record_run(maped: MAPED, regions, **merge_settings) -> dict:
+    """Write how this merge was made into ``regions.save_metadata``; return the calibration every tilt shares.
+
+    The record ``quantem_maped_run_v1`` holds each step's settings, the merge settings, each tilt's
+    file and calibration, the software versions and commits and the time. A calibration field goes on
+    the merge itself only when every tilt records it with the same value.
+    """
+    tilts = []
+    for name, tilt in zip(maped.tilt_names, maped.tilts):
+        source = tilt.metadata.get("source_path")
+        record = {"name": name, "source_path": None if source is None else str(source)}
+        record.update({field: _plain(tilt.metadata.get(field)) for field in CALIBRATION})
+        tilts.append(record)
+    shared = {}
+    for field in CALIBRATION:
+        values = [tilt[field] for tilt in tilts]
+        if values[0] is not None and all(
+            value is not None and np.allclose(value, values[0], rtol=1e-9, atol=0) for value in values
+        ):
+            shared[field] = values[0]
+    run = {
+        "version": 1,
+        "merged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "steps": maped.steps,
+        "merge": {key: _plain(value) for key, value in merge_settings.items()},
+        "tilts": tilts,
+        "software": _software(maped.device),
+    }
+    regions.save_metadata["quantem_maped_run_v1"] = json.dumps(run)
+    return shared
+
+
+def _plain(value):
+    """A metadata value as JSON can hold it: arrays and tuples as lists, numpy numbers as Python numbers."""
+    if isinstance(value, (np.ndarray, torch.Tensor)):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (dict, str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _software(device: torch.device) -> dict:
+    """The versions of the packages that made a merge, each with its git commit when run from a checkout."""
+    found = {"python": ".".join(map(str, sys.version_info[:3])), "device": str(device)}
+    if device.type == "cuda":
+        found["device_name"] = torch.cuda.get_device_name(device)
+    elif device.type == "mps":
+        found["device_name"] = "Apple GPU (MPS)"
+    for package, module in (("torch", "torch"), ("quantem", "quantem"), ("quantem.gpu", "quantem.gpu")):
+        try:
+            version = package_metadata.version(package)
+        except package_metadata.PackageNotFoundError:
+            version = None
+        entry = {"version": version}
+        try:
+            folder = Path(__import__(module, fromlist=["__file__"]).__file__).parent
+        except ImportError:
+            continue
+        entry.update(_git(folder))
+        found[package] = entry
+    return found
+
+
+def _git(folder: Path) -> dict:
+    """The commit, branch and uncommitted-change flag of the checkout holding ``folder``; empty outside one."""
+
+    def run(*arguments: str) -> str | None:
+        """One git command's output in ``folder``, or None when git or the checkout is missing."""
+        try:
+            done = subprocess.run(
+                ["git", "-c", "safe.directory=*", "-C", str(folder), *arguments], capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    commit = run("rev-parse", "HEAD")
+    if commit is None:
+        return {}
+    status = run("status", "--short", "--untracked-files=no")
+    return {"commit": commit, "branch": run("branch", "--show-current") or None, "dirty": bool(status)}

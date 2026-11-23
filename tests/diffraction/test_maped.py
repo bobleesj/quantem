@@ -130,6 +130,35 @@ def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
         assert equal(reopened.read(), reference_t)
 
 
+def test_saved_merge_keeps_calibration_and_how_it_was_made(tmp_path):
+    """The saved merge reopens with the tilts' calibration, every step's settings, the software and the caller's record."""
+    tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
+    for tilt in tilts:
+        tilt.calibration.voltage_kV = 300
+        tilt.calibration.semiangle_mrad = 20
+        tilt.calibration.scan_sampling_A = (0.5, 0.5)
+    tilts[1].calibration.detector_sampling_mrad = (0.8, 0.8)  # one tilt only: not the merge's
+    maped = MAPED(tilts)
+    maped.run(iterations=30, show=False, verbose=False, crop=False)
+    path = tmp_path / "merged_master.h5"
+    maped.merge(save_to=path, crop=True, show=False, verbose=False, metadata={"session": {"series": "s1"}})
+    with io.load(path, device=maped.device, verbose=False) as merged:
+        assert merged.calibration.voltage_kV == 300
+        assert merged.calibration.semiangle_mrad == 20
+        assert merged.calibration.scan_sampling_A == pytest.approx((0.5, 0.5))
+        assert merged.calibration.detector_sampling_mrad is None
+        assert merged.metadata["session"] == {"series": "s1"}
+        run = merged.metadata["maped_run"]
+    assert run["steps"]["align_images"]["iterations"] == 30
+    assert run["steps"]["align_diffraction"] == {"border_taper": 2, "precision": 0.01}
+    assert run["steps"]["find_beam_center"] == {"centers": None, "blur": 1}
+    assert run["merge"]["crop"] is True and run["merge"]["dtype"] == "float32"
+    assert all(tilt["source_path"].endswith(f"tilt_{index}_master.h5") for index, tilt in enumerate(run["tilts"]))
+    assert run["tilts"][1]["detector_sampling_mrad"] == [0.8, 0.8]
+    assert run["software"]["quantem"]["version"]
+    assert run["software"]["device"] == str(maped.device)
+
+
 def test_summaries_are_the_plain_means(tmp_path):
     """Mean diffraction pattern and bright-field image equal the means of the decoded tilt."""
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
