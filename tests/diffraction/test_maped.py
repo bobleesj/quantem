@@ -135,16 +135,17 @@ def test_saved_merge_keeps_calibration_and_how_it_was_made(tmp_path):
     tilts = _load_tilts(tmp_path, scan_shape=(32, 32), detector_shape=(16, 16))
     for tilt in tilts:
         tilt.calibration.voltage_kV = 300
-        tilt.calibration.semiangle_mrad = 20
         tilt.calibration.scan_sampling_A = (0.5, 0.5)
     tilts[1].calibration.detector_sampling_mrad = (0.8, 0.8)  # one tilt only: not the merge's
+    for tilt, semiangle in zip(tilts, (20, 20.2, 19.8)):     # fitted per tilt: the merge keeps the mean
+        tilt.calibration.semiangle_mrad = semiangle
     maped = MAPED(tilts)
     maped.run(iterations=30, show=False, verbose=False, crop=False)
     path = tmp_path / "merged_master.h5"
     maped.merge(save_to=path, crop=True, show=False, verbose=False, metadata={"session": {"series": "s1"}})
     with io.load(path, device=maped.device, verbose=False) as merged:
         assert merged.calibration.voltage_kV == 300
-        assert merged.calibration.semiangle_mrad == 20
+        assert merged.calibration.semiangle_mrad == pytest.approx(20)
         assert merged.calibration.scan_sampling_A == pytest.approx((0.5, 0.5))
         assert merged.calibration.detector_sampling_mrad is None
         assert merged.metadata["session"] == {"series": "s1"}
@@ -155,6 +156,7 @@ def test_saved_merge_keeps_calibration_and_how_it_was_made(tmp_path):
     assert run["merge"]["crop"] is True and run["merge"]["dtype"] == "float32"
     assert all(tilt["source_path"].endswith(f"tilt_{index}_master.h5") for index, tilt in enumerate(run["tilts"]))
     assert run["tilts"][1]["detector_sampling_mrad"] == [0.8, 0.8]
+    assert run["calibration_mean_of_tilts"] == {"semiangle_mrad": {"min": 19.8, "max": 20.2}}
     assert run["software"]["quantem"]["version"]
     assert run["software"]["device"] == str(maped.device)
 

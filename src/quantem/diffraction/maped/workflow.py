@@ -692,6 +692,9 @@ CALIBRATION = (
     "voltage_kV", "semiangle_mrad", "scan_sampling_A", "detector_sampling_mrad",
     "detector_sampling_inv_A", "scan_rotation_deg",
 )
+# The largest relative difference from the tilts' mean at which the merge keeps that mean (the detector
+# step fitted on each tilt's bright-field disk differed by 2.6 % across seven tilts on 2026-11-18)
+CALIBRATION_SPREAD = 0.05
 
 
 def _versioned_record(key: str) -> bool:
@@ -704,7 +707,8 @@ def _record_run(maped: MAPED, regions, **merge_settings) -> dict:
 
     The record ``quantem_maped_run_v1`` holds each step's settings, the merge settings, each tilt's
     file and calibration, the software versions and commits and the time. A calibration field goes on
-    the merge itself only when every tilt records it with the same value.
+    the merge when every tilt records it: their value when they agree, their mean when they differ by at
+    most ``CALIBRATION_SPREAD`` (named, with the range, in ``calibration_mean_of_tilts``), else not at all.
     """
     tilts = []
     for name, tilt in zip(maped.tilt_names, maped.tilts):
@@ -712,19 +716,26 @@ def _record_run(maped: MAPED, regions, **merge_settings) -> dict:
         record = {"name": name, "source_path": None if source is None else str(source)}
         record.update({field: _plain(tilt.metadata.get(field)) for field in CALIBRATION})
         tilts.append(record)
-    shared = {}
+    shared, averaged = {}, {}
     for field in CALIBRATION:
         values = [tilt[field] for tilt in tilts]
-        if values[0] is not None and all(
-            value is not None and np.allclose(value, values[0], rtol=1e-9, atol=0) for value in values
-        ):
+        if any(value is None for value in values):
+            continue
+        stacked = np.asarray(values, dtype=float)
+        if np.allclose(stacked, stacked[0], rtol=1e-9, atol=0):
             shared[field] = values[0]
+        elif np.all(np.abs(stacked - stacked.mean(axis=0)) <= CALIBRATION_SPREAD * np.abs(stacked.mean(axis=0))):
+            # a value fitted on each tilt (the detector step from its bright-field disk): the merge averages
+            # the tilts' patterns, so it keeps their mean, and the record says so
+            shared[field] = _plain(stacked.mean(axis=0))
+            averaged[field] = {"min": _plain(stacked.min(axis=0)), "max": _plain(stacked.max(axis=0))}
     run = {
         "version": 1,
         "merged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "steps": maped.steps,
         "merge": {key: _plain(value) for key, value in merge_settings.items()},
         "tilts": tilts,
+        "calibration_mean_of_tilts": averaged,
         "software": _software(maped.device),
     }
     regions.save_metadata["quantem_maped_run_v1"] = json.dumps(run)
