@@ -65,11 +65,90 @@ def _grid_sample_ncc(
     t0 = t - (t * mask).sum(dim=-1, keepdim=True) / count
     num = (mask * w0 * t0).sum(dim=-1)
     den = (
-        (mask * w0.square()).sum(dim=-1).sqrt()
-        * (mask * t0.square()).sum(dim=-1).sqrt()
-    ).clamp_min(1e-12)
+        (mask * w0.square()).sum(dim=-1).clamp_min(1e-12).sqrt()
+        * (mask * t0.square()).sum(dim=-1).clamp_min(1e-12).sqrt()
+    )
     ncc = (num / den).mean()
     return 1.0 - ncc
+
+
+def _grid_sample_local_ncc(
+    grid_row: torch.Tensor,
+    grid_col: torch.Tensor,
+    ref_t: torch.Tensor,
+    target_batch: torch.Tensor,
+    ref_coverage_t: torch.Tensor,
+    tile_grid: int = 4,
+) -> torch.Tensor:
+    """Warp ``ref_t`` and return hybrid ``0.45 * global + 0.55 * tile`` masked ``1 - NCC``.
+
+    Normalizes mean and variance independently inside each valid ``tile_grid × tile_grid``
+    region (excluding low-coverage or flat/vacuum tiles via NaN-safe variance guards),
+    preventing bright macro blobs from starving darker crystal areas and giving all four
+    edges equal optimization weight on MPS and CUDA.
+    """
+    grid = torch.stack([grid_col, grid_row], dim=-1)
+    warped = F.grid_sample(
+        ref_t, grid, mode='bilinear', align_corners=True, padding_mode='border')[:, 0]
+    coverage = F.grid_sample(
+        ref_coverage_t[:, None],
+        grid,
+        mode='bilinear',
+        align_corners=True,
+        padding_mode='zeros',
+    )[:, 0].detach().clamp(0.0, 1.0)
+    N, H, W = warped.shape
+    w = warped.reshape(N, -1)
+    t = target_batch.reshape(N, -1)
+    mask = coverage.reshape(N, -1)
+    count = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    w0 = w - (w * mask).sum(dim=-1, keepdim=True) / count
+    t0 = t - (t * mask).sum(dim=-1, keepdim=True) / count
+    num = (mask * w0 * t0).sum(dim=-1)
+    global_w_var = (mask * w0.square()).sum(dim=-1)
+    global_t_var = (mask * t0.square()).sum(dim=-1)
+    den = global_w_var.clamp_min(1e-12).sqrt() * global_t_var.clamp_min(1e-12).sqrt()
+    loss_global = 1.0 - (num / den).mean()
+
+    if tile_grid <= 1 or H < tile_grid * 16 or W < tile_grid * 16:
+        return loss_global
+
+    th = H // tile_grid
+    tw = W // tile_grid
+    Hu = th * tile_grid
+    Wu = tw * tile_grid
+    T = tile_grid * tile_grid
+    wt = warped[:, :Hu, :Wu].reshape(N, tile_grid, th, tile_grid, tw).permute(0, 1, 3, 2, 4).reshape(N, T, th * tw)
+    tt = target_batch[:, :Hu, :Wu].reshape(N, tile_grid, th, tile_grid, tw).permute(0, 1, 3, 2, 4).reshape(N, T, th * tw)
+    mt = coverage[:, :Hu, :Wu].reshape(N, tile_grid, th, tile_grid, tw).permute(0, 1, 3, 2, 4).reshape(N, T, th * tw)
+
+    t_cnt = mt.sum(dim=-1, keepdim=True)
+    t_cnt_safe = t_cnt.clamp_min(1.0)
+    wt0 = wt - (wt * mt).sum(dim=-1, keepdim=True) / t_cnt_safe
+    tt0 = tt - (tt * mt).sum(dim=-1, keepdim=True) / t_cnt_safe
+    wt_var = (mt * wt0.square()).sum(dim=-1)
+    tt_var = (mt * tt0.square()).sum(dim=-1)
+    # Scale-invariant tile variance guard (works across 1e-6 weak-phase to 1e+3 HAADF while rejecting flat vacuum)
+    w_var_floor = (1e-4 * global_w_var[:, None] / T).clamp_min(1e-24)
+    t_var_floor = (1e-4 * global_t_var[:, None] / T).clamp_min(1e-24)
+    valid = (
+        (t_cnt[:, :, 0] >= 0.20 * (th * tw))
+        & (wt_var > w_var_floor)
+        & (tt_var > t_var_floor)
+    ).to(warped.dtype)
+    t_num = (mt * wt0 * tt0).sum(dim=-1)
+    t_den = wt_var.clamp_min(1e-24).sqrt() * tt_var.clamp_min(1e-24).sqrt()
+    t_ncc = (t_num / t_den) * valid
+    # Average valid tiles per image first, then across images (consistent with loss_global)
+    valid_per_img = valid.sum(dim=-1)
+    img_has_tiles = valid_per_img >= 1.0
+    per_img_tile_loss = torch.where(
+        img_has_tiles,
+        1.0 - t_ncc.sum(dim=-1) / valid_per_img.clamp_min(1.0),
+        1.0 - (num / den),
+    )
+    loss_tiles = per_img_tile_loss.mean()
+    return 0.45 * loss_global + 0.55 * loss_tiles
 
 
 @torch.compile(mode="reduce-overhead", dynamic=False)
@@ -161,6 +240,49 @@ def _compiled_loss_fn_multi_ncc(
     )
 
 
+@torch.compile(mode="default")
+def _compiled_loss_fn_single_local_ncc(
+    knots_batch: torch.Tensor,
+    ref_t: torch.Tensor,
+    target_batch: torch.Tensor,
+    ref_coverage_t: torch.Tensor,
+    row_scan_offsets: torch.Tensor,
+    col_scan_offsets: torch.Tensor,
+    row_scale: float,
+    col_scale: float,
+    tile_grid: int,
+) -> torch.Tensor:
+    """K=1 path with hybrid global + tile-local ``1 - NCC`` loss."""
+    grid_row = (knots_batch[:, 0, :, :] + row_scan_offsets[:, None, :]) * row_scale - 1.0
+    grid_col = (knots_batch[:, 1, :, :] + col_scan_offsets[:, None, :]) * col_scale - 1.0
+    return _grid_sample_local_ncc(
+        grid_row, grid_col, ref_t, target_batch, ref_coverage_t, tile_grid=tile_grid
+    )
+
+
+@torch.compile(mode="default")
+def _compiled_loss_fn_multi_local_ncc(
+    knots_batch: torch.Tensor,
+    ref_t: torch.Tensor,
+    target_batch: torch.Tensor,
+    ref_coverage_t: torch.Tensor,
+    seg_idx: torch.Tensor,
+    seg_frac: torch.Tensor,
+    row_scale: float,
+    col_scale: float,
+    tile_grid: int,
+) -> torch.Tensor:
+    """K>=2 path with hybrid global + tile-local ``1 - NCC`` loss."""
+    knot_lo = knots_batch[:, :, :, seg_idx]
+    knot_hi = knots_batch[:, :, :, seg_idx + 1]
+    interp = knot_lo + (knot_hi - knot_lo) * seg_frac[None, None, None, :]
+    grid_row = interp[:, 0] * row_scale - 1.0
+    grid_col = interp[:, 1] * col_scale - 1.0
+    return _grid_sample_local_ncc(
+        grid_row, grid_col, ref_t, target_batch, ref_coverage_t, tile_grid=tile_grid
+    )
+
+
 def _optimize_knots_adam(
     ref_batch, target_batch, knots_batch,
     loss_fn, loss_args,
@@ -232,6 +354,67 @@ def sobel_gradient_magnitude(
     return (grad_mag - mean) / std
 
 
+def _project_nonfolding_slope(
+    knots_batch: torch.Tensor,
+    init_batch: torch.Tensor,
+    max_slope: float,
+) -> None:
+    """Project knot displacements so slow- and fast-axis slopes stay non-folding.
+
+    Bounds the L2 slow-scan step ``||Δdisp/Δrow||_2 <= max_slope`` (guaranteeing
+    ``det(J) >= 1 - max_slope`` for arbitrary scan rotation angles) and, when
+    ``K > 1``, also bounds fast-axis knot spacing changes relative to ``init_batch``.
+    Preserves each scanline's mean displacement via vectorized center-outward cumsum.
+    """
+    if max_slope <= 0.0:
+        raise ValueError(f"max_slope must be positive, got {max_slope!r}")
+    H = int(knots_batch.shape[2])
+    K = int(knots_batch.shape[3])
+    if H <= 1:
+        return
+    with torch.no_grad():
+        disp = knots_batch - init_batch
+        dd = disp[:, :, 1:, :] - disp[:, :, :-1, :]  # (N, 2, H-1, K)
+        dd_norm = torch.norm(dd, dim=1, keepdim=True)
+        if float(dd_norm.max()) > max_slope:
+            dd_clamped = dd * torch.clamp(max_slope / dd_norm.clamp_min(1e-8), max=1.0)
+            mid = H // 2
+            out = disp.clone()
+            out[:, :, mid + 1 :, :] = disp[:, :, mid : mid + 1, :] + torch.cumsum(
+                dd_clamped[:, :, mid:, :], dim=2
+            )
+            out[:, :, :mid, :] = disp[:, :, mid : mid + 1, :] - torch.flip(
+                torch.cumsum(torch.flip(dd_clamped[:, :, :mid, :], dims=[2]), dim=2),
+                dims=[2],
+            )
+            out = out + (disp.mean(dim=2, keepdim=True) - out.mean(dim=2, keepdim=True))
+            disp = out
+
+        # When K > 1, also bound fast-axis inter-knot compression/folding along dim=3
+        if K > 1:
+            fast_ref = torch.norm(
+                init_batch[:, :, :, 1:] - init_batch[:, :, :, :-1], dim=1, keepdim=True
+            ).clamp_min(1.0)
+            fast_cap = max_slope * fast_ref
+            df = disp[:, :, :, 1:] - disp[:, :, :, :-1]
+            df_norm = torch.norm(df, dim=1, keepdim=True)
+            if float(df_norm.max()) > float(fast_cap.min()):
+                df_clamped = df * torch.clamp(fast_cap / df_norm.clamp_min(1e-8), max=1.0)
+                mid_k = K // 2
+                out_f = disp.clone()
+                out_f[:, :, :, mid_k + 1 :] = disp[:, :, :, mid_k : mid_k + 1] + torch.cumsum(
+                    df_clamped[:, :, :, mid_k:], dim=3
+                )
+                out_f[:, :, :, :mid_k] = disp[:, :, :, mid_k : mid_k + 1] - torch.flip(
+                    torch.cumsum(torch.flip(df_clamped[:, :, :, :mid_k], dims=[3]), dim=3),
+                    dims=[3],
+                )
+                out_f = out_f + (disp.mean(dim=3, keepdim=True) - out_f.mean(dim=3, keepdim=True))
+                disp = out_f
+
+        knots_batch.copy_(init_batch + disp)
+
+
 def _regularize_knots(
     knots_batch: torch.Tensor,
     knots_prev: torch.Tensor,
@@ -239,6 +422,9 @@ def _regularize_knots(
     max_shift_px: float | None,
     sigma_px: float | None,
     step_size: float | None,
+    row_cov: torch.Tensor | None = None,
+    init_batch: torch.Tensor | None = None,
+    max_slope: float | None = None,
 ) -> None:
     """Apply per-iteration knot regularization (in place on ``knots_batch``).
 
@@ -246,10 +432,12 @@ def _regularize_knots(
         1. Per-knot shift cap: clamp ``|new - prev|`` to ``max_shift_px``
            so the optimizer can't move any knot too far in one outer iter.
         2. Polynomial detrend + Gaussian smooth: keep low-order trends,
-           smooth the residual along the scan-line dimension. Removes
-           high-frequency optimizer wobble while preserving the drift signal.
+           smooth the residual along the scan-line dimension. When ``row_cov``
+           is supplied, uses coverage-weighted polynomial detrending so
+           un-overlapped border rows smoothly extrapolate the interior trend
+           instead of hooking backwards.
         3. Step-size blend: ``new = prev + step_size · (new - prev)``,
-           under-relaxes the update for stability across outer iterations.
+           optionally followed by non-folding slow-axis slope projection.
     """
     # Knots are 4D ``(N, 2, R, K)`` everywhere — K=1 just has trailing 1.
     num_images, _, num_rows_knot, K = knots_batch.shape
@@ -260,33 +448,54 @@ def _regularize_knots(
             scale_factor = torch.clamp(max_shift_px / dist.clamp(min=1e-8), max=1.0)
             knots_batch.copy_(knots_prev + shift * scale_factor)
         if sigma_px is not None and sigma_px > 0 and vander is not None:
-            # Smooth/detrend along the row axis.  Treat each (axis, intra-row
-            # knot) slot as an independent series along rows by moving the row
-            # dim last and flattening the leading channels.
-            knots_flat = knots_batch.permute(0, 1, 3, 2).reshape(-1, num_rows_knot).T
-            if vander.device.type == "mps":
-                # MPS does not implement lstsq. The normalized polynomial basis
-                # has at most four columns, so its full-rank system is small.
-                if vander.shape[0] < vander.shape[1]:
-                    coefficients = torch.linalg.lstsq(
-                        vander.cpu(), knots_flat.cpu()
-                    ).solution.to(vander.device)
-                else:
-                    normal_matrix = vander.T @ vander
-                    coefficients = torch.linalg.solve(
-                        normal_matrix, vander.T @ knots_flat
+            if row_cov is not None:
+                eye = 1e-6 * torch.eye(
+                    vander.shape[1], device=vander.device, dtype=vander.dtype
+                )
+                # Detrend displacement relative to init_batch so even trend_order=0 preserves the scan ramp
+                base_batch = init_batch if init_batch is not None else torch.zeros_like(knots_batch)
+                for img_i in range(num_images):
+                    rw = row_cov[img_i].clamp(min=0.02)
+                    vw = vander * rw[:, None]
+                    disp_i = knots_batch[img_i] - base_batch[img_i]
+                    kf = disp_i.permute(0, 2, 1).reshape(-1, num_rows_knot).T
+                    coef = torch.linalg.solve(vw.T @ vander + eye, vw.T @ kf)
+                    trend = (vander @ coef).T
+                    res = (kf.T - trend) * (row_cov[img_i] / 0.20).clamp(0.0, 1.0)[None, :]
+                    sm = drift_knots.gaussian_smooth_1d(res, sigma_px)
+                    knots_batch[img_i].copy_(
+                        base_batch[img_i] + (sm + trend).reshape(2, K, num_rows_knot).permute(0, 2, 1)
                     )
             else:
-                coefficients = torch.linalg.lstsq(vander, knots_flat).solution
-            trend = (vander @ coefficients).T
-            residual = knots_flat.T - trend
-            smoothed = drift_knots.gaussian_smooth_1d(residual, sigma_px)
-            knots_batch.copy_(
-                (smoothed + trend)
-                .reshape(num_images, 2, K, num_rows_knot)
-                .permute(0, 1, 3, 2))
+                # Smooth/detrend along the row axis.  Treat each (axis, intra-row
+                # knot) slot as an independent series along rows by moving the row
+                # dim last and flattening the leading channels.
+                knots_flat = knots_batch.permute(0, 1, 3, 2).reshape(-1, num_rows_knot).T
+                if vander.device.type == "mps":
+                    # MPS does not implement lstsq. The normalized polynomial basis
+                    # has at most four columns, so its full-rank system is small.
+                    if vander.shape[0] < vander.shape[1]:
+                        coefficients = torch.linalg.lstsq(
+                            vander.cpu(), knots_flat.cpu()
+                        ).solution.to(vander.device)
+                    else:
+                        normal_matrix = vander.T @ vander
+                        coefficients = torch.linalg.solve(
+                            normal_matrix, vander.T @ knots_flat
+                        )
+                else:
+                    coefficients = torch.linalg.lstsq(vander, knots_flat).solution
+                trend = (vander @ coefficients).T
+                residual = knots_flat.T - trend
+                smoothed = drift_knots.gaussian_smooth_1d(residual, sigma_px)
+                knots_batch.copy_(
+                    (smoothed + trend)
+                    .reshape(num_images, 2, K, num_rows_knot)
+                    .permute(0, 1, 3, 2))
         if step_size is not None:
             knots_batch.copy_(knots_prev + (knots_batch - knots_prev) * step_size)
+        if max_slope is not None and init_batch is not None:
+            _project_nonfolding_slope(knots_batch, init_batch, max_slope)
 
 
 def setup_loss_kernel(
@@ -294,6 +503,7 @@ def setup_loss_kernel(
     K: int,
     canvas_shape: tuple[int, int],
     loss: str = "mse",
+    tile_grid: int = 4,
 ):
     """Pick the K-aware compiled loss kernel and precompute its constants.
 
@@ -307,13 +517,15 @@ def setup_loss_kernel(
     sees them as static.
 
     ``loss`` selects the scalar: ``"mse"`` / ``"gradient_mse"`` use MSE
-    kernels; ``"ncc"`` uses ``1 - mean NCC`` (brightness-invariant).
+    kernels; ``"ncc"`` uses ``1 - mean NCC``; ``"local_ncc"`` uses hybrid
+    global + ``tile_grid × tile_grid`` tile-local NCC.
     """
     device, dtype = self._device, self._dtype
     num_images = self.shape[0]
     row_scale = 2.0 / (canvas_shape[0] - 1)
     col_scale = 2.0 / (canvas_shape[1] - 1)
     use_ncc = loss == "ncc"
+    use_local_ncc = loss == "local_ncc"
     if K > 1:
         # Identical to _transform_coordinates_multi_knot's geometry so
         # apply_correction downstream inverts it cleanly.
@@ -321,6 +533,8 @@ def setup_loss_kernel(
         t = torch.linspace(0, 1, num_cols, dtype=dtype, device=device) * (K - 1)
         seg_idx = torch.clamp(t.long(), max=K - 2)
         seg_frac = t - seg_idx.to(dtype)
+        if use_local_ncc:
+            return (_compiled_loss_fn_multi_local_ncc, (seg_idx, seg_frac, row_scale, col_scale, int(tile_grid)))
         fn = (
             _compiled_loss_fn_multi_ncc
             if use_ncc
@@ -344,6 +558,11 @@ def setup_loss_kernel(
             for i in range(num_images)
         ]
     )
+    if use_local_ncc:
+        return (
+            _compiled_loss_fn_single_local_ncc,
+            (row_scan_offsets, col_scan_offsets, row_scale, col_scale, int(tile_grid)),
+        )
     fn = (
         _compiled_loss_fn_single_ncc
         if use_ncc
@@ -373,6 +592,10 @@ def correct_nonrigid(
     early_stop_patience: int = 3,
     early_stop_rtol: float = 1e-4,
     min_iterations: int = 4,
+    tile_grid: int = 4,
+    coverage_weighted: bool = False,
+    max_slope: float | None = None,
+    solve_translation: bool | None = None,
     show_combined: bool = True,
     show_scans: bool = False,
     show_knots: bool = True,
@@ -520,9 +743,10 @@ def correct_nonrigid(
         drift_knots.resize_scanline_knots(self, num_knots)
     if loss == "auto":
         loss = "ncc"
-    valid_losses = ("mse", "gradient_mse", "ncc")
+    valid_losses = ("mse", "gradient_mse", "ncc", "local_ncc")
     if loss not in valid_losses:
         raise ValueError(f"loss must be one of {valid_losses!r} or 'auto', got {loss!r}")
+    uses_cov_loss = loss in ("ncc", "local_ncc")
     if optimizer == "lbfgs" and self._normalized:
         import warnings
 
@@ -556,11 +780,17 @@ def correct_nonrigid(
     knots_batch = (
         torch.stack([self.knots[i] for i in range(num_images)]).detach().requires_grad_(True)
     )
+    init_knots_attr = getattr(self, "_initial_knots", None)
+    init_batch = (
+        torch.stack([init_knots_attr[i] for i in range(num_images)]).detach()
+        if init_knots_attr is not None and (max_slope is not None or coverage_weighted)
+        else None
+    )
     num_rows_knot = knots_batch.shape[2]
     # a reloaded (AutoSerialize) object leaves imgs_t on CPU; alignment
     # tensors must live on the solve device or Sobel/warp kernels mismatch
     target_batch = torch.stack(self.imgs_t).to(self._device)
-    loss_fn, loss_args = setup_loss_kernel(self, K, canvas_shape, loss=loss)
+    loss_fn, loss_args = setup_loss_kernel(self, K, canvas_shape, loss=loss, tile_grid=tile_grid)
     optimizer_steps = (
         optimizer_steps if optimizer_steps is not None else (30 if optimizer == "adam" else 20)
     )
@@ -607,8 +837,9 @@ def correct_nonrigid(
     # Affine (and an optional preceding strip stage) already establishes
     # the absolute frame in reference mode. Re-solving a global shift here
     # can hop by one lattice period after an otherwise good correction.
-    # Mutual multi-scan mode still solves translation every outer step.
-    solve_global_translation = not self._reference_mode
+    # Mutual multi-scan mode still solves translation every outer step unless disabled.
+    solve_global_translation = (not self._reference_mode) if solve_translation is None else bool(solve_translation)
+    need_weights = uses_cov_loss or coverage_weighted
     warp_result = warp_and_translate(
         self,
         max_image_shift,
@@ -617,21 +848,22 @@ def correct_nonrigid(
         solve_translation=solve_global_translation,
         fixed_indices=fixed_set,
         imgs_t_override=imgs_t_override,
-        return_weights=loss == "ncc",
+        return_weights=need_weights,
         lowpass=lowpass,
         ramp=cost_taper,
     )
-    if loss == "ncc":
+    if need_weights:
         warped_t, coverage_weights_t = warp_result
     else:
         warped_t = warp_result
         coverage_weights_t = None
     # Build a boolean mask on device to zero fixed gradients efficiently.
     # knots_batch is always 4D ``(N, 2, R, K)``; broadcast over (2, R, K).
+    fixed_grad_mask = None
     if fixed_set:
-        grad_mask = torch.ones(num_images, 1, 1, 1, dtype=dtype, device=device)
+        fixed_grad_mask = torch.ones(num_images, 1, 1, 1, dtype=dtype, device=device)
         for idx in fixed_set:
-            grad_mask[idx] = 0.0
+            fixed_grad_mask[idx] = 0.0
     error_buffer = []
     best_error = float("inf")
     patience_counter = 0
@@ -647,13 +879,16 @@ def correct_nonrigid(
         with torch.no_grad():
             if fixed_set:
                 # Fixed images define the reference for all moving images.
+                # .contiguous() avoids stride-0 expand recompiles in torch.compile.
                 fixed_mean = warped_t[sorted(fixed_set)].mean(0)
-                ref_batch = fixed_mean[None].expand(num_images, -1, -1)
+                ref_batch = fixed_mean[None].expand(num_images, -1, -1).contiguous()
             else:
                 warped_sum = warped_t.sum(0)
                 ref_batch = (warped_sum[None] - warped_t) / (num_images - 1)
             knots_prev = knots_batch.detach().clone()
-            if loss == "ncc":
+            ref_coverage_batch = None
+            row_cov = None
+            if need_weights:
                 # ``bilinear_kde_batch`` considers weights >= 1e-3 covered.
                 # Reuse that exact ramp so the optimizer and renderer agree
                 # about which reference pixels are measured rather than fill.
@@ -662,7 +897,7 @@ def correct_nonrigid(
                     fixed_coverage = coverage_batch[sorted(fixed_set)].amin(0)
                     ref_coverage_batch = fixed_coverage[None].expand(
                         num_images, -1, -1
-                    )
+                    ).contiguous()
                 else:
                     ref_coverage_batch = torch.stack(
                         [
@@ -672,9 +907,27 @@ def correct_nonrigid(
                             for i in range(num_images)
                         ]
                     )
-                cycle_loss_args = (ref_coverage_batch, *loss_args)
-            else:
-                cycle_loss_args = loss_args
+            cycle_loss_args = (ref_coverage_batch, *loss_args) if uses_cov_loss else loss_args
+            cycle_grad_mask = fixed_grad_mask
+            if coverage_weighted and ref_coverage_batch is not None:
+                if K == 1:
+                    r_off, c_off, r_sc, c_sc = loss_args[:4]
+                    gr0 = (knots_batch[:, 0, :, :] + r_off[:, None, :]) * r_sc - 1.0
+                    gc0 = (knots_batch[:, 1, :, :] + c_off[:, None, :]) * c_sc - 1.0
+                else:
+                    s_idx, s_frac, r_sc, c_sc = loss_args[:4]
+                    lo = knots_batch[:, :, :, s_idx]
+                    hi = knots_batch[:, :, :, s_idx + 1]
+                    ip = lo + (hi - lo) * s_frac[None, None, None, :]
+                    gr0 = ip[:, 0] * r_sc - 1.0
+                    gc0 = ip[:, 1] * c_sc - 1.0
+                g0 = torch.stack([gc0, gr0], dim=-1)
+                row_cov = F.grid_sample(
+                    ref_coverage_batch[:, None], g0,
+                    mode='bilinear', align_corners=True, padding_mode='zeros',
+                )[:, 0].mean(dim=-1)
+                rw_mask = (row_cov / 0.25).clamp(0.0, 1.0)[:, None, :, None]
+                cycle_grad_mask = rw_mask if fixed_grad_mask is None else (rw_mask * fixed_grad_mask)
         # Regularization alters the loss surface between outer iters, so
         # stale momentum / curvature history would push knots the wrong way.
         torch_optimizer.state.clear()
@@ -687,7 +940,7 @@ def correct_nonrigid(
                 cycle_loss_args,
                 torch_optimizer,
                 optimizer_steps,
-                grad_mask=grad_mask if fixed_set else None,
+                grad_mask=cycle_grad_mask,
             )
         else:
             _optimize_knots_lbfgs(
@@ -697,7 +950,7 @@ def correct_nonrigid(
                 loss_fn,
                 cycle_loss_args,
                 torch_optimizer,
-                grad_mask=grad_mask if fixed_set else None,
+                grad_mask=cycle_grad_mask,
             )
         _regularize_knots(
             knots_batch,
@@ -706,6 +959,9 @@ def correct_nonrigid(
             max_knot_step,
             knot_smoothing_sigma,
             update_fraction,
+            row_cov=row_cov,
+            init_batch=init_batch,
+            max_slope=max_slope,
         )
         # Restore fixed knots - regularization is a global smooth that
         # would subtly shift them via polynomial detrend + Gaussian blur.
@@ -721,11 +977,11 @@ def correct_nonrigid(
             solve_translation=solve_global_translation,
             fixed_indices=fixed_set,
             imgs_t_override=imgs_t_override,
-            return_weights=loss == "ncc",
+            return_weights=need_weights,
             lowpass=lowpass,
             ramp=cost_taper,
         )
-        if loss == "ncc":
+        if need_weights:
             warped_t, coverage_weights_t = warp_result
         else:
             warped_t = warp_result

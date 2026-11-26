@@ -199,3 +199,72 @@ def test_nonrigid_diagnostic_defines_fast_roughness():
     doc = DriftCorrection.diagnose_nonrigid.__doc__ or ""
     assert "root-mean-square difference between neighboring knot" in doc
     assert "does not measure image noise" in doc
+
+
+def test_nonrigid_local_ncc_coverage_weighted_and_max_slope_nan_safe():
+    """Tile-local NCC + coverage-weighted non-folding regularization stays finite on flat vacuum."""
+    from scipy.ndimage import map_coordinates
+
+    size = 96
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    base = (
+        np.sin(2.0 * np.pi * yy / 8.0) * np.sin(2.0 * np.pi * xx / 8.0)
+        + 1.2 * np.exp(-((yy - 36.0) ** 2 + (xx - 52.0) ** 2) / 140.0)
+        + 0.9 * np.exp(-((yy - 68.0) ** 2 + (xx - 34.0) ** 2) / 110.0)
+    ).astype(np.float32)
+    # Flat zero-variance vacuum strip exercises NaN-safe variance guards in _grid_sample_local_ncc
+    base[:, :16] = 0.0
+
+    t = np.linspace(-1.0, 1.0, size, dtype=np.float32)
+    dy0 = 3.5 * t + 1.2 * (t**2 - 1.0 / 3.0)
+    dx0 = -2.5 * t
+    dy1 = 1.5 * t - 0.8 * (t**2 - 1.0 / 3.0)
+    dx1 = 1.8 * t
+
+    im0 = map_coordinates(base, [yy + dy0[:, None], xx + dx0[:, None]], order=3, mode="nearest").astype(np.float32)
+    im1_canvas = map_coordinates(base, [yy + dy1[None, :], xx + dx1[None, :]], order=3, mode="nearest").astype(np.float32)
+    im1 = np.ascontiguousarray(np.rot90(im1_canvas, 1))
+
+    drift = DriftCorrection.from_images(im0, im1, scan_direction_degrees=(0.0, 90.0), device="cpu")
+    drift.preprocess(
+        padding_fraction=0.25,
+        smoothing_sigma=0.5,
+        num_knots=1,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    drift.correct_affine(
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    rep_before = float(drift.report().iloc[-1]["Common NCC"])
+    drift.correct_nonrigid(
+        num_knots=1,
+        max_image_shift=6.0,
+        knot_smoothing_sigma=2.0,
+        num_refine_cycles=8,
+        learning_rate=0.05,
+        max_knot_step=0.35,
+        trend_order=2,
+        loss="local_ncc",
+        tile_grid=4,
+        coverage_weighted=True,
+        max_slope=0.42,
+        solve_translation=False,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    rep_after = float(drift.report().iloc[-1]["Common NCC"])
+    assert all(np.isfinite(k.detach().cpu().numpy()).all() for k in drift.knots)
+    assert rep_after >= rep_before
+    # Non-folding slope projection keeps per-row displacement slope <= max_slope (+ float tolerance)
+    for idx in range(2):
+        delta = (drift.knots[idx] - drift._initial_knots[idx]).detach().cpu().numpy()
+        row_slope = np.max(np.abs(np.diff(delta, axis=1)))
+        assert row_slope <= 0.43, f"max_slope violated on scan {idx}: {row_slope:.4f}"
