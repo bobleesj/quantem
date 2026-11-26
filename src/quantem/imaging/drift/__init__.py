@@ -38,6 +38,7 @@ from quantem.imaging.drift.fourdstem import CorrectionResult as CorrectionResult
 from quantem.imaging.drift import plot as plot
 from quantem.imaging.drift import io as io
 from quantem.imaging.drift import fourdstem as fourdstem
+from quantem.imaging.drift import serpentine as serpentine
 from quantem.imaging.drift.io import (
     pair_spectrum_image_references as pair_spectrum_image_references,
     read_emd as read_emd,
@@ -52,6 +53,7 @@ __all__ = [
     "plot",
     "io",
     "fourdstem",
+    "serpentine",
     "pair_spectrum_image_references",
     "read_emd",
     "read_emd_eds",

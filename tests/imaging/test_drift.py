@@ -272,3 +272,66 @@ def test_nonrigid_local_ncc_coverage_weighted_and_max_slope_nan_safe():
         dd = np.diff(delta, axis=1)
         g_par = np.sum(dd * s_hat, axis=0)
         assert float(np.min(g_par)) >= -0.43, f"compression exceeded max_slope on scan {idx}: {g_par.min():.4f}"
+
+
+def test_serpentine_snake_lag_zero_slope_bias():
+    """Verify symmetric midpoint estimator recovers true snake lag without tilted-feature bias."""
+    from scipy.ndimage import shift as ndi_shift
+    from quantem.imaging.drift import serpentine
+
+    size = 128
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    # 30-degree tilted ridges + localized Gaussian features (no snake lag)
+    u = xx * np.cos(np.deg2rad(30.0)) + yy * np.sin(np.deg2rad(30.0))
+    clean = (
+        np.sin(2.0 * np.pi * u / 11.0)
+        + 1.4 * np.exp(-((yy - 40.0) ** 2 + (xx - 55.0) ** 2) / 120.0)
+        + 1.1 * np.exp(-((yy - 88.0) ** 2 + (xx - 78.0) ** 2) / 90.0)
+    ).astype(np.float32)
+
+    # Zero-lag tilted image must NOT report false slope-biased lag
+    info_zero = serpentine.estimate_snake_lag(clean, fast_axis=1)
+    assert abs(info_zero["lag_px"]) < 0.15, f"False slope bias detected: {info_zero}"
+
+    # Inject true bidirectional lag = +2.4 px (even shifted +1.2, odd shifted -1.2)
+    lagged = clean.copy()
+    lagged[0::2] = ndi_shift(clean[0::2], shift=(0.0, +1.2), order=3, mode="nearest")
+    lagged[1::2] = ndi_shift(clean[1::2], shift=(0.0, -1.2), order=3, mode="nearest")
+    info_lag = serpentine.estimate_snake_lag(lagged, fast_axis=1)
+    assert info_lag["applied"] is True
+    assert abs(info_lag["lag_px"] - 2.4) < 0.25, f"Expected ~2.4 px lag, got {info_lag}"
+    fixed = serpentine.decomb_serpentine(lagged, info_lag["lag_px"], fast_axis=1)
+    corr_before = float(np.corrcoef(clean[8:-8, 8:-8].ravel(), lagged[8:-8, 8:-8].ravel())[0, 1])
+    corr_after = float(np.corrcoef(clean[8:-8, 8:-8].ravel(), fixed[8:-8, 8:-8].ravel())[0, 1])
+    assert corr_after > 0.98 and corr_after > corr_before + 0.1
+
+
+def test_serpentine_2x2_interleaved_split_and_reinterleave():
+    """Verify 4-pass serpentine_2x2 pass geometry, DriftCorrection alignment, and full (H,W,2) probes."""
+    from quantem.imaging.drift import DriftCorrection, serpentine
+
+    size = 128
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    base = (
+        1.5 * np.exp(-((yy - 42.0) ** 2 + (xx - 50.0) ** 2) / 140.0)
+        + 1.2 * np.exp(-((yy - 84.0) ** 2 + (xx - 80.0) ** 2) / 110.0)
+        + 0.4 * np.sin(2.0 * np.pi * xx / 14.0) * np.cos(2.0 * np.pi * yy / 14.0)
+    ).astype(np.float32)
+
+    passes, specs = serpentine.split_interleaved_passes(base, "serpentine_2x2", decomb=False, compensate_subgrid=True)
+    assert len(passes) == 4
+    assert [sp["offset"] for sp in specs] == [(0, 0), (0, 1), (1, 1), (1, 0)]
+    assert [sp["angle_deg"] for sp in specs] == [0.0, -90.0, 180.0, 90.0]
+    # Sub-grid compensation aligns all 4 passes to > 0.995 on a drift-free scan
+    for i in range(1, 4):
+        c = float(np.corrcoef(passes[0][4:-4, 4:-4].ravel(), passes[i][4:-4, 4:-4].ravel())[0, 1])
+        assert c > 0.995, f"Sub-grid offset mismatch on pass {i}: corr={c:.4f}"
+
+    rot_passes = [np.rot90(p, k=sp["rot90_k"]).copy() for p, sp in zip(passes, specs)]
+    angles = tuple(sp["angle_deg"] for sp in specs)
+    dc = DriftCorrection.from_images(*rot_passes, scan_direction_degrees=angles, device="cpu")
+    dc.preprocess(padding_fraction=0.25, smoothing_sigma=0.5, num_knots=1, verbose=False)
+    dc.correct_affine(show_combined=False, show_scans=False, show_knots=False, verbose=False)
+    re = serpentine.reinterleave_probe_positions(dc, specs, base.shape, corrected=True)
+    assert re["corrected"].shape == (size, size, 2)
+    assert re["min_det_j"] > 0.85
