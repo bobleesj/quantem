@@ -263,8 +263,12 @@ def test_nonrigid_local_ncc_coverage_weighted_and_max_slope_nan_safe():
     rep_after = float(drift.report().iloc[-1]["Common NCC"])
     assert all(np.isfinite(k.detach().cpu().numpy()).all() for k in drift.knots)
     assert rep_after >= rep_before
-    # Non-folding slope projection keeps per-row displacement slope <= max_slope (+ float tolerance)
+    # Directional non-folding slope projection guarantees det(J) = 1 + g_par >= 1 - max_slope
     for idx in range(2):
-        delta = (drift.knots[idx] - drift._initial_knots[idx]).detach().cpu().numpy()
-        row_slope = np.max(np.abs(np.diff(delta, axis=1)))
-        assert row_slope <= 0.43, f"max_slope violated on scan {idx}: {row_slope:.4f}"
+        init_k = drift._initial_knots[idx].detach().cpu().numpy()
+        delta = drift.knots[idx].detach().cpu().numpy() - init_k
+        s_vec = np.mean(np.diff(init_k[:, :, :1], axis=1), axis=1, keepdims=True)
+        s_hat = s_vec / max(float(np.linalg.norm(s_vec)), 1e-8)
+        dd = np.diff(delta, axis=1)
+        g_par = np.sum(dd * s_hat, axis=0)
+        assert float(np.min(g_par)) >= -0.43, f"compression exceeded max_slope on scan {idx}: {g_par.min():.4f}"

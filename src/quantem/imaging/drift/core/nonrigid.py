@@ -240,7 +240,7 @@ def _compiled_loss_fn_multi_ncc(
     )
 
 
-@torch.compile(mode="default")
+@torch.compile(mode="default", dynamic=False)
 def _compiled_loss_fn_single_local_ncc(
     knots_batch: torch.Tensor,
     ref_t: torch.Tensor,
@@ -260,7 +260,7 @@ def _compiled_loss_fn_single_local_ncc(
     )
 
 
-@torch.compile(mode="default")
+@torch.compile(mode="default", dynamic=False)
 def _compiled_loss_fn_multi_local_ncc(
     knots_batch: torch.Tensor,
     ref_t: torch.Tensor,
@@ -359,11 +359,14 @@ def _project_nonfolding_slope(
     init_batch: torch.Tensor,
     max_slope: float,
 ) -> None:
-    """Project knot displacements so slow- and fast-axis slopes stay non-folding.
+    """Directional non-folding Jacobian projection along slow- and fast-scan axes.
 
-    Bounds the L2 slow-scan step ``||Δdisp/Δrow||_2 <= max_slope`` (guaranteeing
-    ``det(J) >= 1 - max_slope`` for arbitrary scan rotation angles) and, when
-    ``K > 1``, also bounds fast-axis knot spacing changes relative to ``init_batch``.
+    For a scan with unit slow-scan direction ``s_hat``, the raster Jacobian determinant
+    is ``det(J) = 1 + g_par`` where ``g_par = (Δdisp/Δrow) · s_hat``. Positive stretch
+    (``g_par > 0``) and transverse shear (``g_perp`` perpendicular to ``s_hat``) never
+    fold the raster; only compression ``g_par < -max_slope`` reduces ``det(J)`` below
+    ``1 - max_slope``. Bounding compression strictly while keeping stretch and shear
+    generously bounded preserves real piezo/thermal drift without folding.
     Preserves each scanline's mean displacement via vectorized center-outward cumsum.
     """
     if max_slope <= 0.0:
@@ -374,10 +377,20 @@ def _project_nonfolding_slope(
         return
     with torch.no_grad():
         disp = knots_batch - init_batch
+        # Infer each scan's unit slow-scan vector directly from init_batch (works for any angle)
+        init_step = init_batch[:, :, 1:, :1] - init_batch[:, :, :-1, :1]
+        s_vec = init_step.mean(dim=2, keepdim=True)  # (N, 2, 1, 1)
+        s_hat = s_vec / torch.norm(s_vec, dim=1, keepdim=True).clamp_min(1e-8)
+        f_hat = torch.stack([-s_hat[:, 1], s_hat[:, 0]], dim=1)
+
         dd = disp[:, :, 1:, :] - disp[:, :, :-1, :]  # (N, 2, H-1, K)
-        dd_norm = torch.norm(dd, dim=1, keepdim=True)
-        if float(dd_norm.max()) > max_slope:
-            dd_clamped = dd * torch.clamp(max_slope / dd_norm.clamp_min(1e-8), max=1.0)
+        g_par = (dd * s_hat).sum(dim=1, keepdim=True)
+        g_perp = (dd * f_hat).sum(dim=1, keepdim=True)
+        max_nonfold = max(1.8, 2.5 * max_slope)
+        g_par_c = g_par.clamp(-max_slope, max_nonfold)
+        g_perp_c = g_perp.clamp(-max_nonfold, max_nonfold)
+        if not (torch.equal(g_par_c, g_par) and torch.equal(g_perp_c, g_perp)):
+            dd_clamped = g_par_c * s_hat + g_perp_c * f_hat
             mid = H // 2
             out = disp.clone()
             out[:, :, mid + 1 :, :] = disp[:, :, mid : mid + 1, :] + torch.cumsum(
@@ -390,16 +403,19 @@ def _project_nonfolding_slope(
             out = out + (disp.mean(dim=2, keepdim=True) - out.mean(dim=2, keepdim=True))
             disp = out
 
-        # When K > 1, also bound fast-axis inter-knot compression/folding along dim=3
+        # When K > 1, also bound fast-axis compression along dim=3
         if K > 1:
-            fast_ref = torch.norm(
-                init_batch[:, :, :, 1:] - init_batch[:, :, :, :-1], dim=1, keepdim=True
-            ).clamp_min(1.0)
-            fast_cap = max_slope * fast_ref
+            init_f = init_batch[:, :, :, 1:] - init_batch[:, :, :, :-1]
+            fast_ref = torch.norm(init_f, dim=1, keepdim=True).clamp_min(1.0)
+            uf = init_f / fast_ref
+            up = torch.stack([-uf[:, 1], uf[:, 0]], dim=1)
             df = disp[:, :, :, 1:] - disp[:, :, :, :-1]
-            df_norm = torch.norm(df, dim=1, keepdim=True)
-            if float(df_norm.max()) > float(fast_cap.min()):
-                df_clamped = df * torch.clamp(fast_cap / df_norm.clamp_min(1e-8), max=1.0)
+            f_par = (df * uf).sum(dim=1, keepdim=True)
+            f_perp = (df * up).sum(dim=1, keepdim=True)
+            f_par_c = f_par.clamp(-max_slope * fast_ref, max_nonfold * fast_ref)
+            f_perp_c = f_perp.clamp(-max_nonfold * fast_ref, max_nonfold * fast_ref)
+            if not (torch.equal(f_par_c, f_par) and torch.equal(f_perp_c, f_perp)):
+                df_clamped = f_par_c * uf + f_perp_c * up
                 mid_k = K // 2
                 out_f = disp.clone()
                 out_f[:, :, :, mid_k + 1 :] = disp[:, :, :, mid_k : mid_k + 1] + torch.cumsum(
