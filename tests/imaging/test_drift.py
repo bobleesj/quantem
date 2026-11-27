@@ -335,3 +335,7 @@ def test_serpentine_2x2_interleaved_split_and_reinterleave():
     re = serpentine.reinterleave_probe_positions(dc, specs, base.shape, corrected=True)
     assert re["corrected"].shape == (size, size, 2)
     assert re["min_det_j"] > 0.85
+    # Un-rotated pass indexing must match nominal coordinates to < 1.5 px on a zero-drift scan
+    re_nom = serpentine.reinterleave_probe_positions(dc, specs, base.shape, corrected=False)
+    assert float(np.max(np.abs(re_nom["corrected"] - re_nom["nominal"]))) < 1e-4
+    assert float(np.max(np.abs(re["corrected"] - re["nominal"]))) < 1.5

@@ -370,11 +370,15 @@ def reinterleave_probe_positions(
     for i, sp in enumerate(specs):
         k = int(sp["stride"])
         dr, dc_o = sp["offset"]
+        rot90_k = int(sp.get("rot90_k", 0))
         pos_pass = np.asarray(
             dc.probe_positions(image_index=i, corrected=corrected, strip_padding=True, plot=False),
             dtype=np.float32,
         )
-        # Signed Jacobian determinant on pass grid
+        # Un-rotate array indexing from rotated scan frame back to sample (pr, pc) order!
+        if rot90_k % 4 != 0:
+            pos_pass = np.ascontiguousarray(np.rot90(pos_pass, k=-rot90_k))
+        # Signed Jacobian determinant on pass grid (positive nominal handedness for all passes)
         if pos_pass.shape[0] >= 2 and pos_pass.shape[1] >= 2:
             pr = np.diff(pos_pass[:, :-1, 0], axis=0)
             pc = np.diff(pos_pass[:, :-1, 1], axis=0)
@@ -392,13 +396,15 @@ def reinterleave_probe_positions(
 
         lag_px = float((sp.get("snake_lag") or {}).get("lag_px", 0.0))
         if corrected and abs(lag_px) >= 0.05:
+            # decomb_serpentine applies ndi_shift(..., shift=-lag/2) on even lines (out[x]=in[x+lag/2]),
+            # so raw pixel x actually sampled physical coordinate x - lag/2 (and odd lines x + lag/2).
             half_full = 0.5 * lag_px * float(k)
             if int(sp["fast_axis"]) == 1:
-                pos_full[0::2, :, 1] += half_full
-                pos_full[1::2, :, 1] -= half_full
+                pos_full[0::2, :, 1] -= half_full
+                pos_full[1::2, :, 1] += half_full
             else:
-                pos_full[:, 0::2, 0] += half_full
-                pos_full[:, 1::2, 0] -= half_full
+                pos_full[:, 0::2, 0] -= half_full
+                pos_full[:, 1::2, 0] += half_full
 
         corrected_full[dr::k, dc_o::k] = pos_full
 
