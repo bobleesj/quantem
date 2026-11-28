@@ -525,6 +525,7 @@ def preprocess(
     normalize: bool = False,
     downsample: int = 1,
     verbose: bool = True,
+    initial_warp: bool = True,
     show_combined: bool = False,
     show_scans: bool = False,
     show_knots: bool = True,
@@ -728,22 +729,27 @@ def preprocess(
         torch.tensor(self.scan_slow[index], dtype=dtype, device=device)
         for index in range(self.shape[0])
     ]
-    self.imgs_warped = Dataset3d.from_shape(self.shape)
-    canvas_shape = (self.shape[1], self.shape[2])
-    warped_t = torch.zeros(
-        self.shape[0], *canvas_shape, dtype=dtype, device=device
-    )
-    for image_index in range(self.shape[0]):
-        warped, _ = drift_knots.interpolator(self, image_index).warp_to_canvas(
-            self.imgs_t[image_index],
-            canvas_shape,
-            self.kde_sigma,
-            self.pad_value[image_index],
-        )
-        warped_t[image_index] = warped
-        self.imgs_warped.array[image_index] = warped.cpu().numpy()
     self._initial_knots = [knot.clone() for knot in self.knots]
-    report.record_error(self, 0, warped_t)
+    if initial_warp:
+        self.imgs_warped = Dataset3d.from_shape(self.shape)
+        canvas_shape = (self.shape[1], self.shape[2])
+        warped_t = torch.zeros(
+            self.shape[0], *canvas_shape, dtype=dtype, device=device
+        )
+        for image_index in range(self.shape[0]):
+            warped, _ = drift_knots.interpolator(self, image_index).warp_to_canvas(
+                self.imgs_t[image_index],
+                canvas_shape,
+                self.kde_sigma,
+                self.pad_value[image_index],
+            )
+            warped_t[image_index] = warped
+            self.imgs_warped.array[image_index] = warped.cpu().numpy()
+        self._images_warped_stale = False
+        report.record_error(self, 0, warped_t)
+    else:
+        self.imgs_warped = None
+        self._images_warped_stale = True
     drift_plot.show_after_step(
         self,
         "initial",

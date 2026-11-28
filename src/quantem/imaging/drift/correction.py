@@ -420,6 +420,19 @@ class DriftCorrection(AutoSerialize):
 
     integrate_virtual_detector = staticmethod(fourdstem.integrate_virtual_detector)
 
+    def release_gpu(self, drop_warped: bool = True) -> None:
+        """Move small knots to CPU and drop resident GPU image buffers cleanly."""
+        for attr in ("knots", "_initial_knots", "_knots_after_affine", "_knots_after_strip"):
+            val = getattr(self, attr, None)
+            if isinstance(val, list):
+                setattr(self, attr, [k.detach().cpu() if hasattr(k, "detach") else k for k in val])
+        for attr in ("imgs_t", "scan_fast_t", "scan_slow_t"):
+            if hasattr(self, attr):
+                setattr(self, attr, [])
+        if drop_warped:
+            self.imgs_warped = None
+            self._images_warped_stale = True
+
     # -- serialization -------------------------------------------------------
 
     def save(self, path, mode="w", store="auto", skip=(), compression_level=4):

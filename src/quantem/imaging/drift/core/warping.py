@@ -20,7 +20,8 @@ import math
 
 import numpy as np
 import torch
-from torch.fft import fft2, fftfreq, ifft2, ifftshift
+import torch.nn.functional as F
+from torch.fft import fft2, fftfreq, ifft2, ifftshift, irfft2, rfft2, rfftfreq
 from tqdm.auto import tqdm
 
 from quantem.imaging.drift.core import knots as drift_knots
@@ -77,27 +78,31 @@ def cross_corr_batch(
     """
     _, num_rows, num_cols = ref_images.shape
     dtype = ref_images.dtype
-    mov_fft = fft2(mov_images)
+    mov_fft = rfft2(mov_images)
     if shift_images is None:
-        cross_corr_fft = fft2(ref_images) * mov_fft.conj()
+        cross_corr_fft = rfft2(ref_images) * mov_fft.conj()
     else:
-        cross_corr_fft = fft2(shift_images[0]) * fft2(shift_images[1]).conj()
+        cross_corr_fft = rfft2(shift_images[0]) * rfft2(shift_images[1]).conj()
     image_shifts = _translation_from_cross_correlation(
-        cross_corr_fft, upsample_factor, max_shift_mask, subpixel
+        cross_corr_fft, upsample_factor, max_shift_mask, subpixel, num_cols=num_cols
     )
+    half_cols = num_cols // 2 + 1
     if freq_grids is not None:
         freq_row, freq_col = freq_grids
+        if freq_col.shape[-1] == num_cols:
+            freq_col = freq_col[:, :half_cols]
     else:
         freq_row = fftfreq(num_rows, device=ref_images.device, dtype=dtype)[:, None]
-        freq_col = fftfreq(num_cols, device=ref_images.device, dtype=dtype)[None, :]
+        freq_col = rfftfreq(num_cols, device=ref_images.device, dtype=dtype)[None, :]
     phase = -2j * math.pi * (
         freq_row[None] * image_shifts[:, 0, None, None]
         + freq_col[None] * image_shifts[:, 1, None, None]
     )
-    aligned_images = ifft2(mov_fft * torch.exp(phase)).real
+    aligned_images = irfft2(mov_fft * torch.exp(phase), s=(num_rows, num_cols))
     return torch.mean(torch.abs(ref_images - aligned_images), dim=(1, 2))
 
 
+@torch.inference_mode()
 def fixed_overlap_ncc(
     ref_images: torch.Tensor,
     mov_images: torch.Tensor,
@@ -110,6 +115,8 @@ def fixed_overlap_ncc(
     moving scan. Every shift therefore uses the same number of measured pixels,
     and normalized correlation removes intensity-scale differences.
     """
+    from scipy.fft import next_fast_len
+
     scan_rows, scan_cols = scan_shape
     canvas_rows, canvas_cols = ref_images.shape[-2:]
     row_start = (canvas_rows - scan_rows) // 2
@@ -121,36 +128,48 @@ def fixed_overlap_ncc(
         :, row_start : row_start + scan_rows, col_start : col_start + scan_cols
     ]
 
+    # Downsample >=2048 scans to <=1024 for 4-16x lower VRAM & faster FFT scoring
+    ds = 1
+    if min(scan_rows, scan_cols) > 1024:
+        ds = max(2, min(scan_rows, scan_cols) // 1024)
+        hr = (scan_rows // ds) * ds
+        wc = (scan_cols // ds) * ds
+        ref = F.avg_pool2d(ref[:, :hr, :wc].unsqueeze(1), kernel_size=ds, stride=ds).squeeze(1)
+        mov = F.avg_pool2d(mov[:, :hr, :wc].unsqueeze(1), kernel_size=ds, stride=ds).squeeze(1)
+        scan_rows, scan_cols = int(ref.shape[-2]), int(ref.shape[-1])
+
     shift_limit = (
-        min(scan_shape) / 4 if max_image_shift is None else float(max_image_shift)
+        min(scan_rows, scan_cols) / 4
+        if max_image_shift is None
+        else float(max_image_shift) / float(ds)
     )
     margin = min(
         max(1, int(math.ceil(shift_limit))),
-        (min(scan_shape) - 2) // 2,
+        (min(scan_rows, scan_cols) - 2) // 2,
     )
     template = ref[:, margin:-margin, margin:-margin]
     template = template - template.mean(dim=(-2, -1), keepdim=True)
+    # Mean-center mov before variance integral tables to prevent float32 catastrophic
+    # cancellation on positive-offset HAADF images (up to 19% variance distortion).
+    mov_c = mov - mov.mean(dim=(-2, -1), keepdim=True)
     template_rows, template_cols = template.shape[-2:]
 
-    fft_rows = 1 << (scan_rows + template_rows - 2).bit_length()
-    fft_cols = 1 << (scan_cols + template_cols - 2).bit_length()
+    # Exact zero-wraparound FFT size: valid correlation indices 0..2*margin satisfy
+    # u + k <= (2*margin) + (scan_rows - 2*margin - 1) = scan_rows - 1 < fft_rows!
+    fft_rows = next_fast_len(scan_rows, real=True)
+    fft_cols = next_fast_len(scan_cols, real=True)
+    mov_spec = torch.fft.rfft2(mov_c, s=(fft_rows, fft_cols))
+    tpl_spec = torch.fft.rfft2(template, s=(fft_rows, fft_cols))
     numerator = torch.fft.irfft2(
-        torch.fft.rfft2(mov, s=(fft_rows, fft_cols))
-        * torch.fft.rfft2(
-            template.flip((-2, -1)), s=(fft_rows, fft_cols)
-        ),
-        s=(fft_rows, fft_cols),
-    )
-    numerator = numerator[
-        :,
-        template_rows - 1 : scan_rows,
-        template_cols - 1 : scan_cols,
-    ]
+        mov_spec * tpl_spec.conj(), s=(fft_rows, fft_cols)
+    )[:, : 2 * margin + 1, : 2 * margin + 1]
+    del mov_spec, tpl_spec
 
-    integral = torch.nn.functional.pad(mov, (1, 0, 1, 0))
-    integral = integral.cumsum(-2).cumsum(-1)
-    integral_sq = torch.nn.functional.pad(mov.square(), (1, 0, 1, 0))
-    integral_sq = integral_sq.cumsum(-2).cumsum(-1)
+    acc_dtype = torch.float64 if (scan_rows * scan_cols >= (1 << 19)) else mov_c.dtype
+    mov_acc = mov_c.to(acc_dtype)
+    integral = torch.nn.functional.pad(mov_acc, (1, 0, 1, 0)).cumsum(-2).cumsum(-1)
+    integral_sq = torch.nn.functional.pad(mov_acc.square(), (1, 0, 1, 0)).cumsum(-2).cumsum(-1)
+    del mov_acc
 
     def window_sum(table):
         return (
@@ -162,10 +181,12 @@ def fixed_overlap_ncc(
 
     moving_sum = window_sum(integral)
     moving_sum_sq = window_sum(integral_sq)
+    del integral, integral_sq
     pixels = float(template_rows * template_cols)
     moving_norm = torch.sqrt(
         (moving_sum_sq - moving_sum.square() / pixels).clamp_min(0.0)
-    )
+    ).to(mov_c.dtype)
+    del moving_sum, moving_sum_sq
     template_norm = template.norm(dim=(-2, -1), keepdim=True)
     ncc = numerator / (template_norm * moving_norm).clamp_min(1e-12)
 
@@ -182,45 +203,55 @@ def fixed_overlap_ncc(
     peak_col = flat_index % ncc.shape[-1]
     batch = torch.arange(ncc.shape[0], device=ncc.device)
     best_ncc = ncc[batch, peak_row, peak_col]
-    image_shifts = -torch.stack(
-        (peak_row - margin, peak_col - margin), dim=1
-    ).to(ncc.dtype)
+    image_shifts = (
+        -torch.stack((peak_row - margin, peak_col - margin), dim=1).to(ncc.dtype) * float(ds)
+    )
     return 1.0 - best_ncc, image_shifts, best_ncc - ncc[:, margin, margin]
 
 
+@torch.inference_mode()
 def soften_and_lowpass(images, weights=None, lowpass=0.0, ramp=0):
-    """Bounding-box taper and Gaussian low-pass.
+    """Vectorized, sync-free bounding-box taper and Gaussian low-pass.
 
     ``lowpass`` is the real-space Gaussian sigma in pixels; ``ramp`` is the
     linear edge-taper width, also in pixels.
     """
-    masks = (weights > 0.5) if weights is not None else torch.ones_like(images, dtype=torch.bool)
-    out = torch.empty_like(images)
-    for idx in range(images.shape[0]):
-        mask = masks[idx]
-        window = torch.zeros(mask.shape, dtype=images.dtype, device=images.device)
-        rows = torch.nonzero(mask.any(1)).flatten()
-        cols = torch.nonzero(mask.any(0)).flatten()
-        if rows.numel() and cols.numel():
-            def profile(n):
-                t = torch.ones(n, dtype=images.dtype, device=images.device)
-                k = min(int(ramp), n // 2)
-                if k:
-                    u = torch.arange(1, k + 1, dtype=images.dtype, device=images.device) / k
-                    t[:k], t[-k:] = u, u.flip(0)
-                return t
-            r0, r1 = int(rows[0]), int(rows[-1]) + 1
-            c0, c1 = int(cols[0]), int(cols[-1]) + 1
-            window[r0:r1, c0:c1] = profile(r1 - r0)[:, None] * profile(c1 - c0)[None, :]
-        weight = window * mask
-        mean = (images[idx] * weight).sum() / weight.sum() if weight.sum() > 0 else 0.0
-        out[idx] = torch.where(mask, images[idx] - mean, torch.zeros_like(images[idx])) * window
+    N, H, W = images.shape
+    device = images.device
+    dtype = images.dtype
+    masks = (weights > 0.5) if weights is not None else torch.ones((N, H, W), dtype=torch.bool, device=device)
+    r_idx = torch.arange(H, device=device, dtype=torch.int64)
+    c_idx = torch.arange(W, device=device, dtype=torch.int64)
+    has_r = masks.any(dim=2)  # (N, H)
+    has_c = masks.any(dim=1)  # (N, W)
+    r0 = torch.where(has_r, r_idx[None, :], H).amin(dim=1)  # (N,)
+    r1 = torch.where(has_r, r_idx[None, :], -1).amax(dim=1) + 1  # (N,)
+    c0 = torch.where(has_c, c_idx[None, :], W).amin(dim=1)
+    c1 = torch.where(has_c, c_idx[None, :], -1).amax(dim=1) + 1
+    valid_box = (r1 > r0) & (c1 > c0)
+    in_r = (r_idx[None, :] >= r0[:, None]) & (r_idx[None, :] < r1[:, None])
+    in_c = (c_idx[None, :] >= c0[:, None]) & (c_idx[None, :] < c1[:, None])
+    if int(ramp) > 0:
+        kr = torch.clamp((r1 - r0) // 2, max=int(ramp)).clamp_min(1).to(dtype)[:, None]
+        kc = torch.clamp((c1 - c0) // 2, max=int(ramp)).clamp_min(1).to(dtype)[:, None]
+        dr = torch.minimum(r_idx[None, :] - r0[:, None] + 1, r1[:, None] - r_idx[None, :]).to(dtype)
+        dc = torch.minimum(c_idx[None, :] - c0[:, None] + 1, c1[:, None] - c_idx[None, :]).to(dtype)
+        prof_r = torch.where(in_r, (dr / kr).clamp(0.0, 1.0), torch.zeros_like(dr))
+        prof_c = torch.where(in_c, (dc / kc).clamp(0.0, 1.0), torch.zeros_like(dc))
+    else:
+        prof_r = in_r.to(dtype)
+        prof_c = in_c.to(dtype)
+    window = (prof_r[:, :, None] * prof_c[:, None, :]) * valid_box.to(dtype)[:, None, None]
+    weight = window * masks.to(dtype)
+    w_sum = weight.sum(dim=(1, 2), keepdim=True)
+    mean = torch.where(w_sum > 0, (images * weight).sum(dim=(1, 2), keepdim=True) / w_sum.clamp_min(1e-12), torch.zeros_like(w_sum))
+    out = torch.where(masks, images - mean, torch.zeros_like(images)) * window
     if lowpass:
-        fr = fftfreq(images.shape[1], device=images.device, dtype=images.dtype)[:, None]
-        fc = torch.fft.rfftfreq(images.shape[2], device=images.device, dtype=images.dtype)[None, :]
+        fr = fftfreq(H, device=device, dtype=dtype)[:, None]
+        fc = torch.fft.rfftfreq(W, device=device, dtype=dtype)[None, :]
         sigma_cycles = 2.0 * math.pi * lowpass
         kernel = torch.exp(-0.5 * sigma_cycles ** 2 * (fr ** 2 + fc ** 2))
-        out = torch.fft.irfft2(torch.fft.rfft2(out) * kernel, s=out.shape[-2:])
+        out = torch.fft.irfft2(torch.fft.rfft2(out) * kernel, s=(H, W))
     return out
 
 
@@ -264,7 +295,7 @@ def translate_align(
     if lowpass or ramp:
         warped_images = soften_and_lowpass(warped_images, weights, lowpass, ramp)
     image_shifts = torch.zeros(num_images, 2, dtype=dtype, device=device)
-    ref_fft = fft2(warped_images[0])
+    ref_fft = rfft2(warped_images[0])
     # Reject bad correlation peaks from noise or periodicity
     # by zeroing everything beyond max_image_shift pixels from origin
     shift_mask = None
@@ -277,12 +308,12 @@ def translate_align(
         else:
             shift_mask = dist_row[:, None] ** 2 + dist_col[None, :] ** 2 >= max_image_shift ** 2
     freq_row = fftfreq(num_rows, device=device, dtype=dtype)[:, None]
-    freq_col = fftfreq(num_cols, device=device, dtype=dtype)[None, :]
+    freq_col = rfftfreq(num_cols, device=device, dtype=dtype)[None, :]
     for img_idx in range(1, num_images):
-        mov_fft = fft2(warped_images[img_idx])
+        mov_fft = rfft2(warped_images[img_idx])
         cross_corr_fft = ref_fft * mov_fft.conj()
         image_shifts[img_idx] = _translation_from_cross_correlation(
-            cross_corr_fft[None], upsample_factor, shift_mask, subpixel
+            cross_corr_fft[None], upsample_factor, shift_mask, subpixel, num_cols=num_cols
         )[0]
         # Apply the recovered shift to current image via Fourier shift theorem,
         # then blend into running average so later images align to the cumulative mean
@@ -340,8 +371,8 @@ def translate_align_pair_batch(
                   if weight_pairs is not None else None)
         warped_pairs = soften_and_lowpass(flat, flat_w, lowpass, ramp).reshape(
             warped_pairs.shape)
-    ref_fft = fft2(warped_pairs[:, 0])
-    mov_fft = fft2(warped_pairs[:, 1])
+    ref_fft = rfft2(warped_pairs[:, 0])
+    mov_fft = rfft2(warped_pairs[:, 1])
     cross_corr_fft = ref_fft * mov_fft.conj()
     shift_mask = None
     if max_image_shift is not None:
@@ -356,7 +387,7 @@ def translate_align_pair_batch(
             >= max_image_shift**2
         )
     pair_shift = _translation_from_cross_correlation(
-        cross_corr_fft, upsample_factor, shift_mask
+        cross_corr_fft, upsample_factor, shift_mask, num_cols=num_cols
     )
     shifts = torch.zeros(
         num_pairs, 2, 2, dtype=dtype, device=device,
@@ -379,6 +410,7 @@ def warp_and_translate(
     lowpass: float = 0.0,
     ramp: int = 0,
     subpixel: str = "dft",
+    sync_cpu: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Warp scans to their shared canvas and remove residual translation.
 
@@ -407,7 +439,52 @@ def warp_and_translate(
     else:
         knots_batch = knots_batch.to(device=device, dtype=dtype)
 
-    def render(warped_t, weights_t):
+    same_shape = (
+        num_images > 0
+        and all(im.shape == imgs_t[0].shape for im in imgs_t)
+        and (knots_batch is not None or len({k.shape for k in correction.knots}) == 1)
+    )
+    if same_shape:
+        imgs_stack = torch.stack(imgs_t, dim=0)
+        pad_t = torch.as_tensor(correction.pad_value, dtype=dtype, device=device)
+        in_h, in_w = imgs_t[0].shape
+        scan_fast_stack = torch.stack(
+            [sf.to(device=device, dtype=dtype) for sf in correction.scan_fast_t], dim=0
+        )
+        fast_frac = torch.linspace(0.0, 1.0, in_w, dtype=dtype, device=device)
+        fast_row_walk = fast_frac[None, None, :] * (scan_fast_stack[:, 0:1, None] * (in_h - 1))
+        fast_col_walk = fast_frac[None, None, :] * (scan_fast_stack[:, 1:2, None] * (in_w - 1))
+
+    def render():
+        if same_shape:
+            kb = (
+                knots_batch.detach()
+                if knots_batch is not None
+                else torch.stack([k.detach() for k in correction.knots], dim=0)
+            )
+            K = kb.shape[3]
+            if K == 1:
+                row_coords = kb[:, 0, :, :] + fast_row_walk
+                col_coords = kb[:, 1, :, :] + fast_col_walk
+            else:
+                t = fast_frac * (K - 1)
+                seg = torch.clamp(t.long(), max=K - 2)
+                frac = (t - seg.to(dtype))[None, None, None, :]
+                lo = kb[:, :, :, seg]
+                hi = kb[:, :, :, seg + 1]
+                interp = lo + (hi - lo) * frac
+                row_coords = interp[:, 0]
+                col_coords = interp[:, 1]
+            return drift_knots.bilinear_kde_batch(
+                row_coords,
+                col_coords,
+                imgs_stack,
+                canvas_shape,
+                correction.kde_sigma,
+                pad_t,
+            )
+        warped_out = torch.zeros(num_images, *canvas_shape, dtype=dtype, device=device)
+        weights_out = torch.zeros_like(warped_out)
         for img_idx in range(num_images):
             knots_img = (
                 knots_batch[img_idx].detach() if knots_batch is not None else None
@@ -420,15 +497,18 @@ def warp_and_translate(
                 correction.kde_sigma,
                 correction.pad_value[img_idx],
             )
-            warped_t[img_idx] = warped
-            weights_t[img_idx] = image_weights
+            warped_out[img_idx] = warped
+            weights_out[img_idx] = image_weights
+        return warped_out, weights_out
 
-    warped_t = torch.zeros(num_images, *canvas_shape, dtype=dtype, device=device)
-    weights_t = torch.zeros_like(warped_t)
-    render(warped_t, weights_t)
+    warped_t, weights_t = render()
     if not solve_translation:
         if knots_batch is None:
-            correction.imgs_warped.array[:] = warped_t.cpu().numpy()
+            if sync_cpu and getattr(correction, "imgs_warped", None) is not None:
+                correction.imgs_warped.array[:] = warped_t.cpu().numpy()
+                correction._images_warped_stale = False
+            else:
+                correction._images_warped_stale = True
         return (warped_t, weights_t) if return_weights else warped_t
 
     shifts_t = translate_align(warped_t, upsample_factor, max_image_shift,
@@ -448,9 +528,13 @@ def warp_and_translate(
             correction.knots[img_idx][0] += shifts_t[img_idx, 0]
             correction.knots[img_idx][1] += shifts_t[img_idx, 1]
 
-    render(warped_t, weights_t)
+    warped_t, weights_t = render()
     if knots_batch is None:
-        correction.imgs_warped.array[:] = warped_t.cpu().numpy()
+        if sync_cpu and getattr(correction, "imgs_warped", None) is not None:
+            correction.imgs_warped.array[:] = warped_t.cpu().numpy()
+            correction._images_warped_stale = False
+        else:
+            correction._images_warped_stale = True
     return (warped_t, weights_t) if return_weights else warped_t
 
 
@@ -759,10 +843,14 @@ def ensure_warped_images(correction):
     """Keep the displayed warped stack synchronized with the solved knots."""
     fingerprint = knot_fingerprint(correction)
     if (
-        not getattr(correction, "_images_warped_stale", True)
+        getattr(correction, "imgs_warped", None) is not None
+        and not getattr(correction, "_images_warped_stale", True)
         and getattr(correction, "_warped_fingerprint", None) == fingerprint
     ):
         return
+    if getattr(correction, "imgs_warped", None) is None:
+        from quantem.core.datastructures import Dataset3d
+        correction.imgs_warped = Dataset3d.from_shape(correction.shape)
 
     if getattr(correction, "_reference_mode", False):
         scans = np.stack(reference_scan_stack(correction)).astype(
@@ -959,11 +1047,17 @@ def _translation_from_cross_correlation(
     upsample_factor: int,
     max_shift_mask: torch.Tensor | None,
     subpixel: str = "dft",
+    num_cols: int | None = None,
 ) -> torch.Tensor:
     # Keep every solver on one integer → parabolic → DFT refinement and the
     # same centered (row, col) shift convention.
-    num_images, num_rows, num_cols = cross_corr_fft.shape
-    cross_corr = ifft2(cross_corr_fft).real
+    num_images, num_rows, spec_cols = cross_corr_fft.shape
+    is_rfft = num_cols is not None and spec_cols == num_cols // 2 + 1 and num_cols > 1
+    if is_rfft:
+        cross_corr = irfft2(cross_corr_fft, s=(num_rows, num_cols))
+    else:
+        num_cols = spec_cols
+        cross_corr = ifft2(cross_corr_fft).real
     if max_shift_mask is not None:
         fill = cross_corr.flatten(1).min(dim=1).values[:, None, None]
         cross_corr = torch.where(max_shift_mask[None], fill.expand_as(cross_corr), cross_corr)
@@ -978,7 +1072,11 @@ def _translation_from_cross_correlation(
         shifts = torch.stack([refined_row, refined_col], dim=1)
     else:
         shifts = _dft_refine_shifts(
-            cross_corr_fft, refined_row, refined_col, upsample_factor
+            cross_corr_fft,
+            refined_row,
+            refined_col,
+            upsample_factor,
+            num_cols=num_cols if is_rfft else None,
         )
     shifts[:, 0] = ((shifts[:, 0] + num_rows / 2) % num_rows) - num_rows / 2
     shifts[:, 1] = ((shifts[:, 1] + num_cols / 2) % num_cols) - num_cols / 2
@@ -990,6 +1088,7 @@ def _dft_refine_shifts(
     peak_row: torch.Tensor,
     peak_col: torch.Tensor,
     upsample_factor: int,
+    num_cols: int | None = None,
 ) -> torch.Tensor:
     """Refine coarse sub-pixel shifts using DFT upsampling + parabolic fit.
 
@@ -1020,7 +1119,10 @@ def _dft_refine_shifts(
     dtype = peak_row.dtype
     batch_idx = torch.arange(num_test_drifts, device=cross_corr_fft.device)
     upsampled_corr = _dft_upsample_batch(
-        cross_corr_fft, upsample_factor, torch.stack([peak_row, peak_col], dim=1)
+        cross_corr_fft,
+        upsample_factor,
+        torch.stack([peak_row, peak_col], dim=1),
+        num_cols=num_cols,
     )
     upsample_size = upsampled_corr.shape[1]
     peak_flat_idx = upsampled_corr.flatten(1).argmax(dim=1)
@@ -1058,6 +1160,7 @@ def _dft_upsample_batch(
     cross_corr_fft: torch.Tensor,
     upsample_factor: int,
     peak_positions: torch.Tensor,
+    num_cols: int | None = None,
 ) -> torch.Tensor:
     """Sub-pixel peak refinement for all test drifts in one pass.
 
@@ -1083,7 +1186,9 @@ def _dft_upsample_batch(
         where ``P = 2 * ceil(1.5 * upsample_factor) + 1``.
 
     """
-    num_test_drifts, num_rows, num_cols = cross_corr_fft.shape
+    num_test_drifts, num_rows, spec_cols = cross_corr_fft.shape
+    is_rfft = num_cols is not None and spec_cols == num_cols // 2 + 1 and num_cols > 1
+    full_cols = num_cols if is_rfft else spec_cols
     real_dtype = torch.float32 if cross_corr_fft.dtype == torch.complex64 else torch.float64
     # 1.5x radius ensures the patch captures the true peak after parabolic shift
     patch_radius = math.ceil(1.5 * upsample_factor)
@@ -1095,19 +1200,31 @@ def _dft_upsample_batch(
         torch.arange(num_rows, dtype=real_dtype, device=cross_corr_fft.device)
     ) - num_rows // 2
     freq_col_base = ifftshift(
-        torch.arange(num_cols, dtype=real_dtype, device=cross_corr_fft.device)
-    ) - num_cols // 2
+        torch.arange(full_cols, dtype=real_dtype, device=cross_corr_fft.device)
+    ) - full_cols // 2
     freq_row = freq_row_base[None, :] + (peak_positions[:, 0] - num_rows // 2)[:, None]
-    freq_col = freq_col_base[None, :] + (peak_positions[:, 1] - num_cols // 2)[:, None]
+    freq_col = freq_col_base[None, :] + (peak_positions[:, 1] - full_cols // 2)[:, None]
     # Guizar-Sicairos matrix-multiply DFT: K_row @ CC @ K_col
     kern_row = torch.exp(
         -2j * math.pi / (num_rows * upsample_factor)
         * upsample_grid[None, :, None] * freq_row[:, None, :]
     ).to(cross_corr_fft.dtype)  # real → complex for matrix multiply
     kern_col = torch.exp(
-        -2j * math.pi / (num_cols * upsample_factor)
+        -2j * math.pi / (full_cols * upsample_factor)
         * freq_col[:, :, None] * upsample_grid[None, None, :]
     ).to(cross_corr_fft.dtype)  # real → complex for matrix multiply
+    if is_rfft:
+        # Exact Hermitian-symmetric contraction on the half-spectrum rfft2 output:
+        # F[kr, full_cols - j] = conj(F[(-kr) % num_rows, j]) for j = 1 .. (full_cols - 1) // 2.
+        half_cols = full_cols // 2 + 1
+        neg_end = (full_cols - 1) // 2 + 1
+        out = (kern_row @ cross_corr_fft) @ kern_col[:, :half_cols, :]
+        if neg_end > 1:
+            neg_rows = (-torch.arange(num_rows, device=cross_corr_fft.device)) % num_rows
+            out = out + (
+                kern_row[:, :, neg_rows] @ cross_corr_fft[:, :, 1:neg_end].conj()
+            ) @ kern_col[:, half_cols:, :].flip(1)
+        return out.real
     # (N,P,M) @ (N,M,K) @ (N,K,P) -> (N,P,P)
     return (kern_row @ cross_corr_fft @ kern_col).real
 

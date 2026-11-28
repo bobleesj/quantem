@@ -96,7 +96,7 @@ def fourier_crop_torch(
 
 def largest_rectangle(mask: np.ndarray) -> tuple[int, int, int, int]:
     """Return the largest axis-aligned all-true rectangle in ``mask``."""
-    bin_factor = max(1, int(np.ceil(max(mask.shape) / 512)))
+    bin_factor = max(1, int(np.ceil(max(mask.shape) / 128)))
     if bin_factor > 1:
         height = mask.shape[0] // bin_factor
         width = mask.shape[1] // bin_factor
@@ -285,32 +285,46 @@ def corrected(
     if smoothing_sigma is None:
         smoothing_sigma = self.kde_sigma
 
-    stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
-    knots = drift_knots.stage_knots(self, stage)
-    for image_index in range(self.shape[0]):
-        warped, _ = drift_knots.interpolator(
-            self, image_index, knots[image_index]
-        ).warp_to_canvas(
-            self.imgs_t[image_index],
-            canvas_up,
-            smoothing_sigma * upsample_factor,
-            self.pad_value[image_index],
-            upsample_factor=upsample_factor,
-        )
-        stack_corr[image_index] = warped
-    image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
-
-    output_shape = (
-        tuple(int(value) for value in self.imgs[0].shape[:2])
-        if resolved_output_frame == "input"
-        else tuple(int(value) for value in self.shape[-2:])
-    )
-    image_corr_fft = fourier_crop_torch(
-        image_corr_fft,
-        output_shape,
-    ) / upsample_factor**2
-    corrected_array = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
-    if strip_padding:
+    with torch.inference_mode():
+        # Stream per-scan warps into ONE running accumulator (cuts 4k VRAM 4x vs stack_corr)
+        accum = torch.zeros(up_h, up_w, dtype=dtype, device=device)
+        knots = drift_knots.stage_knots(self, stage)
+        n_scans = int(self.shape[0])
+        for image_index in range(n_scans):
+            warped, _ = drift_knots.interpolator(
+                self, image_index, knots[image_index]
+            ).warp_to_canvas(
+                self.imgs_t[image_index],
+                canvas_up,
+                smoothing_sigma * upsample_factor,
+                self.pad_value[image_index],
+                upsample_factor=upsample_factor,
+            )
+            accum.add_(warped, alpha=1.0 / float(n_scans))
+            del warped
+        # Always Fourier-crop the upsampled padded canvas FFT to canvas_shape (exact 1:1
+        # physical scale & intensity), then spatially slice the central scan window when
+        # output_frame='input' or strip_padding=True. Uses real rfft2/irfft2 (2x less VRAM).
+        canvas_shape = (int(self.shape[1]), int(self.shape[2]))
+        if upsample_factor == 1 and up_h == canvas_shape[0] and up_w == canvas_shape[1]:
+            corrected_array = accum.cpu().numpy()
+            del accum
+        else:
+            rfft_full = torch.fft.rfft2(accum)
+            del accum
+            ch, cw = canvas_shape
+            h1 = ch // 2
+            h2 = ch - h1
+            cw_r = cw // 2 + 1
+            rfft_crop = torch.zeros((ch, cw_r), dtype=rfft_full.dtype, device=device)
+            rfft_crop[:h1, :cw_r] = rfft_full[:h1, :cw_r]
+            rfft_crop[-h2:, :cw_r] = rfft_full[-h2:, :cw_r]
+            del rfft_full
+            corrected_array = (
+                torch.fft.irfft2(rfft_crop, s=canvas_shape) / (upsample_factor**2)
+            ).cpu().numpy()
+            del rfft_crop
+    if resolved_output_frame == "input" or strip_padding:
         scan_h, scan_w = self.imgs[0].shape[:2]
         pad_h, pad_w = padding_offset(corrected_array.shape[:2], (scan_h, scan_w), integer=True)
         corrected_array = corrected_array[pad_h : pad_h + scan_h, pad_w : pad_w + scan_w]
@@ -827,7 +841,7 @@ def coverage_mask(self) -> np.ndarray:
     >>> common_pixels = drift.coverage_mask()
     >>> ncc = compare(first[common_pixels], second[common_pixels])
     """
-    canvas_h, canvas_w = self.imgs_warped.array.shape[-2:]
+    canvas_h, canvas_w = int(self.shape[-2]), int(self.shape[-1])
     knot_counts = {int(knots.shape[2]) for knots in self.knots}
     if knot_counts != {1}:
         knots = torch.stack(

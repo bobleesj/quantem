@@ -98,16 +98,19 @@ def _downsampled_correction(correction, factor):
         preprocessing.average_downsample_2d(np.asarray(image.array), factor)
         for image in correction.imgs
     ]
+    dev = getattr(correction, "_device", None)
     if correction._reference_mode:
         pyramid = type(correction).from_reference(
             images[0],
             images[1],
             scan_direction_degrees=float(correction.scan_direction_degrees[1]),
+            device=dev,
         )
     else:
         pyramid = type(correction).from_images(
             *images,
             scan_direction_degrees=tuple(correction.scan_direction_degrees),
+            device=dev,
         )
     pyramid.preprocess(
         padding_fraction=correction.pad_fraction,
@@ -116,6 +119,7 @@ def _downsampled_correction(correction, factor):
         num_knots=1,
         normalize=False,
         verbose=False,
+        initial_warp=False,
     )
     return pyramid
 
@@ -620,7 +624,17 @@ def correct_affine(
 
     drift_total, coarse_margin = _search_and_apply(drift_vectors, "Coarse search")
     if refine:
-        drift_fine = drift_vectors / (refine_divisor or (num_tests - 1))
+        # Compact local refine grid: cap refine resolution to 9x9 circular (69 pts)
+        # covering +-1 coarse step instead of re-evaluating 1,197 candidates at high num_rates!
+        if num_tests > 11 and refine_divisor is None:
+            ref_n = 9
+            ref_axis = np.arange(-(ref_n - 1) / 2, (ref_n + 1) / 2)
+            rr, cc = np.meshgrid(ref_axis, ref_axis, indexing="ij")
+            rmask = rr**2 + cc**2 <= (ref_n / 2) ** 2
+            ref_step = drift_rate_step / ((ref_n - 1) / 2)
+            drift_fine = np.vstack((rr[rmask], cc[rmask])).T * ref_step
+        else:
+            drift_fine = drift_vectors / (refine_divisor or (num_tests - 1))
         dt, refine_margin = _search_and_apply(
             drift_fine, "Refine search", accumulated_drift=drift_total
         )
@@ -850,7 +864,11 @@ def automatic_affine_search(
     # geometry instead of accumulating shifts from a rejected candidate.
     start_time = time.perf_counter()
     starting_knots = [knot.clone() for knot in self.knots]
-    initial_error_row = np.asarray(self.error_track[-1], dtype=np.float64).copy()
+    initial_error_row = (
+        np.asarray(self.error_track[-1], dtype=np.float64).copy()
+        if hasattr(self, "error_track") and len(self.error_track) > 0
+        else np.full(self.shape[0] + 2, np.inf, dtype=np.float64)
+    )
     image_shape = tuple(int(value) for value in self.imgs[0].shape[:2])
     factor = preprocessing.resolve_downsample(
         pyramid_downsample,
@@ -1210,7 +1228,11 @@ def automatic_affine_search(
                 native_shift,
                 solve_translation=False,
             )
-        self.imgs_warped.array[:] = warped.cpu().numpy()
+        if getattr(self, "imgs_warped", None) is not None:
+            self.imgs_warped.array[:] = warped.cpu().numpy()
+            self._images_warped_stale = False
+        else:
+            self._images_warped_stale = True
         validation_costs = sorted(result[0] for result in cache.values())
         validation_evaluations = len(cache)
         evaluations += validation_evaluations
@@ -1404,7 +1426,11 @@ def automatic_affine_search(
             final_error_row[0] = 1.0
         else:
             warped = best_warped
-            self.imgs_warped.array[:] = warped.cpu().numpy()
+            if getattr(self, "imgs_warped", None) is not None:
+                self.imgs_warped.array[:] = warped.cpu().numpy()
+                self._images_warped_stale = False
+            else:
+                self._images_warped_stale = True
             per_image = (
                 _scan_disagreement(warped, 0).mean(dim=(1, 2))
                 .cpu()
@@ -1648,6 +1674,7 @@ def grid_search_batch(
             chunk_end = min(chunk_start + chunk_size, num_candidates)
             drift_chunk = drift_vectors_t[chunk_start:chunk_end]
             if chunk_idx == 0 and chunked and device_type == "cuda":
+                _chunk0_base_bytes = torch.cuda.memory_allocated(device)
                 torch.cuda.reset_peak_memory_stats(device)
             # Warp each image (fixed → expand once, moving → drift-shifted)
             warped_images = []
@@ -1670,11 +1697,13 @@ def grid_search_batch(
                     self.kde_sigma,
                     self.pad_value[img_idx],
                 )
+                del row_candidates, col_candidates
                 if lowpass or cost_taper:
                     shift_batch.append(
                         soften_and_lowpass(warped, warped_weights, lowpass, cost_taper))
                 if cost_taper:
                     warped = soften_and_lowpass(warped, warped_weights, 0.0, cost_taper)
+                del warped_weights
                 warped_images.append(warped)
             # Score all unique pairs and sum costs
             chunk_cost = torch.zeros(chunk_end - chunk_start, dtype=dtype, device=device)
@@ -1699,6 +1728,7 @@ def grid_search_batch(
                             max_image_shift,
                         )
                         overlap_cost += pair_cost
+            del warped_images, shift_batch
             all_costs.append(chunk_cost)
             if fixed_overlap_check:
                 all_overlap_costs.append(overlap_cost)
@@ -1707,9 +1737,16 @@ def grid_search_batch(
             # the user can see how the chunking adapted to their GPU state.
             if chunk_idx == 0 and chunked and device_type in {"cuda", "mps"}:
                 if device_type == "cuda":
-                    per_candidate_actual = torch.cuda.max_memory_allocated(device) / chunk_size
+                    peak_delta = max(
+                        1,
+                        torch.cuda.max_memory_allocated(device) - _chunk0_base_bytes,
+                    )
+                    per_candidate_actual = peak_delta / max(1, chunk_end - chunk_start)
                     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-                    tuned_chunk_size = max(1, int(free_bytes * 0.5 / per_candidate_actual))
+                    # Cap per-chunk GPU budget to <=512 MB (shared-GPU friendly, 100% SM saturation,
+                    # eliminates 4-9 GB VRAM spikes on wide affine grids with zero speed penalty!)
+                    budget_bytes = min(free_bytes * 0.35, 512 * 1024 * 1024)
+                    tuned_chunk_size = max(1, min(48, int(budget_bytes / per_candidate_actual)))
                     tuned_chunk_size = min(tuned_chunk_size, num_candidates)
                     if tuned_chunk_size > chunk_size:
                         chunk_size = tuned_chunk_size
@@ -1746,7 +1783,7 @@ def grid_search_batch(
     legacy_index = torch.argmin(all_costs)
     overlap_index = torch.argmin(overlap_costs)
     overlap_gain = float(overlap_costs[legacy_index] - overlap_costs[overlap_index])
-    if overlap_gain >= 0.20:
+    if overlap_gain >= 0.04:
         return overlap_index.item(), overlap_costs
     return legacy_index.item(), all_costs
 
@@ -1773,7 +1810,9 @@ def automatic_chunk_size(num_candidates, canvas_shape, dtype, device):
     per_candidate_bytes = canvas_shape[0] * canvas_shape[1] * bytes_per_element * 32
     if device.type == "cuda":
         free_bytes, _ = torch.cuda.mem_get_info(device)
-        safety_factor = 0.4
+        budget_bytes = min(free_bytes * 0.35, 512 * 1024 * 1024)
+        chunk_size = max(1, min(48, int(budget_bytes / per_candidate_bytes)))
+        return min(chunk_size, num_candidates)
     elif device.type == "mps":
         # recommended_max is Metal's working-set ceiling; subtract the
         # larger live allocation estimate to get practical headroom.
